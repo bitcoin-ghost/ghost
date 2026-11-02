@@ -1,30 +1,31 @@
-<!-- Bitcoin Ghost · Run a Node -->
+<!-- Bitcoin Ghost — bitcoinghost.org -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Run a node · Bitcoin Ghost</title>
-  <meta name="description" content="Run a Ghost node. Earn sats from the node reward pool. Choose your own mempool policy. No whitelisting, no permission, no minimum stake.">
+  <meta name="description" content="Run a Bitcoin Ghost node pool node: what it earns, what you need, and how to install it.">
   <meta property="og:site_name" content="Bitcoin Ghost">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="Run a Ghost node · Bitcoin Ghost">
-  <meta property="og:description" content="Earn a share of the block reward for running a Ghost node. Archive, mining, and L2 capabilities plus elder bonuses.">
+  <meta property="og:title" content="Run a node · Bitcoin Ghost">
+  <meta property="og:description" content="Run a Bitcoin Ghost node pool node: what it earns, what you need, and how to install it.">
   <meta property="og:url" content="https://bitcoinghost.org/nodes.html">
   <meta property="og:image" content="https://bitcoinghost.org/logo.png">
   <meta name="twitter:card" content="summary">
   <meta name="twitter:site" content="@defenwycke">
   <meta name="twitter:creator" content="@defenwycke">
-  <meta name="twitter:title" content="Run a Ghost node · Bitcoin Ghost">
-  <meta name="twitter:description" content="Earn a share of the block reward for running a Ghost node. Archive, mining, and L2 capabilities plus elder bonuses.">
+  <meta name="twitter:title" content="Run a node · Bitcoin Ghost">
+  <meta name="twitter:description" content="Run a Bitcoin Ghost node pool node: what it earns, what you need, and how to install it.">
   <meta name="twitter:image" content="https://bitcoinghost.org/logo.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/style.css?v=20260424">
+  <link rel="stylesheet" href="/style.css?v=20261102">
   <script>
     (function () {
-      var saved = localStorage.getItem('ghost-theme');
+      var saved = null;
+      try { saved = localStorage.getItem('ghost-theme'); } catch (e) {}
       var system = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
       document.documentElement.setAttribute('data-theme', saved || system);
     })();
@@ -42,6 +43,7 @@
       </svg>
       <span class="wordmark">bitcoinghost</span>
     </a>
+
     <nav class="primary">
       <a href="/">overview</a>
       <a href="/pool.html">pool</a>
@@ -51,6 +53,7 @@
       <a href="/downloads.html">downloads</a>
       <a href="/docs/">docs</a>
     </nav>
+
     <div class="utils">
       <a href="https://github.com/bitcoin-ghost" class="bare icon-btn" aria-label="GitHub">
         <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
@@ -62,358 +65,145 @@
   </div>
 </header>
 
+<!-- NOT READY banner. Remove only after Phases 3 and 4 of docs/NODE_POOL_PLAN.md pass. -->
+<div class="np-banner" role="note">
+  <div class="container">
+    <strong>NOT READY</strong> The node pool is under construction and has not run on signet or mainnet. No block has ever been found and no payout ever made. Do not point hashrate at it. <a href="/docs/#honest-reading">Before you mine →</a>
+  </div>
+</div>
+
 <section class="hero">
   <div class="container">
-    <span class="eyebrow">Nodes</span>
-    <h1>Run a Ghost node.</h1>
+    <span class="eyebrow">run a node · not ready</span>
+    <h1>Run a node pool node.</h1>
     <p class="lead">
-      Earn sats from the node reward pool. Set your own mempool policy.
-      Decentralise mining. No whitelisting, no permission, no minimum stake.
+      Anyone can run one, without asking. Your node builds its own block templates, serves its own miners and keeps
+      the same ledger as every other node. When one of its miners finds a block, the block's transaction fees are yours.
     </p>
     <div class="hero-actions">
-      <a href="/downloads.html" class="btn btn-primary">Download <span class="arrow">→</span></a>
-      <a href="/docs/" class="btn btn-ghost">Operator docs</a>
+      <a href="/docs/#deployment" class="btn btn-primary">Deployment guide <span class="arrow">→</span></a>
+      <a href="/endpoints.html" class="btn btn-ghost">Node list</a>
     </div>
   </div>
 </section>
 
-<!-- ───────── What makes Ghost nodes different ───────── -->
-<section class="block node-diff-section">
+<section class="block">
   <div class="container">
-    <div class="section-label">what makes a ghost node</div>
-    <h2 class="section-title">Ghost's own node — forked from Bitcoin Core, built well beyond it.</h2>
-    <p class="section-lead">
-      A Ghost node runs <code>ghostd</code> — Ghost's own daemon, forked from
-      Bitcoin Core v30 — with <code>ghost-mining</code> alongside it on the
-      same box. It validates Bitcoin mainnet like any full
-      node, then adds a mesh layer, an incentive layer, and a privacy layer that
-      stock Bitcoin Core doesn't have — every feature below is built into the
-      Ghost binaries, and every one toggles in config.
-    </p>
-
-    <ul class="feature-list node-core-pink">
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
-        <div>
-          <div class="fl-name">BUDS</div>
-          <div class="fl-desc">Tier-based mempool policy dial. Accept or reject transactions by class — T0 financial, T1 data, T2 content, T3 abusive — without forking or recompiling.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
-        <div>
-          <div class="fl-name">Reaper</div>
-          <div class="fl-desc">Consensus-safe dead-code filter. Rejects inscription envelopes, runestones, drop stuffing, fake multisig, P2TR annex abuse and oversized OP_RETURNs at the policy layer.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
-        <div>
-          <div class="fl-name">Shroud</div>
-          <div class="fl-desc">Randomised relay delays that defeat timing-correlation attacks used to fingerprint originating nodes and link wallets to IPs.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
-        <div>
-          <div class="fl-name">Ghost Mode</div>
-          <div class="fl-desc">Blocks-only relay. Your node never announces transactions into the mempool, preventing origin-address leakage from passive network surveillance.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
-        <div>
-          <div class="fl-name">Exorcism</div>
-          <div class="fl-desc">Defensive block storage. Blocks are validated in RAM, then hazeable fields — witness, scriptSig, OP_RETURN, coinbase data — are stripped before disk. Harmful bytes never persist.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
-        <div>
-          <div class="fl-name">Tor or clearnet</div>
-          <div class="fl-desc">Embedded Tor subprocess or clean clearnet P2P routing, configurable per node. The mesh counts both identically — no privacy penalty for running hidden.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
-        <div>
-          <div class="fl-name">Decentralised voting</div>
-          <div class="fl-desc">67% Byzantine-fault-tolerant quorum on payouts and consensus actions, gossiped over a ZMQ mesh. Every node can propose, vote, and sign checkpoints.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
-        <div>
-          <div class="fl-name">Incentivised share system</div>
-          <div class="fl-desc">0.5% of every block subsidy plus the full L2 node side of settlement fees flow to the node reward pool. Paid on-chain, every block, to your address.</div>
-        </div>
-      </li>
-    </ul>
-  </div>
-</section>
-
-<!-- ───────── Capabilities: the 5-4-3-2-1 system ───────── -->
-<section class="block node-caps-section">
-  <div class="container">
-    <div class="section-label">capabilities</div>
-    <h2 class="section-title">Opt into more. Earn more shares.</h2>
-    <p class="section-lead">
-      The reward pool is split by capability shares. Every node that
-      meets the uptime gate gets at least one share; each capability you
-      opt into — and prove via random peer challenges — adds more. Five
-      capabilities, maximum fifteen shares.
-    </p>
-
-    <ul class="feature-list node-core-pink cap-bulleted">
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
-        <div>
-          <div class="fl-name">Archive mode <span class="fl-badge">+5</span></div>
-          <div class="fl-desc">Keep the full Bitcoin Ghost chain from genesis and serve block data to peers. Verified via random block-retrieval challenges. Heaviest on storage; highest reward.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
-        <div>
-          <div class="fl-name">Ghost Pay <span class="fl-badge">+4</span></div>
-          <div class="fl-desc">Run the L2 payment service — accept instant payments, serve light wallets, process settlements. Verified via L2 block-lookup challenges. Earns L2 settlement fees on top.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
-        <div>
-          <div class="fl-name">Public mining <span class="fl-badge">+3</span></div>
-          <div class="fl-desc">Open your Stratum ports so external ASICs can point at your node. Verified by peers connecting to your stratum endpoint. Adds miner hashrate to the pool.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
-        <div>
-          <div class="fl-name">Reaper <span class="fl-badge">+2</span></div>
-          <div class="fl-desc">Run the consensus-safe dead-code filter — reject inscription envelopes, runestones, drop stuffing, fake multisig, P2TR annex abuse and oversized OP_RETURNs. Verified by peers submitting policy-classification challenges.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
-        <div>
-          <div class="fl-name">Elder <span class="fl-badge">+1</span></div>
-          <div class="fl-desc">One of the first 101 nodes registered with valid proof-of-work. Slots issued in deterministic order; once burned or retired they stay burned.</div>
-        </div>
-      </li>
-    </ul>
-  </div>
-</section>
-
-<!-- ───────── Mining modes ───────── -->
-<section class="block node-modes-section" id="mining-modes">
-  <div class="container">
-    <div class="section-label">mining modes</div>
-    <h2 class="section-title">Solo, private pool, or public pool.</h2>
-    <p class="section-lead">
-      Every node decides how its hashpower is used and who may point miners
-      at it. Pick one of three modes — switch any time from the node
-      dashboard. No account, no sign-up, no KYC.
-    </p>
-
-    <ul class="feature-list node-core-pink cap-bulleted">
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
-        <div>
-          <div class="fl-name">Private Solo</div>
-          <div class="fl-desc">Your miners only — Stratum ports stay closed to outsiders and the node isn't published in DNS. You keep <strong>99% of the whole block reward — subsidy and transaction fees</strong>, paid straight to your own address. The remaining 1% of subsidy + fees is the protocol fee, split between the treasury and the node pool. No reward sharing.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
-        <div>
-          <div class="fl-name">Private Pool</div>
-          <div class="fl-desc">Run a pool for a group you choose. Miners connect with a password and rewards are pool-aggregated and shared across connected hashers — but the node stays out of DNS, so the public can't find it. Good for a farm, a club, or friends pooling together.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
-        <div>
-          <div class="fl-name">Public Pool <span class="fl-badge">+3</span></div>
-          <div class="fl-desc">Published in DNS so anyone can point an ASIC at your node. Rewards are pool-aggregated and shared, and accepting external miners earns the public-mining capability (+3 shares). This is the default mode.</div>
-        </div>
-      </li>
-    </ul>
-
-    <p class="section-lead" style="margin-top:1.5rem">
-      Set it at install with <code>--mining-mode solo|pool|public</code>, or
-      change it later in the node dashboard under <strong>Mining</strong>.
-    </p>
-    <p class="section-lead" style="margin-top:1rem">
-      <strong>Name your pool.</strong> Every block you find carries a tag in
-      its coinbase, visible on any block explorer. By default it reflects the
-      mode (<code>- G H O S T - PublicPool</code>), but you can set a custom
-      name — <code>- G H O S T - YourPool</code> — from the node dashboard's
-      Pool Setup (ASCII, up to 30 characters). It's how your pool gets
-      recognised on-chain.
-    </p>
-  </div>
-</section>
-
-<!-- ───────── The gate ───────── -->
-<section class="block node-gate-section">
-  <div class="container">
-    <div class="section-label">the gate</div>
-    <h2 class="section-title">One rule: stay up.</h2>
-    <p class="section-lead">
-      Before any node's shares count toward payout, it must maintain
-      <strong>95% uptime over the trailing 7 days</strong>. Measured by
-      peer health-ping receipts, tamper-resistant by mesh cross-validation.
-      This is the only gatekeeper in the system — everything else is
-      capability-based and opt-in.
-    </p>
-
-    <div class="core-tiles core-tiles-3">
-      <div class="ct-tile">
-        <div class="k">window</div>
-        <div class="v">7 days</div>
-        <div class="sub">trailing, rolling</div>
-      </div>
-      <div class="ct-tile">
-        <div class="k">threshold</div>
-        <div class="v accent">95%</div>
-        <div class="sub">of samples must be online</div>
-      </div>
-      <div class="ct-tile">
-        <div class="k">consequence</div>
-        <div class="v">no payout</div>
-        <div class="sub">until you climb back above 95%</div>
-      </div>
+    <div class="section-label">what a node gets</div>
+    <h2 class="section-title">Fees from your own miners' blocks. Nothing for being up.</h2>
+    <div class="np-prose">
+      <p>A node's income is the <strong>transaction fees</strong> of every block its own miners find, paid to its
+      <strong>fee address</strong>. Miners are paid separately, from the subsidy, by the ledger. A node with no miners earns nothing.</p>
+      <p>There are no node rewards, capabilities, elders or uptime requirements any more. Those belonged to the old
+      network and are removed.</p>
+      <p>Running your own node is also the one sure way not to be cheated by a node: a node builds its miners' jobs,
+      and until <code>ghost-audit</code> exists, a miner on someone else's node is trusting it.</p>
     </div>
   </div>
 </section>
 
-<!-- ───────── Hardware ───────── -->
-<section class="block node-hw-section">
+<section class="block">
   <div class="container">
-    <div class="section-label">hardware</div>
+    <div class="section-label">before you start</div>
     <h2 class="section-title">What you need.</h2>
-    <p class="section-lead">
-      Ghost runs its own Bitcoin full node (<code>ghostd</code>) plus the
-      pool and Pay daemons on the same box. Minimum specs scale with the
-      capabilities you opt into — a pruned Bitcoin-only node is far cheaper
-      than a full-archive node with Pay enabled.
-    </p>
 
     <div class="hw-table-wrap">
       <table class="hw-table">
-        <thead>
-          <tr>
-            <th>Config</th>
-            <th>RAM</th>
-            <th>Disk</th>
-            <th>Bandwidth</th>
-            <th>Notes</th>
-          </tr>
-        </thead>
+        <thead><tr><th>Component</th><th>Minimum</th><th>Recommended</th></tr></thead>
         <tbody>
-          <tr>
-            <td><strong>Minimum</strong></td>
-            <td>4 GB</td>
-            <td>700 GB SSD</td>
-            <td>1 Mbps ↑↓</td>
-            <td>Full Bitcoin validation + Ghost consensus. No archive, no Pay.</td>
-          </tr>
-          <tr>
-            <td><strong>Recommended</strong></td>
-            <td>8 GB</td>
-            <td>1 TB SSD</td>
-            <td>10 Mbps ↑↓</td>
-            <td>Comfortable margin. Enables Pay. Headroom for mesh gossip and share traffic.</td>
-          </tr>
-          <tr>
-            <td><strong>Archive</strong></td>
-            <td>16 GB</td>
-            <td>2 TB SSD</td>
-            <td>50 Mbps ↑↓</td>
-            <td>Full historical block serving. Pass archive challenges under load.</td>
-          </tr>
-          <tr>
-            <td><strong>Public mining</strong></td>
-            <td>+2 GB</td>
-            <td>—</td>
-            <td>+10 Mbps ↑</td>
-            <td>Add to any config. Share-propagation latency matters; low-ping bandwidth helps.</td>
-          </tr>
+          <tr><td>CPU</td><td>4 cores</td><td>8+ cores</td></tr>
+          <tr><td>RAM</td><td>8 GB</td><td>16+ GB</td></tr>
+          <tr><td>Storage</td><td>500 GB SSD</td><td>1 TB NVMe</td></tr>
+          <tr><td>Network</td><td>100 Mbps symmetric</td><td>1 Gbps</td></tr>
         </tbody>
       </table>
     </div>
 
-    <div class="pending-note">
-      A home server, PC or laptop running Bitcoin Ghost can be a Ghost
-      node. Tor is supported for operators who want to stay off clearnet —
-      the mesh counts Tor and clearnet nodes identically.
+    <div class="feature-group">
+      <div class="features">
+        <div class="feature">
+          <div class="name">Linux x86_64, Ubuntu</div>
+          <div class="desc">The installer runs as root, uses <code>apt-get</code> and <code>ufw</code>, and refuses anything that isn't x86_64.</div>
+        </div>
+        <div class="feature">
+          <div class="name">A fee address</div>
+          <div class="desc"><code>--fee-address</code>: P2SH, P2WPKH, P2WSH or P2TR on the node's network. P2PKH is refused, and a bad checksum is refused rather than paid.</div>
+        </div>
+        <div class="feature">
+          <div class="name">An alert endpoint</div>
+          <div class="desc">Optional, for example <code>https://ntfy.sh</code>. Without one, alerts for low disk, node offline and restart loops fire into nothing.</div>
+        </div>
+        <div class="feature">
+          <div class="name">Relay peers</div>
+          <div class="desc">Optional: <code>--relay-peer host:port</code>, repeatable. Without any, the node waits for peers to dial it on the relay port, 8566.</div>
+        </div>
+        <div class="feature">
+          <div class="name">SSH on port 22, or a rule first</div>
+          <div class="desc">The installer enables <code>ufw</code> and only allows SSH on 22. If yours is elsewhere, add the rule before you install.</div>
+        </div>
+        <div class="feature">
+          <div class="name">A server of its own</div>
+          <div class="desc">Never run a node pool node on the same server as an old-network node: they use the same unit names, paths and ports.</div>
+        </div>
+      </div>
     </div>
   </div>
 </section>
 
-<!-- ───────── Quickstart ───────── -->
-<section class="block node-quickstart-section">
+<section class="block">
   <div class="container">
-    <div class="section-label">quickstart</div>
-    <h2 class="section-title">From zero to node in five steps.</h2>
-    <p class="section-lead">
-      Full walkthrough in the <a href="/docs/">operator docs</a>; this is
-      the sketch.
-    </p>
+    <div class="section-label">install</div>
+    <h2 class="section-title">One command, once there is a release.</h2>
+    <pre class="diagram">curl -sSL https://get.bitcoinghost.org | sudo GHOST_VERSION=<span class="m">&lt;node pool release tag&gt;</span> bash -s -- \
+  --fee-address <span class="m">bc1q…</span> \
+  --alert-webhook https://ntfy.sh</pre>
+    <div class="np-prose">
+      <p><strong>No node pool release has been published yet.</strong> Every release on GitHub so far belongs to the old
+      network, so the installer refuses to run without <code>GHOST_VERSION</code> naming a node pool release.</p>
+      <p><strong>No share-chain genesis is published for mainnet or signet.</strong> Until one is, the pool refuses to start
+      on those networks; regtest works for testing.</p>
+      <p>The installer verifies the release signature, generates every key on the machine, keeps the node off the old
+      network, and leaves automatic updates off. <a href="/docs/#deployment">Everything it does →</a></p>
+    </div>
 
-    <ol class="quickstart-steps">
-      <li>
-        <div class="qs-n">1</div>
-        <div class="qs-body">
-          <div class="qs-title">Run the installer</div>
-          <div class="qs-desc">One command installs <code>ghostd</code> and <code>ghost-mining</code> with signed binaries and systemd units:<br><code>curl -sSL https://get.bitcoinghost.org | sudo bash -s -- --payout-address bc1q…</code><br>The script verifies the GPG release signature before writing anything. Prefer to do it by hand? Grab the tarball from the <a href="/downloads.html">downloads page</a> and verify it yourself.</div>
-        </div>
-      </li>
-      <li>
-        <div class="qs-n">2</div>
-        <div class="qs-body">
-          <div class="qs-title">Choose your sync</div>
-          <div class="qs-desc">Full initial block download (the default) validates every block from genesis — fully trustless. In a hurry? <code>--sync fast</code> loads a verified assumeUTXO snapshot at height 910000 and back-fills history behind it, so the node is usable in minutes rather than days.</div>
-        </div>
-      </li>
-      <li>
-        <div class="qs-n">3</div>
-        <div class="qs-body">
-          <div class="qs-title">Configure capabilities</div>
-          <div class="qs-desc">Edit <code>pool.toml</code> — set <code>public_address</code>, pick your mempool <code>policy.profile</code>, flip <code>archive_mode</code>, <code>[ghost_pay]</code>, and <code>public_mining</code> to match what you want to offer.</div>
-        </div>
-      </li>
-      <li>
-        <div class="qs-n">4</div>
-        <div class="qs-body">
-          <div class="qs-title">Add seed peers + start</div>
-          <div class="qs-desc">Drop a few mainnet seed nodes into <code>seed_nodes</code> and run <code>systemctl start ghost-mining</code>. The mesh does peer discovery from there.</div>
-        </div>
-      </li>
-      <li>
-        <div class="qs-n">5</div>
-        <div class="qs-body">
-          <div class="qs-title">Pass the gate</div>
-          <div class="qs-desc">Stay online. After ~7 days of 95%+ uptime, you're eligible for the reward pool. Each capability verifies over the same window via random peer challenges.</div>
-        </div>
-      </li>
-    </ol>
+    <div class="hw-table-wrap">
+      <table class="hw-table">
+        <thead><tr><th>Port</th><th>What</th></tr></thead>
+        <tbody>
+          <tr><td>3333</td><td>Stratum V1, hobby tier</td></tr>
+          <tr><td>4444</td><td>Stratum V1, farm tier</td></tr>
+          <tr><td>34255</td><td>Stratum V2</td></tr>
+          <tr><td>8566</td><td>Share-chain relay (<code>--relay-port</code>)</td></tr>
+          <tr><td>8333</td><td>Bitcoin P2P (38333 on signet, 18444 on regtest)</td></tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 </section>
 
-<!-- ───────── Final CTA ───────── -->
-<section class="block connect-cta" style="border-bottom:none">
+<section class="block">
   <div class="container">
-    <div class="section-label">ready?</div>
-    <h2 class="section-title">Join the mesh.</h2>
-    <p class="section-lead">
-      Every node makes the pool harder to capture. Get the binary, spin
-      it up, help Ghost run forever on its own.
-    </p>
-    <div class="hero-actions" style="margin-top: 24px">
-      <a href="/downloads.html" class="btn btn-primary">Download <span class="arrow">→</span></a>
-      <a href="/docs/" class="btn btn-ghost">Read the full operator guide</a>
+    <div class="section-label">being listed</div>
+    <h2 class="section-title">Open listing. No approval.</h2>
+    <div class="np-prose">
+      <p>Any node with a valid advert that passes an outside probe will appear on the <a href="/endpoints.html">node list</a>.
+      There is no roster and no signed list. The listing service is <strong>not built yet</strong>; until it is, the node list
+      shows a placeholder.</p>
     </div>
+  </div>
+</section>
+
+<section class="block" style="border-bottom: none;">
+  <div class="container">
+    <div class="section-label">read this first</div>
+    <h2 class="section-title">Before you run a node.</h2>
+    <ul class="np-honest">
+      <li><strong>No block has ever been found</strong> by the node pool.</li>
+      <li><strong>No payout has ever been made.</strong></li>
+      <li><strong>Your balance may stay unpaid for a long time.</strong></li>
+      <li><strong>An unaudited node can cheat you.</strong> The tool to audit one, <code>ghost-audit</code>, is not built yet.</li>
+      <li><strong>If you need steady income, use an established pool.</strong></li>
+    </ul>
   </div>
 </section>
 
@@ -422,18 +212,47 @@
     <div class="colophon">
       <div class="brand">
         <svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="width:22px;height:22px;">
-          <path d="M9 10h.01"/>
-          <path d="M15 10h.01"/>
-          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
+        <path d="M9 10h.01"/>
+        <path d="M15 10h.01"/>
+        <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
         </svg>
         <span class="wordmark">bitcoinghost</span>
       </div>
       <div class="meta">Open source under the MIT license. No ICO, no foundation, no venture money.</div>
     </div>
-    <div><h4>Core</h4><ul></ul></div>
-    <div><h4>Pool</h4><ul></ul></div>
-    <div><h4>Pay</h4><ul></ul></div>
-    <div><h4>Products</h4><ul></ul></div>
+    <div>
+      <h4>Node pool</h4>
+      <ul>
+        <li><a href="/">How it works</a></li>
+        <li><a href="/pool.html">Pool status</a></li>
+        <li><a href="/endpoints.html">Node list</a></li>
+        <li><a href="/miner.html">Miner lookup</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Mine</h4>
+      <ul>
+        <li><a href="/miners.html">Point a miner</a></li>
+        <li><a href="/miners.html#firmware">Firmware</a></li>
+        <li><a href="/docs/#payouts">Payout rule</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Run a node</h4>
+      <ul>
+        <li><a href="/nodes.html">Run a node</a></li>
+        <li><a href="/downloads.html">Downloads</a></li>
+        <li><a href="/docs/#deployment">Deployment</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Read first</h4>
+      <ul>
+        <li><a href="/docs/#honest-reading">Before you mine</a></li>
+        <li><a href="/docs/#ghost-audit">Auditing a node</a></li>
+        <li><a href="/security.html">Security</a></li>
+      </ul>
+    </div>
     <div>
       <h4>Project</h4>
       <ul>
@@ -457,7 +276,7 @@
     btn.addEventListener('click', function () {
       var next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
       html.setAttribute('data-theme', next);
-      localStorage.setItem('ghost-theme', next);
+      try { localStorage.setItem('ghost-theme', next); } catch (e) {}
       render();
     });
   })();

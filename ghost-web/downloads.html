@@ -21,7 +21,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/style.css?v=20260424">
+  <link rel="stylesheet" href="/style.css?v=20261102">
   <script>
     (function () {
       var saved = localStorage.getItem('ghost-theme');
@@ -64,6 +64,13 @@
   </div>
 </header>
 
+<!-- NOT READY banner. Remove only after Phases 3 and 4 of docs/NODE_POOL_PLAN.md pass. -->
+<div class="np-banner" role="note">
+  <div class="container">
+    <strong>NOT READY</strong> The node pool is under construction and has not run on signet or mainnet. No block has ever been found and no payout ever made. Do not point hashrate at it. <a href="/docs/#honest-reading">Before you mine →</a>
+  </div>
+</div>
+
 <section class="hero">
   <div class="container">
     <span class="eyebrow">Downloads</span>
@@ -86,13 +93,21 @@
     <h2 class="section-title">Run a Ghost node.</h2>
     <p class="section-lead">
       The node package is a single signed tarball containing every binary a
-      node runs: <code>ghostd</code> (a clean Bitcoin Core v30 fork),
-      and <code>ghost-mining</code> (mining pool + BFT payout consensus). The command-line tools
-      — <code>ghost-cli</code> (the <code>ghostd</code> RPC client),
-      <code>ghost-admin</code>, <code>ghost-light-wallet-cli</code> and
-      <code>ghost-light-wallet-tui</code> — ship in the same tarball. See the
-      <a href="/nodes.html">nodes</a> page for hardware requirements and the
-      full operator guide.
+      node runs: <code>ghostd</code> (a Bitcoin Core fork),
+      <code>ghost-mining</code>, <code>pool_sv2</code> (the Stratum V2 pool, which
+      builds the node pool's coinbase and runs the share-chain relay) and
+      <code>translator_sv2</code> (Stratum V1 in front of it), plus
+      <code>ghost-cli</code> (the <code>ghostd</code> RPC client) and
+      <code>ghost-admin</code>. See the <a href="/nodes.html">nodes</a> page for
+      hardware requirements and the <a href="/docs/#deployment">deployment guide</a>
+      for the rest.
+    </p>
+
+    <p class="section-lead">
+      <strong>No node pool release has been published yet.</strong> Every release
+      on GitHub so far belongs to the old network, which keeps running until the
+      handover. The installer refuses to run without <code>GHOST_VERSION</code>
+      naming a node pool release.
     </p>
 
     <p class="section-lead">
@@ -108,15 +123,14 @@
       <div class="ct-tile ct-wide">
         <div class="k">one-command install</div>
         <div class="v" style="font-size:15px; line-height:1.7;">
-          <code>curl -sSL https://get.bitcoinghost.org | sudo bash -s -- \</code><br>
-          <code>&nbsp;&nbsp;--payout-address bc1q…</code>
+          <code>curl -sSL https://get.bitcoinghost.org | sudo GHOST_VERSION=&lt;tag&gt; bash -s -- \</code><br>
+          <code>&nbsp;&nbsp;--fee-address bc1q… --alert-webhook https://ntfy.sh</code>
         </div>
         <div class="sub" style="margin-top:14px;">
-          Downloads and installs <code>ghostd</code> and <code>ghost-mining</code>
-          with systemd units. It verifies the GPG
-          release signature before writing any binary. Add <code>--sync fast</code>
-          to load a verified assumeUTXO snapshot (height 910000) instead of a
-          full initial block download.
+          Installs the node with systemd units. It verifies the GPG release
+          signature before writing any binary, runs a preflight before changing
+          anything, and keeps the node off the old network. Full trustless sync
+          is the default.
         </div>
       </div>
       <div class="ct-tile">
@@ -152,19 +166,10 @@
         </svg>
         <div>
           <div class="fl-name">systemd units included <span class="fl-badge">one-shot install</span></div>
-          <div class="fl-desc">The installer writes and enables <code>ghostd</code> and <code>ghost-mining</code> services, plus a sync gate so the pool only starts once the node is ready.</div>
+          <div class="fl-desc">The installer writes the <code>ghostd</code>, <code>ghost-mining</code>, <code>sri-pool</code> and <code>sri-translator</code> services, plus a sync gate so the pool only starts once the node is ready.</div>
         </div>
       </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M9 10h.01"/><path d="M15 10h.01"/>
-          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
-        </svg>
-        <div>
-          <div class="fl-name">assumeUTXO fast-sync <span class="fl-badge">--sync fast</span></div>
-          <div class="fl-desc">Load a verified UTXO snapshot at height 910000 and be usable in minutes; the node back-fills and validates history behind it. Full trustless IBD from genesis stays the default.</div>
-        </div>
-      </li>
+      
       <li>
         <svg class="gh-bullet" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
           <path d="M9 10h.01"/><path d="M15 10h.01"/>
@@ -172,7 +177,7 @@
         </svg>
         <div>
           <div class="fl-name">Build from source <span class="fl-badge">reproduce it</span></div>
-          <div class="fl-desc"><code>git clone https://github.com/bitcoin-ghost/ghost</code>, check out the latest release tag, then <code>cargo build --release --workspace</code>. Binaries land in <code>target/release/</code>. Full build docs are in the repo README.</div>
+          <div class="fl-desc"><code>git clone https://github.com/bitcoin-ghost/ghost</code>, check out a node pool release tag (none is published yet), then <code>cargo build --release --workspace</code>. Binaries land in <code>target/release/</code>. Full build docs are in the repo README.</div>
         </div>
       </li>
     </ul>
@@ -186,8 +191,9 @@
     <h2 class="section-title">Watch and manage your node.</h2>
     <p class="section-lead">
       The node dashboard is a small web frontend you run against your own
-      node. It shows hashrate, shares, capabilities, verification results and
-      payouts, and lets you adjust policy, mining mode and reaper settings. It
+      node. It is being rebuilt for the node pool: node status and peers, the
+      share-chain tip, connected miners with their slot class and any firmware
+      warning, balances, and recent pool blocks. It
       binds to localhost and is password-protected — per-operator by design,
       with no public endpoint.
     </p>
@@ -283,18 +289,47 @@
     <div class="colophon">
       <div class="brand">
         <svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="width:22px;height:22px;">
-          <path d="M9 10h.01"/>
-          <path d="M15 10h.01"/>
-          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
+        <path d="M9 10h.01"/>
+        <path d="M15 10h.01"/>
+        <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
         </svg>
         <span class="wordmark">bitcoinghost</span>
       </div>
       <div class="meta">Open source under the MIT license. No ICO, no foundation, no venture money.</div>
     </div>
-    <div><h4>Core</h4><ul></ul></div>
-    <div><h4>Pool</h4><ul></ul></div>
-    <div><h4>Pay</h4><ul></ul></div>
-    <div><h4>Products</h4><ul></ul></div>
+    <div>
+      <h4>Node pool</h4>
+      <ul>
+        <li><a href="/">How it works</a></li>
+        <li><a href="/pool.html">Pool status</a></li>
+        <li><a href="/endpoints.html">Node list</a></li>
+        <li><a href="/miner.html">Miner lookup</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Mine</h4>
+      <ul>
+        <li><a href="/miners.html">Point a miner</a></li>
+        <li><a href="/miners.html#firmware">Firmware</a></li>
+        <li><a href="/docs/#payouts">Payout rule</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Run a node</h4>
+      <ul>
+        <li><a href="/nodes.html">Run a node</a></li>
+        <li><a href="/downloads.html">Downloads</a></li>
+        <li><a href="/docs/#deployment">Deployment</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Read first</h4>
+      <ul>
+        <li><a href="/docs/#honest-reading">Before you mine</a></li>
+        <li><a href="/docs/#ghost-audit">Auditing a node</a></li>
+        <li><a href="/security.html">Security</a></li>
+      </ul>
+    </div>
     <div>
       <h4>Project</h4>
       <ul>
