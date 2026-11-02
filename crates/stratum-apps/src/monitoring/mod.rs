@@ -16,6 +16,8 @@ pub mod server;
 pub mod snapshot_cache;
 pub mod sv1;
 
+/// The HTTP framework the server runs on, for [`MonitoringServer::with_routes`].
+pub use axum;
 pub use client::{
     ExtendedChannelInfo, StandardChannelInfo, Sv2ClientInfo, Sv2ClientMetadata,
     Sv2ClientsMonitoring, Sv2ClientsSummary,

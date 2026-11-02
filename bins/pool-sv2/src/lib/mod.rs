@@ -39,6 +39,7 @@ mod io_task;
 #[cfg(feature = "monitoring")]
 mod monitoring;
 pub mod node_pool;
+pub mod node_pool_api;
 pub mod node_pool_relay;
 pub mod share_webhook;
 pub mod template_receiver;
@@ -127,7 +128,11 @@ impl PoolSv2 {
                     self.config.monitoring_cache_refresh_secs().unwrap_or(15),
                 ),
             )
-            .expect("Failed to initialize monitoring server");
+            .expect("Failed to initialize monitoring server")
+            // The node pool's ledger and status API (W2.11), on the same loopback listener.
+            .with_routes(crate::node_pool_api::router(
+                channel_manager.node_pool_api.clone(),
+            ));
 
             let cancellation_token_clone = cancellation_token.clone();
             let shutdown_signal = async move {
