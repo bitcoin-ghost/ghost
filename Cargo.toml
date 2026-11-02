@@ -58,10 +58,6 @@ members = [
     "bins/ghost-miner-proxy",
     # Headless setup CLI
     "bins/ghost-setup",
-    # Mobile Apps
-    "apps/ghost-tap/core",
-    "apps/ghost-tap/tests/integration",
-    "apps/ghost-tap/desktop/src-tauri",
     # Wraith Wallet (desktop)
     "apps/wraith-wallet/core",
     "apps/wraith-wallet/ipc",
@@ -119,8 +115,6 @@ ghost-zkp = { path = "crates/ghost-zkp" }
 ghost-mpc = { path = "crates/ghost-mpc" }
 ghost-glyph = { path = "crates/ghost-glyph" }
 # GSP crates
-# Mobile Apps
-ghost-tap-core = { path = "apps/ghost-tap/core" }
 # Wraith Wallet
 wraith-wallet-core = { path = "apps/wraith-wallet/core" }
 wraith-wallet-ipc = { path = "apps/wraith-wallet/ipc" }
@@ -218,13 +212,9 @@ ratatui = "0.30"
 crossterm = "0.29"
 
 # Additional crypto
-k256 = { version = "0.14", features = ["ecdsa"] }
-bellperson = "0.26"
-blstrs = "0.7"
 chacha20poly1305 = "0.10"
 zeroize = { version = "1.7", features = ["derive"] }
 subtle = "2.5"
-ripemd = "0.1"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 secrecy = "0.8"
 
@@ -235,15 +225,10 @@ hyper = { version = "1.0", features = ["full"] }
 libc = "0.2"
 
 # Dev dependencies
-tokio-test = "0.4"
 proptest = "1.4"
 
 # Encoding
 bech32 = "0.11"
-bs58 = "0.5"
-
-# FFI
-uniffi = "0.27"
 
 # Workspace-level package for integration tests
 [package]

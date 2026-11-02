@@ -10,11 +10,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # The Tauri desktop crates (wraith-wallet-gui, ghost-tap-desktop) need a built
-  # JS frontend (`dist/`) before `tauri::generate_context!` will compile, which is
-  # a separate Node pipeline from the Rust workspace. They are excluded from the
-  # pure-Rust jobs below and built on their own; everything else gets full coverage.
-  WORKSPACE_EXCLUDES: --workspace --exclude wraith-wallet-gui --exclude ghost-tap-desktop
+  # The Tauri desktop crate (wraith-wallet-gui) needs a built JS frontend (`dist/`)
+  # before `tauri::generate_context!` will compile, which is a separate Node pipeline
+  # from the Rust workspace. It is excluded from the pure-Rust jobs below and built on
+  # its own; everything else gets full coverage.
+  WORKSPACE_EXCLUDES: --workspace --exclude wraith-wallet-gui
   # System packages the Rust workspace needs: Cap'n Proto (bitcoin-core-sv2 build
   # script) and SQLite (ghost-storage).
   LINUX_DEPS: libsqlite3-dev capnproto libcapnp-dev
