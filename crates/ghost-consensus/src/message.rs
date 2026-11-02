@@ -24,7 +24,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use ghost_common::types::{HealthPing, NodeCapabilities, NodeId};
+use ghost_common::types::{HealthPing, NodeId};
 
 /// Topic prefixes for ZMQ messages
 pub mod topics {
@@ -468,8 +468,6 @@ pub struct DiscoveryMessage {
     pub node_id: NodeId,
     /// Node's public address
     pub public_address: String,
-    /// Node's capabilities
-    pub capabilities: NodeCapabilities,
     /// Known peers (for gossip)
     pub known_peers: Vec<PeerInfo>,
 }
@@ -483,8 +481,6 @@ pub struct PeerInfo {
     pub public_address: String,
     /// Last seen timestamp
     pub last_seen: u64,
-    /// Capabilities
-    pub capabilities: NodeCapabilities,
 }
 
 #[cfg(test)]

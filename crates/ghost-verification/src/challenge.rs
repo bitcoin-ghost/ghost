@@ -72,8 +72,6 @@ pub struct HealthResponse {
     pub miner_count: u32,
     /// Connected peers
     pub peer_count: u32,
-    /// Capabilities
-    pub capabilities: CapabilityStatus,
     /// Uptime (seconds)
     pub uptime_secs: u64,
     /// Cumulative `Database::with_connection` usage: `(calls, total_ms_held, slow_calls)` (#537).
@@ -111,39 +109,6 @@ pub struct MeshValidationStats {
     pub bad_timestamp: u64,
     pub other_errors: u64,
     pub memory_limit_exceeded: u64,
-}
-
-/// Capability status
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CapabilityStatus {
-    /// Archive mode enabled
-    pub archive_mode: bool,
-    /// Ghost Pay enabled
-    pub ghost_pay: bool,
-    /// Public mining enabled
-    pub public_mining: bool,
-    /// Reaper policy enabled
-    pub reaper: bool,
-    /// Elder status
-    pub elder_status: bool,
-    /// GSP (Ghost Service Protocol) light wallet server enabled
-    pub gsp_enabled: bool,
-    /// Total shares
-    pub total_shares: i32,
-}
-
-impl From<ghost_common::types::NodeCapabilities> for CapabilityStatus {
-    fn from(caps: ghost_common::types::NodeCapabilities) -> Self {
-        Self {
-            archive_mode: caps.archive_mode,
-            ghost_pay: caps.ghost_pay,
-            public_mining: caps.public_mining,
-            reaper: caps.reaper,
-            elder_status: caps.elder_status,
-            gsp_enabled: false, // Set via VerificationState.gsp_enabled()
-            total_shares: caps.total_shares(),
-        }
-    }
 }
 
 /// Maximum age of a signed response before it's considered stale (5 minutes)
@@ -330,7 +295,6 @@ mod tests {
             round_id: 1,
             miner_count: 10,
             peer_count: 5,
-            capabilities: CapabilityStatus::default(),
             uptime_secs: 3600,
         };
 
@@ -365,7 +329,6 @@ mod tests {
             round_id: 0,
             miner_count: 0,
             peer_count: 0,
-            capabilities: CapabilityStatus::default(),
             uptime_secs: 0,
         };
 

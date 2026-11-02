@@ -12,7 +12,6 @@
 //! cargo test --test integration cryptography
 //! cargo test --test integration config_validation
 //! cargo test --test integration stratum_validation
-//! cargo test --test integration consensus_voting
 //! cargo test --test integration buds_classification
 //! cargo test --test integration security
 //! cargo test --test integration round_management
@@ -21,8 +20,6 @@
 
 pub mod buds_classification;
 pub mod config_validation;
-pub mod consensus;
-pub mod consensus_voting;
 pub mod cryptography;
 pub mod discovery_security;
 pub mod e2e;

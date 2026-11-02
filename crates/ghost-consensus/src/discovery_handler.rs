@@ -746,7 +746,6 @@ impl DiscoveryHandler {
         DiscoveryMessage {
             node_id: self.node_id,
             public_address: self.public_address.clone(),
-            capabilities: ghost_common::types::NodeCapabilities::default(),
             known_peers,
         }
     }
@@ -763,7 +762,6 @@ impl DiscoveryHandler {
                 node_id: *node_id,
                 public_address: addr.clone(),
                 last_seen: now,
-                capabilities: ghost_common::types::NodeCapabilities::default(),
             })
             .collect()
     }
@@ -1210,7 +1208,6 @@ mod tests {
         use crate::message::{DiscoveryMessage, MessageEnvelope, MessageType};
 
         use ghost_common::identity::NodeIdentity;
-        use ghost_common::types::NodeCapabilities;
 
         let peers = Arc::new(PeerManager::new([1u8; 32], 100));
         let handler = DiscoveryHandler::new([1u8; 32], "tcp://8.8.8.8:8559".to_string(), peers);
@@ -1222,7 +1219,6 @@ mod tests {
         let discovery_msg = DiscoveryMessage {
             node_id: [3u8; 32], // Claims to be node 3 (NOT the signer)
             public_address: "tcp://8.8.8.9:8559".to_string(),
-            capabilities: NodeCapabilities::default(),
             known_peers: vec![],
         };
 
@@ -1276,7 +1272,6 @@ mod tests {
         use crate::message::{DiscoveryMessage, MessageEnvelope, MessageType};
 
         use ghost_common::identity::NodeIdentity;
-        use ghost_common::types::NodeCapabilities;
 
         let peers = Arc::new(PeerManager::new([1u8; 32], 100));
         let handler = DiscoveryHandler::new([1u8; 32], "tcp://8.8.8.8:8559".to_string(), peers);
@@ -1288,7 +1283,6 @@ mod tests {
         let discovery_msg = DiscoveryMessage {
             node_id: identity.node_id(),                // Matches the signer
             public_address: "8.8.8.9:8559".to_string(), // Valid public address (no tcp:// prefix)
-            capabilities: NodeCapabilities::default(),
             known_peers: vec![],
         };
 

@@ -30,7 +30,7 @@ use ghost_common::error::{GhostError, GhostResult};
 use ghost_common::identity::NodeIdentity;
 use ghost_common::metrics::Metrics;
 use ghost_common::rpc::BitcoinRpc;
-use ghost_common::types::{NodeCapabilities, WindowBestRecord};
+use ghost_common::types::WindowBestRecord;
 use ghost_storage::Database;
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
@@ -960,11 +960,8 @@ pub struct DashboardConfig {
     /// Ghost mode local egress: announce/serve our own txs while ghost mode is on
     pub ghost_mode_local_egress: bool,
     pub archive_mode: bool,
-    pub ghost_pay: bool,
     pub public_mining: bool,
     pub reaper: bool,
-    pub elder: bool,
-    pub elder_slot: Option<u32>,
     /// Maximum miners this node will accept
     pub max_miners: u32,
     /// Node display name for node finder
@@ -1013,11 +1010,8 @@ impl Default for DashboardConfig {
             // `with_full_node_config`; leaving this false means a node whose
             // config does not enable archiving can never claim it.
             archive_mode: false,
-            ghost_pay: true,     // enabled by default
             public_mining: true, // enabled by default
             reaper: true,        // enabled by default
-            elder: false,        // set per-node
-            elder_slot: None,
             max_miners: 1000,
             node_name: None,
             region: None,
@@ -1101,10 +1095,6 @@ pub struct PoolPeerInfo {
 /// `Peer` returned by `PeerManager::get_connected_peers`, keeping the
 /// `ghost-consensus` peer type out of this crate's public surface.
 ///
-/// `elder` is the peer's elder *status* (registration order), while the
-/// `cap_elder` capability mirrors the same bit as advertised in the
-/// node's capability set; both are surfaced so the frontend can show the
-/// elder badge consistently with the other capability flags.
 #[derive(Debug, Clone)]
 pub struct MeshNodeInfo {
     /// Node ID (hex).
@@ -1112,18 +1102,6 @@ pub struct MeshNodeInfo {
     /// Public address (`host:port`) the peer advertises. May be empty if
     /// the peer has not published one yet.
     pub address: String,
-    /// Whether this node is an elder (registration order).
-    pub elder: bool,
-    /// Archive-mode capability.
-    pub cap_archive: bool,
-    /// Ghost Pay (L2) capability.
-    pub cap_ghost_pay: bool,
-    /// Public-mining capability.
-    pub cap_public_mining: bool,
-    /// Reaper strict-mode capability.
-    pub cap_reaper: bool,
-    /// Elder-status capability bit (mirrors `elder`).
-    pub cap_elder: bool,
     /// The node's own realized hashrate (TH/s) over its trailing window.
     pub hashrate_th: f64,
     /// Miners currently connected to this node.
@@ -1235,8 +1213,6 @@ pub struct VerificationState {
     pub network: ghost_common::config::BitcoinNetwork,
     /// Node identity for signing responses
     identity: Option<Arc<NodeIdentity>>,
-    /// Capabilities
-    pub capabilities: NodeCapabilities,
     /// Operator-signed fleet control (#403). Disabled unless an operator public key is
     /// configured — a node nobody set up for remote control must not be controllable.
     pub fleet_auth: Arc<crate::fleet_auth::FleetAuth>,
@@ -1586,7 +1562,7 @@ pub(crate) fn share_pow_is_acceptable(
 
 impl VerificationState {
     /// Create new verification state
-    pub fn new(node_id: String, version: String, capabilities: NodeCapabilities) -> Self {
+    pub fn new(node_id: String, version: String) -> Self {
         // Initialize dashboard config with defaults (all features enabled)
         let dashboard_config = DashboardConfig::default();
         // L-28: Capture debug endpoint setting at startup - immutable thereafter
@@ -1603,7 +1579,6 @@ impl VerificationState {
             // ghost-mining overrides this via `with_network` from pool.toml.
             network: ghost_common::config::BitcoinNetwork::Signet,
             identity: None,
-            capabilities,
             start_time: Instant::now(),
             records_cache: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             scoped_set_flight: crate::single_flight::SingleFlight::default(),
@@ -2098,9 +2073,6 @@ impl VerificationState {
         {
             let mut dashboard = self.dashboard_config.write();
             dashboard.archive_mode = config.storage.archive_mode;
-            // Same rule for GhostPay (#1014): the display matches the claim, and Ghost Pay is
-            // removed, so the node never claims it.
-            dashboard.ghost_pay = false;
         }
         self.full_node_config = Some(parking_lot::RwLock::new(config));
         self.full_node_config_path = Some(path);
@@ -2609,7 +2581,6 @@ impl VerificationState {
             round_id: (self.get_round_id)(),
             miner_count: (self.get_miner_count)(),
             peer_count: (self.get_peer_count)(),
-            capabilities: self.capabilities.into(),
             uptime_secs: self.start_time.elapsed().as_secs(),
         }
     }
@@ -3073,21 +3044,17 @@ mod tests {
         // Fail the first credit, accept every later one.
         let attempts = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&attempts);
-        let state = VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            NodeCapabilities::default(),
-        )
-        .with_share_recorder(move |_| {
-            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
-                // Exactly what a rate limit or startup-window rejection looks like here.
-                Err(GhostError::Internal("no active round".to_string()))
-            } else {
-                Ok(())
-            }
-        })
-        .with_callbacks(|| 960_000, || 1, || 1, || 1)
-        .with_share_pow_verify_height(959_030);
+        let state = VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+            .with_share_recorder(move |_| {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // Exactly what a rate limit or startup-window rejection looks like here.
+                    Err(GhostError::Internal("no active round".to_string()))
+                } else {
+                    Ok(())
+                }
+            })
+            .with_callbacks(|| 960_000, || 1, || 1, || 1)
+            .with_share_pow_verify_height(959_030);
 
         // A genuine share: the genesis header justifies its claimed work.
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Bitcoin);
@@ -3145,17 +3112,13 @@ mod tests {
 
         let recorded = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&recorded);
-        let state = VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            NodeCapabilities::default(),
-        )
-        .with_share_recorder(move |_| {
-            counter.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        })
-        .with_callbacks(|| 960_000, || 1, || 1, || 1)
-        .with_share_pow_verify_height(959_030);
+        let state = VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+            .with_share_recorder(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .with_callbacks(|| 960_000, || 1, || 1, || 1)
+            .with_share_pow_verify_height(959_030);
 
         let header = [0u8; 80];
         let header_hex = hex::encode(header);
@@ -3276,17 +3239,13 @@ mod tests {
 
         let recorded = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&recorded);
-        let state = VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            NodeCapabilities::default(),
-        )
-        .with_share_recorder(move |_| {
-            counter.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        })
-        .with_callbacks(|| 960_000, || 1, || 1, || 1)
-        .with_share_pow_verify_height(959_030);
+        let state = VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+            .with_share_recorder(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .with_callbacks(|| 960_000, || 1, || 1, || 1)
+            .with_share_pow_verify_height(959_030);
 
         let header = [0u8; 80];
         let header_hex = hex::encode(header);
@@ -3386,19 +3345,15 @@ mod tests {
         let block_counter = Arc::clone(&blocks);
         let share_counter = Arc::clone(&recorded);
 
-        let state = VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            NodeCapabilities::default(),
-        )
-        .with_share_recorder(move |_| {
-            share_counter.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        })
-        .with_block_found_callback(move |_| {
-            block_counter.fetch_add(1, Ordering::SeqCst);
-        })
-        .with_callbacks(|| 100, || 1, || 1, || 1);
+        let state = VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+            .with_share_recorder(move |_| {
+                share_counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .with_block_found_callback(move |_| {
+                block_counter.fetch_add(1, Ordering::SeqCst);
+            })
+            .with_callbacks(|| 100, || 1, || 1, || 1);
         // Below every gate, so the PoW check is not what decides this test.
 
         let batch = || ShareBatch {
@@ -3450,16 +3405,12 @@ mod tests {
 
         let recorded = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&recorded);
-        let state = VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            NodeCapabilities::default(),
-        )
-        .with_share_recorder(move |_| {
-            counter.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        })
-        .with_callbacks(|| 100, || 1, || 1, || 1);
+        let state = VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+            .with_share_recorder(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .with_callbacks(|| 100, || 1, || 1, || 1);
         // Height left unwired: the dormant u64::MAX default.
 
         let share = ShareNotification {
@@ -3493,20 +3444,16 @@ mod tests {
         let block_counter = Arc::clone(&blocks);
         let share_counter = Arc::clone(&recorded);
 
-        let state = VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            NodeCapabilities::default(),
-        )
-        .with_share_recorder(move |_| {
-            share_counter.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        })
-        .with_block_found_callback(move |_| {
-            block_counter.fetch_add(1, Ordering::SeqCst);
-        })
-        .with_callbacks(|| 960_000, || 1, || 1, || 1)
-        .with_share_pow_verify_height(959_030);
+        let state = VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+            .with_share_recorder(move |_| {
+                share_counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .with_block_found_callback(move |_| {
+                block_counter.fetch_add(1, Ordering::SeqCst);
+            })
+            .with_callbacks(|| 960_000, || 1, || 1, || 1)
+            .with_share_pow_verify_height(959_030);
 
         let forged = ShareData {
             timestamp_ms: 0,
@@ -3548,11 +3495,7 @@ mod tests {
         use crate::challenge::MeshValidationStats;
 
         fn state() -> VerificationState {
-            VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                NodeCapabilities::default(),
-            )
+            VerificationState::new("test_node".to_string(), "1.0.0".to_string())
         }
 
         // Unwired: absent, NOT a confident row of zeros.
@@ -3578,7 +3521,6 @@ mod tests {
     }
 
     use super::*;
-    use ghost_common::types::NodeCapabilities;
 
     /// The payout address is everything before the FIRST dot.
     ///
@@ -3638,12 +3580,8 @@ mod tests {
         let mut node_config = FullNodeConfig::default();
         node_config.storage.archive_mode = false;
 
-        let state = VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            NodeCapabilities::default(),
-        )
-        .with_full_node_config(node_config, std::path::PathBuf::from("/tmp/pool.toml"));
+        let state = VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+            .with_full_node_config(node_config, std::path::PathBuf::from("/tmp/pool.toml"));
 
         assert!(
             !state.dashboard_config.read().archive_mode,
@@ -3654,12 +3592,8 @@ mod tests {
         // config has the Claimed capability follow it true.
         let mut node_config_on = FullNodeConfig::default();
         node_config_on.storage.archive_mode = true;
-        let state_on = VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            NodeCapabilities::default(),
-        )
-        .with_full_node_config(node_config_on, std::path::PathBuf::from("/tmp/pool.toml"));
+        let state_on = VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+            .with_full_node_config(node_config_on, std::path::PathBuf::from("/tmp/pool.toml"));
         assert!(
             state_on.dashboard_config.read().archive_mode,
             "storage.archive_mode=true must let the dashboard archive claim be true"
@@ -3668,11 +3602,7 @@ mod tests {
 
     #[test]
     fn test_verification_state_default_requires_auth() {
-        let state = VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            NodeCapabilities::default(),
-        );
+        let state = VerificationState::new("test_node".to_string(), "1.0.0".to_string());
 
         // Default should require internal auth
         assert!(state.require_internal_auth);
@@ -3684,24 +3614,16 @@ mod tests {
         let secret = test_secret();
         let auth = crate::auth::InternalAuth::new(&secret).unwrap();
 
-        let state = VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            NodeCapabilities::default(),
-        )
-        .with_internal_auth(auth);
+        let state = VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+            .with_internal_auth(auth);
 
         assert!(state.internal_auth.is_some());
     }
 
     #[test]
     fn test_verification_state_allow_insecure_api() {
-        let state = VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            NodeCapabilities::default(),
-        )
-        .allow_insecure_internal_api(true);
+        let state = VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+            .allow_insecure_internal_api(true);
 
         // Should allow insecure mode
         assert!(!state.require_internal_auth);
@@ -3713,7 +3635,6 @@ mod tests {
         let state = Arc::new(VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            NodeCapabilities::default(),
         ));
 
         // Should fail because require_internal_auth is true but internal_auth is None
@@ -3729,12 +3650,8 @@ mod tests {
     fn test_auth_validation_insecure_mode() {
         // When allow_insecure_internal_api(true) is set, the validation
         // should pass even without auth configured
-        let state = VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            NodeCapabilities::default(),
-        )
-        .allow_insecure_internal_api(true);
+        let state = VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+            .allow_insecure_internal_api(true);
 
         // The validation logic: require_internal_auth && internal_auth.is_none()
         // With allow_insecure = true: require_internal_auth = false
@@ -3748,12 +3665,8 @@ mod tests {
         let secret = test_secret();
         let auth = crate::auth::InternalAuth::new(&secret).unwrap();
 
-        let state = VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            NodeCapabilities::default(),
-        )
-        .with_internal_auth(auth);
+        let state = VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+            .with_internal_auth(auth);
 
         // The validation logic: require_internal_auth && internal_auth.is_none()
         // With auth configured: internal_auth.is_none() = false
@@ -3764,11 +3677,7 @@ mod tests {
 
     #[test]
     fn test_auth_validation_requires_auth_when_missing() {
-        let state = VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            NodeCapabilities::default(),
-        );
+        let state = VerificationState::new("test_node".to_string(), "1.0.0".to_string());
 
         // The validation logic: require_internal_auth && internal_auth.is_none()
         // Default state: require_internal_auth = true, internal_auth = None
@@ -3821,11 +3730,7 @@ mod tests {
     // L-28: Debug endpoints immutability tests
     #[test]
     fn test_debug_endpoints_frozen_at_startup_disabled() {
-        let state = VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            NodeCapabilities::default(),
-        );
+        let state = VerificationState::new("test_node".to_string(), "1.0.0".to_string());
 
         // Default should be disabled
         assert!(!state.debug_endpoints_enabled());
@@ -3833,12 +3738,8 @@ mod tests {
 
     #[test]
     fn test_debug_endpoints_frozen_at_startup_enabled() {
-        let state = VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            NodeCapabilities::default(),
-        )
-        .with_debug_endpoints(true);
+        let state = VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+            .with_debug_endpoints(true);
 
         // Should be enabled after with_debug_endpoints(true)
         assert!(state.debug_endpoints_enabled());
@@ -3846,12 +3747,8 @@ mod tests {
 
     #[test]
     fn test_debug_endpoints_immutable_after_set() {
-        let state = VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            NodeCapabilities::default(),
-        )
-        .with_debug_endpoints(true);
+        let state = VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+            .with_debug_endpoints(true);
 
         // Even if someone modifies DashboardConfig, the frozen value should persist
         {
@@ -4343,18 +4240,13 @@ mod tests {
     #[test]
     fn a_state_given_an_identity_signs_a_nonce_bound_response_under_its_own_node_id() {
         use ghost_common::identity::NodeIdentity;
-        use ghost_common::types::NodeCapabilities;
 
         use std::sync::Arc;
 
         let identity = Arc::new(NodeIdentity::generate());
         let node_id_hex = identity.node_id_hex();
 
-        let unwired = VerificationState::new(
-            node_id_hex.clone(),
-            "test".to_string(),
-            NodeCapabilities::default(),
-        );
+        let unwired = VerificationState::new(node_id_hex.clone(), "test".to_string());
         assert!(
             !unwired.can_sign(),
             "a state with no identity must not claim it can sign"
@@ -4366,12 +4258,8 @@ mod tests {
             "signing without an identity must yield None, not an unsigned artefact"
         );
 
-        let wired = VerificationState::new(
-            node_id_hex.clone(),
-            "test".to_string(),
-            NodeCapabilities::default(),
-        )
-        .with_node_identity(Arc::clone(&identity));
+        let wired = VerificationState::new(node_id_hex.clone(), "test".to_string())
+            .with_node_identity(Arc::clone(&identity));
 
         assert!(
             wired.can_sign(),

@@ -49,7 +49,6 @@ use ghost_common::identity::NodeIdentity;
 use ghost_common::metrics::Metrics;
 use ghost_common::rpc::BitcoinRpc;
 use ghost_common::signer::SignerConfig;
-use ghost_common::types::NodeCapabilities;
 use ghost_common::zmq::{ZmqConfig, ZmqSubscriber};
 use ghost_consensus::ban_manager::BanManager;
 use ghost_consensus::health_handler::HealthPingHandler;
@@ -471,9 +470,6 @@ fn print_local_status(h: &serde_json::Value) {
             "UNREACHABLE"
         }
     );
-    if let Some(caps) = h.get("capabilities") {
-        println!("Capabilities:{caps}");
-    }
 }
 
 /// Heap profiling allocator, compiled in only under `--features heap-profiling`.
@@ -828,14 +824,6 @@ async fn main() -> Result<()> {
         mining_mode, is_public_mining
     );
 
-    // What this node advertises in its health pings. The capability ladder, its challenges and
-    // node rewards are gone; only whether this node takes outside hashpower is still read (by the
-    // translator's load balancer).
-    let capabilities = NodeCapabilities {
-        public_mining: is_public_mining,
-        ..Default::default()
-    };
-
     // Register this node in the database (peer tracking and discovery).
     let node_id_hex = identity.node_id_hex();
     if let Err(e) = db.register_node(
@@ -986,7 +974,7 @@ async fn main() -> Result<()> {
     // SRI pool connects to ghost-mining's TDP server for templates
     // SRI translator handles SV1 miners on port 3333
 
-    // Initialize P2P mesh with actual node capabilities for health pings
+    // Initialize the P2P mesh (health pings and discovery)
     // C-1: Enable Noise Protocol encryption for sensitive P2P traffic
     let noise_keypair_path = data_dir.join("noise.key");
     let mesh_config = MeshConfig {
@@ -996,14 +984,6 @@ async fn main() -> Result<()> {
             .clone()
             .unwrap_or_else(|| "127.0.0.1".to_string()),
         ports: config.network.p2p.clone(),
-        capabilities,
-        // Advertise a coordinator endpoint ONLY when opted in — otherwise a
-        // stray config value would falsely mark us coordinator-reachable.
-        advertised_coordinator_endpoint: if config.coordinator.coordinator_enabled {
-            config.coordinator.advertised_endpoint.clone()
-        } else {
-            None
-        },
         // SV1 tier listeners, so peers can route by tier (#495).
         //
         // Only advertised when this node actually accepts outside hashpower. A private or solo
@@ -1232,7 +1212,6 @@ async fn main() -> Result<()> {
     let mut verification_state = VerificationState::new(
         identity.node_id_hex(),
         env!("CARGO_PKG_VERSION").to_string(),
-        capabilities,
     );
 
     // Give the HTTP layer the node's signing key. Without this `can_sign()` is false
@@ -1284,7 +1263,8 @@ async fn main() -> Result<()> {
             .peers()
             .get_connected_peers(30)
             .into_iter()
-            .filter(|p| p.capabilities.public_mining && !p.public_address.is_empty())
+            // Every node is a pool node; a peer with no known address cannot be routed to.
+            .filter(|p| !p.public_address.is_empty())
             .map(|p| PoolPeerInfo {
                 public_address: p.public_address.clone(),
                 miner_count: p.miner_count,
@@ -1307,7 +1287,7 @@ async fn main() -> Result<()> {
 
     // Live mesh node list for the public /api/v1/pool/mesh-nodes endpoint.
     // Maps every connected peer to MeshNodeInfo using only already-gossiped,
-    // public fields (capabilities, hashrate, miner count). 120s freshness:
+    // public fields (hashrate, miner count). 120s freshness:
     // wide enough to tolerate a few missed ~10s health pings, narrow enough
     // that a genuinely gone node ages out. Self is added by the handler from
     // local state, so this returns peers only. No network calls.
@@ -1324,12 +1304,6 @@ async fn main() -> Result<()> {
             .map(|p| MeshNodeInfo {
                 node_id: p.node_id_hex(),
                 address: p.public_address.clone(),
-                elder: p.is_elder,
-                cap_archive: p.capabilities.archive_mode,
-                cap_ghost_pay: p.capabilities.ghost_pay,
-                cap_public_mining: p.capabilities.public_mining,
-                cap_reaper: p.capabilities.reaper,
-                cap_elder: p.capabilities.elder_status,
                 hashrate_th: p.local_hashrate_th,
                 miner_count: p.miner_count,
                 deduped_miner_count: deduped.get(&p.node_id).copied().unwrap_or(0),

@@ -46,109 +46,6 @@ pub type BlockHeight = u64;
 /// Amount in satoshis
 pub type Satoshis = u64;
 
-/// Node capabilities flags
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct NodeCapabilities {
-    /// Archive mode enabled (+5 shares)
-    pub archive_mode: bool,
-    /// Ghost Pay L2 enabled (+4 shares)
-    pub ghost_pay: bool,
-    /// Public mining enabled (+3 shares)
-    pub public_mining: bool,
-    /// Reaper strict mode enabled (+2 shares)
-    pub reaper: bool,
-    /// Elder status (+1 share)
-    pub elder_status: bool,
-    /// Wraith coordinator role opted in. Earns the mixing service fee, NOT
-    /// 5-4-3-2-1 shares — so it is deliberately excluded from `total_shares()`
-    /// and needs no verification challenge. `#[serde(default)]` so health pings
-    /// from peers on pre-coordinator builds (which omit the field) still
-    /// deserialize as `coordinator = false`.
-    #[serde(default)]
-    pub coordinator: bool,
-}
-
-impl NodeCapabilities {
-    /// Create new capabilities with all disabled
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Calculate total shares (0-15)
-    ///
-    /// MEDIUM-STOR-1: Uses checked arithmetic to prevent overflow.
-    /// The compile-time assertion below ensures max possible shares < i32::MAX.
-    pub fn total_shares(&self) -> i32 {
-        let mut shares = 0i32;
-        if self.archive_mode {
-            shares = shares
-                .checked_add(crate::constants::ARCHIVE_MODE_SHARES)
-                .expect(
-                    "BUG: share calculation overflow - max possible shares verified < i32::MAX",
-                );
-        }
-        if self.ghost_pay {
-            shares = shares
-                .checked_add(crate::constants::GHOST_PAY_SHARES)
-                .expect(
-                    "BUG: share calculation overflow - max possible shares verified < i32::MAX",
-                );
-        }
-        if self.public_mining {
-            shares = shares
-                .checked_add(crate::constants::PUBLIC_MINING_SHARES)
-                .expect(
-                    "BUG: share calculation overflow - max possible shares verified < i32::MAX",
-                );
-        }
-        if self.reaper {
-            shares = shares.checked_add(crate::constants::REAPER_SHARES).expect(
-                "BUG: share calculation overflow - max possible shares verified < i32::MAX",
-            );
-        }
-        if self.elder_status {
-            shares = shares
-                .checked_add(crate::constants::ELDER_STATUS_SHARES)
-                .expect(
-                    "BUG: share calculation overflow - max possible shares verified < i32::MAX",
-                );
-        }
-        shares
-    }
-
-    /// Shares for a capability set that QUALIFICATION produced, where `coordinator` is a proven
-    /// verdict rather than a self-report (#736).
-    ///
-    /// ⛔ Never call this on capabilities a peer reported about itself. `total_shares()` leaves
-    /// `coordinator` out precisely because a health ping's flag proves nothing; this method is the
-    /// one place it counts, and only `QualifiedCapabilityProvider` sets it from ledger verdicts.
-    pub fn proven_shares(&self) -> i32 {
-        let mut shares = self.total_shares();
-        if self.coordinator {
-            debug_assert!(
-                !self.ghost_pay,
-                "the +4 slot pays GhostPay OR coordinator, never both"
-            );
-            shares = shares
-                .checked_add(crate::constants::COORDINATOR_SHARES)
-                .expect(
-                    "BUG: share calculation overflow - max possible shares verified < i32::MAX",
-                );
-        }
-        shares
-    }
-
-    /// Check if node has any capabilities
-    pub fn has_any(&self) -> bool {
-        self.archive_mode
-            || self.ghost_pay
-            || self.public_mining
-            || self.reaper
-            || self.elder_status
-            || self.coordinator
-    }
-}
-
 /// Capacity state for load balancing
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -194,76 +91,6 @@ impl CapacityState {
             Self::HardLimit => 1.0,
         }
     }
-}
-
-/// Consensus result types
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ConsensusResult {
-    /// Proposal approved by 67%+
-    Approved {
-        proposal_hash: [u8; 32],
-        approval_count: u32,
-        total_nodes: u32,
-    },
-    /// Proposal rejected by 67%+
-    Rejected {
-        proposal_hash: [u8; 32],
-        rejection_count: u32,
-        total_nodes: u32,
-        reason: Option<String>,
-    },
-    /// Voting timed out
-    Timeout {
-        proposal_hash: [u8; 32],
-        approvals: u32,
-        rejections: u32,
-        total_nodes: u32,
-    },
-    /// Error during consensus
-    Error(String),
-}
-
-/// Vote type for consensus
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum VoteType {
-    /// Vote on payout proposal
-    PayoutApproval,
-    /// Vote on elder revocation
-    ElderRevocation,
-    /// Vote on share allocation
-    ShareAllocation,
-}
-
-/// Revocation reason for elders
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RevocationReason {
-    /// Offline for 7+ days
-    ExtendedOffline { offline_days: u64 },
-    /// Malicious behavior detected
-    MaliciousBehavior { description: String },
-    /// Voluntary resignation
-    Voluntary,
-}
-
-/// Block found event
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BlockFoundEvent {
-    /// Block hash
-    pub block_hash: BlockHash,
-    /// Block height
-    pub block_height: BlockHeight,
-    /// Round ID
-    pub round_id: RoundId,
-    /// Winning miner pubkey hash
-    pub winning_miner: [u8; 32],
-    /// Node that found the block
-    pub found_by_node: NodeId,
-    /// Transaction fees in satoshis
-    pub tx_fees_satoshis: Satoshis,
-    /// Block subsidy in satoshis
-    pub subsidy_satoshis: Satoshis,
-    /// Timestamp
-    pub timestamp: u64,
 }
 
 /// Share proof for P2P propagation
@@ -520,8 +347,6 @@ pub struct HealthPing {
     pub block_height: BlockHeight,
     /// Current round ID
     pub round_id: RoundId,
-    /// Node capabilities
-    pub capabilities: NodeCapabilities,
     /// Connected miners count
     pub miner_count: u32,
     /// Timestamp
@@ -585,9 +410,6 @@ pub struct HealthPing {
     /// actually runs, so no peer was ever a farm-routing candidate and the busiest node could not
     /// shed a farm miner. This is the half that switches it on (#495).
     ///
-    /// Deliberately NOT in `NodeCapabilities`: every field there feeds `total_shares()` for the
-    /// 5-4-3-2-1 scoring model, and a port number would corrupt the score.
-    ///
     /// `None` on a peer that predates this field. The consumer treats absent-hobby as "serves the
     /// default 3333", which is what every node did before the farm tier existed, and absent-farm
     /// as "not a farm target" — assuming a farm port is how a farm miner lands on a hobby floor,
@@ -599,24 +421,7 @@ pub struct HealthPing {
     /// treated identically: not a farm routing target.
     #[serde(default)]
     pub farm_port: Option<u16>,
-    /// If this node has opted in as a Wraith coordinator
-    /// (`capabilities.coordinator`), the reachable endpoint a wallet should dial
-    /// to mix with it: a public `host:port` or a `.onion`. This is a DELIBERATE,
-    /// operator-chosen advertisement (unlike `public_address`, which is withheld
-    /// per S-7) — a coordinator is useless if unreachable, and operators wanting
-    /// privacy advertise a Tor hidden service instead of an IP. `None` for nodes
-    /// that haven't opted in. `#[serde(default)]` for backward compatibility.
-    #[serde(default)]
-    pub coordinator_endpoint: Option<String>,
-    /// If this node is an active coordinator, the number of Wraith mixing
-    /// sessions it handled over a recent trailing window. Summed across the mesh
-    /// at each epoch boundary to size the next epoch's coordinator seat count
-    /// (demand-driven scaling). 0 for non-coordinators and idle coordinators.
-    /// `#[serde(default)]` for backward compatibility.
-    #[serde(default)]
-    pub coordinator_sessions: u32,
-    /// This node's own trailing-7-day uptime, as a PERCENTAGE (0-100) — the
-    /// qualification gatekeeper metric (>=95% before capabilities count).
+    /// This node's own trailing-7-day uptime, as a PERCENTAGE (0-100).
     /// Gossiped so the dashboard Swarm page can render each mesh peer's uptime
     /// instead of a dash. `Option` (not a plain `f64` defaulting to 0.0) so an
     /// older peer that omits it — or one with no uptime samples yet — is shown
@@ -630,18 +435,6 @@ pub struct HealthPing {
     /// `#[serde(default)]` for backward compatibility.
     #[serde(default)]
     pub peer_count: Option<u32>,
-    /// This node's node-reward payout address (a Bitcoin address string). Gossiped
-    /// so EVERY node learns EVERY node's payout address — without this, each node
-    /// only knows its own (written from local config), so the qualified-node
-    /// candidate set (`get_all_node_ids_with_payout`, which filters
-    /// `payout_address IS NOT NULL`) is `{self}` on every node and the payout-ledger
-    /// checkpoint can never converge. Public information (it is a coinbase output),
-    /// and authenticated: the receiver stores it only for the Noise-authenticated
-    /// `envelope.sender`, so a node can only advertise its OWN address. `None` for
-    /// nodes with no configured payout address (or older peers); `#[serde(default)]`
-    /// keeps the wire change additive for a mixed-version fleet.
-    #[serde(default)]
-    pub payout_address: Option<String>,
 }
 
 /// One node's best (rarest) valid share in a public records window.
@@ -1232,99 +1025,6 @@ mod tests {
     }
 
     #[test]
-    fn test_node_capabilities_shares() {
-        let mut caps = NodeCapabilities::new();
-        assert_eq!(caps.total_shares(), 0);
-
-        caps.archive_mode = true;
-        assert_eq!(caps.total_shares(), 5);
-
-        caps.public_mining = true;
-        assert_eq!(caps.total_shares(), 8); // 5 + 3
-
-        caps.reaper = true;
-        assert_eq!(caps.total_shares(), 10); // 5 + 3 + 2
-
-        caps.ghost_pay = true;
-        caps.elder_status = true;
-        assert_eq!(caps.total_shares(), 15); // 5 + 3 + 2 + 4 + 1
-    }
-
-    /// #736: `total_shares` never counts a coordinator — the flag there is a self-report — and
-    /// `proven_shares` counts it as the +4 slot GhostPay held.
-    #[test]
-    fn only_proven_shares_counts_a_coordinator() {
-        let caps = NodeCapabilities {
-            public_mining: true,
-            reaper: true,
-            elder_status: true,
-            coordinator: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            caps.total_shares(),
-            6,
-            "a self-reported coordinator earns nothing"
-        );
-        assert_eq!(caps.proven_shares(), 10, "a proven one earns the +4 slot");
-    }
-
-    #[test]
-    fn test_coordinator_earns_no_shares_but_counts_as_a_capability() {
-        // Coordinator is fee-incentivised, not share-bearing — it must add 0 to
-        // the 5-4-3-2-1 total even when every share-bearing capability is set.
-        let mut caps = NodeCapabilities {
-            archive_mode: true,
-            ghost_pay: true,
-            public_mining: true,
-            reaper: true,
-            elder_status: true,
-            coordinator: true,
-        };
-        assert_eq!(
-            caps.total_shares(),
-            15,
-            "coordinator must not change the share total"
-        );
-
-        // But a coordinator-only node still "has a capability".
-        caps = NodeCapabilities::new();
-        caps.coordinator = true;
-        assert_eq!(caps.total_shares(), 0);
-        assert!(caps.has_any());
-    }
-
-    #[test]
-    fn test_node_capabilities_coordinator_serde_default() {
-        // A health ping from a pre-coordinator build omits the field entirely;
-        // it must still deserialize (as coordinator = false), not error.
-        let legacy = r#"{"archive_mode":true,"ghost_pay":false,"public_mining":true,"reaper":false,"elder_status":false}"#;
-        let caps: NodeCapabilities =
-            serde_json::from_str(legacy).expect("legacy caps must deserialize");
-        assert!(!caps.coordinator);
-        assert!(caps.archive_mode && caps.public_mining);
-
-        // Round-trips with the field present.
-        let mut on = caps;
-        on.coordinator = true;
-        let json = serde_json::to_string(&on).expect("serialize");
-        let back: NodeCapabilities = serde_json::from_str(&json).expect("deserialize");
-        assert!(back.coordinator);
-    }
-
-    #[test]
-    fn test_reaper_works_independently() {
-        // Reaper works with private mining (no public_mining flag)
-        let mut caps = NodeCapabilities::new();
-        caps.reaper = true;
-        assert_eq!(caps.total_shares(), 2); // Reaper alone counts
-
-        // Also works with public mining
-        caps.public_mining = true;
-        assert_eq!(caps.total_shares(), 5); // 2 + 3
-    }
-
-    #[test]
     fn test_capacity_state() {
         assert_eq!(CapacityState::from_load(10, 100), CapacityState::Healthy);
         assert_eq!(CapacityState::from_load(60, 100), CapacityState::Normal);
@@ -1483,7 +1183,6 @@ mod tests {
             public_address: String::new(),
             block_height: 0,
             round_id: 0,
-            capabilities: NodeCapabilities::new(),
             miner_count: 2,
             timestamp: 1,
             pow_proof: None,
@@ -1500,11 +1199,8 @@ mod tests {
                 timestamp: 1,
                 miner_id_redacted: "bc1q7z…y492.avalon1".to_string(),
             }],
-            coordinator_endpoint: None,
-            coordinator_sessions: 0,
             uptime_percent: Some(99.5),
             peer_count: Some(3),
-            payout_address: Some("bc1qexamplepayoutaddr".to_string()),
         }
     }
 
@@ -1538,51 +1234,12 @@ mod tests {
     }
 
     #[test]
-    fn health_ping_payout_address_roundtrips_and_defaults_none() {
-        // The payout address drives the qualified-node candidate set, so its wire
-        // behaviour is consensus-relevant: it must roundtrip, and an older peer that
-        // omits it must default to None (not qualify, rather than qualify with junk).
-        let ping = sample_health_ping();
-        let back: HealthPing = serde_json::from_slice(&serde_json::to_vec(&ping).unwrap()).unwrap();
-        assert_eq!(back.payout_address, ping.payout_address);
-
-        let mut v = serde_json::to_value(&ping).unwrap();
-        assert!(v
-            .as_object_mut()
-            .unwrap()
-            .remove("payout_address")
-            .is_some());
-        let old: HealthPing = serde_json::from_value(v).unwrap();
-        assert_eq!(old.payout_address, None);
-    }
-
-    #[test]
     fn health_ping_hashrate_roundtrip() {
         let ping = sample_health_ping();
         let json = serde_json::to_string(&ping).unwrap();
         let back: HealthPing = serde_json::from_str(&json).unwrap();
         assert_eq!(back.local_hashrate_th, 4.0);
         assert_eq!(back.active_miner_id_hashes.len(), 2);
-    }
-
-    #[test]
-    fn health_ping_coordinator_endpoint_roundtrip_and_back_compat() {
-        // Present-and-set survives a round-trip.
-        let mut ping = sample_health_ping();
-        ping.coordinator_endpoint = Some("abc123def456.onion:9100".to_string());
-        let back: HealthPing =
-            serde_json::from_str(&serde_json::to_string(&ping).unwrap()).unwrap();
-        assert_eq!(
-            back.coordinator_endpoint.as_deref(),
-            Some("abc123def456.onion:9100")
-        );
-
-        // An older node's ping omits the field entirely → defaults to None,
-        // proving the wire change is additive.
-        let mut v = serde_json::to_value(sample_health_ping()).unwrap();
-        v.as_object_mut().unwrap().remove("coordinator_endpoint");
-        let back: HealthPing = serde_json::from_value(v).unwrap();
-        assert_eq!(back.coordinator_endpoint, None);
     }
 
     #[test]

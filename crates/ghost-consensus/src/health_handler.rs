@@ -50,25 +50,6 @@ use crate::mesh::MessageHandler;
 use crate::message::{HealthPingMessage, MessageEnvelope, MessageType};
 use crate::peer::PeerManager;
 
-/// Callback for registering discovered elders
-pub type ElderCallback = Arc<dyn Fn(NodeId) + Send + Sync>;
-
-/// Callback for registering node capabilities (for payout calculation)
-pub type NodeCapabilitiesCallback =
-    Arc<dyn Fn(NodeId, ghost_common::types::NodeCapabilities) + Send + Sync>;
-
-/// P2P4-M2: Callback to verify capabilities against challenge results
-///
-/// This callback queries the verification system to determine which capabilities
-/// have been verified for a given node. It takes the node ID and returns the
-/// set of VERIFIED capabilities (not just claimed ones).
-///
-/// The verification system maintains challenge results and pass rates. Only
-/// capabilities with sufficient challenge passes (e.g., 10+ challenges, 95% pass)
-/// should be included in the returned capabilities.
-pub type CapabilityVerifierCallback =
-    Arc<dyn Fn(&NodeId) -> ghost_common::types::NodeCapabilities + Send + Sync>;
-
 /// Rate limit configuration for health pings
 ///
 /// Default: 10 pings burst, 1/second sustained per node
@@ -372,12 +353,6 @@ impl HealthRateLimiter {
 /// Maximum timestamp drift allowed for health pings (H4 security fix)
 const MAX_TIMESTAMP_DRIFT_SECS: u64 = 300; // 5 minutes
 
-/// Default minimum uptime for voter registration (C2 security fix)
-const DEFAULT_MIN_UPTIME_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
-
-/// Default registration cooldown (C2 security fix)
-const DEFAULT_REGISTRATION_COOLDOWN_SECS: u64 = 3600; // 1 hour
-
 /// Configuration for the health ping handler
 #[derive(Debug, Clone)]
 pub struct HealthHandlerConfig {
@@ -389,10 +364,6 @@ pub struct HealthHandlerConfig {
     pub rate_limit_max_tokens: u32,
     /// Rate limit refill rate (tokens per second)
     pub rate_limit_refill_rate: u32,
-    /// Minimum uptime (seconds) required for voter registration (C2 security fix)
-    pub min_uptime_for_voting_secs: u64,
-    /// Cooldown between registration attempts (C2 security fix)
-    pub registration_cooldown_secs: u64,
     /// Maximum timestamp drift for health pings (H4 security fix)
     pub max_timestamp_drift_secs: u64,
     /// AUTH4-3: Reject peers with invalid PoW (don't update peer info)
@@ -401,15 +372,6 @@ pub struct HealthHandlerConfig {
     /// When false, peer info is still updated but node is not registered as voter.
     /// Default: true (strict mode for production)
     pub reject_invalid_pow_peers: bool,
-    /// P2P-H4: Require capability verification for payout calculations
-    ///
-    /// When true, if no capability_verifier is configured, nodes are registered
-    /// with empty capabilities (no shares) instead of trusting claimed capabilities.
-    /// This prevents nodes from claiming capabilities they haven't verified.
-    ///
-    /// When false (dev only), claimed capabilities are trusted if no verifier is set.
-    /// Default: true (production mode - require verification)
-    pub require_capability_verification: bool,
 }
 
 impl Default for HealthHandlerConfig {
@@ -419,11 +381,8 @@ impl Default for HealthHandlerConfig {
             pow_difficulty: NODE_ID_POW_DIFFICULTY,
             rate_limit_max_tokens: HEALTH_RATE_LIMIT_MAX_TOKENS,
             rate_limit_refill_rate: HEALTH_RATE_LIMIT_REFILL_RATE,
-            min_uptime_for_voting_secs: DEFAULT_MIN_UPTIME_SECS,
-            registration_cooldown_secs: DEFAULT_REGISTRATION_COOLDOWN_SECS,
             max_timestamp_drift_secs: MAX_TIMESTAMP_DRIFT_SECS,
             reject_invalid_pow_peers: true, // AUTH4-3: Strict mode by default
-            require_capability_verification: true, // P2P-H4: Require verification by default
         }
     }
 }
@@ -434,12 +393,6 @@ pub struct HealthPingHandler {
     peers: Arc<PeerManager>,
     /// Database for persisting peer info
     db: Option<Arc<Database>>,
-    /// Callback to register discovered elders
-    elder_callback: Option<ElderCallback>,
-    /// Callback to register node capabilities for payout calculations
-    node_capabilities_callback: Option<NodeCapabilitiesCallback>,
-    /// P2P4-M2: Callback to verify capabilities against challenge results
-    capability_verifier: Option<CapabilityVerifierCallback>,
     /// Rate limiter for incoming pings
     rate_limiter: HealthRateLimiter,
     /// Configuration
@@ -450,28 +403,6 @@ pub struct HealthPingHandler {
     /// accepted. When ban_manager was Optional, a misconfiguration could result
     /// in is_banned() always returning false, defeating ban enforcement.
     ban_manager: Arc<BanManager>,
-    /// Last registration time per node (C2 security fix - cooldown tracking)
-    last_registration: RwLock<HashMap<NodeId, Instant>>,
-    /// First seen time per node (C2 security fix - uptime tracking)
-    ///
-    /// M-11 SECURITY: Node-Local Uptime Tracking Limitation
-    ///
-    /// This uptime tracking is NODE-LOCAL only. Each node independently tracks when
-    /// it first saw each peer. This has important security implications:
-    ///
-    /// 1. Different nodes may have different first_seen times for the same peer
-    /// 2. Uptime calculations are NOT consensus-critical and should NOT be used for:
-    ///    - Voting eligibility (use CanonicalElderList instead)
-    ///    - Payout share calculations (use verified capabilities from ghost-verification)
-    ///    - Any decision requiring agreement across nodes
-    ///
-    /// 3. Uptime data here is used ONLY for:
-    ///    - Local DoS protection (rate limiting new nodes)
-    ///    - Peer quality heuristics (preferring long-running peers)
-    ///
-    /// For consensus-critical uptime verification, nodes must query distributed uptime
-    /// from peers via the verification system (see ghost-verification crate).
-    first_seen_times: RwLock<HashMap<NodeId, Instant>>,
     /// Peers whose in-memory `first_seen` has been restored from the database this
     /// process. One read per peer per restart; see `PeerManager::backdate_first_seen`.
     age_restored: RwLock<std::collections::HashSet<NodeId>>,
@@ -515,17 +446,12 @@ impl HealthPingHandler {
         Self {
             peers,
             db,
-            elder_callback: None,
-            node_capabilities_callback: None,
-            capability_verifier: None,
             rate_limiter: HealthRateLimiter::new(
                 config.rate_limit_max_tokens,
                 config.rate_limit_refill_rate,
             ),
             config,
             ban_manager,
-            last_registration: RwLock::new(HashMap::new()),
-            first_seen_times: RwLock::new(HashMap::new()),
             age_restored: RwLock::new(std::collections::HashSet::new()),
             difficulty_adjuster: DynamicDifficultyAdjuster::new(),
         }
@@ -534,36 +460,6 @@ impl HealthPingHandler {
     /// Set the database for persistence
     pub fn with_database(mut self, db: Arc<Database>) -> Self {
         self.db = Some(db);
-        self
-    }
-
-    /// Set callback for elder discovery
-    ///
-    /// When a HealthPing is received from a node with elder_status=true,
-    /// this callback will be invoked to register the elder.
-    pub fn with_elder_callback(mut self, callback: ElderCallback) -> Self {
-        self.elder_callback = Some(callback);
-        self
-    }
-
-    /// Set callback for node capabilities registration
-    ///
-    /// When a HealthPing is received, this callback will be invoked to
-    /// register the node's capabilities for payout calculations.
-    pub fn with_node_capabilities_callback(mut self, callback: NodeCapabilitiesCallback) -> Self {
-        self.node_capabilities_callback = Some(callback);
-        self
-    }
-
-    /// P2P4-M2: Set callback for capability verification
-    ///
-    /// When set, capabilities from health pings will be verified against
-    /// challenge results before being registered. Only VERIFIED capabilities
-    /// (those that have passed sufficient challenges) will be registered.
-    ///
-    /// If not set, claimed capabilities are registered as-is (legacy behavior).
-    pub fn with_capability_verifier(mut self, verifier: CapabilityVerifierCallback) -> Self {
-        self.capability_verifier = Some(verifier);
         self
     }
 
@@ -624,65 +520,6 @@ impl HealthPingHandler {
 
         let max_drift_ms = self.config.max_timestamp_drift_secs * 1000;
         timestamp.abs_diff(now) <= max_drift_ms
-    }
-
-    /// Check if node can register as voter (C2 security fix)
-    ///
-    /// Implements two protections against validator set manipulation:
-    /// 1. Minimum uptime requirement - node must be known for min_uptime_for_voting_secs
-    /// 2. Registration cooldown - can't re-register within registration_cooldown_secs
-    fn can_register_as_voter(&self, node_id: &NodeId) -> bool {
-        let now = Instant::now();
-
-        // Check registration cooldown
-        {
-            let last_reg = self.last_registration.read();
-            if let Some(last_time) = last_reg.get(node_id) {
-                let cooldown = Duration::from_secs(self.config.registration_cooldown_secs);
-                if now.duration_since(*last_time) < cooldown {
-                    debug!(
-                        node_id = %hex::encode(&node_id[..8]),
-                        "Registration cooldown not elapsed"
-                    );
-                    return false;
-                }
-            }
-        }
-
-        // Check minimum uptime requirement
-        {
-            let first_seen = self.first_seen_times.read();
-            if let Some(first_time) = first_seen.get(node_id) {
-                let min_uptime = Duration::from_secs(self.config.min_uptime_for_voting_secs);
-                if now.duration_since(*first_time) < min_uptime {
-                    debug!(
-                        node_id = %hex::encode(&node_id[..8]),
-                        elapsed_secs = now.duration_since(*first_time).as_secs(),
-                        required_secs = min_uptime.as_secs(),
-                        "Node has not met minimum uptime requirement for voting"
-                    );
-                    return false;
-                }
-            } else {
-                // First time seeing this node - record it but don't allow registration yet
-                drop(first_seen);
-                self.first_seen_times.write().insert(*node_id, now);
-                debug!(
-                    node_id = %hex::encode(&node_id[..8]),
-                    "First time seeing node - starting uptime tracking"
-                );
-                return false;
-            }
-        }
-
-        true
-    }
-
-    /// Record a successful voter registration (C2 security fix)
-    fn record_registration(&self, node_id: &NodeId) {
-        self.last_registration
-            .write()
-            .insert(*node_id, Instant::now());
     }
 
     /// Check if node is banned
@@ -797,7 +634,6 @@ impl HealthPingHandler {
             block_height = ping.block_height,
             round_id = ping.round_id,
             miner_count = ping.miner_count,
-            elder = ping.capabilities.elder_status,
             has_pow = ping.pow_proof.is_some(),
             "Received health ping"
         );
@@ -819,68 +655,9 @@ impl HealthPingHandler {
             warn!(
                 node_id = %short_id,
                 has_pow = ping.pow_proof.is_some(),
-                "Node without valid PoW - not registering as voter (lenient mode)"
+                "Node without valid PoW (lenient mode)"
             );
-            // In lenient mode, still update peer info but don't register as voter
-        }
-
-        // Register node as voter for BFT consensus ONLY if:
-        // 1. PoW is valid (Sybil resistance)
-        // 2. C2: Node meets uptime requirements and cooldown elapsed
-        if pow_valid && self.can_register_as_voter(&envelope.sender) {
-            if let Some(ref callback) = self.elder_callback {
-                callback(envelope.sender);
-                self.record_registration(&envelope.sender);
-                debug!(node_id = %short_id, "Registered node as BFT voter from health ping (PoW verified, uptime met)");
-            }
-
-            // Register node capabilities for payout calculations (only with valid PoW)
-            if let Some(ref callback) = self.node_capabilities_callback {
-                // P2P4-M2 + P2P-H4: Determine capabilities based on verification
-                let capabilities = if let Some(ref verifier) = self.capability_verifier {
-                    // Verifier is configured - use VERIFIED capabilities
-                    let verified_caps = verifier(&envelope.sender);
-                    debug!(
-                        node_id = %short_id,
-                        claimed_archive = ping.capabilities.archive_mode,
-                        verified_archive = verified_caps.archive_mode,
-                        claimed_ghost_pay = ping.capabilities.ghost_pay,
-                        verified_ghost_pay = verified_caps.ghost_pay,
-                        claimed_public_mining = ping.capabilities.public_mining,
-                        verified_public_mining = verified_caps.public_mining,
-                        claimed_reaper = ping.capabilities.reaper,
-                        verified_reaper = verified_caps.reaper,
-                        claimed_elder = ping.capabilities.elder_status,
-                        verified_elder = verified_caps.elder_status,
-                        "Using verified capabilities instead of claimed"
-                    );
-                    verified_caps
-                } else if self.config.require_capability_verification {
-                    // P2P-H4: No verifier AND verification required = empty capabilities
-                    // This prevents nodes from getting shares without verification
-                    warn!(
-                        node_id = %short_id,
-                        "No capability verifier configured but verification required - using empty capabilities"
-                    );
-                    ghost_common::types::NodeCapabilities::default()
-                } else {
-                    // Dev mode: trust claimed capabilities (NOT for production)
-                    debug!(
-                        node_id = %short_id,
-                        "INSECURE: Using claimed capabilities without verification (dev mode)"
-                    );
-                    ping.capabilities
-                };
-
-                callback(envelope.sender, capabilities);
-                debug!(node_id = %short_id, "Registered node capabilities for payout");
-            }
-        } else if pow_valid {
-            // PoW valid but uptime/cooldown requirements not met
-            debug!(
-                node_id = %short_id,
-                "Node has valid PoW but does not meet voter registration requirements"
-            );
+            // In lenient mode, still update peer info
         }
 
         // Update peer's last seen time in memory (regardless of PoW - for tracking)
@@ -904,16 +681,10 @@ impl HealthPingHandler {
         }
         self.peers.update_last_seen(&envelope.sender);
 
-        // Update miner_count and capabilities from the health ping on every tick,
+        // Update miner_count and Core health from the health ping on every tick,
         // even when the peer address hasn't changed — these are live metrics.
-        self.peers.update_health_metrics(
-            &envelope.sender,
-            ping.miner_count,
-            ping.capabilities,
-            ping.coordinator_endpoint.clone(),
-            ping.coordinator_sessions,
-            ping.core_healthy,
-        );
+        self.peers
+            .update_health_metrics(&envelope.sender, ping.miner_count, ping.core_healthy);
         // Active miner_id hashes (mesh-wide dedup count) + this node's own
         // realized hashrate (summed across the mesh for the pool total).
         self.peers.update_active_miner_hashes(
@@ -947,7 +718,6 @@ impl HealthPingHandler {
         if let Some(ref db) = self.db {
             self.restore_peer_age(db, &envelope.sender, &node_id_hex);
             let now = chrono::Utc::now().timestamp();
-            let capabilities_json = serde_json::to_string(&ping.capabilities).unwrap_or_default();
 
             // Create peer record for database
             let peer = PeerRecord {
@@ -963,7 +733,7 @@ impl HealthPingHandler {
                 failure_count: 0,
                 is_banned: false,
                 ban_until: None,
-                capabilities: Some(capabilities_json),
+                capabilities: None,
                 protocol_version: Some(1),
             };
 
@@ -971,21 +741,7 @@ impl HealthPingHandler {
                 warn!(error = %e, peer_id = %short_id, "Failed to persist peer info");
             }
 
-            // Register node in nodes table (required for node reward payouts).
-            // Thread through the peer's gossip'd PoW proof so they're eligible
-            // for elder promotion on our local DB view (without this the mesh
-            // never converges on an elder set — each node sees only itself
-            // as eligible because only its own PoW ever gets stored).
-            let capabilities_str = format!(
-                "archive:{},ghost_pay:{},public_mining:{},reaper:{}",
-                ping.capabilities.archive_mode,
-                ping.capabilities.ghost_pay,
-                ping.capabilities.public_mining,
-                ping.capabilities.reaper
-            );
-            let peer_pow_hex = ping.pow_proof.map(|(nonce, difficulty)| {
-                ghost_common::identity::NodeIdProof { nonce, difficulty }.to_hex()
-            });
+            // Register node in the nodes table (peer tracking and discovery).
             // #629: the ping carries no address post-S-7, so take the one discovery observed.
             // Passing the ping's empty string straight through wiped the stored address on
             // every ping, because the upsert uses `COALESCE(?2, public_address)` and an empty
@@ -996,12 +752,10 @@ impl HealthPingHandler {
                 .map(|p| p.public_address);
             let address_for_db = address_to_persist(discovered.as_deref(), &ping.public_address);
 
-            if let Err(e) = db.register_node_with_elder_check_and_pow(
+            if let Err(e) = db.register_node(
                 &node_id_hex,
                 address_for_db,
                 None, // display_name not available from health ping
-                &capabilities_str,
-                peer_pow_hex.as_deref(),
             ) {
                 debug!(error = %e, peer_id = %short_id, "Failed to register node from health ping");
             }
@@ -1010,59 +764,9 @@ impl HealthPingHandler {
             if let Err(e) = db.record_uptime_sample(&node_id_hex, now, true) {
                 warn!(error = %e, peer_id = %short_id, "Failed to record uptime sample");
             }
-
-            // Learn this peer's node-reward payout address (payout-finalisation).
-            // `node_id_hex` is `hex(envelope.sender)` — the Noise-authenticated
-            // sender — so a node can only advertise its OWN address; it can never
-            // set a peer's. Without this every node's `nodes.payout_address` is NULL
-            // except its own, so `get_all_node_ids_with_payout` returns `{self}` and
-            // the payout-ledger checkpoint's node set never converges. The address is
-            // public (a coinbase output); the read path still validates it, and a
-            // bounded length guards against a malformed advertisement. `register_node`
-            // above created the row, so this UPDATE lands on it.
-            if let Some(ref addr) = ping.payout_address {
-                if !addr.is_empty() && addr.len() <= 128 {
-                    if let Err(e) = db.update_node_payout_address(&node_id_hex, addr) {
-                        debug!(error = %e, peer_id = %short_id, "Failed to store peer payout address");
-                    }
-                }
-            }
         }
 
         Ok(())
-    }
-
-    /// Check for elders that have been offline > ELDER_OFFLINE_THRESHOLD_DAYS.
-    /// Returns list of (node_id, offline_days) for elders exceeding the threshold.
-    /// Skips our own node_id (don't propose revocation of self).
-    pub fn detect_offline_elders(&self, elder_node_ids: &[NodeId]) -> Vec<(NodeId, u64)> {
-        let all_peers = self.peers.get_all_peers();
-        let peer_map: HashMap<NodeId, &crate::peer::Peer> =
-            all_peers.iter().map(|p| (p.node_id, p)).collect();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let threshold_secs = ghost_common::constants::ELDER_OFFLINE_THRESHOLD_DAYS * 86400;
-        let our_id = self.peers.our_node_id();
-
-        let mut offline = Vec::new();
-        for elder_id in elder_node_ids {
-            if *elder_id == our_id {
-                continue;
-            }
-            if let Some(peer) = peer_map.get(elder_id) {
-                if peer.last_seen > 0 {
-                    let offline_secs = now.saturating_sub(peer.last_seen);
-                    if offline_secs > threshold_secs {
-                        let offline_days = offline_secs / 86400;
-                        offline.push((*elder_id, offline_days));
-                    }
-                }
-            }
-            // Elder not in peer table at all — no evidence of how long offline, skip
-        }
-        offline
     }
 }
 
@@ -1578,7 +1282,6 @@ mod tests {
             "public_address": "10.0.0.8:8555",
             "block_height": 966_500u64,
             "round_id": 1u64,
-            "capabilities": ghost_common::types::NodeCapabilities::default(),
             "miner_count": 0u32,
             // Milliseconds, as `validate_timestamp` reads it.
             "timestamp": chrono::Utc::now().timestamp_millis() as u64,

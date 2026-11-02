@@ -843,7 +843,6 @@ async fn node_info_handler(State(state): State<Arc<VerificationState>>) -> impl 
     Json(serde_json::json!({
         "node_id": health.node_id,
         "version": health.version,
-        "capabilities": health.capabilities,
         "uptime_secs": health.uptime_secs,
         "block_height": health.block_height,
         "round_id": health.round_id,
@@ -1012,9 +1011,7 @@ async fn api_node_status_handler(State(state): State<Arc<VerificationState>>) ->
         "peer_count": health.peer_count,
         "miner_count": health.miner_count,
         "is_synced": true,
-        // Capability flags are public - used for verification challenges
         "archive_mode": config.archive_mode,
-        "ghost_pay": config.ghost_pay,
         "public_mining": config.public_mining,
         "private_mining": false,
         "reaper": config.reaper,
@@ -1035,7 +1032,6 @@ async fn api_node_info_handler(State(state): State<Arc<VerificationState>>) -> i
         "node_id_short": node_id_short,
         "nickname": node_id_short,
         "version": health.version,
-        "capabilities": health.capabilities,
         "uptime_seconds": health.uptime_secs,
         "uptime_secs": health.uptime_secs,
         "sync_height": health.block_height,
@@ -1046,7 +1042,6 @@ async fn api_node_info_handler(State(state): State<Arc<VerificationState>>) -> i
         "peer_count": health.peer_count,
         "miner_count": health.miner_count,
         "archive_mode": config.archive_mode,
-        "ghost_pay": config.ghost_pay,
         "public_mining": config.public_mining,
         "reaper": config.reaper
     }))
@@ -1327,14 +1322,13 @@ async fn api_mining_status_handler(
         "round_id": health.round_id,
         "miner_count": health.miner_count,
         "total_hashrate": mesh_hashrate_th,
-        "shares_this_round": health.capabilities.total_shares,
         "difficulty": network_difficulty,
         "best_hash": null,
         "is_synced": true,
         // Dashboard-compatible aliases
         "enabled": true,
         "private_mining": config.private_mining.unwrap_or(false),
-        "public_mining": health.capabilities.public_mining,
+        "public_mining": true,
         "hashrate_th": mesh_hashrate_th,
         "local_hashrate_th": local_hashrate_th,
         "connected_miners": mesh_active_miners,
@@ -1847,25 +1841,10 @@ async fn api_pool_recent_shares_handler(
 /// helper always renders a peer (`is_self = false`). Pulled out as a free
 /// function so the JSON contract is unit-testable without a live server.
 ///
-/// `is_registry_elder` is whether this node's `node_id` is present in the DB
-/// elder registry (the authoritative source the Elders & MPC page uses). A
-/// peer's own `elder`/`cap_elder` bits derive from its health-ping capability
-/// advertisement, which is `false` for peers whose elder status isn't gossiped
-/// (verification-gated), so the registry membership is OR-ed in — a genuine
-/// elder is never downgraded, and a registered elder is correctly reflected.
-fn mesh_node_to_json(node: &MeshNodeInfo, is_registry_elder: bool) -> serde_json::Value {
-    let elder = node.elder || is_registry_elder;
+fn mesh_node_to_json(node: &MeshNodeInfo) -> serde_json::Value {
     serde_json::json!({
         "node_id": node.node_id,
         "address": node.address,
-        "elder": elder,
-        "capabilities": {
-            "archive": node.cap_archive,
-            "ghost_pay": node.cap_ghost_pay,
-            "public_mining": node.cap_public_mining,
-            "reaper": node.cap_reaper,
-            "elder": elder,
-        },
         "hashrate_th": node.hashrate_th,
         "miner_count": node.miner_count,
         "deduped_miner_count": node.deduped_miner_count,
@@ -1901,21 +1880,6 @@ async fn api_pool_mesh_nodes_handler(
 ) -> impl IntoResponse {
     let health = state.get_health().await;
 
-    // Authoritative elder set = the DB elder registry (`nodes.is_elder`), the
-    // same source the Elders & MPC page reads. A peer's health-ping `elder`
-    // capability bit is verification-gated and reads `false` for registered
-    // elders that haven't gossiped it, so it can't be trusted to render the
-    // role — the registry can. Fetched once per request; keyed by the hex
-    // `node_id` (both `get_elders()` and the mesh `node_id`s are the lowercase
-    // hex of the 32-byte id via `hex::encode`). Degrades to an empty set when
-    // no DB is attached, preserving the previous (health-ping-only) behaviour.
-    let elder_ids: std::collections::HashSet<String> = state
-        .database
-        .as_ref()
-        .and_then(|db| db.get_elders().ok())
-        .map(|elders| elders.into_iter().map(|e| e.node_id).collect())
-        .unwrap_or_default();
-
     // Self address: the operator-configured public host (+ HTTP port when a
     // bare host was configured). Falls back to an empty string — never fails.
     let self_address = {
@@ -1930,21 +1894,9 @@ async fn api_pool_mesh_nodes_handler(
         }
     };
 
-    let self_caps = &health.capabilities;
-    // Same registry-OR-bit resolution used for peers, so self's role reflects
-    // the elder registry too (not only its own advertised capability bit).
-    let self_elder = self_caps.elder_status || elder_ids.contains(&health.node_id);
     let self_node = serde_json::json!({
         "node_id": health.node_id,
         "address": self_address,
-        "elder": self_elder,
-        "capabilities": {
-            "archive": self_caps.archive_mode,
-            "ghost_pay": self_caps.ghost_pay,
-            "public_mining": self_caps.public_mining,
-            "reaper": self_caps.reaper,
-            "elder": self_elder,
-        },
         // This node's own realized hashrate (same windowed value it gossips);
         // 0.0 on deploys without the local-hashrate provider wired.
         "hashrate_th": state.local_hashrate().unwrap_or(0.0),
@@ -1969,8 +1921,7 @@ async fn api_pool_mesh_nodes_handler(
 
     for peer in state.mesh_nodes() {
         if seen.insert(peer.node_id.clone()) {
-            let is_registry_elder = elder_ids.contains(&peer.node_id);
-            nodes.push(mesh_node_to_json(&peer, is_registry_elder));
+            nodes.push(mesh_node_to_json(&peer));
         }
     }
 
@@ -2479,7 +2430,6 @@ async fn api_pool_mesh_leaderboard_handler(
             .filter(|n| !n.trim().is_empty())
             .unwrap_or_else(|| mesh_node_name(&addr, &health.node_id))
     };
-    let self_caps = &health.capabilities;
     let mut nodes = vec![serde_json::json!({
         "node_id": health.node_id.clone(),
         "name": self_name,
@@ -2487,14 +2437,6 @@ async fn api_pool_mesh_leaderboard_handler(
         // Deduped real-miner count (matches Capacity/Swarm/overview), not the
         // raw share-ledger miner_count which double-counts (issue #281).
         "miner_count": state.self_deduped_miner_count(),
-        "shares": mesh_capability_shares(
-            self_caps.archive_mode,
-            self_caps.ghost_pay,
-            self_caps.public_mining,
-            self_caps.reaper,
-            self_caps.elder_status,
-        ),
-        "elder": self_caps.elder_status,
         "healthy": health.healthy,
         "is_self": true,
     })];
@@ -2510,14 +2452,6 @@ async fn api_pool_mesh_leaderboard_handler(
             "hashrate_th": peer.hashrate_th,
             // Deduped real-miner count, consistent with the self row (issue #281).
             "miner_count": peer.deduped_miner_count,
-            "shares": mesh_capability_shares(
-                peer.cap_archive,
-                peer.cap_ghost_pay,
-                peer.cap_public_mining,
-                peer.cap_reaper,
-                peer.cap_elder,
-            ),
-            "elder": peer.cap_elder,
             "healthy": peer.healthy,
             "is_self": false,
         }));
@@ -2929,7 +2863,6 @@ async fn api_pool_status_handler(State(state): State<Arc<VerificationState>>) ->
         "mesh_active_miners": mesh_active_miners,
         "round_id": health.round_id,
         "uptime_secs": health.uptime_secs,
-        "total_shares": health.capabilities.total_shares,
         "current_round_duration_secs": current_round_duration_secs,
         "estimated_time_to_block_secs": estimated_time_to_block_secs,
         // 4444 was hard-coded here and is NOT the SV2 port — it is the SV1 farm/rental tier
@@ -2947,7 +2880,6 @@ async fn api_config_handler(State(state): State<Arc<VerificationState>>) -> impl
     let config = state.dashboard_config.read();
     Json(serde_json::json!({
         "archive_mode": config.archive_mode,
-        "ghost_pay": config.ghost_pay,
         "public_mining": config.public_mining,
         "reaper": config.reaper,
         "ghost_mode": config.ghost_mode,
@@ -3051,10 +2983,14 @@ async fn api_resources_handler(State(state): State<Arc<VerificationState>>) -> i
 async fn api_buds_capabilities_handler(
     State(state): State<Arc<VerificationState>>,
 ) -> impl IntoResponse {
-    let health = state.get_health().await;
+    let reaper = state
+        .full_node_config
+        .as_ref()
+        .map(|c| c.read().reaper.enabled)
+        .unwrap_or(false);
     Json(serde_json::json!({
-        "reaper": health.capabilities.reaper,
-        "allowed_tiers": if health.capabilities.reaper {
+        "reaper": reaper,
+        "allowed_tiers": if reaper {
             vec!["T0", "T1"]
         } else {
             vec!["T0", "T1", "T2"]
@@ -3063,24 +2999,6 @@ async fn api_buds_capabilities_handler(
         "allow_inscriptions": false,
         "allow_runes": false
     }))
-}
-
-/// API v1 Swarm handler - for multi-node management
-/// Capability shares (0-15) from the individual capability booleans.
-/// Mirrors `NodeCapabilities::total_shares()` for the mesh-gossiped flags
-/// (Archive +5, Ghost Pay +4, Public Mining +3, Reaper +2, Elder +1).
-fn mesh_capability_shares(
-    archive: bool,
-    ghost_pay: bool,
-    public_mining: bool,
-    reaper: bool,
-    elder: bool,
-) -> u32 {
-    (archive as u32) * 5
-        + (ghost_pay as u32) * 4
-        + (public_mining as u32) * 3
-        + (reaper as u32) * 2
-        + (elder as u32)
 }
 
 /// Display name for a mesh node: the host portion of its advertised address,
@@ -3129,20 +3047,10 @@ async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl 
         (addr, name)
     };
 
-    let self_caps = &health.capabilities;
     let self_hashrate = state.local_hashrate().unwrap_or(0.0);
-    let self_shares = mesh_capability_shares(
-        self_caps.archive_mode,
-        self_caps.ghost_pay,
-        self_caps.public_mining,
-        self_caps.reaper,
-        self_caps.elder_status,
-    );
 
-    // This node's own trailing-7-day uptime %, the qualification gatekeeper
-    // metric (>=95% before capabilities count). It's the exact figure the
-    // qualification layer reads (`get_uptime_percent`, GHOST-10 time-based
-    // denominator) over the self-recorded samples — the self-uptime task
+    // This node's own trailing-7-day uptime % (`get_uptime_percent`, GHOST-10
+    // time-based denominator) over the self-recorded samples — the self-uptime task
     // records under `identity.node_id_hex()`, which is `state.node_id` /
     // `health.node_id`. Returned as a percentage (0-100) to match the
     // peer-gossiped `uptime_percent` the frontend already renders. Left as
@@ -3166,13 +3074,6 @@ async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl 
         "version": health.version.clone(),
         "hashrate_th": self_hashrate,
         "miner_count": health.miner_count,
-        "shares": self_shares,
-        "max_shares": 15,
-        "archive_mode": self_caps.archive_mode,
-        "ghost_pay": self_caps.ghost_pay,
-        "public_mining": self_caps.public_mining,
-        "reaper": self_caps.reaper,
-        "elder": self_caps.elder_status,
         // Locally-known stats the mesh doesn't gossip (fixes the self row's "—").
         "peer_count": health.peer_count,
         "l1_height": health.block_height,
@@ -3187,24 +3088,15 @@ async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl 
 
     let mut online_nodes: u32 = if health.healthy { 1 } else { 0 };
     let mut combined_hashrate = self_hashrate;
-    let mut combined_shares = self_shares;
 
     for peer in state.mesh_nodes() {
         if !seen.insert(peer.node_id.clone()) {
             continue;
         }
-        let shares = mesh_capability_shares(
-            peer.cap_archive,
-            peer.cap_ghost_pay,
-            peer.cap_public_mining,
-            peer.cap_reaper,
-            peer.cap_elder,
-        );
         if peer.healthy {
             online_nodes += 1;
         }
         combined_hashrate += peer.hashrate_th;
-        combined_shares += shares;
         nodes.push(serde_json::json!({
             "node_id": peer.node_id,
             "name": mesh_node_name(&peer.address, &peer.node_id),
@@ -3214,13 +3106,6 @@ async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl 
             "source": "mesh",
             "hashrate_th": peer.hashrate_th,
             "miner_count": peer.miner_count,
-            "shares": shares,
-            "max_shares": 15,
-            "archive_mode": peer.cap_archive,
-            "ghost_pay": peer.cap_ghost_pay,
-            "public_mining": peer.cap_public_mining,
-            "reaper": peer.cap_reaper,
-            "elder": peer.cap_elder,
             // Gossiped Swarm telemetry — `None` → JSON null → "—" on the page,
             // so a peer running an older build (that doesn't gossip these) shows
             // a dash rather than a fabricated 0 until the fleet is updated.
@@ -3240,8 +3125,7 @@ async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl 
             "name": self_name,
             "address": self_address,
             "version": health.version,
-            "capabilities": health.capabilities,
-        },
+            },
         "nodes": nodes,
         "total": total_nodes,
         "stats": {
@@ -3249,8 +3133,6 @@ async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl 
             "online_nodes": online_nodes,
             "offline_nodes": total_nodes.saturating_sub(online_nodes),
             "combined_hashrate_th": combined_hashrate,
-            "combined_shares": combined_shares,
-            "max_combined_shares": total_nodes * 15,
         },
     }))
 }
@@ -4293,7 +4175,6 @@ async fn api_config_full_handler(State(state): State<Arc<VerificationState>>) ->
 
     Json(serde_json::json!({
         "archive_mode": archive_mode,
-        "ghost_pay": config.ghost_pay,
         "public_mining": public_mining,
         "reaper": config.reaper,
         "ghost_mode": config.ghost_mode,
@@ -9535,15 +9416,11 @@ mod tests {
     #[tokio::test]
     async fn swarm_update_all_handler_does_not_fabricate_success() {
         use axum::response::IntoResponse;
-        use ghost_common::types::NodeCapabilities;
 
         use http_body_util::BodyExt;
 
-        let state = crate::server::VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            NodeCapabilities::default(),
-        );
+        let state =
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string());
 
         let resp = api_swarm_update_all_post_handler(
             axum::extract::State(std::sync::Arc::new(state)),
@@ -9581,14 +9458,12 @@ mod tests {
     #[tokio::test]
     async fn swarm_update_version_is_refused_by_design_not_unimplemented() {
         use axum::response::IntoResponse;
-        use ghost_common::types::NodeCapabilities;
 
         use http_body_util::BodyExt;
 
         let state = std::sync::Arc::new(crate::server::VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            NodeCapabilities::default(),
         ));
         let resp = api_swarm_node_update_version_handler(
             axum::extract::State(state),
@@ -9622,7 +9497,6 @@ mod tests {
         use super::super::*;
         use axum::response::IntoResponse;
         use ed25519_dalek::{Signer, SigningKey};
-        use ghost_common::types::NodeCapabilities;
 
         use http_body_util::BodyExt;
         use serde_json::json;
@@ -9644,16 +9518,13 @@ mod tests {
                 let dir = tempfile::tempdir().unwrap();
                 let path = dir.path().join("pool.toml");
                 std::fs::write(&path, include_str!("../../../config/mainnet.toml")).unwrap();
-                let mut state = crate::server::VerificationState::new(
-                    NODE.to_string(),
-                    "1.0.0".to_string(),
-                    NodeCapabilities::default(),
-                )
-                .with_pool_config_path(path.clone())
-                .with_full_node_config(
-                    toml::from_str(include_str!("../../../config/mainnet.toml")).unwrap(),
-                    path.clone(),
-                );
+                let mut state =
+                    crate::server::VerificationState::new(NODE.to_string(), "1.0.0".to_string())
+                        .with_pool_config_path(path.clone())
+                        .with_full_node_config(
+                            toml::from_str(include_str!("../../../config/mainnet.toml")).unwrap(),
+                            path.clone(),
+                        );
                 state.fleet_auth = Arc::new(crate::fleet_auth::FleetAuth::new(
                     NODE.to_string(),
                     with_key.then(|| operator().verifying_key().to_bytes()),
@@ -9926,14 +9797,12 @@ mod tests {
     #[tokio::test]
     async fn swarm_refresh_serves_live_status_for_this_node_only() {
         use axum::response::IntoResponse;
-        use ghost_common::types::NodeCapabilities;
 
         use http_body_util::BodyExt;
 
         let state = std::sync::Arc::new(crate::server::VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            NodeCapabilities::default(),
         ));
 
         // Addressed to this node: a real status body, not a 501.
@@ -10218,27 +10087,17 @@ mod tests {
     }
 
     fn create_test_state_with_auth() -> Arc<crate::server::VerificationState> {
-        use ghost_common::types::NodeCapabilities;
-
         let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
-        let state = crate::server::VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            NodeCapabilities::default(),
-        )
-        .with_internal_auth(auth);
+        let state =
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_internal_auth(auth);
 
         Arc::new(state)
     }
 
     fn create_test_state_without_auth() -> Arc<crate::server::VerificationState> {
-        use ghost_common::types::NodeCapabilities;
-
-        let mut state = crate::server::VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            NodeCapabilities::default(),
-        );
+        let mut state =
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string());
 
         // Set require_internal_auth to false so we can test the reject-all fallback
         state.require_internal_auth = false;
@@ -10273,7 +10132,6 @@ mod tests {
     #[tokio::test]
     async fn test_status_reports_configured_network() {
         use ghost_common::config::BitcoinNetwork;
-        use ghost_common::types::NodeCapabilities;
 
         async fn network_field(state: Arc<crate::server::VerificationState>) -> String {
             let app = super::create_router(state);
@@ -10297,12 +10155,8 @@ mod tests {
 
         let make_state = |network| {
             Arc::new(
-                crate::server::VerificationState::new(
-                    "test_node".to_string(),
-                    "1.0.0".to_string(),
-                    NodeCapabilities::default(),
-                )
-                .with_network(network),
+                crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                    .with_network(network),
             )
         };
 
@@ -10320,7 +10174,6 @@ mod tests {
         let default_state = Arc::new(crate::server::VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            NodeCapabilities::default(),
         ));
         assert_eq!(network_field(default_state).await, "signet");
     }
@@ -10336,7 +10189,6 @@ mod tests {
     #[serial]
     async fn test_config_reaper_post_auto_applies_ghostd() {
         use ghost_common::config::NodeConfig as FullNodeConfig;
-        use ghost_common::types::NodeCapabilities;
 
         // Poll the shared apply record until it leaves the "applying" state.
         async fn settle(state: &Arc<crate::server::VerificationState>) -> String {
@@ -10391,13 +10243,9 @@ mod tests {
             let path = dir.path().join("pool.toml");
             let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
             let state = Arc::new(
-                crate::server::VerificationState::new(
-                    "test_node".to_string(),
-                    "1.0.0".to_string(),
-                    NodeCapabilities::default(),
-                )
-                .with_internal_auth(auth.clone())
-                .with_full_node_config(FullNodeConfig::default(), path.clone()),
+                crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                    .with_internal_auth(auth.clone())
+                    .with_full_node_config(FullNodeConfig::default(), path.clone()),
             );
             // Keep `dir` alive for the state's lifetime by leaking it (test-only).
             std::mem::forget(dir);
@@ -10447,12 +10295,8 @@ mod tests {
         // --- Not persisted: no config path → skipped, no restart, no ghostd. ---
         let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
         let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth.clone()),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_internal_auth(auth.clone()),
         );
         let resp = post_reaper(Arc::clone(&state), auth, true).await;
         assert_eq!(resp["persisted"].as_bool(), Some(false));
@@ -10500,7 +10344,6 @@ mod tests {
     #[serial]
     async fn test_config_post_with_valid_auth_succeeds() {
         use ghost_common::config::NodeConfig as FullNodeConfig;
-        use ghost_common::types::NodeCapabilities;
 
         // The archive_mode POST persists to pool.toml + regenerates the ghostd
         // drop-in, so it fail-closes without a loaded config. Provide one (and the
@@ -10510,13 +10353,9 @@ mod tests {
         let path = dir.path().join("pool.toml");
         let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
         let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth.clone())
-            .with_full_node_config(FullNodeConfig::default(), path.clone()),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_internal_auth(auth.clone())
+                .with_full_node_config(FullNodeConfig::default(), path.clone()),
         );
         let app = super::create_router(state);
 
@@ -10557,20 +10396,15 @@ mod tests {
     async fn test_config_policy_profile_post_persists_and_restarts() {
         use ghost_common::config::NodeConfig as FullNodeConfig;
         use ghost_common::config::PolicyProfile as CfgProfile;
-        use ghost_common::types::NodeCapabilities;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.toml");
 
         let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
         let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth.clone())
-            .with_full_node_config(FullNodeConfig::default(), path.clone()),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_internal_auth(auth.clone())
+                .with_full_node_config(FullNodeConfig::default(), path.clone()),
         );
 
         // Without auth → 401.
@@ -10664,20 +10498,15 @@ mod tests {
     async fn test_config_block_priority_post_persists_and_restarts() {
         use ghost_common::config::BlockPriority;
         use ghost_common::config::NodeConfig as FullNodeConfig;
-        use ghost_common::types::NodeCapabilities;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.toml");
 
         let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
         let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth.clone())
-            .with_full_node_config(FullNodeConfig::default(), path.clone()),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_internal_auth(auth.clone())
+                .with_full_node_config(FullNodeConfig::default(), path.clone()),
         );
 
         // Default is MaxFee before any write.
@@ -10778,20 +10607,15 @@ mod tests {
     async fn test_config_policy_custom_post_persists_and_restarts() {
         use ghost_common::config::NodeConfig as FullNodeConfig;
         use ghost_common::config::{BudsTier, PolicyProfile as CfgProfile};
-        use ghost_common::types::NodeCapabilities;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.toml");
 
         let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
         let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth.clone())
-            .with_full_node_config(FullNodeConfig::default(), path.clone()),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_internal_auth(auth.clone())
+                .with_full_node_config(FullNodeConfig::default(), path.clone()),
         );
 
         // A representative custom body: T0+T1 only, all data off, tight limits.
@@ -10914,7 +10738,6 @@ mod tests {
     async fn test_config_full_surfaces_policy() {
         use ghost_common::config::NodeConfig as FullNodeConfig;
         use ghost_common::config::{BudsTier, CustomPolicyConfig, PolicyProfile as CfgProfile};
-        use ghost_common::types::NodeCapabilities;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.toml");
@@ -10934,13 +10757,9 @@ mod tests {
         });
 
         let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                NodeCapabilities::default(),
-            )
-            .with_full_node_config(cfg, path.clone())
-            .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap()),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_full_node_config(cfg, path.clone())
+                .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap()),
         );
 
         // `/api/v1/config/full` carries the operator's payout addresses, so it is served from
@@ -10981,7 +10800,6 @@ mod tests {
     #[tokio::test]
     async fn test_config_full_reads_real_config() {
         use ghost_common::config::{MiningMode, NodeConfig as FullNodeConfig};
-        use ghost_common::types::NodeCapabilities;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.toml");
@@ -10994,13 +10812,9 @@ mod tests {
         cfg.network.mining_mode = MiningMode::PublicPool;
 
         let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                NodeCapabilities::default(),
-            )
-            .with_full_node_config(cfg, path.clone())
-            .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap()),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_full_node_config(cfg, path.clone())
+                .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap()),
         );
 
         // This test asserts the response carries `node_payout_address` and the Ghost Pay
@@ -11050,19 +10864,14 @@ mod tests {
     #[tokio::test]
     async fn test_pool_name_post_persists_and_restarts() {
         use ghost_common::config::NodeConfig as FullNodeConfig;
-        use ghost_common::types::NodeCapabilities;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.toml");
         let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
         let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth.clone())
-            .with_full_node_config(FullNodeConfig::default(), path.clone()),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_internal_auth(auth.clone())
+                .with_full_node_config(FullNodeConfig::default(), path.clone()),
         );
 
         let body = r#"{"name": "SatoshiPool"}"#;
@@ -11102,19 +10911,14 @@ mod tests {
     #[tokio::test]
     async fn test_operator_window_post_persists_and_clamps() {
         use ghost_common::config::{NodeConfig as FullNodeConfig, VALIDATOR_WINDOW_BLOCKS};
-        use ghost_common::types::NodeCapabilities;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.toml");
         let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
         let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth.clone())
-            .with_full_node_config(FullNodeConfig::default(), path.clone()),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_internal_auth(auth.clone())
+                .with_full_node_config(FullNodeConfig::default(), path.clone()),
         );
 
         let post = |body: &'static str| {
@@ -11233,22 +11037,17 @@ mod tests {
         Arc<crate::server::VerificationState>,
         Arc<std::sync::atomic::AtomicUsize>,
     ) {
-        use ghost_common::types::NodeCapabilities;
-
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let recorded = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&recorded);
-        let state = crate::server::VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            NodeCapabilities::default(),
-        )
-        .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap())
-        .with_share_recorder(move |_| {
-            counter.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        });
+        let state =
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap())
+                .with_share_recorder(move |_| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                });
         (Arc::new(state), recorded)
     }
 
@@ -11426,18 +11225,13 @@ mod tests {
     async fn the_singular_lane_answers_4xx_for_a_share_it_refuses() {
         use bitcoin::hashes::{sha256d, Hash};
         use ghost_accounting::DifficultyCalculator;
-        use ghost_common::types::NodeCapabilities;
 
         let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap())
-            .with_share_recorder(|_| Ok(()))
-            .with_callbacks(|| 960_000, || 1, || 1, || 1)
-            .with_share_pow_verify_height(959_030),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap())
+                .with_share_recorder(|_| Ok(()))
+                .with_callbacks(|| 960_000, || 1, || 1, || 1)
+                .with_share_pow_verify_height(959_030),
         );
 
         let header = [0u8; 80];
@@ -11504,12 +11298,8 @@ mod tests {
 
         // A genuine node fault is still 5xx: no recorder wired at all.
         let broken = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap()),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap()),
         );
         assert_eq!(
             post(&broken, 1024.0, &"ef".repeat(32), None).await,
@@ -11527,12 +11317,9 @@ mod tests {
     /// fallback cannot be reintroduced by a refactor that never touches startup.)
     #[tokio::test]
     async fn share_ingest_fails_closed_when_no_secret_is_configured() {
-        use ghost_common::types::NodeCapabilities;
-
         let state = Arc::new(crate::server::VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            NodeCapabilities::default(),
         ));
         assert!(
             state.require_internal_auth,
@@ -11738,12 +11525,6 @@ mod tests {
         let node = MeshNodeInfo {
             node_id: "deadbeef".to_string(),
             address: "1.2.3.4:8080".to_string(),
-            elder: true,
-            cap_archive: true,
-            cap_ghost_pay: false,
-            cap_public_mining: true,
-            cap_reaper: false,
-            cap_elder: true,
             hashrate_th: 12.5,
             miner_count: 3,
             deduped_miner_count: 2,
@@ -11754,10 +11535,9 @@ mod tests {
             peer_count: Some(3),
         };
 
-        let v = mesh_node_to_json(&node, false);
+        let v = mesh_node_to_json(&node);
         assert_eq!(v["node_id"], "deadbeef");
         assert_eq!(v["address"], "1.2.3.4:8080");
-        assert_eq!(v["elder"], true);
         assert_eq!(v["hashrate_th"], 12.5);
         assert_eq!(v["miner_count"], 3);
         assert_eq!(v["deduped_miner_count"], 2);
@@ -11769,12 +11549,6 @@ mod tests {
         assert_eq!(v["peer_count"], 3);
         // Peers are never self.
         assert_eq!(v["is_self"], false);
-        // Capabilities are nested exactly as the website expects.
-        assert_eq!(v["capabilities"]["archive"], true);
-        assert_eq!(v["capabilities"]["ghost_pay"], false);
-        assert_eq!(v["capabilities"]["public_mining"], true);
-        assert_eq!(v["capabilities"]["reaper"], false);
-        assert_eq!(v["capabilities"]["elder"], true);
     }
 
     #[test]
@@ -11785,12 +11559,6 @@ mod tests {
         let node = MeshNodeInfo {
             node_id: "00ff".to_string(),
             address: String::new(),
-            elder: false,
-            cap_archive: false,
-            cap_ghost_pay: false,
-            cap_public_mining: false,
-            cap_reaper: false,
-            cap_elder: false,
             hashrate_th: 0.0,
             miner_count: 0,
             deduped_miner_count: 0,
@@ -11801,7 +11569,7 @@ mod tests {
             peer_count: None,
         };
 
-        let v = mesh_node_to_json(&node, false);
+        let v = mesh_node_to_json(&node);
         assert_eq!(v["address"], "");
         assert_eq!(v["hashrate_th"], 0.0);
         assert_eq!(v["miner_count"], 0);
@@ -11813,128 +11581,6 @@ mod tests {
         assert!(v["l1_height"].is_null());
         assert!(v["uptime_percent"].is_null());
         assert!(v["peer_count"].is_null());
-        assert!(v["capabilities"].is_object());
-    }
-
-    #[test]
-    fn test_mesh_node_to_json_registry_elder_promotes() {
-        // Reproduces the Geo/mesh-nodes role bug: a peer that IS a registered
-        // elder but whose health-ping elder bit reads `false` (verification-
-        // gated / not gossiped) must still render as an elder because the DB
-        // registry — the authoritative source — says so.
-        let node = MeshNodeInfo {
-            node_id: "aa".repeat(32),
-            address: "5.6.7.8:8080".to_string(),
-            elder: false,
-            cap_archive: false,
-            cap_ghost_pay: false,
-            cap_public_mining: true,
-            cap_reaper: false,
-            cap_elder: false,
-            hashrate_th: 1.0,
-            miner_count: 1,
-            deduped_miner_count: 1,
-            max_capacity: 100,
-            healthy: true,
-            l1_height: Some(1),
-            uptime_percent: Some(99.0),
-            peer_count: Some(2),
-        };
-
-        // Registry says this node_id is an elder → elder=true everywhere.
-        let promoted = mesh_node_to_json(&node, true);
-        assert_eq!(promoted["elder"], true);
-        assert_eq!(promoted["capabilities"]["elder"], true);
-        // Other capabilities are untouched.
-        assert_eq!(promoted["capabilities"]["public_mining"], true);
-        assert_eq!(promoted["capabilities"]["archive"], false);
-
-        // Not in the registry and no advertised bit → stays a plain node.
-        let not_elder = mesh_node_to_json(&node, false);
-        assert_eq!(not_elder["elder"], false);
-        assert_eq!(not_elder["capabilities"]["elder"], false);
-    }
-
-    #[test]
-    fn test_mesh_capability_shares() {
-        // Full stack: 5 + 4 + 3 + 2 + 1 = 15.
-        assert_eq!(mesh_capability_shares(true, true, true, true, true), 15);
-        // None: 0.
-        assert_eq!(mesh_capability_shares(false, false, false, false, false), 0);
-        // Ghost Pay (+4) + Public Mining (+3) + Reaper (+2) + Elder (+1) = 10,
-        // matching the observed production self-node total.
-        assert_eq!(mesh_capability_shares(false, true, true, true, true), 10);
-        // Individual weights.
-        assert_eq!(mesh_capability_shares(true, false, false, false, false), 5);
-        assert_eq!(mesh_capability_shares(false, false, false, false, true), 1);
-    }
-
-    /// The weighting exists TWICE — here for the dashboard, and in
-    /// `NodeCapabilities::total_shares()` for the payout path — so pin them
-    /// together across every combination.
-    ///
-    /// ⛔ This matters most for a change nobody has made yet. #736 moves the +4
-    /// off GhostPay when that service is removed, and a reweight that lands in
-    /// one of these and not the other does not fail loudly: nodes get paid on
-    /// one number while the dashboard shows another, and the disagreement
-    /// surfaces as an operator asking why their earnings do not match their
-    /// screen. This test makes that a red build instead.
-    #[test]
-    fn the_dashboard_and_payout_weightings_agree() {
-        use ghost_common::types::NodeCapabilities;
-
-        for bits in 0u8..32 {
-            let archive = bits & 1 != 0;
-            let ghost_pay = bits & 2 != 0;
-            let public_mining = bits & 4 != 0;
-            let reaper = bits & 8 != 0;
-            let elder = bits & 16 != 0;
-
-            let caps = NodeCapabilities {
-                archive_mode: archive,
-                ghost_pay,
-                public_mining,
-                reaper,
-                elder_status: elder,
-                coordinator: false,
-            };
-            assert_eq!(
-                mesh_capability_shares(archive, ghost_pay, public_mining, reaper, elder) as i32,
-                caps.total_shares(),
-                "the dashboard and the payout path disagree for \
-                 archive={archive} ghost_pay={ghost_pay} mining={public_mining} \
-                 reaper={reaper} elder={elder}"
-            );
-        }
-    }
-
-    /// The coordinator flag earns the mixing service fee, not 5-4-3-2-1 shares,
-    /// and is excluded from the total on purpose — it is self-reported in a
-    /// health ping, so paying for it would pay for an assertion.
-    ///
-    /// Pinned because #736 intends to change exactly this. When the +4 moves to
-    /// a VERIFIED coordinator capability, this test should fail and be updated
-    /// deliberately — rather than the exclusion being dropped by accident and
-    /// nobody noticing that an unverified boolean started paying.
-    #[test]
-    fn the_coordinator_flag_earns_no_shares_yet() {
-        use ghost_common::types::NodeCapabilities;
-
-        let mut caps = NodeCapabilities {
-            archive_mode: false,
-            ghost_pay: false,
-            public_mining: false,
-            reaper: false,
-            elder_status: false,
-            coordinator: false,
-        };
-        assert_eq!(caps.total_shares(), 0);
-        caps.coordinator = true;
-        assert_eq!(
-            caps.total_shares(),
-            0,
-            "the coordinator flag is self-reported; it must not pay until it is verified (#736)"
-        );
     }
 
     #[test]
@@ -11955,8 +11601,6 @@ mod tests {
     /// Build a state with operator auth + an in-memory DB holding one recent
     /// `<addr>.<worker>` share, for the miner-details endpoint tests.
     fn miner_details_state() -> Arc<crate::server::VerificationState> {
-        use ghost_common::types::NodeCapabilities;
-
         use ghost_storage::Database;
 
         let db = Database::in_memory().unwrap();
@@ -11979,13 +11623,9 @@ mod tests {
 
         let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
         Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth)
-            .with_database(db),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_internal_auth(auth)
+                .with_database(db),
         )
     }
 
@@ -12240,7 +11880,6 @@ mod tests {
     #[tokio::test]
     async fn test_mining_status_exposes_authority_key() {
         use ghost_common::config::NodeConfig as FullNodeConfig;
-        use ghost_common::types::NodeCapabilities;
 
         async fn authority(state: Arc<crate::server::VerificationState>) -> serde_json::Value {
             let app = super::create_router(state);
@@ -12271,7 +11910,6 @@ mod tests {
         let default_state = Arc::new(crate::server::VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            NodeCapabilities::default(),
         ));
         assert_eq!(
             authority(default_state).await,
@@ -12284,12 +11922,8 @@ mod tests {
         let mut blank_cfg = FullNodeConfig::default();
         blank_cfg.network.sv2_authority_public_key = Some("   ".to_string());
         let blank_state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                NodeCapabilities::default(),
-            )
-            .with_full_node_config(blank_cfg, dir_blank.path().join("pool.toml")),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_full_node_config(blank_cfg, dir_blank.path().join("pool.toml")),
         );
         assert_eq!(
             authority(blank_state).await,
@@ -12303,12 +11937,8 @@ mod tests {
         let mut cfg = FullNodeConfig::default();
         cfg.network.sv2_authority_public_key = Some("customAuthorityKey123".to_string());
         let override_state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                NodeCapabilities::default(),
-            )
-            .with_full_node_config(cfg, path),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_full_node_config(cfg, path),
         );
         assert_eq!(
             authority(override_state).await,

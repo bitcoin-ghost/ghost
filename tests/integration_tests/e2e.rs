@@ -51,64 +51,6 @@ mod buds_classification {
 }
 
 // ============================================================================
-// Consensus E2E Tests
-// ============================================================================
-
-mod consensus {
-    use ghost_common::VoteType;
-
-    #[test]
-    fn test_vote_types_serialization() {
-        let votes = vec![
-            VoteType::PayoutApproval,
-            VoteType::ElderRevocation,
-            VoteType::ShareAllocation,
-        ];
-
-        for vote in votes {
-            let json = serde_json::to_string(&vote).unwrap();
-            let parsed: VoteType = serde_json::from_str(&json).unwrap();
-            assert_eq!(vote, parsed);
-        }
-    }
-
-    #[test]
-    fn test_bft_threshold_calculation() {
-        // 67% threshold for BFT
-        // For n nodes, need ceil(2n/3) votes
-
-        fn required_votes(total: usize) -> usize {
-            (total * 2).div_ceil(3) // Ceiling of 2/3
-        }
-
-        assert_eq!(required_votes(3), 2); // 2 out of 3
-        assert_eq!(required_votes(4), 3); // 3 out of 4
-        assert_eq!(required_votes(5), 4); // 4 out of 5
-        assert_eq!(required_votes(6), 4); // 4 out of 6
-        assert_eq!(required_votes(7), 5); // 5 out of 7
-        assert_eq!(required_votes(10), 7); // 7 out of 10
-    }
-
-    #[test]
-    fn test_quorum_scenarios() {
-        fn has_quorum(votes: usize, total: usize) -> bool {
-            votes >= (total * 2).div_ceil(3)
-        }
-
-        // 3 node cluster
-        assert!(!has_quorum(1, 3)); // 1/3 - no quorum
-        assert!(has_quorum(2, 3)); // 2/3 - quorum!
-        assert!(has_quorum(3, 3)); // 3/3 - quorum!
-
-        // 5 node cluster
-        assert!(!has_quorum(2, 5)); // 2/5 - no quorum
-        assert!(!has_quorum(3, 5)); // 3/5 - no quorum
-        assert!(has_quorum(4, 5)); // 4/5 - quorum!
-        assert!(has_quorum(5, 5)); // 5/5 - quorum!
-    }
-}
-
-// ============================================================================
 // Full Stack Integration Tests
 // ============================================================================
 
@@ -117,10 +59,8 @@ mod full_stack {
     #[test]
     fn test_crate_imports() {
         use ::ghost_buds::BudsTier;
-        use ::ghost_common::VoteType;
 
         // If this compiles, all crates are compatible
         let _ = BudsTier::T0;
-        let _ = VoteType::PayoutApproval;
     }
 }

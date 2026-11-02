@@ -26,7 +26,7 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use tracing::{debug, info};
 
-use ghost_common::types::{NodeCapabilities, NodeId, WindowBestRecord};
+use ghost_common::types::{NodeId, WindowBestRecord};
 
 /// L-3 FIX: Extract host portion from an address, handling both IPv4 and IPv6 formats.
 ///
@@ -198,20 +198,6 @@ impl PeerManager {
             if merged.best_records.is_empty() {
                 merged.best_records = existing.best_records.clone();
             }
-            if merged.coordinator_endpoint.is_none() {
-                merged.coordinator_endpoint = existing.coordinator_endpoint.clone();
-            }
-            // Same rule as the endpoint above, and as `update_health_metrics`'s own
-            // guard: "not reported" and "reported all false" are identical for a
-            // struct of plain bools, so an all-default re-announce must not be
-            // believed. Missing this while preserving the endpoint beside it is
-            // why, once the maturity bug (#891) was fixed, every remaining Wraith
-            // roster refusal was `not_opted_in` and never `no_endpoint`: discovery
-            // blanked `coordinator` on each re-announce and the next health ping
-            // put it back, so rosters flapped between 3 and 8 all day.
-            if merged.capabilities == ghost_common::types::NodeCapabilities::default() {
-                merged.capabilities = existing.capabilities;
-            }
             // Same reasoning as the fields above: a bare re-announce carries no tier ports, and
             // blanking them would drop the peer out of farm routing until its next full ping.
             if merged.hobby_port.is_none() {
@@ -219,9 +205,6 @@ impl PeerManager {
             }
             if merged.farm_port.is_none() {
                 merged.farm_port = existing.farm_port;
-            }
-            if merged.coordinator_sessions == 0 {
-                merged.coordinator_sessions = existing.coordinator_sessions;
             }
             // Preserve the health-ping telemetry a re-announce (Peer::new) carries
             // at its defaults, so the Swarm figures don't blank out between pings.
@@ -336,16 +319,6 @@ impl PeerManager {
             .collect()
     }
 
-    /// Get elder peers
-    pub fn get_elder_peers(&self) -> Vec<Peer> {
-        self.peers
-            .read()
-            .values()
-            .filter(|p| p.is_elder)
-            .cloned()
-            .collect()
-    }
-
     /// Move a peer's `first_seen` back to `first_seen_secs`, if that is earlier.
     /// Returns whether it moved.
     ///
@@ -378,65 +351,21 @@ impl PeerManager {
         }
     }
 
-    /// Update live metrics from a health ping (miner count + capabilities + Core health).
+    /// Update live metrics from a health ping (miner count + Core health).
     pub fn update_health_metrics(
         &self,
         node_id: &NodeId,
         miner_count: u32,
-        capabilities: ghost_common::types::NodeCapabilities,
-        coordinator_endpoint: Option<String>,
-        coordinator_sessions: u32,
         core_healthy: Option<bool>,
     ) {
         if let Some(peer) = self.peers.write().get_mut(node_id) {
             peer.miner_count = miner_count;
             // Only overwrite on an explicit report. A ping from a node that predates the field
             // carries `None`, and taking that at face value would erase a known-bad reading and
-            // put an unhealthy peer straight back into routing — the same trap as the
-            // capabilities guard below, which exists because #518 flapped on exactly this.
+            // put an unhealthy peer straight back into routing.
             if core_healthy.is_some() {
                 peer.core_healthy = core_healthy;
             }
-            // Do not let a ping that claims NOTHING erase what a peer has already told us.
-            //
-            // `NodeCapabilities` is a struct of plain bools, so "not reported" and "reported all
-            // false" are identical on the wire. Taking an all-default value at face value made
-            // the flags flap: at any moment an observer had a peer or two reading
-            // `public_mining = false` that were demonstrably public, and it was a different peer
-            // each time (#518). Nodes then blinked in and out of the public list, and anything
-            // routing on the bit skipped healthy peers intermittently.
-            //
-            // Every neighbouring field here is already guarded this way — the coordinator
-            // endpoint below, and L1 height / uptime / peer count / L2 in `update_node_telemetry`.
-            // Capabilities was the one that was not.
-            //
-            // The limit, stated plainly: an operator genuinely turning EVERY capability off is
-            // indistinguishable from a ping that reports none, so that transition needs a
-            // restart to take effect. A node advertising nothing is not a useful peer anyway,
-            // and it ages out of the connected set on its own. Representing it properly means
-            // making absence explicit on the wire, which is a protocol change.
-            let claims_nothing = capabilities == ghost_common::types::NodeCapabilities::default();
-            let we_know_better =
-                peer.capabilities != ghost_common::types::NodeCapabilities::default();
-            if claims_nothing && we_know_better {
-                debug!(
-                    node_id = %hex::encode(&node_id[..8]),
-                    "Health ping reported no capabilities; keeping the last known set"
-                );
-            } else {
-                peer.capabilities = capabilities;
-            }
-            // Only overwrite a known endpoint with a freshly-advertised one;
-            // never clobber a good endpoint with `None` (a ping where the peer
-            // momentarily omitted it / hasn't re-advertised yet).
-            if coordinator_endpoint.is_some() {
-                peer.coordinator_endpoint = coordinator_endpoint;
-            }
-            // Session load is a live gauge — always take the latest, including 0
-            // (an active coordinator that went idle legitimately reports 0). The
-            // upsert/re-announce path preserves it instead, so a bare re-announce
-            // can't reset it to 0 between pings.
-            peer.coordinator_sessions = coordinator_sessions;
         }
     }
 
@@ -602,12 +531,6 @@ pub struct Peer {
     pub last_seen: u64,
     /// Connection state
     pub state: PeerState,
-    /// Is an elder
-    pub is_elder: bool,
-    /// Elder order (if elder)
-    pub elder_order: Option<u32>,
-    /// Node capabilities
-    pub capabilities: NodeCapabilities,
     /// Latency in milliseconds
     pub latency_ms: Option<u32>,
     /// Messages received from this peer
@@ -619,9 +542,7 @@ pub struct Peer {
     /// Whether this peer's own Ghost Core was reachable at its last health ping (#778).
     ///
     /// `None` means the peer has never reported it — either it predates the field or it has not
-    /// pinged since connecting. Deliberately NOT folded into `capabilities`: that struct feeds
-    /// `total_shares()` and the capability proofs of #605, and node health is a live gauge, not
-    /// an earned capability.
+    /// pinged since connecting.
     pub core_healthy: Option<bool>,
     /// Truncated SHA-256 hashes of miner_ids active on this peer in the
     /// last ~5 min, from the most recent health ping. Used for mesh-wide
@@ -648,16 +569,6 @@ pub struct Peer {
     /// peer's) so the `/api/v1/pool/records` endpoint returns the mesh-wide
     /// rarest record per window. Empty for older peers that don't report it.
     pub best_records: Vec<WindowBestRecord>,
-    /// If this peer opted in as a Wraith coordinator, the endpoint it advertised
-    /// in its most recent health ping (public `host:port` or a `.onion`). Source
-    /// of the coordinator-election `EndpointMap`. `None` until the peer advertises
-    /// one (or for peers that haven't opted in).
-    pub coordinator_endpoint: Option<String>,
-    /// If this peer is an active coordinator, the Wraith mixing sessions it
-    /// reported handling recently (most recent health ping). Summed across the
-    /// eligible set at the epoch boundary to size the seat count. 0 when idle or
-    /// not a coordinator.
-    pub coordinator_sessions: u32,
     /// This peer's L1 (Bitcoin) block height, from its most recent health ping.
     /// Surfaced on the Swarm page. `0` for older peers that hardcoded it (or
     /// haven't reported yet) — treated as "unknown" and rendered "—" upstream.
@@ -686,9 +597,6 @@ impl Peer {
             // nothing, and conflating that with a positive report is how a stale optimistic
             // reading survives a restart.
             core_healthy: None,
-            is_elder: false,
-            elder_order: None,
-            capabilities: NodeCapabilities::default(),
             latency_ms: None,
             messages_received: 0,
             messages_sent: 0,
@@ -699,8 +607,6 @@ impl Peer {
             hobby_port: None,
             farm_port: None,
             best_records: Vec::new(),
-            coordinator_endpoint: None,
-            coordinator_sessions: 0,
             block_height: 0,
             uptime_percent: None,
             peer_count: None,
@@ -772,8 +678,6 @@ pub struct PeerScore {
     pub latency_score: f64,
     /// Reliability component
     pub reliability_score: f64,
-    /// Capability component
-    pub capability_score: f64,
 }
 
 impl PeerScore {
@@ -801,29 +705,14 @@ impl PeerScore {
             0.4 // < 1 day
         };
 
-        // Capability score
-        let capability_score = peer.capabilities.total_shares() as f64 / 15.0;
-
-        // LOW-CONS-2: Elder bonus capped at 0.1 to prevent Sybil-boosted elder advantage
-        // A higher bonus (e.g., 0.2) combined with malicious elder registration could give
-        // disproportionate influence in peer selection. Capped to balance legitimate elder
-        // priority while limiting potential Sybil amplification.
-        let elder_bonus = if peer.is_elder { 0.1 } else { 0.0 };
-
-        // L-4 FIX: Weights adjusted to sum to 1.0 for proper scoring
-        // 0.30 + 0.30 + 0.30 + 0.10 = 1.0
-        // Elder bonus is included in the base calculation, not added separately
-        let score = (latency_score * 0.30)
-            + (reliability_score * 0.30)
-            + (capability_score * 0.30)
-            + elder_bonus; // 0.10 for elders, 0.0 for non-elders
+        // Latency and reliability weigh equally.
+        let score = (latency_score * 0.5) + (reliability_score * 0.5);
 
         Self {
             node_id: peer.node_id,
             score,
             latency_score,
             reliability_score,
-            capability_score,
         }
     }
 }
@@ -1084,7 +973,7 @@ mod tests {
         // A health ping populates the gossip metrics.
         let hashes = vec![[1u8; 16], [2u8; 16], [3u8; 16]];
         mgr.update_active_miner_hashes(&pid, hashes.clone(), 4.5);
-        mgr.update_health_metrics(&pid, 3, NodeCapabilities::default(), None, 0, None);
+        mgr.update_health_metrics(&pid, 3, None);
         mgr.update_max_capacity(&pid, 64);
         let records = vec![WindowBestRecord {
             window: "day".to_string(),
@@ -1120,158 +1009,6 @@ mod tests {
             vec![[9u8; 16]],
             "a real ping update must still overwrite"
         );
-    }
-
-    /// The field the re-announce guard forgot.
-    ///
-    /// `upsert_peer` rescues twelve fields when discovery rebuilds a peer with
-    /// `Peer::new` — hashrate, miner counts, tier ports, telemetry, `first_seen`,
-    /// and the coordinator ENDPOINT. It did not rescue `capabilities`, so every
-    /// re-announce blanked `coordinator` back to false until the next health
-    /// ping up to 10s later, and the node dropped out of the Wraith roster for
-    /// that window. `test_upsert_preserves_gossiped_metrics_on_reannounce`
-    /// passes `NodeCapabilities::default()`, so it never exercised this.
-    ///
-    /// Measured on the v1.11.41 canaries, 2026-09-12: with the maturity bug
-    /// (#891) fixed, roster sizes still swung between 3 and 8 — and EVERY
-    /// refusal was `not_opted_in`, never `no_endpoint`, because the endpoint was
-    /// preserved here and the capability beside it was not.
-    #[test]
-    fn a_reannounce_does_not_blank_the_coordinator_capability() {
-        use ghost_common::types::NodeCapabilities;
-        let mgr = PeerManager::new([0u8; 32], 100);
-        let pid = [8u8; 32];
-        mgr.upsert_peer(Peer::new(pid, "1.2.3.4:8555".to_string()));
-
-        let caps = NodeCapabilities {
-            coordinator: true,
-            public_mining: true,
-            ..Default::default()
-        };
-        mgr.update_health_metrics(&pid, 1, caps, Some("1.2.3.4:9100".into()), 0, None);
-        assert!(
-            mgr.get_peer(&pid).unwrap().capabilities.coordinator,
-            "precondition: the ping told us it coordinates"
-        );
-
-        // Discovery re-announces the SAME peer with a freshly-built (empty) Peer.
-        mgr.upsert_peer(Peer::new(pid, "1.2.3.4:8555".to_string()));
-
-        let got = mgr.get_peer(&pid).unwrap();
-        assert!(
-            got.capabilities.coordinator,
-            "a re-announce must not blank the coordinator opt-in — that is the \
-             node falling out of the roster until its next health ping"
-        );
-        assert!(got.capabilities.public_mining, "nor any other capability");
-        assert_eq!(
-            got.coordinator_endpoint.as_deref(),
-            Some("1.2.3.4:9100"),
-            "the endpoint was already preserved and must stay so"
-        );
-    }
-
-    /// The rescue must not freeze the flags: a re-announce that genuinely
-    /// carries capabilities still wins, exactly as a real ping does.
-    #[test]
-    fn a_reannounce_that_carries_capabilities_still_updates_them() {
-        use ghost_common::types::NodeCapabilities;
-        let mgr = PeerManager::new([0u8; 32], 100);
-        let pid = [9u8; 32];
-        mgr.upsert_peer(Peer::new(pid, "1.2.3.4:8555".to_string()));
-        mgr.update_health_metrics(
-            &pid,
-            1,
-            NodeCapabilities {
-                coordinator: true,
-                ..Default::default()
-            },
-            None,
-            0,
-            None,
-        );
-
-        let mut reannounce = Peer::new(pid, "1.2.3.4:8555".to_string());
-        reannounce.capabilities = NodeCapabilities {
-            coordinator: false,
-            reaper: true,
-            ..Default::default()
-        };
-        mgr.upsert_peer(reannounce);
-
-        let got = mgr.get_peer(&pid).unwrap();
-        assert!(got.capabilities.reaper, "a real value must apply");
-        assert!(
-            !got.capabilities.coordinator,
-            "and it must be able to turn a flag OFF, or the rescue is a freeze"
-        );
-    }
-
-    /// A ping that reports NO capabilities must not erase what a peer already told us.
-    ///
-    /// `NodeCapabilities` is all bools, so "not reported" and "reported all false" look
-    /// identical on the wire. Believing an all-default ping made the flags flap — a peer or two
-    /// reading `public_mining = false` at any moment while demonstrably public, a different peer
-    /// each time (#518). Nodes blinked out of the public mining list, and anything routing on
-    /// the bit skipped healthy peers.
-    #[test]
-    fn a_ping_claiming_no_capabilities_does_not_erase_known_ones() {
-        use ghost_common::types::NodeCapabilities;
-        let mgr = PeerManager::new([0xFFu8; 32], 100);
-        let pid = [11u8; 32];
-        mgr.upsert_peer(Peer::new(pid, "10.0.0.11:8080".to_string()));
-
-        let caps = NodeCapabilities {
-            public_mining: true,
-            reaper: true,
-            ..Default::default()
-        };
-        mgr.update_health_metrics(&pid, 5, caps, None, 0, None);
-        assert!(mgr.get_peer(&pid).unwrap().capabilities.public_mining);
-
-        // The flap: a ping carrying nothing.
-        mgr.update_health_metrics(&pid, 6, NodeCapabilities::default(), None, 0, None);
-        let got = mgr.get_peer(&pid).unwrap();
-        assert!(
-            got.capabilities.public_mining,
-            "a ping that claims nothing must not clear a known capability"
-        );
-        assert_eq!(
-            got.miner_count, 6,
-            "the rest of the ping must still be applied — only capabilities are held"
-        );
-    }
-
-    /// The guard must not freeze capabilities: a ping that reports a REAL set still wins,
-    /// including one that turns an individual capability off.
-    #[test]
-    fn a_ping_with_real_capabilities_still_updates_them() {
-        use ghost_common::types::NodeCapabilities;
-        let mgr = PeerManager::new([0xFFu8; 32], 100);
-        let pid = [12u8; 32];
-        mgr.upsert_peer(Peer::new(pid, "10.0.0.12:8080".to_string()));
-
-        let caps = NodeCapabilities {
-            public_mining: true,
-            reaper: true,
-            ..Default::default()
-        };
-        mgr.update_health_metrics(&pid, 1, caps, None, 0, None);
-
-        // Operator turns public mining off but the node still runs the reaper: a real claim,
-        // not an empty one, so it must be believed.
-        let narrowed = NodeCapabilities {
-            reaper: true,
-            ..Default::default()
-        };
-        mgr.update_health_metrics(&pid, 1, narrowed, None, 0, None);
-
-        let got = mgr.get_peer(&pid).unwrap();
-        assert!(
-            !got.capabilities.public_mining,
-            "a real claim must be applied"
-        );
-        assert!(got.capabilities.reaper);
     }
 
     /// A health ping that omits the tier ports must not blank what the peer already told us.
@@ -1324,7 +1061,6 @@ mod tests {
     fn test_peer_scoring() {
         let mut peer = Peer::new([1u8; 32], "127.0.0.1:8555".to_string());
         peer.latency_ms = Some(50);
-        peer.is_elder = true;
 
         let score = PeerScore::calculate(&peer);
         assert!(score.score > 0.0);
@@ -1382,47 +1118,30 @@ mod tests {
     }
 
     #[test]
-    fn test_score_low_latency_elder() {
+    fn test_score_low_latency_long_lived() {
         let mut peer = Peer::new([10u8; 32], "10.0.0.1:8555".to_string());
         peer.latency_ms = Some(10);
-        peer.is_elder = true;
-        // Max out capabilities for highest possible score
-        peer.capabilities = NodeCapabilities {
-            archive_mode: true,
-            ghost_pay: true,
-            public_mining: true,
-            reaper: true,
-            elder_status: true,
-            coordinator: false,
-        };
         // Set first_seen far in the past for max reliability (30+ days)
         peer.first_seen = peer.first_seen.saturating_sub(86400 * 31);
 
         let score = PeerScore::calculate(&peer);
-        // latency_score = 1.0 (10ms < 50), reliability_score = 1.0 (31 days),
-        // capability_score = 15/15 = 1.0, elder_bonus = 0.1
-        // score = 0.30 + 0.30 + 0.30 + 0.10 = 1.0
-        assert!(
-            score.score >= 0.95,
-            "Expected score near max, got {}",
-            score.score
-        );
+        // latency_score = 1.0 (10ms < 50), reliability_score = 1.0 (31 days): score = 1.0
+        assert_eq!(score.score, 1.0);
         assert_eq!(score.latency_score, 1.0);
     }
 
     #[test]
-    fn test_score_high_latency_non_elder() {
+    fn test_score_high_latency_new_peer() {
         let mut peer = Peer::new([11u8; 32], "10.0.0.2:8555".to_string());
         peer.latency_ms = Some(1000);
-        peer.is_elder = false;
-        // No capabilities
-        peer.capabilities = NodeCapabilities::default();
 
         let score = PeerScore::calculate(&peer);
-        // latency_score = 0.2 (1000ms >= 500), reliability_score = 0.4 (just created, < 1 day),
-        // capability_score = 0/15 = 0.0, elder_bonus = 0.0
-        // score = 0.06 + 0.12 + 0.0 + 0.0 = 0.18
-        assert!(score.score < 0.3, "Expected low score, got {}", score.score);
+        // latency_score = 0.2 (1000ms >= 500), reliability_score = 0.4 (< 1 day): score = 0.3
+        assert!(
+            score.score < 0.35,
+            "Expected low score, got {}",
+            score.score
+        );
         assert_eq!(score.latency_score, 0.2);
     }
 
@@ -1443,20 +1162,10 @@ mod tests {
         // Create 3 peers with clearly different scores
         let mut peer_high = Peer::new([20u8; 32], "10.0.0.10:8555".to_string());
         peer_high.latency_ms = Some(10);
-        peer_high.is_elder = true;
-        peer_high.capabilities = NodeCapabilities {
-            archive_mode: true,
-            ghost_pay: true,
-            public_mining: true,
-            reaper: true,
-            elder_status: true,
-            coordinator: false,
-        };
         peer_high.first_seen = peer_high.first_seen.saturating_sub(86400 * 31);
 
         let mut peer_mid = Peer::new([21u8; 32], "10.0.1.10:8555".to_string());
         peer_mid.latency_ms = Some(150);
-        peer_mid.capabilities.archive_mode = true;
 
         let mut peer_low = Peer::new([22u8; 32], "10.0.2.10:8555".to_string());
         peer_low.latency_ms = Some(1000);

@@ -94,23 +94,12 @@ pub struct MeshConfig {
     pub health_ping_interval_secs: u64,
     /// Maximum seen messages to track (prevents memory exhaustion)
     pub max_seen_messages: usize,
-    /// Node capabilities to advertise in health pings
-    pub capabilities: ghost_common::types::NodeCapabilities,
-    /// Wraith coordinator endpoint to advertise in health pings when this node
-    /// has opted in (`coordinator` capability). A public `host:port` or a
-    /// `.onion`. `None` for nodes that haven't opted in — they advertise no
-    /// endpoint and so are never elected.
-    pub advertised_coordinator_endpoint: Option<String>,
     /// SV1 hobby and farm listeners advertised to peers so the load balancer can route by tier
     /// (#495). Both `None` until the operator configures them; a peer that advertises neither is
     /// still a valid hobby target on the default port, but never a farm target.
     pub advertised_hobby_port: Option<u16>,
     /// See `advertised_hobby_port`.
     pub advertised_farm_port: Option<u16>,
-    /// This node's node-reward payout address, advertised in health pings so every
-    /// peer learns it (see `HealthPing::payout_address`). Read from local config;
-    /// `None` when no payout address is configured.
-    pub advertised_payout_address: Option<String>,
     /// C-1: Enable Noise Protocol for transport encryption
     ///
     /// When enabled, sensitive P2P messages (shares, blocks, votes, payouts)
@@ -183,11 +172,8 @@ impl Default for MeshConfig {
             dedup_window_secs: 60,
             health_ping_interval_secs: 10,
             max_seen_messages: 100_000, // Cap at 100k messages (~3.2MB with 32-byte IDs)
-            capabilities: ghost_common::types::NodeCapabilities::default(),
-            advertised_coordinator_endpoint: None,
             advertised_hobby_port: None,
             advertised_farm_port: None,
-            advertised_payout_address: None,
             // C-1: Enable Noise by default for secure-by-default operation
             noise_enabled: true,
             noise_port: DEFAULT_NOISE_PORT,
@@ -330,9 +316,6 @@ pub struct MeshNetwork {
     validation_stats: RwLock<ValidationStats>,
     /// C-1: Noise Protocol connection pool for encrypted P2P communication
     noise_pool: Option<Arc<NoiseConnectionPool>>,
-    /// Live node capabilities (updated after MPC contribution succeeds)
-    /// Initialized from config.capabilities, then mutated via update_elder_status()
-    capabilities: RwLock<ghost_common::types::NodeCapabilities>,
     /// Application-provided callback for real miner count (used in health pings).
     /// If None, falls back to peer_count.
     miner_count_fn: Option<Arc<dyn Fn() -> u32 + Send + Sync>>,
@@ -370,10 +353,6 @@ pub struct MeshNetwork {
     /// `0` means we haven't computed it yet (mesh started before capacity
     /// init); peers treat it as unknown and skip utilisation routing for us.
     max_capacity: AtomicU32,
-    /// Wraith mixing sessions this node handled over a recent window, advertised
-    /// in health pings so the mesh can size coordinator seats by demand. 0 until
-    /// this node activates a coordinator role and starts reporting (Inc 4).
-    coordinator_sessions: AtomicU32,
 }
 
 /// Message identifier for deduplication
@@ -1500,7 +1479,6 @@ impl MeshNetwork {
             Self::load_and_reserve_sequence(config.sequence_persist_path.as_deref());
 
         Ok(Self {
-            capabilities: RwLock::new(config.capabilities),
             identity,
             config: config.clone(),
             peers,
@@ -1533,7 +1511,6 @@ impl MeshNetwork {
             uptime_percent_fn: None,
             core_healthy_fn: None,
             max_capacity: AtomicU32::new(0),
-            coordinator_sessions: AtomicU32::new(0),
         })
     }
 
@@ -1542,19 +1519,6 @@ impl MeshNetwork {
     /// re-called if the operator throttle (`network.max_miners`) changes.
     pub fn set_max_capacity(&self, value: u32) {
         self.max_capacity.store(value, Ordering::Relaxed);
-    }
-
-    /// Set the recent Wraith-coordinator session count advertised in health
-    /// pings. Called by the in-process coordinator (Inc 4) as rounds complete;
-    /// stays 0 on nodes that aren't active coordinators.
-    pub fn set_coordinator_sessions(&self, value: u32) {
-        self.coordinator_sessions.store(value, Ordering::Relaxed);
-    }
-
-    /// This node's currently-advertised coordinator session count (for the
-    /// election's demand sum, which includes self).
-    pub fn coordinator_sessions(&self) -> u32 {
-        self.coordinator_sessions.load(Ordering::Relaxed)
     }
 
     /// Set a callback that provides the real connected-miner count for health pings.
@@ -1836,20 +1800,6 @@ impl MeshNetwork {
     /// Register a message handler
     pub fn register_handler(&self, handler: Arc<dyn MessageHandler>) {
         self.handlers.write().push(handler);
-    }
-
-    /// Update elder status in live capabilities
-    ///
-    /// Called after MPC contribution succeeds so health pings
-    /// immediately reflect the new elder status (+1 share).
-    pub fn update_elder_status(&self, is_elder: bool) {
-        let mut caps = self.capabilities.write();
-        caps.elder_status = is_elder;
-        info!(
-            elder_status = is_elder,
-            total_shares = caps.total_shares(),
-            "Updated live capabilities: elder_status"
-        );
     }
 
     /// Get peer manager
@@ -3497,7 +3447,6 @@ impl MeshNetwork {
                 public_address: String::new(), // S-7: Don't broadcast IP in cleartext ZMQ
                 block_height,
                 round_id: 0, // Would track current round
-                capabilities: *self.capabilities.read(),
                 miner_count: self
                     .miner_count_fn
                     .as_ref()
@@ -3513,15 +3462,8 @@ impl MeshNetwork {
                 hobby_port: self.config.advertised_hobby_port,
                 farm_port: self.config.advertised_farm_port,
                 best_records,
-                // Static, operator-chosen advertisement (read from config, never
-                // mutated at runtime), so reading from self.config is fine.
-                coordinator_endpoint: self.config.advertised_coordinator_endpoint.clone(),
-                coordinator_sessions: self.coordinator_sessions.load(Ordering::Relaxed),
                 uptime_percent,
                 peer_count,
-                // Operator-chosen, read from config — advertise our payout address so
-                // every peer's node registry converges (see HealthPing::payout_address).
-                payout_address: self.config.advertised_payout_address.clone(),
             };
 
             match self.create_envelope(
