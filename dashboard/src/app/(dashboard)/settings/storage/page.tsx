@@ -8,8 +8,7 @@ import { StoragePruningCard } from "@/components/settings/StoragePruningCard";
 /**
  * Settings › Storage — central mirror of the L1 pruning controls (Archive Mode,
  * Operator Window, BUDS prune profile) that also live on /storage. Reuses the
- * exact same StoragePruningCard component + mutations. Full L2 pruning status,
- * quick-reference tables and backups remain on /storage and /system.
+ * exact same StoragePruningCard component + mutations. Quick-reference tables and backups remain on /storage and /system.
  */
 export default function StorageSettingsPage() {
   return (

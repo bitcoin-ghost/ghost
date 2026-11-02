@@ -92,7 +92,7 @@ export default function NetworkPage() {
           <StatCard
             label="Connected peers"
             value={peerCount.toLocaleString()}
-            tooltip="Mesh peers currently connected to your node."
+            tooltip="Old mesh peers connected to this node, as the node backend reports them. The node pool's share-chain relay peers are on the Share Chain page."
           />
           <StatCard
             label="Onion address"

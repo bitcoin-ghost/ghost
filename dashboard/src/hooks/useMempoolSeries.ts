@@ -3,13 +3,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { usePoolSeriesHistory } from '@/hooks/queries';
-import type { SeriesPoint } from '@/hooks/usePoolSeries';
+
+export interface SeriesPoint {
+  t: number;
+  v: number;
+}
 
 /**
  * Rolling time-series of this node's mempool transaction count, for the Mempool
  * page graph + tiles.
  *
- * It mirrors {@link usePoolSeries}: the preferred source is the backend
+ * The preferred source is the backend
  * `GET /api/v1/pool/series` ring (sampled every 30s, up to 24h, survives
  * reloads), which now carries a per-sample `mempool_txs` (getmempoolinfo.size)
  * and `block_txs` (block-template tx count). When that ring is empty — or is an
@@ -17,8 +21,7 @@ import type { SeriesPoint } from '@/hooks/usePoolSeries';
  * client-side session buffer keyed on the mempool page's own `/buds/mempool`
  * query (`total` = getmempoolinfo.size): every time that query refetches we
  * append the latest reading. Session accumulation is driven by subscribing to
- * the react-query cache (an external system), the same idiomatic pattern
- * usePoolSeries uses.
+ * the react-query cache (an external system).
  *
  * There is no session source for the block-template tx count (the buds/mempool
  * RPC view doesn't expose it), so `blockTxs` / `latestBlockTxs` are populated

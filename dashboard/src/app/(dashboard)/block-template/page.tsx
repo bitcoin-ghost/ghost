@@ -19,7 +19,7 @@ export default function BlockTemplatePage() {
         <BlockTemplateCard />
       </SectionErrorBoundary>
 
-      {/* How that block's coinbase splits across miners, nodes, treasury, fees. */}
+      {/* How that block's coinbase splits between the treasury, miners' balances and the finder. */}
       <SectionErrorBoundary section="Coinbase Payments">
         <CoinbasePaymentsCard />
       </SectionErrorBoundary>
