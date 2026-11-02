@@ -436,6 +436,8 @@ pub struct Relay {
     published: VecDeque<Published>,
     last_publish: Option<JobAnchor>,
     last_snapshot_at: u64,
+    /// The local Bitcoin tip moved since the last re-batch: re-batch at the next tick.
+    rebatch_due: bool,
     last_tip_announce: u64,
     /// The best chain whose credits the stored ledger holds: `path[i]` is the anchor at height
     /// `i + 1`.
@@ -517,6 +519,7 @@ impl Relay {
             published: VecDeque::new(),
             last_publish: None,
             last_snapshot_at: 0,
+            rebatch_due: false,
             last_tip_announce: 0,
             path: Vec::new(),
             applied_tip: g.hash,
@@ -899,8 +902,15 @@ impl Relay {
     // Events
     // ---------------------------------------------------------------------------------------
 
-    /// The local Bitcoin tip moved.
+    /// The local Bitcoin tip moved. The next tick re-batches: a batch keeps only shares
+    /// includable a couple of blocks past the tip it was built at, and jobs carry it until the
+    /// next re-batch, so waiting for the 30 s backstop let a job commit shares that the tip had
+    /// already moved out of the window, which makes its anchor invalid (seen on regtest, where
+    /// blocks come seconds apart).
     pub fn set_btc_tip(&mut self, h: u32) {
+        if h != self.btc_tip {
+            self.rebatch_due = true;
+        }
         self.btc_tip = h;
     }
 
@@ -1099,7 +1109,7 @@ impl Relay {
         if let Err(e) = self.maybe_checkpoint(hdr) {
             error!("NP_RELAY: checkpoint failed: {e}");
         }
-        if now.saturating_sub(self.last_snapshot_at) >= self.p.backstop_secs {
+        if self.rebatch_due || now.saturating_sub(self.last_snapshot_at) >= self.p.backstop_secs {
             self.publish_snapshot(hdr, false);
         }
         if now.saturating_sub(self.last_tip_announce) >= self.p.tip_announce_secs {
@@ -2178,6 +2188,7 @@ impl Relay {
     /// Re-batch and publish if `(best, batch_root)` changed (always on `force`).
     fn publish_snapshot(&mut self, hdr: &dyn HeaderLookup, force: bool) {
         self.last_snapshot_at = self.now;
+        self.rebatch_due = false;
         let ids = self.snapshot_batch(hdr);
         let job = JobAnchor {
             parent_anchor: self.chain.best(),

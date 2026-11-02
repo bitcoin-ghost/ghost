@@ -326,6 +326,42 @@ fn a_batch_off_its_root_and_an_anchor_with_a_bad_share_are_refused() {
     );
 }
 
+/// A job's batch follows the Bitcoin tip: when the tip moves past a loose share's window, the
+/// next tick re-batches without it, not the 30 s backstop.
+#[test]
+fn a_new_bitcoin_tip_re_batches_at_the_next_tick() {
+    let mut s = Sim::mesh(1);
+    let id = s.mine(0, false).id();
+    s.tick(31);
+    let carried = s.nodes[0].published.last().unwrap().batch_root;
+    assert_eq!(
+        carried,
+        batch_root(&[id]),
+        "the backstop batches the loose share"
+    );
+
+    // The tip moves well past the share's job height; one second later, not thirty.
+    let now = s.now + 1;
+    let n = &mut s.nodes[0];
+    n.relay.set_btc_tip(START_TIP + 30);
+    let outs = n.relay.tick(&s.btc.headers, now);
+    let jobs: Vec<JobAnchor> = outs
+        .into_iter()
+        .filter_map(|o| match o {
+            crate::relay::Out::Publish(j) => Some(j),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(jobs.len(), 1, "re-batched at once");
+    assert_eq!(jobs[0].batch_root, batch_root(&[]));
+
+    // And only once: an unchanged tip waits for the backstop again.
+    let outs = s.nodes[0].relay.tick(&s.btc.headers, now + 1);
+    assert!(!outs
+        .iter()
+        .any(|o| matches!(o, crate::relay::Out::Publish(_))));
+}
+
 #[test]
 fn a_restarted_node_reloads_its_chain_and_ledger() {
     let dir = std::env::temp_dir().join(format!("np-relay-restart-{}", std::process::id()));
