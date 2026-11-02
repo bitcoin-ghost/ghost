@@ -140,7 +140,6 @@ futures = "0.3"
 base64 = "0.22"
 
 # Cryptography
-snow = "0.9"
 getrandom = "0.2"
 
 # JWT
@@ -161,7 +160,6 @@ crossterm = "0.29"
 # Additional crypto
 chacha20poly1305 = "0.10"
 zeroize = { version = "1.7", features = ["derive"] }
-x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 secrecy = "0.8"
 
 # HTTP
