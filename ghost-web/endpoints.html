@@ -94,7 +94,7 @@
     <div id="np-list-status" class="np-placeholder">Loading the node list…</div>
     <div class="hw-table-wrap" id="np-list-wrap" hidden>
       <table class="hw-table">
-        <thead><tr><th>Node</th><th>Stratum V1</th><th>Stratum V2</th><th>Relay</th><th>Region</th></tr></thead>
+        <thead><tr><th>Node</th><th>Stratum V1</th><th>Stratum V2</th><th>Relay</th><th>Version</th><th>Recent probes</th><th>Last probe</th><th>Region</th></tr></thead>
         <tbody id="np-list-body"></tbody>
       </table>
     </div>
@@ -102,7 +102,12 @@
 
     <div class="np-prose">
       <p>This list is generated, not curated: any node with a valid advert that passes an outside probe is listed,
-      and nothing else decides it. The generator is <strong>not built yet</strong>.</p>
+      and nothing else decides it. No roster, no approval, no signed list. The generator is <code>ghost-audit list</code>:
+      it finds nodes from the relays' own address gossip, reads each node's advertised stratum ports from its relay port,
+      and probes them like a miner would. A node is listed after 3 passing probes out of its last 6, with no failed probe
+      among them, and taken off after 3 probes in a row that did not pass, or at once after a failed one. A probe that
+      could not measure a node never counts as a pass. <a href="/docs/#node-pool">How listing works →</a></p>
+      <p>Region is not shown: nothing the probe measures says where a node is.</p>
       <p>Being listed means a node answered a probe. It does not mean the node is honest. A miner on someone else's
       node who does not audit it with <code>ghost-audit</code> is trusting it. <a href="/docs/#ghost-audit">Auditing a node →</a></p>
     </div>
@@ -185,8 +190,8 @@
 </script>
 
 <script>
-  // Reads /node-list.json, which the open-listing generator will write. Until
-  // it exists the file is a marked placeholder ("placeholder": true).
+  // Reads /node-list.json, written by `ghost-audit list` (schema ghost-audit/node-list/v1).
+  // An empty or never-generated list shows a plain message; nothing is guessed.
   (function () {
     var statusEl = document.getElementById('np-list-status');
     var wrap = document.getElementById('np-list-wrap');
@@ -195,35 +200,54 @@
     function esc(s) {
       return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
-    function port(host, p, scheme) {
-      if (!host || !p) return '—';
-      return '<code>' + esc((scheme || '') + host + ':' + p) + '</code>';
+    function code(s) { return s ? '<code>' + esc(s) + '</code>' : '—'; }
+    function when(unix) {
+      if (!unix) return '—';
+      var d = new Date(unix * 1000);
+      return isNaN(d.getTime()) ? '—' : esc(d.toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC'));
+    }
+    function name(n) {
+      if (n.node_id) return '<code title="' + esc(n.node_id) + '">' + esc(String(n.node_id).slice(0, 12)) + '…</code>';
+      return esc(n.host || '—');
+    }
+    function sv2(n) {
+      if (!n.sv2) return '—';
+      var key = n.sv2_authority_key ? '<br><span class="np-status-note">key <code title="' + esc(n.sv2_authority_key) + '">' +
+        esc(String(n.sv2_authority_key).slice(0, 12)) + '…</code></span>' : '';
+      return code(n.sv2) + key;
+    }
+    function recent(r) {
+      if (!r || !r.probes) return '—';
+      return esc(r.pass + ' of ' + r.probes + ' passed');
     }
     fetch('/node-list.json', { cache: 'no-store' })
       .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
       .then(function (d) {
         var nodes = (d && Array.isArray(d.nodes)) ? d.nodes : [];
-        if (d && d.placeholder) {
-          statusEl.textContent = 'No nodes are listed yet. ' + (d.note || 'This is a placeholder until the listing generator exists.');
-          return;
+        if (d && d.generated_at) {
+          meta.textContent = 'Generated ' + d.generated_at + ' on ' + (d.network || 'an unnamed network') +
+            ' from ' + (d.candidates || 0) + ' candidate node' + (d.candidates === 1 ? '' : 's') + '.';
         }
         if (!nodes.length) {
-          statusEl.textContent = 'No nodes are listed right now.';
+          statusEl.textContent = d && d.generated_at
+            ? 'No node is listed right now: none has passed enough probes.'
+            : 'No node is listed yet: the list has not been generated.';
           return;
         }
         body.innerHTML = nodes.map(function (n) {
-          var host = n.host || n.address || '';
           return '<tr>' +
-            '<td>' + esc(n.name || n.nickname || host || '—') + '</td>' +
-            '<td>' + port(host, n.sv1_port, 'stratum+tcp://') + '</td>' +
-            '<td>' + port(host, n.sv2_port) + '</td>' +
-            '<td>' + port(host, n.relay_port) + '</td>' +
+            '<td>' + name(n) + '</td>' +
+            '<td>' + code(n.sv1) + '</td>' +
+            '<td>' + sv2(n) + '</td>' +
+            '<td>' + code(n.relay) + '</td>' +
+            '<td>' + esc(n.user_agent || '—') + '</td>' +
+            '<td>' + recent(n.recent) + '</td>' +
+            '<td>' + when(n.last_probe) + '</td>' +
             '<td>' + esc(n.region || '—') + '</td>' +
           '</tr>';
         }).join('');
         statusEl.hidden = true;
         wrap.hidden = false;
-        if (d.generated_at) meta.textContent = 'Generated ' + d.generated_at + '.';
       })
       .catch(function () {
         statusEl.textContent = 'The node list is unavailable right now.';

@@ -186,9 +186,10 @@
     <div class="section-label">being listed</div>
     <h2 class="section-title">Open listing. No approval.</h2>
     <div class="np-prose">
-      <p>Any node with a valid advert that passes an outside probe will appear on the <a href="/endpoints.html">node list</a>.
-      There is no roster and no signed list. The listing service is <strong>not built yet</strong>; until it is, the node list
-      shows a placeholder.</p>
+      <p>Any node with a valid advert that passes an outside probe appears on the <a href="/endpoints.html">node list</a>.
+      There is no roster and no signed list. <code>ghost-audit list</code> finds nodes from the relays' address gossip, probes
+      the stratum ports each advertises like a miner would, and lists a node after 3 passing probes out of its last 6. No lister
+      is running yet, so the list is empty. <a href="/docs/#node-pool">Getting listed →</a></p>
     </div>
   </div>
 </section>
