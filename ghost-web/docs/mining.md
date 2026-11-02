@@ -23,7 +23,7 @@ You are credited at the payout address, on every node, whichever node you mine o
 
 Which node you use matters in two ways:
 
-- **That node builds your jobs.** A dishonest node can put its own payee on your jobs. `ghost-audit` will detect this; it is [not built yet](#ghost-audit). Until it is, you are trusting the node you mine on. Running your own node removes that trust.
+- **That node builds your jobs.** A dishonest node can put its own payee on your jobs. `ghost-audit` detects this ([Auditing your node](#ghost-audit)); it is built but not released yet. Until you run it, you are trusting the node you mine on. Running your own node removes that trust.
 - **That node gets the transaction fees** of any block you find. If you run your own node, that is you.
 
 ## Why your coinbase may be small
@@ -77,4 +77,4 @@ A miner can under-report what it can carry; nothing in the protocol prevents tha
 ## What you can check today
 
 - Your balance: the [miner page](/miner.html).
-- Whether your node pays you honestly: not yet. That is what `ghost-audit` is for, and it is [coming](#ghost-audit).
+- Whether your node pays you honestly: [`ghost-audit`](#ghost-audit), built but not released yet.

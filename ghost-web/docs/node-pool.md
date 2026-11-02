@@ -32,7 +32,7 @@ The details are on [The payout rule](#payouts).
 6. **Credit.** Each share credits sats at once, worked out from its own difficulty. Every node reaches the same balance because it runs the same arithmetic on the same chain.
 7. **Block found.** A block's outputs come from the balance table as it stood 20 blocks earlier, so a reorg of the share chain can't change what the block should pay.
 8. **Settle.** Nodes see the block and retire what it paid. The block records which anchor it built on, so any node can check it from Bitcoin plus the share chain. Coinbase outputs can be spent after 100 confirmations, as usual.
-9. **Verify.** `ghost-audit` will let a miner check that their node really credited them. It is not built yet; until it is, a miner is trusting the node it mines on. See [Auditing your node](#ghost-audit).
+9. **Verify.** `ghost-audit` lets a miner check that every job their node sends pays the canonical coinbase and credits them. It is built but not released yet; without it, a miner is trusting the node it mines on. See [Auditing your node](#ghost-audit).
 
 ## What is gone
 
@@ -66,7 +66,7 @@ See [Mining on the node pool](#mining). In short: `stratum+tcp://<node>:3333` fo
 |---|---|
 | [Mining on the node pool](#mining) | Connecting a miner, firmware limits, the sensing loop |
 | [The payout rule](#payouts) | Who gets paid, in what order, and how much |
-| [Auditing your node](#ghost-audit) | `ghost-audit`, which is coming |
+| [Auditing your node](#ghost-audit) | `ghost-audit`: what it checks and how to run it |
 | [Before you mine](#honest-reading) | What has and hasn't been proven, and how long waits are |
 | [Deployment](#deployment) | Installing and running a node |
 | [`NODE_POOL_SPEC.md`](https://github.com/bitcoin-ghost/ghost/blob/main/docs/NODE_POOL_SPEC.md) | The full specification |
