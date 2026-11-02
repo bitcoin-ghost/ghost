@@ -1021,7 +1021,7 @@ fn template(k: u64) -> NewTemplate<'static> {
         coinbase_tx_outputs_count: 1,
         coinbase_tx_outputs: bitcoin::consensus::serialize(&witness).try_into().unwrap(),
         coinbase_tx_locktime: 0,
-        merkle_path: path.try_into().unwrap(),
+        merkle_path: path.into(),
     }
 }
 
@@ -1437,8 +1437,7 @@ async fn a_wrong_authority_key_is_refused() {
         |_| panic!("no job may be judged"),
     )
     .await
-    .err()
-    .expect("refused");
+    .expect_err("refused");
     assert!(matches!(e, Sv2Error::WrongKey(_)), "{e}");
     let e = audit_sv2_jobs(
         &sv2_target(addr, "not-a-key", &me, 1, 5),
@@ -1447,8 +1446,7 @@ async fn a_wrong_authority_key_is_refused() {
         |_| {},
     )
     .await
-    .err()
-    .expect("refused");
+    .expect_err("refused");
     assert!(matches!(e, Sv2Error::BadKey(_)), "{e}");
 }
 

@@ -285,7 +285,7 @@ impl Sv2Session {
         let (reader, writer) = noise.into_split();
         let mut s = Sv2Session {
             reader,
-            writer: writer,
+            writer,
             kind,
             channel_id: 0,
             target: None,
