@@ -519,9 +519,10 @@ mod tests {
         });
 
         // Positive control: if the walk finds nothing, every assertion below is vacuous and this
-        // test would keep passing while the configs rotted.
+        // test would keep passing while the configs rotted. One since the old regtest cluster's
+        // two went with it (config/sri/pool-config.toml; the installer writes its own inline).
         assert!(
-            configs.len() >= 3,
+            !configs.is_empty(),
             "expected to find the shipped share_webhook configs, found {:?}",
             configs
         );
