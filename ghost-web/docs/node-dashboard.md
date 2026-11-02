@@ -119,16 +119,33 @@ Tailscale uses WireGuard under the hood for encrypted connections. It handles NA
 
 ## Dashboard Features
 
-:::warning Being rebuilt
-The dashboard is being rebuilt for the node pool (W2.14 in the build plan). Pages for elders, capabilities, checkpoints, votes, node rewards, Wraith, Ghost Pay, Tap and L2 are removed. The list below is what the rebuilt dashboard is planned to show; check the dashboard itself for what your release has.
-:::
+The dashboard is built for the node pool. Its node pool pages:
 
-- Node status and share-chain relay peers
-- Share-chain tip and recent anchors
-- Connected miners, each with its sensed slot class and any firmware warning (see [Mining on the node pool](#mining))
-- Per-miner shares and ledger balance, queue position and expected wait
-- Recent pool blocks with their payouts and the change sent to the treasury
-- Settlement status
+| Page | Shows |
+| --- | --- |
+| **Overview** (`/`) | Node pool health: the pool service answering, relay peers, settlement caught up, provisional and mismatched blocks, anchors waiting for their batch. The Bitcoin node's sync, the share-chain tip and anchor height, the fee address, and where the share chain starts (genesis anchor and height, genesis tier, table digest, pinned digest). |
+| **Miners** (`/miners`) | Every open channel with its payout address, worker, slot class (how many miner outputs its jobs carry), sensed firmware model, sensing state and any firmware warning. Per payout address: hashrate, shares in the last 24 hours, ledger balance, queue position and expected wait. Each address links to its own page. |
+| **Miner** (`/miners/{address}`) | Workers on this node, the ledger balance, its rank in the oldest and largest queues, what the next block would pay it at each slot class, its payouts (settled or provisional, confirmations, spendable) and its recent credited shares. |
+| **Pool Blocks** (`/blocks`) | Recent pool blocks: subsidy, what each paid to miners and to whom, the treasury base (`S/200`), the change sent to the treasury, and whether settlement matched the block or retired it provisionally. Settlement counters since start. |
+| **Share Chain** (`/share-chain`) | The tip, cumulative work and `T_net`, loose shares and anchors waiting for their batch, the relay's counters since start, the checkpoint depth, pruning on or off, and the stored checkpoints. |
+| **Connect Miners** (`/mining`) | This node's stratum ports, the SV2 authority key and the username rule (`<payout-address>.<worker>`; P2SH, P2WPKH, P2WSH and P2TR only). |
+
+**Settings** shows the fee address read-only. It is a money destination, so the dashboard never
+writes it: re-run the installer with `--fee-address`, or edit `fee_address` under `[node_pool]` in
+`/etc/ghost/pool-config.toml` and restart pool_sv2. Alerts (including the webhook) are set under
+Settings, Alerts.
+
+The Bitcoin node, privacy, transaction filtering, storage and system pages are unchanged. Pages
+for elders, capabilities, checkpoints, votes, node rewards, Wraith, Ghost Pay, Tap and L2 are
+gone, as are the old mesh's pool, geo, capacity and peers pages.
+
+:::info Honest readings
+Where the node does not report a value, the dashboard says **unknown**; where a call fails, it says
+**unavailable** with the reason. It never fills a gap with zero or with a healthy state. Hashrate,
+shares and worker status are this node's own (only the node a miner is connected to sees its
+shares); balances, queue positions and payouts are the share chain's and are the same on every
+node.
+:::
 
 ## API Access
 
@@ -143,18 +160,19 @@ in their own right, not because of any localhost exemption.
 ```bash
 # Against the node backend on :8080 (not the dashboard):
 
-# Example: Get node status
-$ curl http://localhost:8080/api/v1/node/status
+# The node pool's status: share chain, peers, settlement, blocks, miners
+$ curl http://localhost:8080/api/v1/node-pool/status
 
-# Example: Get mining stats
-$ curl http://localhost:8080/api/v1/mining/status
+# One miner's ledger: balance, queue position, shares, payouts
+$ curl http://localhost:8080/api/v1/ledger/<address>
 
-# Example: Toggle Ghost Mode
-$ curl -X PATCH \
-     -H "Content-Type: application/json" \
-     -d '{"ghost_mode": true}' \
-     http://localhost:8080/api/v1/config
+# One miner's workers on this node and its expected wait
+$ curl http://localhost:8080/api/v1/miner/<address>
 ```
+
+These three are forwarded to pool_sv2, which builds them on its loopback monitoring listener; if
+pool_sv2 does not answer, the backend says so with a `503`. Routes of removed features answer
+`410 Gone` with the feature's name.
 
 The dashboard's own API (port `3000`, including the `/api/v1/*` proxy) is a
 different matter: it requires a session on **every** request, including from

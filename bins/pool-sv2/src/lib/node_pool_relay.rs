@@ -333,6 +333,10 @@ pub struct RelayParts {
     pub status: watch::Receiver<RelayStatus>,
     /// Settlement's progress.
     pub settlement: watch::Receiver<SettlementStatus>,
+    /// Checkpoints are folded this many Bitcoin blocks below the tip (0: never).
+    pub checkpoint_depth: u32,
+    /// Batches below the older kept checkpoint are deleted (`false`: an archive node).
+    pub prune: bool,
 }
 
 /// Open the store and start the relay, publishing to `np`'s anchor driver and taking its
@@ -386,6 +390,7 @@ pub async fn start_with_parts(
         params.checkpoint_depth = d;
     }
     params.prune = cfg.prune;
+    let (checkpoint_depth, prune) = (params.checkpoint_depth, params.prune);
     let relay = Relay::open(params, db.clone(), archive).map_err(|e| format!("relay: {e}"))?;
     let rpc = || {
         BitcoinRpc::new(
@@ -444,6 +449,8 @@ pub async fn start_with_parts(
         genesis_table_digest: table_digest,
         status: handle.status.clone(),
         settlement: handle.settlement.clone(),
+        checkpoint_depth,
+        prune,
     };
     Ok((handle, parts))
 }

@@ -264,6 +264,21 @@ pub struct NpCheckpoint {
     pub created_at: i64,
 }
 
+/// A stored checkpoint's identity without its payload ([`Database::np_checkpoint_heads`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NpCheckpointHead {
+    /// The anchor the state is folded at.
+    pub anchor_hash: AnchorHash,
+    /// Its anchor height.
+    pub height: u32,
+    /// Its `btc_height`.
+    pub btc_height: u32,
+    /// The digest the payload must have.
+    pub digest: [u8; 32],
+    /// When it was written, unix seconds.
+    pub created_at: i64,
+}
+
 fn db_err(e: rusqlite::Error) -> GhostError {
     GhostError::Database(e.to_string())
 }
@@ -1749,6 +1764,43 @@ impl Database {
         })
     }
 
+    /// Every stored checkpoint without its payload, newest (highest anchor) first: what a status
+    /// page shows, without reading the folded state.
+    pub fn np_checkpoint_heads(&self) -> GhostResult<Vec<NpCheckpointHead>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT anchor_hash, height, btc_height, digest, created_at FROM \
+                     np_checkpoints ORDER BY height DESC, anchor_hash",
+                )
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, Vec<u8>>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                })
+                .map_err(db_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_err)?;
+            rows.into_iter()
+                .map(|(a, h, b, d, at)| {
+                    Ok(NpCheckpointHead {
+                        anchor_hash: blob32(a, "np checkpoint anchor")?,
+                        height: u32_col(h, "np checkpoint height")?,
+                        btc_height: u32_col(b, "np checkpoint btc_height")?,
+                        digest: blob32(d, "np checkpoint digest")?,
+                        created_at: at,
+                    })
+                })
+                .collect()
+        })
+    }
+
     /// Remove the checkpoint at `anchor_hash`, if any.
     pub fn np_delete_checkpoint(&self, anchor_hash: &AnchorHash) -> GhostResult<()> {
         self.with_connection(|conn| {
@@ -2681,6 +2733,17 @@ mod tests {
         again.payload = vec![0];
         db.np_put_checkpoint(&again).unwrap();
         assert_eq!(db.np_load_checkpoints().unwrap(), vec![c(2, 20), again]);
+        let heads = db.np_checkpoint_heads().unwrap();
+        assert_eq!(
+            heads
+                .iter()
+                .map(|x| (x.anchor_hash, x.height, x.btc_height, x.digest))
+                .collect::<Vec<_>>(),
+            vec![
+                (h(2), 20, 1_020, h(2 ^ 0xFF)),
+                (h(1), 10, 1_010, h(1 ^ 0xFF))
+            ]
+        );
         db.np_delete_checkpoint(&h(2)).unwrap();
         assert_eq!(db.np_load_checkpoints().unwrap().len(), 1);
     }

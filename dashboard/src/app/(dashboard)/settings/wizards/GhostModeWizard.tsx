@@ -115,7 +115,7 @@ export default function GhostModeWizard({ isOpen, onClose }: GhostModeWizardProp
                   <div>
                     <span className="text-[color:var(--fg)] font-medium">Ghost Mode</span>
                     <p className="text-sm text-[color:var(--dim)] mt-1">
-                      Enable Ghost protocol features and L2 participation
+                      Stop relaying transactions and messages to peers, except blocks
                     </p>
                   </div>
                   <Toggle

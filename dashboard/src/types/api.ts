@@ -16,7 +16,6 @@ export interface NodeInfo {
   peer_count?: number;
   miner_count?: number;
   archive_mode?: boolean;
-  public_mining?: boolean;
   reaper?: boolean;
   mempool_profile?: string;
   template_profile?: string;
@@ -39,7 +38,6 @@ export interface NodeStatus {
   tor_mode?: boolean;
   onion_address?: string;
   archive_mode?: boolean;
-  public_mining?: boolean;
   reaper?: boolean;
 }
 
@@ -70,7 +68,6 @@ export interface NodeConfig {
   ghost_mode_local_egress?: boolean;
   archive_mode?: boolean;
   reaper?: boolean;
-  public_mining?: boolean;
 }
 
 // Pruning configuration — the VW/OW/AW three-window model. Pruning is
@@ -185,7 +182,6 @@ export interface MiningStatus {
   best_hash?: string | null;
   // Dashboard-compatible aliases (added to backend)
   enabled?: boolean;
-  public_mining?: boolean;
   hashrate_th?: number;
   local_hashrate_th?: number;
   local_connected_miners?: number;
@@ -210,42 +206,6 @@ export interface MiningStatus {
   // network-wide default. Optional: absent on pre-redeploy nodes, in which
   // case the frontend falls back to its bundled constant.
   authority_public_key?: string;
-}
-
-export interface MinerInfo {
-  worker_name?: string;
-  hashrate_th?: number;
-  shares_submitted?: number;
-  shares_accepted?: number;
-  last_share?: number;
-  connected_at?: number;
-  ip_address?: string;
-  // Backend fields
-  miner_id?: string;
-  address?: string;
-  difficulty?: number;
-  total_shares?: number;
-  valid_shares?: number;
-  stale_shares?: number;
-  last_share_at?: number;
-  user_agent?: string;
-}
-
-export interface MinersResponse {
-  // `/api/v1/mining/miners/full` returns `total`; the operator-authed
-  // `/api/v1/mining/miners` returns `total_miners`. Both are optional so the
-  // count can be sourced from whichever endpoint answered.
-  total?: number;
-  total_miners?: number;
-  miners?: MinerInfo[];
-  // True when the backend withheld the per-miner list (public/unauthed path or
-  // a pre-redeploy node that lacks the operator-authed detail mode). When true,
-  // `miners` is absent and the UI shows the aggregate count instead of a table.
-  miners_redacted?: boolean;
-  // Aggregate stats returned when miners array is not available (no HMAC auth)
-  total_hashrate_th?: number;
-  total_shares_accepted?: number;
-  total_shares_submitted?: number;
 }
 
 // Pool time-series (GET /api/v1/pool/series) — rolling server-side history of
@@ -315,35 +275,6 @@ export interface ChainHealthResponse {
   reorg_count_24h: number;
 }
 
-// Mesh-wide leaderboard (GET /api/v1/pool/mesh-leaderboard) — node-ranked
-// leaderboard + mesh-wide best-share records per window, aggregated with no new
-// gossip.
-export interface MeshLeaderboardNode {
-  node_id: string;
-  name: string;
-  hashrate_th: number;
-  miner_count: number;
-  healthy: boolean;
-  is_self: boolean;
-}
-
-export interface MeshLeaderboardRecord {
-  window: string;
-  share_hash: string;
-  leading_zero_bits: number;
-  leading_hex_zeros: number;
-  miner_id_redacted: string;
-  timestamp: number;
-  difficulty: number;
-}
-
-export interface MeshLeaderboardResponse {
-  nodes: MeshLeaderboardNode[];
-  node_count: number;
-  records: MeshLeaderboardRecord[];
-  limit_note: string;
-}
-
 // Best Hash types
 export interface BestHashEntry {
   hash?: string | null;
@@ -366,42 +297,6 @@ export interface BestHashResponse {
   block_height?: number;
   round_id?: number;
   chain?: string;
-}
-
-// Network types
-export interface PoolStatus {
-  // Backend fields
-  pool_name?: string;
-  version?: string;
-  block_height?: number;
-  peer_count?: number;
-  miner_count?: number;
-  round_id?: number;
-  uptime_secs?: number;
-  // Dashboard aliases
-  connected?: boolean;
-  pool_hashrate_ph?: number;
-  active_nodes?: number;
-  active_miners?: number;
-  blocks_found?: number;
-  current_round_duration_secs?: number;
-  estimated_time_to_block_secs?: number;
-}
-
-export interface PeerInfo {
-  node_id?: string;
-  address?: string;
-  latency_ms?: number;
-  synced?: boolean;
-  version?: string;
-  connected_at?: number;
-  last_seen?: number;
-  is_self?: boolean;
-}
-
-export interface PeersResponse {
-  total: number;
-  peers: PeerInfo[];
 }
 
 // Logs types
@@ -686,26 +581,15 @@ export interface TorModeStatus {
   tor_running?: boolean;
 }
 
-// Coinbase payout breakdown for the block currently being built.
-// One agreed recipient's slice of the miner pool.
-export interface CoinbaseRecipient { address: string; amount_sat: number }
-// One node's slice of the node reward pool.
-export interface CoinbaseNode { node_id: string; address?: string; amount_sat: number }
+// The coinbase split of the block currently being built (GET /api/v1/mining/coinbase).
 export interface MiningCoinbaseResponse {
   available: boolean;
   height?: number;
-  round_id?: number;
   subsidy_sat?: number;
-  tx_fees_to_finder_sat?: number;
-  treasury_sat?: number;
+  /** The treasury's fixed base share, S/200; any change Rm cannot pay comes on top. */
+  treasury_base_sat?: number;
+  /** Rm: what the block pays to miners' balances at most. */
   miner_pool_sat?: number;
-  node_reward_pool_sat?: number;
+  tx_fees_to_finder_sat?: number;
   total_coinbase_sat?: number;
-  miner_count?: number;
-  node_count?: number;
-  // When the request is not operator-authed the node redacts per-recipient
-  // addresses (amounts still present, `address` fields omitted).
-  addresses_redacted?: boolean;
-  miners?: CoinbaseRecipient[];
-  nodes?: CoinbaseNode[];
 }

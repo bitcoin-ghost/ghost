@@ -1,11 +1,11 @@
 // Node queries
 export * from './useNodeQueries';
 
-// Network queries
-export * from './useNetworkQueries';
-
 // Mining queries
 export * from './useMiningQueries';
+
+// Node pool queries
+export * from './useNodePoolQueries';
 
 // Config queries
 export * from './useConfigQueries';
@@ -40,9 +40,6 @@ export * from './useSystemQueries';
 // Resource queries
 export * from './useResourceQueries';
 
-// Mesh queries
-export * from './useMeshQueries';
-
 // Haze queries
 export * from './useHazeQueries';
 
@@ -54,6 +51,3 @@ export * from './useReaperQueries';
 
 // Filtering-activity queries
 export * from './useFilteringQueries';
-
-// Geo (offline GeoIP database) queries
-export * from './useGeoQueries';

@@ -17,7 +17,10 @@
 //!   network's, or not a payee class, is a 400.
 //! - `GET /api/v1/node-pool/status`: share-chain tip and anchor height, peers, settlement
 //!   caught up or not, recent pool blocks with their payouts and the treasury change, and the
-//!   connected miners with their slot class and any firmware warning.
+//!   connected miners with their slot class and any firmware warning. For the operator dashboard
+//!   (W2.14) it also carries this node's id, the relay's counters since start (`relay_stats`),
+//!   and its retention (`retention`: the checkpoint depth, whether it prunes, and the stored
+//!   checkpoints without their folded state).
 
 use std::{collections::HashSet, future::Future, pin::Pin, str::FromStr, sync::Arc};
 
@@ -416,17 +419,67 @@ pub struct SettlementView {
     pub disconnected: u64,
 }
 
+/// The relay's counters since this node started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RelayStatsView {
+    /// Network shares accepted into the loose pool.
+    pub shares_accepted: u64,
+    /// Network shares dropped as stale or not includable.
+    pub shares_stale: u64,
+    /// Network shares refused as invalid.
+    pub shares_invalid: u64,
+    /// Anchors whose batch completed.
+    pub anchors_valid: u64,
+    /// Anchors found invalid.
+    pub anchors_invalid: u64,
+    /// Best-tip changes that disconnected at least one anchor.
+    pub reorgs: u64,
+}
+
+/// A stored ledger checkpoint, without its folded state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CheckpointView {
+    /// The anchor it is folded at, internal byte order.
+    pub anchor: String,
+    /// Its anchor height.
+    pub anchor_height: u32,
+    /// Its Bitcoin height.
+    pub btc_height: u32,
+    /// The digest its stored state must hash to.
+    pub digest: String,
+    /// When it was written, unix seconds.
+    pub created_at: i64,
+}
+
+/// How much of the share chain this node keeps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RetentionView {
+    /// Checkpoints fold this many Bitcoin blocks below the tip; 0 is never.
+    pub checkpoint_depth: u32,
+    /// Batches below the older kept checkpoint are deleted. `false` is an archive node, which
+    /// can serve a fresh node's sync from genesis.
+    pub prune: bool,
+    /// Stored checkpoints, newest first (two are kept).
+    pub checkpoints: Vec<CheckpointView>,
+}
+
 /// `GET /api/v1/node-pool/status`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StatusResponse {
     /// This node's network.
     pub network: &'static str,
+    /// This node's id (the one its job tags commit to), if it has one.
+    pub node_id: Option<String>,
     /// Where the share chain starts.
     pub start: StartView,
     /// The share chain's tip.
     pub share_chain: ChainView,
     /// Connected relay peers.
     pub peers: usize,
+    /// The relay's counters since start.
+    pub relay_stats: RelayStatsView,
+    /// Checkpoints and pruning.
+    pub retention: RetentionView,
     /// Settlement.
     pub settlement: SettlementView,
     /// The finder output: every fee of a block this node's miners find.
@@ -732,9 +785,22 @@ impl NodePoolApi {
                 }),
             })
             .collect();
+        let checkpoints = db
+            .np_checkpoint_heads()
+            .map_err(internal)?
+            .into_iter()
+            .map(|c| CheckpointView {
+                anchor: hex::encode(c.anchor_hash),
+                anchor_height: c.height,
+                btc_height: c.btc_height,
+                digest: hex::encode(c.digest),
+                created_at: c.created_at,
+            })
+            .collect();
         let start = &self.parts.start;
         Ok(StatusResponse {
             network: start.network.as_str(),
+            node_id: self.live.node_id().map(hex::encode),
             start: StartView {
                 genesis_anchor: hex::encode(start.genesis_anchor),
                 genesis_btc_height: start.genesis_btc_height,
@@ -753,6 +819,19 @@ impl NodePoolApi {
                 unseen_anchors: relay.unseen,
             },
             peers: relay.peers,
+            relay_stats: RelayStatsView {
+                shares_accepted: relay.stats.shares_accepted,
+                shares_stale: relay.stats.shares_stale,
+                shares_invalid: relay.stats.shares_invalid,
+                anchors_valid: relay.stats.anchors_valid,
+                anchors_invalid: relay.stats.anchors_invalid,
+                reorgs: relay.stats.reorgs,
+            },
+            retention: RetentionView {
+                checkpoint_depth: self.parts.checkpoint_depth,
+                prune: self.parts.prune,
+                checkpoints,
+            },
             settlement: SettlementView {
                 caught_up: st.caught_up(),
                 synced_height: st.synced_height,

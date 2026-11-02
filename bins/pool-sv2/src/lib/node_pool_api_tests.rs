@@ -14,7 +14,7 @@ use ghost_np_relay::{
     settlement::{SettlementStats, SettlementStatus},
 };
 use ghost_storage::{
-    node_pool_store::{NpAnchorRecord, NpBatchShare, NpShareRecord},
+    node_pool_store::{NpAnchorRecord, NpBatchShare, NpCheckpoint, NpShareRecord},
     Database,
 };
 use stratum_apps::stratum_core::bitcoin::{
@@ -150,8 +150,24 @@ pub(crate) fn world() -> World {
         loose: 3,
         unseen: 1,
         peers: 2,
-        stats: RelayStats::default(),
+        stats: RelayStats {
+            shares_accepted: 40,
+            shares_stale: 2,
+            shares_invalid: 1,
+            anchors_valid: 7,
+            anchors_invalid: 0,
+            reorgs: 1,
+        },
     };
+    db.np_put_checkpoint(&NpCheckpoint {
+        anchor_hash: [0xC1; 32],
+        height: 3,
+        btc_height: 700,
+        payload: vec![1, 2, 3],
+        digest: [0xD1; 32],
+        created_at: 1_500,
+    })
+    .unwrap();
     let (_status_tx, status_rx) = watch::channel(status);
     let (settlement_tx, settlement_rx) = watch::channel(SettlementStatus {
         synced_height: Some(999),
@@ -176,6 +192,8 @@ pub(crate) fn world() -> World {
         genesis_table_digest: [0x42; 32],
         status: status_rx,
         settlement: settlement_rx,
+        checkpoint_depth: 288,
+        prune: true,
     };
     let miners = vec![ChannelStatus {
         key: (4, 1),
@@ -412,6 +430,44 @@ async fn the_status_has_its_documented_shape() {
         );
     }
     assert!(v["settlement"]["caught_up"].is_boolean());
+}
+
+/// The dashboard's share-chain page reads the relay's counters and its retention from the
+/// status: checkpoints come without their folded state, and an unknown node id is `null`.
+#[tokio::test]
+async fn the_status_carries_relay_counters_and_retention() {
+    let w = world();
+    let s = w.api.status().await.unwrap();
+    assert_eq!(s.node_id, None);
+    assert_eq!(
+        s.relay_stats,
+        RelayStatsView {
+            shares_accepted: 40,
+            shares_stale: 2,
+            shares_invalid: 1,
+            anchors_valid: 7,
+            anchors_invalid: 0,
+            reorgs: 1,
+        }
+    );
+    assert_eq!(
+        (s.retention.checkpoint_depth, s.retention.prune),
+        (288, true)
+    );
+    assert_eq!(
+        s.retention.checkpoints,
+        vec![CheckpointView {
+            anchor: "c1".repeat(32),
+            anchor_height: 3,
+            btc_height: 700,
+            digest: "d1".repeat(32),
+            created_at: 1_500,
+        }]
+    );
+    let v = serde_json::to_value(&s).unwrap();
+    assert!(v["node_id"].is_null());
+    assert!(v["retention"]["checkpoints"][0].get("payload").is_none());
+    assert_eq!(v["relay_stats"]["reorgs"], 1);
 }
 
 #[cfg(feature = "monitoring")]
