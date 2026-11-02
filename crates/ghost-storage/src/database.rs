@@ -2431,40 +2431,6 @@ mod tests {
         assert_eq!(retrieved, Some(address.to_string()));
     }
 
-    #[test]
-    fn test_node_address_encryption_roundtrip() {
-        let db = Database::in_memory().expect("Failed to create in-memory database");
-        db.set_encryption_key(test_encryption_key());
-
-        let node_id = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-        let address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
-
-        // First register the node so it exists
-        db.upsert_node(&crate::models::NodeRecord {
-            node_id: node_id.to_string(),
-            public_address: Some("127.0.0.1:8555".to_string()),
-            display_name: None,
-            first_seen: 1000,
-            last_seen: 1000,
-            is_elder: false,
-            elder_order: None,
-            capabilities: "{}".to_string(),
-            total_uptime_secs: 0,
-            uptime_7d_percent: 0.0,
-            verification_pass_rate: 0.0,
-            total_shares_received: 0,
-            total_blocks_found: 0,
-            payout_address: Some(address.to_string()),
-        })
-        .expect("Failed to upsert node");
-
-        // Retrieve and verify it's decrypted
-        let retrieved = db
-            .get_node_payout_address(node_id)
-            .expect("Failed to get node address");
-        assert_eq!(retrieved, Some(address.to_string()));
-    }
-
     /// Unique scratch path under the system temp dir for a file-based test DB.
     fn temp_db_path(tag: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
