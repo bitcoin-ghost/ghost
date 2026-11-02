@@ -143,6 +143,11 @@ rpc_host = "127.0.0.1"
 rpc_port = 8332
 rpc_user = "${BITCOIN_RPC_USER}"
 rpc_password = "${BITCOIN_RPC_PASSWORD}"
+# Retention (W2.13). A ledger checkpoint is folded this many Bitcoin blocks below the share-chain
+# tip (0: never; at least 40). prune = true deletes stored batches below the older of the two kept
+# checkpoints; leave it off on archive nodes, which serve a fresh node's sync from genesis.
+# checkpoint_depth = 288
+# prune = false
 
 # Template Provider Configuration
 # Connects to ghost-mining's TDP server

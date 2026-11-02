@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 63;
+const SCHEMA_VERSION: u32 = 64;
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
@@ -140,6 +140,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (61, migrate_v61),
         (62, migrate_v62),
         (63, migrate_v63),
+        (64, migrate_v64),
     ];
 
     for &(version, migrate_fn) in pre_v10 {
@@ -2882,6 +2883,56 @@ const NODE_POOL_V63_DDL: &str = "
     );
 ";
 
+/// v64: share-chain sync (W2.13): the Bitcoin block archive and the ledger checkpoints.
+///
+/// Additive only, like v63: two new `np_*` tables.
+///
+/// - `np_btc_blocks`: every Bitcoin header the node pool has met above its genesis (and the 11
+///   below it, for median time past), on every branch, with the block's coinbase and its merkle
+///   branch. Settlement and share checks walk a share's Bitcoin ancestry through it, and a peer
+///   whose Bitcoin node never saw a stale branch fetches it from here: Bitcoin peers do not serve
+///   stale blocks.
+/// - `np_checkpoints`: the folded ledger state at a deep anchor, so a restart does not replay
+///   every batch and batches below it can be pruned. `digest` covers `payload`; a row whose
+///   digest does not match is corrupt and is rebuilt.
+fn migrate_v64(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v64: node pool sync tables");
+    conn.execute_batch(NODE_POOL_V64_DDL)
+        .map_err(|e| GhostError::Migration(e.to_string()))?;
+    info!("v64: created the node pool sync tables (np_btc_blocks, np_checkpoints)");
+    Ok(())
+}
+
+/// The v64 schema. `IF NOT EXISTS` throughout, so a replay is a no-op.
+const NODE_POOL_V64_DDL: &str = "
+    -- One row per archived Bitcoin block: the 80-byte header, its height, and (above the
+    -- archive floor) its coinbase without witness data and the merkle branch from the coinbase
+    -- txid to the header's merkle root. Stale blocks stay: shares and pool blocks refer to them.
+    CREATE TABLE IF NOT EXISTS np_btc_blocks (
+        hash         BLOB    PRIMARY KEY CHECK (typeof(hash) = 'blob' AND length(hash) = 32),
+        prev         BLOB    NOT NULL CHECK (typeof(prev) = 'blob' AND length(prev) = 32),
+        height       INTEGER NOT NULL CHECK (height >= 0),
+        header       BLOB    NOT NULL CHECK (typeof(header) = 'blob' AND length(header) = 80),
+        coinbase     BLOB    CHECK (coinbase IS NULL OR typeof(coinbase) = 'blob'),
+        branch       BLOB    CHECK (branch IS NULL
+                                    OR (typeof(branch) = 'blob' AND length(branch) % 32 = 0)),
+        received_at  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_np_btc_blocks_height ON np_btc_blocks(height);
+
+    -- Ledger checkpoints: the snapshot state folded at a deep anchor on the best chain.
+    -- `payload` is the relay's encoding; `digest` is sha256 over it with a domain tag.
+    CREATE TABLE IF NOT EXISTS np_checkpoints (
+        anchor_hash  BLOB    PRIMARY KEY CHECK (typeof(anchor_hash) = 'blob'
+                                                AND length(anchor_hash) = 32),
+        height       INTEGER NOT NULL CHECK (height >= 0),
+        btc_height   INTEGER NOT NULL CHECK (btc_height >= 0),
+        payload      BLOB    NOT NULL CHECK (typeof(payload) = 'blob'),
+        digest       BLOB    NOT NULL CHECK (typeof(digest) = 'blob' AND length(digest) = 32),
+        created_at   INTEGER NOT NULL
+    );
+";
+
 /// v62 (#1034): make the per-target ledger index covering.
 ///
 /// `ledger_voterset_challenger_rows` reads one target+capability over the seven-day window, once
@@ -4077,7 +4128,7 @@ mod tests {
         let fresh_np = np_schema(&fresh);
         assert_eq!(
             fresh_np.iter().filter(|o| o.0 == "table").count(),
-            10,
+            12,
             "{fresh_np:?}"
         );
 
@@ -4097,7 +4148,7 @@ mod tests {
         let before = other_schema(&conn);
 
         run_migrations(&conn).unwrap();
-        assert_eq!(get_schema_version(&conn).unwrap(), 63);
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
         assert_eq!(
             other_schema(&conn),
             before,
@@ -4113,6 +4164,7 @@ mod tests {
         run_migrations(&conn).unwrap();
         let once = np_schema(&conn);
         migrate_v63(&conn).unwrap();
+        migrate_v64(&conn).unwrap();
         assert_eq!(np_schema(&conn), once);
     }
 

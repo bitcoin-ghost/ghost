@@ -1,4 +1,4 @@
-# Porting notes: W2.1 pure core and W2.5 relay
+# Porting notes: W2.1 pure core, W2.5 relay, W2.13 sync
 
 Readings chosen where the spec leaves a detail open. Each one follows the Python reference
 (`refimpl_v3.py`) for the payout rule, or the simulator in the design folder
@@ -135,11 +135,9 @@ anchor's ancestry, the share, and the Bitcoin headers, so every viewer reaches t
 ## Settlement (W2.7, `ghost-np-relay/src/settlement.rs`)
 - **Where**: in the relay task, over the relay's store; it is the relay's `Retirements` hook
   (`SettledView`), so every table a share is checked against and every job pays subtracts it.
-- **The view is the node's Bitcoin best chain**: the retirements a table subtracts for job height
-  `H` are those of settled pool blocks below `H` on this node's best chain, whatever the including
-  anchor. A pure function of the including anchor's ancestry would need the stale-branch archive
-  (W2.13); until then two nodes on different Bitcoin tips can disagree for the time a block takes
-  to propagate.
+- **The stored ledger follows the node's Bitcoin best chain**: settlement retires into `np_ledger`
+  what pool blocks on this node's best chain paid, judged by the anchors it holds. Since W2.13 no
+  table reads it: share checks and jobs use the deterministic rule below.
 - **A pool block** has a `GHPP` tag and a `GHNP` second-to-last output. Its anchor is looked up
   by the 16-byte prefix among held anchors with their batch (or genesis). **Match**: the table
   `block_table(anchor, H)` has the root the block commits, and the outputs are canonical for some
@@ -155,6 +153,46 @@ anchor's ancestry, the share, and the Bitcoin headers, so every viewer reaches t
   block at that height. On start, every settled block is re-checked against the best chain, and
   one whose anchor is not held goes back to provisional. A sync scans at most 500 blocks.
 
+## Sync, archive and checkpoints (W2.13)
+Readings chosen where the spec was silent; written into spec 2.2, "Share-chain sync".
+
+- **Deterministic retirements.** A table for a share of job height `H` on Bitcoin block `P`,
+  included by `X`, subtracts the pool blocks on `P`'s ancestry above genesis and below `H` (the
+  archive walk, `BtcArchive::pool_blocks_on`). A block retires its paid miner outputs
+  (`provisional_retirements`) unless an anchor with its `GHPP` prefix is on `X`'s ancestry and
+  none matches it, then nothing. "Held" is replaced by "on the includer's ancestry", which every
+  viewer of `X` shares; a job's includer is the next anchor on its parent. A block's own match is
+  `block_table_on(A, k, B.prev)`, recursive on lower heights and cached per (block, anchor). The
+  tag in the table cache key digests the retirements, not a node view.
+- **`block_table(parent, h)`** (pool_sv2's jobs, settlement) uses this node's best-chain block at
+  `h - 1` as `prev`: the job's own `prev_hash`. `block_table_on` takes `prev` explicitly.
+- **Archive.** Settlement archives every best-chain block it reads (`BlockSource::block`: header,
+  height, coinbase without witness, merkle branch from the block's txids), and the 11 headers at
+  genesis for median time past. Stale blocks stay. A wanted hash is read back from the local
+  Bitcoin node (walking `prev` to an archived block, at most 2,016), then asked of peers. A peer
+  block whose parent is missing waits in a pool of 256 while the parent is fetched from the same
+  peer. Median time past is computed from the archived times; `next_bits` across a retarget
+  boundary only from this node's best-chain child.
+- **Headers.** `Headers` replies follow the server's best chain from the first locator hash on
+  it. A reply whose first anchor's parent is unknown, or whose anchors do not chain, scores 20. A
+  full reply (32) asks again from its last anchor. One header request is outstanding at a time;
+  a peer is not re-asked within the request timeout (5 s) unless its last reply was full.
+- **Share bodies** are checked against their header before they are kept (`share_integrity`):
+  coinbase folds to the merkle root, scriptSig carries the preimage's tag and parent prefix.
+  Before W2.13 a substituted body made an honest anchor invalid; now it scores 50 on its sender.
+- **Checkpoints.** Fold height `F = btc_height(C) + 1` is the highest at which every includer
+  descending from `C` folds the same prefix: no descendant's credit (job height at least
+  `btc_height(C) - 12`) has `c + 20 <= F`, and a pool block below `F` was built on an anchor with
+  `btc_height < btc_height(C)`, which is on a descendant's ancestry only if it is `C`'s ancestor.
+  The fold's Bitcoin ancestry is `C`'s own `prev_hash`. Pool-block checks for heights `F..=F+20`
+  are computed before the fold and carried, since their tables reach below `C`; one that arrives
+  later counts what it paid. Depth below 40 is raised to 40.
+- **Pruning** deletes stored batches below the older kept checkpoint (`np_prune_batches_below`).
+  In memory, batches and credits at or below the newest checkpoint are dropped whether or not the
+  store prunes; serving reads them back from the store.
+- **Migration v64** holds `np_btc_blocks` and `np_checkpoints`; the plan's genesis-table
+  import moves to v65.
+
 ## Open, not decided here
 - **K = 120.** Resolved for the relay above: the duplicate check reaches back to `S(H)`. The spec's
   constants table still lists K; it should be reworded.
@@ -162,3 +200,8 @@ anchor's ancestry, the share, and the Bitcoin headers, so every viewer reaches t
   reach on regtest. The PoW base is a parameter so Phase 3 can choose; `share_face` keeps the
   reference's difficulty-1 constant.
 - **Treasury address**, from the user.
+- **Archive peers.** A fresh node cannot validate batches older than every peer's window. Which
+  nodes run with `prune` off (all 8 fleet nodes, at least) is the operators' call.
+- **Deep reorgs.** A share-chain fork from below a node's checkpoint is never followed; that node
+  must resync from an archive peer. With the default depth (288 blocks, two days) this needs a
+  fork kept private for about two days.
