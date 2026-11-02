@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Node pool regtest end-to-end harness (plan, Phase 3, first stage).
+"""Node pool end-to-end harness (plan, Phase 3): regtest, and our own signet (--network signet).
 
 Native processes on loopback, one temp directory, no Docker. Per node:
 
-  ghostd (regtest, peered) -> ghost-mining (TDP template provider) -> pool_sv2
+  ghostd (regtest or signet, peered) -> ghost-mining (TDP template provider) -> pool_sv2
   ([node_pool] + [node_pool.relay], relays peered) -> translator_sv2 (SV1) -> cpu_miner.py
+
+Signet is a custom signet of the run's own (-signetchallenge, a fresh network id every run, so its
+message start and genesis are nobody else's), mined by ghostd's own generatetoaddress for plain
+blocks and by the pool's miners for pool blocks; see SIGNET_* below and scenarios_signet.py.
 
 The Bitcoin node is ghostd, as on every node pool node, run as the installer runs it (Reaper on;
 --no-reaper turns it off). --bitcoind (or BITCOIND=) runs any other binary that speaks Core's RPC
@@ -45,6 +49,22 @@ WITNESS_PREFIX = "6a24aa21a9ed"
 COIN = 100_000_000
 # Regtest's subsidy schedule (Halving::REGTEST): it halves every 150 blocks.
 HALVING = 150
+# The network the run is on, and what follows from it. configure_network() sets these for
+# --network before the scenarios import them; the defaults are regtest's.
+NETWORK = "regtest"
+HRP = "bcrt"
+TIER_BASE = REGTEST_TIER_BASE
+GENESIS_ANCHOR = "UNSET"  # regtest's default anchor (REGTEST_GENESIS), as the installer writes it
+GENESIS_HEIGHT = 0
+SIGNET_CHALLENGE = None
+# Signet: the proof-of-work limit (chainparams, SigNetParams), the minimum difficulty, about 4.8M
+# hashes a block. Blocks stay there below the first retarget at 2,016.
+SIGNET_POW_LIMIT = 0x377AE << 216
+# Signet tier base: 2^17 x the limit. The network tier (floor 10) is then 2^7 easier than a block
+# and the anchor tier (+8) half a block's target, so every block is a network share and half are
+# anchors; a share that is not a block is below pool_sv2's channel floor (difficulty 2^10,
+# 2^42 hashes) and never reaches the relay, as on regtest. tier_base is configuration on signet.
+SIGNET_TIER_BASE = f"{SIGNET_POW_LIMIT << 17:064x}"
 # Agents chosen to land in each class of the ceiling table (slot_class_sensing.rs).
 AGENTS = [
     ("cpuminer/2.5", 3),              # unknown -> smallest class
@@ -63,8 +83,12 @@ SERIAL_AGENT = "cgminer/4.10"
 # (cut(H) is at or below genesis, so rule 6 has no snapshot anchor): jobs are still served there,
 # and pool_sv2 says they earn nothing (NODE_POOL_VOID_WORK).
 BOOTSTRAP_HEIGHT = 1
+# The height the synthetic ledger export is taken at (its rows' queue_since).
+EXPORT_HEIGHT = 1
 # The first job height whose shares earn: genesis btc_height (0) + SNAPSHOT_CUT_LAG + 1.
 FIRST_EARNING_HEIGHT = 21
+# The snapshot cut lag, cut(H) = H - 20.
+CUT_LAG = 20
 # The installer's Reaper flags for ghostd (scripts/install-node.sh, REAPER_FLAGS).
 REAPER_FLAGS = ["-ghostreaper=enabled", "-ghostreaper-rejectinscription=1",
                 "-ghostreaper-rejectdropstuffing=1", "-ghostreaper-rejectfakepubkey=1",
@@ -142,11 +166,47 @@ def p2pkh_address(tag):
 
 
 def payee(tag, taproot=False):
-    """(address, script hex) for a deterministic regtest payee."""
+    """(address, script hex) for a deterministic payee on the run's network."""
     h = hashlib.sha256(tag.encode()).digest()
     if taproot:
-        return segwit_address("bcrt", 1, h), "5120" + h.hex()
-    return segwit_address("bcrt", 0, h[:20]), "0014" + h[:20].hex()
+        return segwit_address(HRP, 1, h), "5120" + h.hex()
+    return segwit_address(HRP, 0, h[:20]), "0014" + h[:20].hex()
+
+
+def configure_network(args):
+    """Set the module's network values for --network (before scenarios import them)."""
+    global NETWORK, HRP, TIER_BASE, GENESIS_ANCHOR, GENESIS_HEIGHT, SIGNET_CHALLENGE, HALVING
+    global BOOTSTRAP_HEIGHT, FIRST_EARNING_HEIGHT, EXPORT_HEIGHT
+    NETWORK = args.network
+    if NETWORK == "regtest":
+        return
+    HRP = "tb"
+    HALVING = 210_000
+    TIER_BASE = SIGNET_TIER_BASE
+    # The run's own signet: <32-byte network id> OP_DROP OP_TRUE. An empty block solution
+    # satisfies it (signet.cpp: no solution, "to support OP_TRUE as trivial block challenge"), so
+    # pool miners can find blocks: a challenge needing a signature cannot be pool-mined, since the
+    # signature commits to the merkle root and so to every extranonce a miner rolls. The id makes
+    # the network's message start, and so the network, the run's alone.
+    net_id = hashlib.sha256(b"GhostNodePool/signet-harness/" + os.urandom(16)).digest()
+    SIGNET_CHALLENGE = "20" + net_id.hex() + "7551"
+    GENESIS_ANCHOR = hashlib.sha256(b"GhostNodePool/genesis/signet/" + net_id).hexdigest()
+    GENESIS_HEIGHT = args.signet_genesis_height
+    # The export is taken at the genesis anchor's height (the freeze), and plain blocks run 20
+    # past it before any pool job, so the first pool job is at the first earning height: the
+    # operational rule of plan Phase 4 (genesis anchor at least 20 blocks before miners are
+    # repointed), rehearsed. No work is void.
+    EXPORT_HEIGHT = GENESIS_HEIGHT
+    BOOTSTRAP_HEIGHT = GENESIS_HEIGHT + CUT_LAG
+    FIRST_EARNING_HEIGHT = GENESIS_HEIGHT + CUT_LAG + 1
+
+
+def audit_chain_args():
+    """ghost-audit's share-chain arguments for the run's network (its start and tier base)."""
+    if NETWORK == "regtest":
+        return ["--network", "regtest"]
+    return ["--network", NETWORK, "--genesis-anchor", GENESIS_ANCHOR, "--genesis-height",
+            str(GENESIS_HEIGHT), "--tier-base", TIER_BASE]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -278,8 +338,10 @@ class Node:
     def start_bitcoind(self, peers):
         d = os.path.join(self.dir, "bitcoin")
         os.makedirs(d, exist_ok=True)
-        conf = [
-            "regtest=1", "server=1", "[regtest]", f"rpcuser={RPC_USER}", f"rpcpassword={RPC_PASS}",
+        chain = ["regtest=1", "server=1", "[regtest]"] if NETWORK == "regtest" else [
+            "signet=1", "server=1", "[signet]", f"signetchallenge={SIGNET_CHALLENGE}"]
+        conf = chain + [
+            f"rpcuser={RPC_USER}", f"rpcpassword={RPC_PASS}",
             f"rpcport={self.rpc_port}", "rpcbind=127.0.0.1", "rpcallowip=127.0.0.1",
             f"port={self.p2p}", "bind=127.0.0.1", "listen=1", "discover=0", "dnsseed=0",
             "fixedseeds=0", "listenonion=0", "fallbackfee=0.0002", "txindex=0",
@@ -310,7 +372,7 @@ rpc_host = "127.0.0.1"
 rpc_port = {self.rpc_port}
 rpc_user = "{RPC_USER}"
 rpc_password = "{RPC_PASS}"
-network = "regtest"
+network = "{NETWORK}"
 zmq_hashblock = "tcp://127.0.0.1:{self.zmq_block}"
 zmq_hashtx = "tcp://127.0.0.1:{self.zmq_tx}"
 
@@ -384,14 +446,14 @@ ghost_pool_health_url = "http://127.0.0.1:{self.http}/health"
 sensing_min_shares = {a.sensing_min_shares}
 
 [node_pool.relay]
-network = "regtest"
+network = "{NETWORK}"
 listen = "127.0.0.1:{self.relay}"
 advertise_sv1_port = {self.sv1}
 peers = [{peers}]
 db_path = "{d}/node-pool.db"
-genesis_anchor = "UNSET"
-genesis_btc_height = 0
-{pin}tier_base = "{REGTEST_TIER_BASE}"
+genesis_anchor = "{GENESIS_ANCHOR}"
+genesis_btc_height = {GENESIS_HEIGHT}
+{pin}tier_base = "{TIER_BASE}"
 rpc_host = "127.0.0.1"
 rpc_port = {self.rpc_port}
 rpc_user = "{RPC_USER}"
@@ -482,14 +544,21 @@ authority_pubkey = "{POOL_PUB}"
             self.log("translator"), cwd=d, env={"RUST_LOG": "info", "NO_COLOR": "1"})
         wait_for(lambda: port_open(self.sv1), 60, what=f"node{self.i} translator SV1 port")
 
-    def start_miners(self, specs, pace, anchor_odds):
+    def start_miners(self, specs, pace, anchor_odds, name="miner"):
+        """One cpu_miner.py process (`name`) mining for `specs`, (user, agent) pairs. A node
+        may run several, paused and resumed apart (pause_miners)."""
         argv = [sys.executable, os.path.join(HERE, "cpu_miner.py"), "127.0.0.1", str(self.sv1),
                 "--events", os.path.join(self.dir, "miner-events.jsonl"), "--pace", str(pace),
-                "--anchor-odds", str(anchor_odds), "--tier-base", REGTEST_TIER_BASE,
-                "--seed", str(1000 + self.i)]
+                "--anchor-odds", str(anchor_odds), "--tier-base", TIER_BASE,
+                "--seed", str(1000 + 10 * self.i + len(self.miner_procs()))]
+        if self.h.grinder:
+            argv += ["--grinder", self.h.grinder]
         for user, agent in specs:
             argv += ["--miner", f"{user}@{agent}"]
-        self.procs["miner"] = Proc("miner", argv, self.log("miner"))
+        self.procs[name] = Proc(name, argv, self.log(name))
+
+    def miner_procs(self):
+        return [n for n in self.procs if n.startswith("miner")]
 
     def start_sv2_device(self, user):
         dev = self.h.args.mining_device
@@ -502,13 +571,15 @@ authority_pubkey = "{POOL_PUB}"
             self.log("sv2-device"), env={"RUST_LOG": "info", "NO_COLOR": "1"})
         return True
 
-    def pause_miners(self, paused):
-        for n in ("miner", "sv2-device"):
-            if n in self.procs:
+    def pause_miners(self, paused, only=None):
+        """Pause (SIGSTOP) or resume every miner process of this node, or only those named."""
+        for n in self.miner_procs() + ["sv2-device"]:
+            if n in self.procs and (only is None or n in only):
                 self.procs[n].signal(signal.SIGSTOP if paused else signal.SIGCONT)
 
     def stop(self):
-        for n in ("sv2-device", "miner", "translator", "pool_sv2", "ghost-mining", "bitcoind"):
+        for n in ["sv2-device"] + self.miner_procs() + ["translator", "pool_sv2", "ghost-mining",
+                                                         "bitcoind"]:
             if n in self.procs:
                 self.procs[n].stop()
 
@@ -560,6 +631,8 @@ class Harness:
         self.work = args.workdir or tempfile.mkdtemp(prefix="np-regtest-")
         os.makedirs(self.work, exist_ok=True)
         self.nodes = []
+        self.retired = []  # nodes stopped and taken out of the run (retire())
+        self.next_index = 0
         self.t0 = time.time()
         self.peak_rss = 0
         self.export_dir = self.export_digest = None
@@ -568,8 +641,20 @@ class Harness:
         self.is_ghostd = "Ghost Core" in out
         self.genesis = {}  # script hex -> sats owed at genesis
         self.genesis_addr = {}  # script hex -> address
+        self.grinder = self.build_grinder() if args.network != "regtest" else None
         if args.genesis_rows:
             self.make_export(args.genesis_rows)
+
+    def build_grinder(self):
+        """grind.c built into the work dir for the miners (signet's blocks need ~4.8M hashes).
+        None, and a pure-Python search, if it does not build."""
+        out = os.path.join(self.work, "grind.so")
+        r = subprocess.run(["cc", "-O2", "-shared", "-fPIC", os.path.join(HERE, "grind.c"),
+                            "-lcrypto", "-o", out], capture_output=True, text=True)
+        if r.returncode != 0:
+            say(f"  grind.c did not build ({r.stderr.strip()[-200:]}); the miners search in Python")
+            return None
+        return out
 
     def make_export(self, rows):
         """A synthetic ledger export in GhostLedgerExport/v1, the format `pool_sv2
@@ -583,9 +668,9 @@ class Harness:
             self.genesis_addr[script] = addr
         self.genesis = table
         ordered = sorted(table.items(), key=lambda kv: bytes.fromhex(kv[0]))
-        net = b"regtest"
+        net = NETWORK.encode()
         body = b"GhostLedgerExport/v1" + len(net).to_bytes(2, "big") + net
-        body += BOOTSTRAP_HEIGHT.to_bytes(8, "big")
+        body += EXPORT_HEIGHT.to_bytes(8, "big")
         body += len(ordered).to_bytes(4, "big")
         for script, sats in ordered:
             sb = bytes.fromhex(script)
@@ -597,7 +682,7 @@ class Harness:
         with open(os.path.join(self.export_dir, "ledger-export.bin"), "wb") as f:
             f.write(body)
         with open(os.path.join(self.export_dir, "ledger-export.json"), "w") as f:
-            json.dump({"digest_sha256": digest, "network": "regtest",
+            json.dump({"digest_sha256": digest, "network": NETWORK,
                        "genesis_table": [{"script_hex": s, "face_units": str(v << 32)}
                                          for s, v in ordered]}, f)
         self.export_digest = digest
@@ -610,7 +695,7 @@ class Harness:
 
     def rss_mb(self):
         total = 0
-        for n in self.nodes:
+        for n in self.all_nodes():
             for p in n.procs.values():
                 if not p.alive():
                     continue
@@ -636,16 +721,29 @@ class Harness:
     def honest(self):
         return [n for n in self.nodes if not n.fault and "pool_sv2" in n.procs and n.procs["pool_sv2"].alive()]
 
+    def retire(self, n):
+        """Stop node n and take it out of the run's node list (its ports and directory are
+        never reused); teardown still checks it."""
+        n.stop()
+        if n in self.nodes:
+            self.nodes.remove(n)
+            self.retired.append(n)
+
+    def all_nodes(self):
+        return self.nodes + self.retired
+
     def add_node(self, mine=True, fault=None, agents=None, anchor_odds=None):
-        i = len(self.nodes)
+        i = self.next_index
+        self.next_index += 1
         n = Node(self, i)
         n.fault = fault
         others = [m for m in self.nodes]
         n.start_bitcoind([m.p2p for m in others])
         self.nodes.append(n)
         if i == 0 and n.rpc("getblockcount") == 0:
-            # Leave initial block download (regtest's genesis is from 2011); see BOOTSTRAP_HEIGHT.
-            n.rpc("generatetoaddress", BOOTSTRAP_HEIGHT, payee("bootstrap")[0])
+            # Leave initial block download (regtest's genesis is from 2011, signet's from 2020);
+            # see BOOTSTRAP_HEIGHT. On signet these are the plain blocks below the genesis anchor.
+            self.generate(n, BOOTSTRAP_HEIGHT)
         # Synced to node0's tip as it was, or past it: earlier nodes' miners keep mining.
         h0 = self.nodes[0].rpc("getblockcount")
         tip = self.nodes[0].rpc("getblockhash", h0)
@@ -677,10 +775,23 @@ class Harness:
             f"relay :{n.relay} api :{n.pool_mon}  sv1 :{n.sv1}  miners {len(n.miners)}")
         return n
 
+    def generate(self, n, count, tag="bootstrap"):
+        """Plain (non-pool) blocks from n's own ghostd, one call each. Signet's minimum
+        difficulty takes a few million hashes, past generatetoaddress's default of 1M tries."""
+        addr = payee(tag)[0]
+        out = []
+        for _ in range(count):
+            got = []
+            while not got:
+                got = n.rpc("generatetoaddress", 1, addr, 1 << 30, timeout=600)
+            out += got
+        return out
+
     def teardown(self):
         # Miners and proxies first, so nothing reconnects; then everything else at once.
-        procs = [p for n in self.nodes for k, p in n.procs.items() if k in ("sv2-device", "miner")]
-        procs += [p for n in self.nodes for k, p in n.procs.items() if k not in ("sv2-device", "miner")]
+        first = [p for n in self.all_nodes() for k, p in n.procs.items()
+                 if k == "sv2-device" or k.startswith("miner")]
+        procs = first + [p for n in self.all_nodes() for p in n.procs.values() if p not in first]
         for p in procs:
             p.terminate()
         for p in procs:
@@ -698,10 +809,13 @@ class Harness:
             except OSError:
                 break
         out = subprocess.run(["pgrep", "-af", self.work], capture_output=True, text=True).stdout
+        # Inside the work dir only: a path that merely starts with its name (a log beside it,
+        # say) is someone else's.
         left = [l for l in out.splitlines()
-                if l.strip() and int(l.split()[0]) not in mine and "pgrep" not in l]
+                if l.strip() and int(l.split()[0]) not in mine and "pgrep" not in l
+                and re.search(re.escape(self.work) + r"(/|\s|$)", l)]
         # And every process started, by pid (the SV2 device's command line names no path here).
-        for n in self.nodes:
+        for n in self.all_nodes():
             for name, p in n.procs.items():
                 try:
                     os.killpg(p.p.pid, 0)  # its process group still has a member
@@ -745,7 +859,7 @@ class Harness:
 
 # ---------------------------------------------------------------------------------------------
 def subsidy(h):
-    """Regtest's block subsidy at height h."""
+    """The run's network's block subsidy at height h."""
     return 0 if h // HALVING >= 64 else (50 * COIN) >> (h // HALVING)
 
 
@@ -809,12 +923,12 @@ def run(args):
         t = time.time()
         h.teardown()
         left = h.leftovers()
-        busy = [p for n in h.nodes for p in (n.p2p, n.rpc_port, n.pool, n.relay, n.sv1, n.tdp, n.http)
+        busy = [p for n in h.all_nodes() for p in (n.p2p, n.rpc_port, n.pool, n.relay, n.sv1, n.tdp, n.http)
                 if port_open(p)]
         if left or busy:
             result("teardown", "FAIL", [f"left running: {l}" for l in left] + [f"port still open: {p}" for p in busy])
         else:
-            result("teardown", "PASS", f"{sum(len(n.procs) for n in h.nodes)} processes stopped in "
+            result("teardown", "PASS", f"{sum(len(n.procs) for n in h.all_nodes())} processes stopped in "
                    f"{time.time() - t:.1f}s; none left matching {h.work}; every port closed")
     say("\n== summary")
     for name, verdict, _ in RESULTS:
@@ -828,7 +942,10 @@ def run(args):
 
 
 def scenarios(h):
-    from scenarios import ALL  # noqa: E402 - kept in its own file
+    if h.args.network == "signet":
+        from scenarios_signet import ALL  # noqa: E402 - kept in its own file
+    else:
+        from scenarios import ALL  # noqa: E402 - kept in its own file
     for sc in ALL:
         if h.args.only and sc.__name__ not in h.args.only:
             continue
@@ -854,7 +971,11 @@ def find_ghostd(cache):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--nodes", type=int, default=3)
+    ap.add_argument("--network", choices=["regtest", "signet"], default="regtest",
+                    help="regtest, or a custom signet of the run's own (scenarios_signet.py)")
+    ap.add_argument("--signet-genesis-height", type=int, default=30,
+                    help="signet: plain blocks mined first; the genesis anchor and export height")
+    ap.add_argument("--nodes", type=int, default=None, help="default 3 (regtest), 4 (signet)")
     ap.add_argument("--miners-per-node", type=int, default=2)
     ap.add_argument("--bitcoind", default=os.environ.get("BITCOIND") or os.environ.get("GHOSTD"),
                     help="the Bitcoin node binary (default: ghostd; see run.sh)")
@@ -870,8 +991,14 @@ def main():
     ap.add_argument("--keep", action="store_true", help="keep the work dir even on success")
     ap.add_argument("--base-port", type=int, default=21000)
     ap.add_argument("--pace", type=float, default=8.0, help="mean seconds between a miner's shares")
+    ap.add_argument("--signet-blocks", type=int, default=90,
+                    help="signet: Bitcoin blocks to mine in the main mining phase")
+    ap.add_argument("--reorg-depth", type=int, default=4,
+                    help="signet: blocks the reorg scenario takes off the best chain, at least")
     ap.add_argument("--anchor-odds", type=float, default=0.35)
-    ap.add_argument("--sensing-min-shares", type=int, default=2)
+    ap.add_argument("--sensing-min-shares", type=int, default=None,
+                    help="valid shares before a class step; default 2 (regtest), 1 (signet: every "
+                         "share is a block, and the climb must fit in genesis-only snapshots)")
     ap.add_argument("--mine-to", type=int, default=110, help="Bitcoin height to mine to first")
     ap.add_argument("--no-serial-miner", dest="serial_miner", action="store_false",
                     help="leave out node0's cgminer-style (serialising) miner")
@@ -886,12 +1013,23 @@ def main():
                     help="pool_sv2 built with --features np-fault-injection, for the hostile node")
     ap.add_argument("--genesis-rows", type=int, default=1200,
                     help="rows of the synthetic genesis export every node imports (0: none)")
-    ap.add_argument("--faults", nargs="*", default=["wrong-treasury", "fee-skim"])
+    ap.add_argument("--faults", nargs="*", default=None,
+                    help="hostile builds (node_pool_fault.rs); default wrong-treasury fee-skim "
+                         "(regtest), and payee-order no-root overpay as well (signet)")
     ap.add_argument("--hostile-blocks", type=int, default=3)
     ap.add_argument("--past-halving", action="store_true",
                     help="finally mine past regtest's first halving (150) and report what happens")
     ap.add_argument("--only", nargs="*", help="scenario function names to run")
     args = ap.parse_args()
+    signet = args.network == "signet"
+    if args.nodes is None:
+        args.nodes = 4 if signet else 3
+    if args.sensing_min_shares is None:
+        args.sensing_min_shares = 1 if signet else 2
+    if args.faults is None:
+        args.faults = ["wrong-treasury", "fee-skim"] + (
+            ["payee-order", "no-root", "overpay"] if signet else [])
+    configure_network(args)
     args.bitcoind = args.bitcoind or find_ghostd(args.ghostd_cache)
     if not args.bitcoind:
         raise SystemExit("no ghostd: run `run.sh --fetch-ghostd`, put ghostd on PATH, or pass "

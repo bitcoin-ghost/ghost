@@ -13,6 +13,13 @@ any share that reaches T_net is also a block. A miner here therefore submits onl
 meet the network tier (or, with probability --anchor-odds, the anchor tier T_net + 8), and then
 sleeps --pace seconds, so the block rate is set by the harness and not by the CPU.
 
+On the harness's signet the tier base is set so that the network tier is easier than a block and
+the anchor tier harder (harness.py, SIGNET_TIER_BASE): a miner aims at the easier of the network
+tier and the job's own block target, so again every share it submits is a Bitcoin block, and
+pool_sv2 (whose channel floor, difficulty 2^10, is out of a CPU's reach) accepts it as one.
+Signet's minimum difficulty is about 4.8M hashes, so --grinder names grind.so (grind.c, built by
+the harness) to search nonces natively; without it the search is pure Python.
+
 Writes one JSON event per line to --events. Pause and resume with SIGSTOP / SIGCONT.
 
 Usage: cpu_miner.py HOST PORT --miner USER@AGENT [--miner ...] --events FILE
@@ -41,6 +48,7 @@ ap.add_argument("--tier-base", default="7fffff" + "00" * 29)
 ap.add_argument("--t-net", type=int, default=10)
 ap.add_argument("--anchor-offset", type=int, default=8)
 ap.add_argument("--seed", type=int, default=None)
+ap.add_argument("--grinder", help="grind.so (grind.c) for a native nonce search")
 ARGS = ap.parse_args()
 
 BASE = int(ARGS.tier_base, 16)
@@ -49,6 +57,20 @@ ANCHOR_TARGET = BASE >> (ARGS.t_net + ARGS.anchor_offset)
 LOG = open(ARGS.events, "a", buffering=1)
 LOG_LOCK = threading.Lock()
 RNG = random.Random(ARGS.seed)
+GRIND = None
+if ARGS.grinder:
+    import ctypes
+    GRIND = ctypes.CDLL(ARGS.grinder).grind
+    GRIND.restype = ctypes.c_int64
+    GRIND.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint32]
+# Nonces per native call, between checks for a newer job.
+GRIND_CHUNK = 1 << 21
+
+
+def bits_target(nbits):
+    """The target a compact nBits encodes."""
+    exp, mant = nbits >> 24, nbits & 0x007FFFFF
+    return mant << (8 * (exp - 3)) if exp >= 3 else mant >> (8 * (3 - exp))
 
 
 def emit(miner, kind, **kw):
@@ -166,15 +188,22 @@ class Miner(threading.Thread):
         head = u32le(int(ver, 16)) + pv
         tail = u32le(int(ntime, 16)) + u32le(int(nbits, 16))
         # Not the pool's share target: pool_sv2 floors every channel at difficulty 2^10 (about
-        # 2^42 hashes a share), out of a CPU's reach. On regtest a hash that meets the network
-        # tier is a Bitcoin block, and a block is accepted whatever the channel target.
-        target = ANCHOR_TARGET if want_anchor else NS_TARGET
+        # 2^42 hashes a share), out of a CPU's reach. A hash that meets the job's block target is
+        # a Bitcoin block, and a block is accepted whatever the channel target; so never aim
+        # easier than a block (on regtest the network tier is already harder than one).
+        block = bits_target(int(nbits, 16))
+        target = min(ANCHOR_TARGET if want_anchor else NS_TARGET, block)
         en2_start = RNG.getrandbits(24)
         for en2 in range(en2_start, en2_start + 0x10000):
             en2h = struct.pack("<I", en2 & 0xFFFFFFFF).hex().ljust(self.en2sz * 2, "0")[:self.en2sz * 2]
             root = dsha(binascii.unhexlify(cb1 + self.en1 + en2h + cb2))
             for b in branch:
                 root = dsha(root + binascii.unhexlify(b))
+            if GRIND is not None:
+                found = self.grind(job_id, head + root + tail, target, en2h, ntime)
+                if found is not None:
+                    return found
+                continue
             mid = hashlib.sha256(head + root[:28])
             rest = root[28:] + tail
             for nonce in range(0x100000):
@@ -192,6 +221,26 @@ class Miner(threading.Thread):
                          ns=value <= NS_TARGET, anchor=value <= ANCHOR_TARGET)
                     return True
         return False
+
+    def grind(self, job_id, header76, target, en2h, ntime):
+        """Native nonce search over the whole nonce space of one extranonce2. True on a submit,
+        False when a newer job arrived, None when the space is exhausted."""
+        tbe = target.to_bytes(32, "big")
+        for start in range(0, 1 << 32, GRIND_CHUNK):
+            if not self.jobs.empty():
+                return False
+            nonce = GRIND(header76, tbe, start, GRIND_CHUNK)
+            if nonce < 0:
+                continue
+            digest = dsha(header76 + u32le(nonce))
+            value = int.from_bytes(digest, "little")
+            self.sent[self.rid] = {"job": job_id, "hash": digest[::-1].hex(),
+                                   "ns": value <= NS_TARGET, "anchor": value <= ANCHOR_TARGET}
+            self.send("mining.submit", [self.user, job_id, en2h, ntime, f"{nonce:08x}"])
+            emit(self.user, "share", job=job_id, hash=digest[::-1].hex(),
+                 ns=value <= NS_TARGET, anchor=value <= ANCHOR_TARGET)
+            return True
+        return None
 
     def run(self):
         while True:

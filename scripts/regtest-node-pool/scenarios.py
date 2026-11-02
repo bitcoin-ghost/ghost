@@ -8,7 +8,7 @@ import time
 
 from harness import (FIRST_EARNING_HEIGHT, logged, RPC_PASS, RPC_USER, SERIAL_AGENT, SLOT_CLASSES, TREASURY_SCRIPT as TREASURY,
                      check_coinbase, p2pkh_address, payee, result, say, subsidy, wait_for, Proc, HERE,
-                     REGTEST_TIER_BASE)
+                     TIER_BASE, NETWORK, GENESIS_HEIGHT, audit_chain_args)
 import sys
 
 def genesis_args(h):
@@ -51,7 +51,8 @@ def bringup(h):
     ev, ok = [], True
     for n in h.nodes:
         line = next((l for l in n.read_log("pool_sv2").splitlines() if "NODE_POOL_START:" in l), None)
-        if not line or "network=regtest" not in line or "genesis_btc_height=0" not in line:
+        if (not line or f"network={NETWORK}" not in line
+                or f"genesis_btc_height={GENESIS_HEIGHT}" not in line):
             ok = False
         ev.append(f"node{n.i}: " + (line.split("NODE_POOL_START: ", 1)[1][:150] if line else "no NODE_POOL_START line"))
     try:
@@ -61,7 +62,7 @@ def bringup(h):
     except TimeoutError as e:
         ok = False
         ev.append(str(e))
-    result("bring-up: every node on the regtest genesis, relays peered", "PASS" if ok else "FAIL", ev)
+    result(f"bring-up: every node on the {NETWORK} genesis, relays peered", "PASS" if ok else "FAIL", ev)
 
 
 def mine(h):
@@ -209,7 +210,7 @@ def one_refused_miner(h):
     t = time.time()
     proc = Proc("refused-miner", [sys.executable, os.path.join(HERE, "cpu_miner.py"), "127.0.0.1",
                                   str(n0.sv1), "--events", events, "--miner", f"{bad}@bitaxe/v2.10.0",
-                                  "--tier-base", REGTEST_TIER_BASE], os.path.join(n0.dir, "refused-miner.log"))
+                                  "--tier-base", TIER_BASE], os.path.join(n0.dir, "refused-miner.log"))
     try:
         def dropped():
             with open(events) as f:
@@ -246,7 +247,8 @@ def blocks_settle(h):
         return result("pool blocks: settled on every node, exact coinbase sums", "UNMEASURED",
                       "the nodes never went quiet")
     n0 = h.nodes[0]
-    blocks = h.pool_blocks(n0)
+    # Blocks a hostile node found (an earlier scenario on signet) are judged there, not here.
+    blocks = [b for b in h.pool_blocks(n0) if b[1] not in STATE.get("hostile_hashes", set())]
     STATE["pool_blocks"] = blocks
     payees = ({m[2] for n in h.nodes for m in n.miners} | {payee("node0/sv2-device", True)[1]}
               | set(h.genesis))
@@ -310,8 +312,11 @@ def blocks_settle(h):
                     if any(f"building a job without its snapshot table" in l and f"height={height} " in l + " "
                            for n2 in h.honest() for l in n2.read_log("pool_sv2").splitlines()):
                         line += " (a node built jobs at that height without its snapshot table)"
-        if st["mismatched"] or st["provisional"]:
+        # Hostile blocks (an earlier scenario on signet) are the only mismatches allowed.
+        hostile = len(STATE.get("hostile_hashes", ()))
+        if st["mismatched"] != hostile or st["provisional"]:
             ok = False
+            line += f"; mismatched {st['mismatched']}, of which hostile blocks {hostile}"
         ev.append(line)
     result("pool blocks: every node logs settlement for each block; exact coinbase sums",
            "PASS" if ok else "FAIL", ev)
@@ -328,15 +333,27 @@ def slot_classes(h):
                 ev.append(f"node{n.i} store: {cnt} network shares committed slot_class {cls}")
         finally:
             c.close()
+        log = n.read_log("pool_sv2")
         for m in n.status()["miners"]:
             sens = m.get("sensing") or {}
             want = next((cls for (u, a, s, ag, cls) in n.miners if a == m["address"]), None)
             agent_ok = m["kind"] == "standard" or sens.get("agent") not in (None, "SRI/Translator Proxy/")
             reached = m["kind"] == "standard" and m["slot_class"] == 500 or (want and m["slot_class"] == want)
+            note = ""
+            if not reached and want:
+                # Reached, then dropped by the no-share timeout: the harness pauses miners
+                # (SIGSTOP) between on-demand phases, and a silent settled miner loses its class.
+                changes = [l for l in log.splitlines() if "slot class changed" in l and m["address"] in l]
+                at = max((k for k, l in enumerate(changes) if f"to={want} cause=Passed" in l), default=None)
+                drops = changes[at + 1:] if at is not None else []
+                if drops and all("Failed(NoShares)" in l for l in drops):
+                    reached = True
+                    note = (f"; reached {want}, then dropped {len(drops)} class(es) by the no-share "
+                            f"timeout while paused")
             ok &= bool(agent_ok and reached)
             ev.append(f"node{n.i} {m['kind']} {m['address'][:14]}.. agent={sens.get('agent')!r} "
                       f"model={sens.get('model')!r} class={m['slot_class']} ceiling={sens.get('ceiling_class')} "
-                      f"settled={sens.get('settled')} (expected {want if m['kind'] == 'extended' else 500})")
+                      f"settled={sens.get('settled')} (expected {want if m['kind'] == 'extended' else 500}){note}")
     missing = [c for c in SLOT_CLASSES if c not in seen_classes]
     if missing:
         ok = False
@@ -474,7 +491,7 @@ def audit(h):
     target, peer = h.nodes[0], h.nodes[1 % len(h.nodes)]
     addr, _ = payee("auditor", False)
     data = os.path.join(h.work, "audit")
-    argv = [exe, "audit", "--network", "regtest", "--relay-peer", f"127.0.0.1:{peer.relay}",
+    argv = [exe, "audit"] + audit_chain_args() + ["--relay-peer", f"127.0.0.1:{peer.relay}",
             "--data-dir", data, "--rpc-port", str(target.rpc_port), "--rpc-user", RPC_USER,
             "--rpc-password", RPC_PASS, "--stratum", f"127.0.0.1:{target.sv1}",
             "--node-relay", f"127.0.0.1:{target.relay}", "--address", addr, "--jobs",
@@ -600,7 +617,14 @@ def past_halving(h):
            "and settle on every node", "PASS" if ok else "FAIL", ev)
 
 
-FAULT_REASON = {"wrong-treasury": "wrong treasury", "fee-skim": "fee skim"}
+# What ghost-audit must name for each fault: its reason code, and words its detail must hold.
+FAULT_REASON = {
+    "wrong-treasury": ("wrong_treasury", "not the treasury"),
+    "fee-skim": ("fee_skim", "subsidy"),
+    "payee-order": ("outputs_not_canonical", "not in rule order"),
+    "no-root": ("malformed_coinbase", "no GHNP ledger commitment"),
+    "overpay": ("inflated_balance", "canonical is"),
+}
 
 
 def hostile(h):
@@ -619,14 +643,23 @@ def hostile(h):
         ev, ok = [], True
 
         def hostile_blocks():
+            """Best-chain blocks the hostile node's miners found: every share they submit is a
+            Bitcoin block (cpu_miner.py), so their share hashes name the blocks, whatever the
+            fault left in the coinbase."""
             out = []
-            for height in range(start + 1, honest[0].rpc("getblockcount") + 1):
-                bh = honest[0].rpc("getblockhash", height)
-                cb = honest[0].rpc("getblock", bh, 2)["tx"][0]
+            for e in miner_events(bad):
+                if e["ev"] != "share":
+                    continue
+                try:
+                    hdr = honest[0].rpc("getblockheader", e["hash"])
+                except RuntimeError:
+                    continue  # never reached this node, or not a block
+                if hdr.get("confirmations", -1) < 1 or hdr["height"] <= start:
+                    continue
+                cb = honest[0].rpc("getblock", e["hash"], 2)["tx"][0]
                 vouts = [(round(v["value"] * 1e8), v["scriptPubKey"]["hex"]) for v in cb["vout"]]
-                if any(sc == bad.fee_script for _, sc in vouts) or vouts[0][1] != TREASURY:
-                    out.append((height, bh, vouts))
-            return out
+                out.append((hdr["height"], e["hash"], vouts))
+            return sorted(set((x, y, tuple(z)) for x, y, z in out))
         try:
             wait_for(lambda: len(hostile_blocks()) >= h.args.hostile_blocks, 240, step=3,
                      what=f"{h.args.hostile_blocks} blocks from the hostile node")
@@ -636,7 +669,9 @@ def hostile(h):
         fault_line = next((l for l in bad.read_log("pool_sv2").splitlines() if "NODE_POOL_FAULT" in l), "")
         ev.append(f"node{bad.i} pool_sv2: {fault_line.split('NODE_POOL_FAULT: ', 1)[-1][:120] or 'no fault line'}")
         blocks = hostile_blocks()
-        ev.append(f"{len(blocks)} blocks found by the hostile node: heights {[b[0] for b in blocks]}")
+        STATE.setdefault("hostile_hashes", set()).update(bh for _, bh, _ in blocks)
+        ev.append(f"{len(blocks)} blocks found by the hostile node: heights {[b[0] for b in blocks]}; "
+                  f"miner outputs {[len(v) - 3 for _, _, v in blocks]}")
         try:
             h.quiesce(180)
         except TimeoutError as e:
@@ -651,10 +686,16 @@ def hostile(h):
             rs = n.status()["relay_stats"]
             refused_shares = {k: rs[k] - stats0[n.i][k] for k in ("shares_invalid", "shares_stale", "anchors_invalid")}
             mism = st["mismatched"] - before[n.i]["mismatched"]
-            good = len(refused) == len(blocks) and len(blocks) > 0
+            # Nothing the hostile node's miner mined is credited on an honest node.
+            credited = [m[1] for m in bad.miners
+                        if int(n.ledger(m[1]).get("balance", {}).get("units", 0) or 0) != 0]
+            settled = [bh for _, bh, _ in blocks if logged(new, bh, "NP_SETTLE: pool block settled")]
+            good = (len(refused) == len(blocks) and len(blocks) > 0 and mism >= len(blocks)
+                    and not credited and not settled)
             ok &= good
             ev.append(f"node{n.i}: 'does not pay its anchor's canonical outputs' for {len(refused)}/{len(blocks)}"
-                      f" hostile blocks; mismatched +{mism}; hostile anchors refused as 'coinbase outputs are "
+                      f" hostile blocks; settled {len(settled)}; mismatched +{mism}; hostile miner credited: "
+                      f"{credited or 'no'}; hostile anchors refused as 'coinbase outputs are "
                       f"not canonical': {anchors}; relay counters {refused_shares}")
         digests = {n.i: n.digests() for n in honest}
         same = len({json.dumps(d, sort_keys=True) for d in digests.values()}) == 1
@@ -663,7 +704,7 @@ def hostile(h):
         # ghost-audit against the hostile node must FAIL, naming the fault.
         exe = os.path.join(h.args.bin_dir, "ghost-audit")
         addr, _ = payee(f"auditor/{fault}")
-        argv = [exe, "audit", "--network", "regtest", "--relay-peer", f"127.0.0.1:{honest[0].relay}",
+        argv = [exe, "audit"] + audit_chain_args() + ["--relay-peer", f"127.0.0.1:{honest[0].relay}",
                 "--data-dir", os.path.join(h.work, f"audit-{fault}"), "--rpc-port", str(honest[0].rpc_port),
                 "--rpc-user", RPC_USER, "--rpc-password", RPC_PASS, "--stratum", f"127.0.0.1:{bad.sv1}",
                 "--node-relay", f"127.0.0.1:{bad.relay}", "--address", addr, "--jobs", "1", "--json",
@@ -672,8 +713,8 @@ def hostile(h):
         with open(os.path.join(h.work, f"audit-{fault}.log"), "w") as f:
             f.write(out.stdout + "\n--- stderr\n" + out.stderr)
         reports = [json.loads(l) for l in out.stdout.splitlines() if l.startswith("{")]
-        text = json.dumps(reports).lower()
-        named = FAULT_REASON[fault].replace(" ", "_") in text.replace(" ", "_")
+        code, words = FAULT_REASON[fault]
+        named = any(r.get("reason") == code and words in str(r.get("detail")) for r in reports)
         failed = any(str(r.get("verdict")).lower() == "fail" for r in reports)
         ok &= named and failed
         ev.append(f"ghost-audit vs node{bad.i}: exit {out.returncode}; " +

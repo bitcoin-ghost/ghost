@@ -7,6 +7,13 @@
 #   scripts/regtest-node-pool/run.sh --build              # debug-build what it needs, then run
 #   scripts/regtest-node-pool/run.sh [harness options]    # run on existing debug builds
 #   scripts/regtest-node-pool/run.sh --help               # every option
+#   scripts/regtest-node-pool/run.sh --network signet     # our own signet (scenarios_signet.py)
+#
+# --network signet runs 4 nodes on a custom signet of the run's own (-signetchallenge with a
+# fresh network id, so nobody else's chain or peers): ghostd mines the plain blocks up to the
+# genesis anchor and 20 past it, then the pool's miners win blocks on demand. It needs a C
+# compiler and libcrypto for the miners' native nonce search (grind.c); without them the miners
+# fall back to Python, far too slow for signet's ~4.8M-hash blocks.
 #
 # The Bitcoin node is ghostd, as on every node pool node: GHOSTD= or --bitcoind, else the newest
 # release --fetch-ghostd verified and cached, else `ghostd` on PATH or /opt/ghost/bin/ghostd. BITCOIND= (or --bitcoind)
