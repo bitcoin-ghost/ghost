@@ -1483,7 +1483,7 @@ impl ReaperSettings {
 ///
 /// [alerts.events]
 /// block_found = true
-/// node_offline = true
+/// low_disk = true
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -1578,19 +1578,20 @@ pub struct TelegramChannel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AlertEvents {
-    /// Node became unreachable / unhealthy (health monitor).
-    #[serde(default = "default_true")]
-    pub node_offline: bool,
-    /// A verified capability regressed from qualified to drift/failing.
-    #[serde(default = "default_true")]
-    pub capability_drift: bool,
+    /// Retired `node_offline` and `capability_drift` events: nothing fires them since the old
+    /// mesh's health monitor and capabilities were removed. Accepted so older configs still load; never written back.
+    #[serde(default, skip_serializing, rename = "node_offline")]
+    pub retired_node_offline: Option<IgnoredAny>,
+    /// Retired key, see `retired_node_offline`.
+    #[serde(default, skip_serializing, rename = "capability_drift")]
+    pub retired_capability_drift: Option<IgnoredAny>,
     /// Free disk fell below the low-disk threshold.
     #[serde(default = "default_true")]
     pub low_disk: bool,
     /// A configuration change or update needs a node restart to apply.
     #[serde(default = "default_true")]
     pub restart_needed: bool,
-    /// Connected peer count dropped (mesh partition / peers lost).
+    /// Share-chain relay peers dropped, or there are none (the relay-peers monitor).
     #[serde(default = "default_true")]
     pub peer_count_drop: bool,
     /// This node found a block.
@@ -1624,8 +1625,8 @@ pub struct AlertEvents {
 impl Default for AlertEvents {
     fn default() -> Self {
         Self {
-            node_offline: true,
-            capability_drift: true,
+            retired_node_offline: None,
+            retired_capability_drift: None,
             low_disk: true,
             restart_needed: true,
             peer_count_drop: true,
@@ -2207,7 +2208,16 @@ mod tests {
             block_found = true
         "#;
         let parsed: AlertEvents = toml::from_str(legacy).expect("legacy events parse");
-        assert!(!parsed.capability_drift, "explicit legacy value preserved");
+        // The retired events still load, and are not written back.
+        let written = toml::to_string(&parsed).expect("serialize");
+        for k in ["node_offline", "capability_drift"] {
+            assert!(!written.contains(k), "retired `{k}` written back");
+        }
+        assert!(parsed.low_disk && parsed.block_found);
+        assert!(
+            toml::from_str::<AlertEvents>("capability_drfit = true").is_err(),
+            "a typo is still refused"
+        );
         assert!(
             parsed.reorg_detected && parsed.behind_tip && parsed.update_available,
             "reorg/behind-tip/update events default ON for old configs"
@@ -2232,7 +2242,7 @@ mod tests {
         assert!(!parsed.reorg_detected && !parsed.behind_tip && !parsed.update_available);
         assert!(!parsed.mempool_congestion && !parsed.fee_spike && !parsed.failed_login);
         // Untouched events keep their default-ON.
-        assert!(parsed.node_offline && parsed.block_found);
+        assert!(parsed.low_disk && parsed.block_found);
     }
 
     #[test]

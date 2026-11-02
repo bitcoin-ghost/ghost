@@ -23,14 +23,10 @@
 //! `AlertsConfig` (read `VerificationState::full_node_config`) and call
 //! `dispatch_event`. The intended trigger sites are:
 //!
-//! * `NodeOffline`      — health monitor in `ghost-consensus` when a peer/self
-//!   crosses the unhealthy threshold.
-//! * `CapabilityDrift`  — `ghost-verification` qualification when a capability
-//!   regresses qualified→drift.
 //! * `LowDisk`          — the resource sampler that already backs the dashboard
 //!   resource endpoint.
 //! * `RestartNeeded`    — wherever `VerificationState::request_restart` is set.
-//! * `PeerCountDrop`    — the mesh peer-count callback in `bins/ghost-pool`.
+//! * `PeerCountDrop`    — the relay-peers monitor in `bins/ghost-pool`.
 //! * `BlockFound`       — the `block_found_fn` callback in `bins/ghost-pool`.
 
 use ghost_common::config::AlertsConfig;
@@ -43,15 +39,11 @@ use tracing::{debug, warn};
 /// caller supplies a free-form `detail` string at the trigger site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AlertEvent {
-    /// Node became unreachable / unhealthy.
-    NodeOffline,
-    /// A verified capability regressed from qualified to drift/failing.
-    CapabilityDrift,
     /// Free disk fell below the low-disk threshold.
     LowDisk,
     /// A change or update needs a node restart to apply.
     RestartNeeded,
-    /// Connected peer count dropped.
+    /// Share-chain relay peers dropped, or there are none.
     PeerCountDrop,
     /// This node found a block.
     BlockFound,
@@ -69,7 +61,7 @@ pub enum AlertEvent {
     /// A burst of consecutive failed dashboard login attempts was detected.
     FailedLogin,
     /// A service restarted repeatedly in a short window — a crash loop. Distinct
-    /// from `NodeOffline`: the node answers, but something under it keeps dying,
+    /// from the node going offline: the node answers, but something under it keeps dying,
     /// which is exactly the shape the hourly OOM had before it was diagnosed.
     ServiceRestartLoop,
 }
@@ -79,8 +71,6 @@ impl AlertEvent {
     pub fn is_enabled(self, cfg: &AlertsConfig) -> bool {
         let e = &cfg.events;
         match self {
-            AlertEvent::NodeOffline => e.node_offline,
-            AlertEvent::CapabilityDrift => e.capability_drift,
             AlertEvent::LowDisk => e.low_disk,
             AlertEvent::RestartNeeded => e.restart_needed,
             AlertEvent::PeerCountDrop => e.peer_count_drop,
@@ -98,11 +88,9 @@ impl AlertEvent {
     /// Short human title used in the alert subject / push title.
     pub fn title(self) -> &'static str {
         match self {
-            AlertEvent::NodeOffline => "Node offline",
-            AlertEvent::CapabilityDrift => "Capability drift",
             AlertEvent::LowDisk => "Low disk space",
             AlertEvent::RestartNeeded => "Restart needed",
-            AlertEvent::PeerCountDrop => "Peer count dropped",
+            AlertEvent::PeerCountDrop => "Relay peers dropped",
             AlertEvent::BlockFound => "Block found",
             AlertEvent::ReorgDetected => "Chain reorg detected",
             AlertEvent::BehindTip => "Node behind tip",
@@ -568,8 +556,6 @@ mod tests {
             let mut c = base();
             // Start from all-off so the test only exercises the event we pick.
             let mut events = AlertEvents {
-                node_offline: false,
-                capability_drift: false,
                 low_disk: false,
                 restart_needed: false,
                 peer_count_drop: false,
@@ -581,6 +567,7 @@ mod tests {
                 fee_spike: false,
                 failed_login: false,
                 service_restart_loop: false,
+                ..AlertEvents::default()
             };
             pick(&mut events);
             c.events = events;
@@ -603,21 +590,12 @@ mod tests {
 
     #[tokio::test]
     async fn edge_keys_are_independent() {
-        let d = AlertDispatcher::new("node".into(), enabled_for(|e| e.node_offline = true));
-        // Two different peers offline -> two independent alerts.
-        assert!(
-            d.fire_edge(AlertEvent::NodeOffline, "peerA", true, "d")
-                .await
-        );
-        assert!(
-            d.fire_edge(AlertEvent::NodeOffline, "peerB", true, "d")
-                .await
-        );
-        // Re-reporting peerA -> suppressed.
-        assert!(
-            !d.fire_edge(AlertEvent::NodeOffline, "peerA", true, "d")
-                .await
-        );
+        let d = AlertDispatcher::new("node".into(), enabled_for(|e| e.low_disk = true));
+        // Two different mounts low -> two independent alerts.
+        assert!(d.fire_edge(AlertEvent::LowDisk, "/a", true, "d").await);
+        assert!(d.fire_edge(AlertEvent::LowDisk, "/b", true, "d").await);
+        // Re-reporting /a -> suppressed.
+        assert!(!d.fire_edge(AlertEvent::LowDisk, "/a", true, "d").await);
     }
 
     #[tokio::test]
@@ -702,7 +680,7 @@ mod tests {
             )
             .await
         );
-        let d = AlertDispatcher::new("node".into(), enabled_for(|e| e.node_offline = true));
+        let d = AlertDispatcher::new("node".into(), enabled_for(|e| e.low_disk = true));
         assert!(
             !d.fire_rate_limited(
                 AlertEvent::FailedLogin,
