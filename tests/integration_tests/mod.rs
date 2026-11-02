@@ -2,13 +2,6 @@
 //!
 //! These tests verify end-to-end functionality across multiple components.
 //!
-//! # Test Categories
-//!
-//! The legacy two-phase Wraith mixing tests (categories 10, 23, 24, 28, 30, 31)
-//! were removed when the protocol moved to single-round atomic CoinJoin.
-//! Single-round coverage now lives in the wraith-coordinator and
-//! wraith-wallet-core test crates.
-//!
 //! # Running Tests
 //!
 //! ```bash
@@ -49,7 +42,6 @@ pub mod round_management;
 pub mod rpc_client;
 pub mod security;
 pub mod settlement_reconciliation;
-pub mod silent_payment_v2;
 pub mod storage;
 pub mod stratum_payout_consensus;
 pub mod stratum_validation;

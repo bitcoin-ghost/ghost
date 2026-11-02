@@ -511,6 +511,4 @@ fn test_040_multiple_signatures_same_message() {
 // =============================================================================
 // Additional tests would continue for:
 // - Noise Protocol (Tests 55-64) - requires noise module
-// - Blind Signatures (Tests 65-74) - in wraith protocol
-// - Silent Payment Keys (Tests 82-85) - in ghost-keys
 // =============================================================================

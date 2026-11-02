@@ -34,10 +34,6 @@ members = [
     "crates/ghost-accounting",
     "crates/ghost-verification",
     # Ghost Pay L2
-    "crates/ghost-keys",
-    "crates/ghost-lock",
-    "bins/ghost-lock-signer",
-    "crates/ghost-entropy",
     "crates/ghost-reconciliation",
     # ZK-BFT Infrastructure
     "crates/ghost-zkp",
@@ -95,9 +91,6 @@ ghost-accounting = { path = "crates/ghost-accounting" }
 ghost-mining = { path = "bins/ghost-pool" }
 ghost-verification = { path = "crates/ghost-verification" }
 # Ghost Pay L2 crates
-ghost-keys = { path = "crates/ghost-keys" }
-ghost-entropy = { path = "crates/ghost-entropy" }
-ghost-lock = { path = "crates/ghost-lock" }
 ghost-reconciliation = { path = "crates/ghost-reconciliation" }
 # ZK-BFT Infrastructure
 ghost-zkp = { path = "crates/ghost-zkp" }
@@ -119,7 +112,6 @@ bitcoin = { version = "0.32", features = ["serde"] }
 ed25519-dalek = { version = "2.1", features = ["serde", "rand_core"] }
 sha2 = "0.10"
 hmac = "0.12"
-hkdf = "0.12"
 rand = "0.8"
 hex = "0.4"
 
@@ -167,11 +159,6 @@ base64 = "0.22"
 # Cryptography
 snow = "0.9"
 getrandom = "0.2"
-
-# BIP standards
-bip39 = "2.0"
-bip32 = { version = "0.6", features = ["alloc"] }
-secp256k1 = { version = "0.29", features = ["rand", "global-context", "serde"] }
 
 # JWT
 jsonwebtoken = "9.0"
@@ -223,7 +210,6 @@ ghost-buds = { workspace = true }
 ghost-policy = { workspace = true }
 ghost-consensus = { workspace = true, features = ["test-utils", "zk-consensus"] }
 ghost-mining = { workspace = true }
-ghost-keys = { workspace = true }
 ghost-reconciliation = { workspace = true }
 ghost-storage = { workspace = true }
 ghost-zkp = { workspace = true }
