@@ -165,6 +165,11 @@ impl TierBinding {
         Ok(Self::from_parts(node_id, cfg.activation_height))
     }
 
+    /// This node's identity, as resolved.
+    pub fn node_id(&self) -> &[u8; 32] {
+        &self.node_id
+    }
+
     /// The height at/above which per-tier jobs are emitted.
     pub fn activation_height(&self) -> u64 {
         self.activation_height
@@ -258,7 +263,7 @@ pub fn bip34_height(coinbase_prefix: &[u8]) -> Option<u64> {
 }
 
 /// One Ghost coinbase tag is one push: `[len][magic][payload]`. Present or absent, never partial.
-fn tag_len_at(bytes: &[u8], magic: &[u8; 4], payload_len: usize) -> usize {
+pub(crate) fn tag_len_at(bytes: &[u8], magic: &[u8; 4], payload_len: usize) -> usize {
     let total = 1 + 4 + payload_len;
     let present = bytes.len() >= total
         && bytes[0] as usize == 4 + payload_len

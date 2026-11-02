@@ -51,9 +51,12 @@ use crate::{
 };
 
 mod mining_message_handler;
+mod node_pool_jobs;
 mod template_distribution_message_handler;
 
 const POOL_ALLOCATION_BYTES: usize = 4;
+/// How often the node pool's sensing clocks run.
+const NODE_POOL_TICK_SECS: u64 = 5;
 const CLIENT_SEARCH_SPACE_BYTES: usize = 16;
 
 /// Bytes of [`POOL_ALLOCATION_BYTES`] spent on the fixed server id. Everything left over is
@@ -170,6 +173,10 @@ pub struct ChannelManager {
     /// `None` — the default and only shipped state — is dormant: one group job per template,
     /// byte-identical to before the field existed. See `tier_binding.rs`.
     pub(crate) tier_binding: Option<Arc<crate::tier_binding::TierBinding>>,
+    /// The node pool job layer, when `[node_pool]` is configured. `None` — the default and only
+    /// shipped state — leaves every path as it was. Even when present it acts only on templates
+    /// at/above its activation height. See `node_pool.rs`.
+    pub(crate) node_pool: Option<Arc<crate::node_pool::NodePool>>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -250,6 +257,30 @@ impl ChannelManager {
             }
         };
 
+        // NODE_POOL: resolve the job layer, if configured. Like the tier binding, a bad identity
+        // refuses startup. Configured, it also accepts the Ghost agent TLV from the translator.
+        let node_pool = match config.node_pool() {
+            None => None,
+            Some(cfg) => {
+                let np = crate::node_pool::NodePool::resolve(cfg, config.shares_per_minute())
+                    .await
+                    .map_err(|e| PoolError::shutdown(PoolErrorKind::Configuration(e)))?;
+                warn!(
+                    activation_height = np.activation_height(),
+                    "NODE_POOL: the node pool job layer is CONFIGURED. Templates at/above the \
+                     activation height get per-channel GhostShare/v2 tags and slot-class sensing"
+                );
+                Some(Arc::new(np))
+            }
+        };
+        let mut supported_extensions = config.supported_extensions().to_vec();
+        if node_pool.is_some()
+            && !supported_extensions
+                .contains(&ghost_common::slot_class_sensing::AGENT_TLV_EXTENSION_TYPE)
+        {
+            supported_extensions.push(ghost_common::slot_class_sensing::AGENT_TLV_EXTENSION_TYPE);
+        }
+
         let channel_manager = ChannelManager {
             channel_manager_data,
             channel_manager_channel,
@@ -257,11 +288,12 @@ impl ChannelManager {
             shares_per_minute: config.shares_per_minute(),
             pool_tag_string: config.pool_signature().to_string(),
             coinbase_reward_script: config.coinbase_reward_script().clone(),
-            supported_extensions: config.supported_extensions().to_vec(),
+            supported_extensions,
             required_extensions: config.required_extensions().to_vec(),
             job_declarator,
             share_webhook_sender,
             tier_binding,
+            node_pool,
         };
 
         Ok(channel_manager)
@@ -589,6 +621,13 @@ impl ChannelManager {
             let cm = self.clone();
             let vardiff_future = self.run_vardiff_loop();
             tokio::pin!(vardiff_future);
+            // NODE_POOL: anchor publishes and the sensing clock. Both branches are disabled when
+            // `[node_pool]` is absent, so the loop below is the old loop.
+            let mut anchor_rx = cm.node_pool.as_ref().map(|np| np.subscribe());
+            let mut anchor_open = anchor_rx.is_some();
+            let node_pool_on = cm.node_pool.is_some();
+            let mut sensing_clock =
+                tokio::time::interval(std::time::Duration::from_secs(NODE_POOL_TICK_SECS));
             loop {
                 let mut cm_template = cm.clone();
                 let mut cm_downstreams = cm.clone();
@@ -621,6 +660,16 @@ impl ChannelManager {
                             }
                         }
                     }
+                    // Cancellation-safe: `changed()` only marks the value seen when it resolves.
+                    changed = async { anchor_rx.as_mut().expect("guarded").changed().await }, if anchor_open => {
+                        match changed {
+                            Ok(()) => cm.node_pool_rebuild(None).await,
+                            Err(_) => anchor_open = false,
+                        }
+                    }
+                    _ = sensing_clock.tick(), if node_pool_on => {
+                        cm.node_pool_tick().await;
+                    }
                     dm = cm_downstreams.channel_manager_channel.downstream_receiver.recv() => {
                         let res = cm_downstreams.process_downstream_mining_message(dm).await;
                         if let Err(e) = res {
@@ -651,6 +700,9 @@ impl ChannelManager {
     // 1. Removes the corresponding Downstream from the `downstream` map.
     // 2. Removes the channels of the corresponding Downstream from `vardiff` map.
     pub fn remove_downstream(&self, downstream_id: DownstreamId) {
+        if let Some(np) = &self.node_pool {
+            np.on_downstream_removed(downstream_id);
+        }
         self.channel_manager_data.super_safe_lock(|cm_data| {
             cm_data.downstream.remove(&downstream_id);
             cm_data
@@ -724,7 +776,7 @@ impl ChannelManager {
         channel_state: &mut ExtendedChannel<'static, DefaultJobStore<ExtendedJob<'static>>>,
         vardiff_state: &mut VardiffState,
         updates: &mut Vec<RouteMessageTo>,
-        tier_binding: Option<&crate::tier_binding::TierBinding>,
+        tier_binding: Option<&crate::node_pool::PerChannelMode>,
     ) {
         let (hashrate, target, shares_per_minute) = (
             channel_state.get_nominal_hashrate(),
@@ -780,7 +832,7 @@ impl ChannelManager {
         channel: &mut StandardChannel<'static, DefaultJobStore<StandardJob<'static>>>,
         vardiff_state: &mut VardiffState,
         updates: &mut Vec<RouteMessageTo>,
-        tier_binding: Option<&crate::tier_binding::TierBinding>,
+        tier_binding: Option<&crate::node_pool::PerChannelMode>,
     ) {
         let hashrate = channel.get_nominal_hashrate();
         let target = channel.get_target();
@@ -856,12 +908,9 @@ impl ChannelManager {
             .super_safe_lock(|channel_manager_data| {
                 // SHARE_TIER_BIND: quantise retargets only while the chain (as seen through the
                 // last future template's BIP34 height) is at/above the activation height.
-                let tier_binding = self.tier_binding.as_deref().filter(|tb| {
-                    channel_manager_data
-                        .last_future_template
-                        .as_ref()
-                        .is_some_and(|t| tb.template_is_tiered(t))
-                });
+                let tier_binding =
+                    self.per_channel_mode(channel_manager_data.last_future_template.as_ref());
+                let tier_binding = tier_binding.as_ref();
                 for (vardiff_key, vardiff_state) in channel_manager_data.vardiff.iter_mut() {
                     let downstream_id = &vardiff_key.downstream_id;
                     let channel_id = &vardiff_key.channel_id;

@@ -112,6 +112,33 @@ pub struct ShareTierBindingConfig {
     pub activation_height: u64,
 }
 
+/// `[node_pool]`: the node pool job layer (W2.3). Absent, the default and the only shipped
+/// state, means none of it runs. Present, it still does nothing until a template's BIP34 height
+/// reaches `activation_height`, which itself defaults to
+/// `ghost_common::node_pool_constants::NODE_POOL_ACTIVATION_HEIGHT` (`u64::MAX`).
+///
+/// When active: per-channel `GhostShare/v2` share tags (with the slot class and the parent
+/// anchor), SV2 standard channels at the full class, and per-miner slot-class sensing. The
+/// translator must run with `quantise_to_tiers = true`, as for `[share_tier_binding]`, and list
+/// the Ghost agent extension (`0x4748`) in its `supported_extensions` for SV1 user agents to
+/// reach the sensing loop. See `node_pool.rs`.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct NodePoolConfig {
+    /// This node's 32-byte identity, hex. Normally omitted: read from ghost-mining exactly as
+    /// `[share_tier_binding]` reads it, and checked against it when pinned.
+    #[serde(default)]
+    pub node_id: Option<String>,
+    /// Where to read this node's identity from. Defaults to the co-located ghost-mining.
+    #[serde(default)]
+    pub ghost_pool_health_url: Option<String>,
+    /// Template height at/above which the job layer runs. Defaults to the compiled constant.
+    #[serde(default)]
+    pub activation_height: Option<u64>,
+    /// Valid shares a class needs before a miner is stepped up. Defaults to 20.
+    #[serde(default)]
+    pub sensing_min_shares: Option<u32>,
+}
+
 /// Configuration for the Pool, including connection, authority, and coinbase settings.
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct PoolConfig {
@@ -142,6 +169,8 @@ pub struct PoolConfig {
     share_webhook: Option<ShareWebhookConfig>,
     #[serde(default)]
     share_tier_binding: Option<ShareTierBindingConfig>,
+    #[serde(default)]
+    node_pool: Option<NodePoolConfig>,
 
     /// Concurrent downstream connections allowed in total. `None` takes
     /// [`crate::connection_limit::DEFAULT_MAX_DOWNSTREAM_CONNECTIONS`].
@@ -163,6 +192,11 @@ impl PoolConfig {
     /// The SHARE_TIER_BIND configuration, when present. `None` = dormant, today's behaviour.
     pub fn share_tier_binding(&self) -> Option<&ShareTierBindingConfig> {
         self.share_tier_binding.as_ref()
+    }
+
+    /// The node pool configuration, when present. `None` = dormant, today's behaviour.
+    pub fn node_pool(&self) -> Option<&NodePoolConfig> {
+        self.node_pool.as_ref()
     }
 }
 
@@ -206,6 +240,7 @@ impl PoolConfig {
             jds,
             share_webhook: None,
             share_tier_binding: None,
+            node_pool: None,
             // `None` is DEFAULTED, not unlimited — see the field docs. This constructor is the
             // programmatic path (tests, JDS); the TOML path gets the same defaults through serde.
             max_downstream_connections: None,
