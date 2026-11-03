@@ -31,6 +31,13 @@ GPG_KEY_FP="777FE81F8CC077FD3D08055E852C2B3190F5B928"
 # comes out of the verified tarball.
 GHOSTD_URL="${GHOSTD_URL:-}"
 RELEASE_KEY_URL="https://get.bitcoinghost.org/ghost-release-key.asc"
+# Release assets live at <this>/<tag>/<asset>.
+RELEASE_DOWNLOAD_URL="https://github.com/bitcoin-ghost/ghost/releases/download"
+# ⛔ TEST ONLY: a local release mirror signed with a throwaway key, for rehearsing an install
+# end to end before any node pool release exists (see test_release_mirror below). Both must be
+# set; refused on mainnet. Never set either for a real node.
+TEST_RELEASE_MIRROR="${GHOST_TEST_RELEASE_MIRROR:-}"
+TEST_RELEASE_KEY_FP="${GHOST_TEST_RELEASE_KEY_FP:-}"
 # ⛔ No old-network peers. The old network's eight nodes keep running `main` beside node pool
 # nodes, and the two must never talk: a seed list here used to name the old fleet, so every install
 # dialled its mesh. A node pool node agrees on its ledger over the share-chain relay
@@ -50,6 +57,11 @@ NETWORK="mainnet"          # mainnet | signet | regtest
 # and pool_sv2 refuses to start until it is set.
 RELAY_PORT="8566"
 RELAY_PEERS=""
+# A custom signet (`signetchallenge`, hex) and Bitcoin peers to dial (`addnode`, host:port). The
+# node pool's own signet is a custom one, and a node on it finds the chain only through peers that
+# carry it; without a challenge `--network signet` is the public signet.
+SIGNET_CHALLENGE=""
+BITCOIN_PEERS=""
 GENESIS_ANCHOR=""
 GENESIS_HEIGHT=""
 PREFLIGHT_ONLY="false"
@@ -100,6 +112,9 @@ Node pool:
                                 for mainnet or signet yet: without these the node is
                                 installed with an UNSET placeholder and pool_sv2 refuses to
                                 start until it is set.
+  --signet-challenge <hex>    signet only: a custom signet's challenge script (signetchallenge).
+                                Default: the public signet.
+  --bitcoin-peer <host:port>  A Bitcoin peer for ghostd to dial (addnode); repeat for more.
   --preflight-only            Run the preflight checks and exit; change nothing.
 
 Strongly recommended:
@@ -170,6 +185,8 @@ while [[ $# -gt 0 ]]; do
     --relay-peer)     RELAY_PEERS="${RELAY_PEERS:+$RELAY_PEERS }$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --genesis-anchor) GENESIS_ANCHOR="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --genesis-height) GENESIS_HEIGHT="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --signet-challenge) SIGNET_CHALLENGE="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --bitcoin-peer)   BITCOIN_PEERS="${BITCOIN_PEERS:+$BITCOIN_PEERS }$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --preflight-only) PREFLIGHT_ONLY="true"; shift;;
     --alert-webhook)  ALERT_WEBHOOK="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --alert-topic)    ALERT_TOPIC="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
@@ -545,7 +562,7 @@ np_preflight() {
       pf_line FAIL "Bitcoin node on 127.0.0.1:8332 runs chain '${chain}', not ${NETWORK}"
     fi
   elif [[ -r /etc/bitcoin/bitcoin.conf ]] && [[ -n "$(pf_port_owner 8332)" ]]; then
-    pf_line FAIL "Bitcoin RPC port 8332 is listening but does not answer with /etc/bitcoin/bitcoin.conf's credentials"
+    pf_line FAIL "Bitcoin RPC port 8332 is listening but does not answer with /etc/bitcoin/bitcoin.conf's credentials (a re-run by an older installer changed the password under a running ghostd: sudo systemctl restart ghostd, then re-run)"
   else
     pf_line PASS "no Bitcoin node yet: ghostd is installed and checked again once started"
   fi
@@ -565,6 +582,25 @@ np_preflight() {
       fi
     done
   fi
+  # ghostd's chain: a custom signet's challenge, and Bitcoin peers to dial.
+  if [[ -n "${SIGNET_CHALLENGE:-}" ]]; then
+    if [[ "$NETWORK" != signet ]]; then
+      pf_line FAIL "--signet-challenge is for --network signet, not ${NETWORK}"
+    elif [[ "$SIGNET_CHALLENGE" =~ ^([0-9a-fA-F]{2}){1,520}$ ]]; then
+      pf_line PASS "custom signet, challenge ${SIGNET_CHALLENGE:0:16}…"
+    else
+      pf_line FAIL "signet challenge '${SIGNET_CHALLENGE}' is not a hex script"
+    fi
+  elif [[ "$NETWORK" == signet ]]; then
+    pf_line WARN "no --signet-challenge: this node joins the public signet"
+  fi
+  for p in ${BITCOIN_PEERS:-}; do
+    if [[ "$p" =~ ^([^[:space:]=]+):([0-9]{1,5})$ ]] && (( BASH_REMATCH[2] > 0 && BASH_REMATCH[2] < 65536 )); then
+      pf_line PASS "Bitcoin peer ${p}"
+    else
+      pf_line FAIL "Bitcoin peer '${p}' is not host:port"
+    fi
+  done
   if [[ "$GENESIS_ANCHOR" == UNSET ]]; then
     pf_line WARN "no share-chain genesis is published for ${NETWORK}: pool_sv2 will refuse to start until one is set (--genesis-anchor/--genesis-height)"
   elif [[ "$NETWORK" == mainnet && "$GENESIS_ANCHOR" =~ ^[0-9a-fA-F]{64}$ && ! "$GENESIS_ANCHOR" =~ ^0{64}$
@@ -900,6 +936,17 @@ if [[ -z "$RELAY_PEERS" ]]; then
   RELAY_PEERS="$(old_key peers | tr -d '[]",')"
   RELAY_PEERS="$(_trim "$RELAY_PEERS")"
 fi
+# bitcoin.conf is rewritten on every run, so a custom signet's challenge and the Bitcoin peers are
+# read back from it when the flags do not say otherwise. Losing the challenge would move the node
+# to the public signet, a different chain.
+OLD_BITCOIN_CONF=/etc/bitcoin/bitcoin.conf
+if [[ -z "$SIGNET_CHALLENGE" && "$NETWORK" == signet && -r "$OLD_BITCOIN_CONF" ]]; then
+  SIGNET_CHALLENGE="$(sed -nE 's/^signetchallenge=([0-9a-fA-F]+)$/\1/p' "$OLD_BITCOIN_CONF" | head -1)"
+  [[ -n "$SIGNET_CHALLENGE" ]] && log "Keeping the custom signet challenge from ${OLD_BITCOIN_CONF}"
+fi
+if [[ -z "$BITCOIN_PEERS" && -r "$OLD_BITCOIN_CONF" ]]; then
+  BITCOIN_PEERS="$(sed -nE 's/^addnode=(.+)$/\1/p' "$OLD_BITCOIN_CONF" | paste -sd' ' -)"
+fi
 np_network_defaults "$NETWORK" "$SYNC_MODE" "$ARCHIVE"
 if [[ -n "$GENESIS_ANCHOR" && -z "$GENESIS_HEIGHT" ]]; then
   err "--genesis-anchor needs --genesis-height: the anchor's Bitcoin height is part of the genesis."
@@ -923,11 +970,36 @@ fi
 # ⛔ Preflight, before anything on this machine is changed. A FAIL stops the install here.
 np_preflight || err "Preflight failed — fix the FAIL lines above and re-run."
 [[ "$PREFLIGHT_ONLY" == "true" ]] && exit 0
+
+# ⛔ TEST ONLY: install from a local release mirror instead of GitHub. The mirror is laid out as
+# release-node-pool.yml publishes, under one URL M:
+#   M/releases                       the release list (GitHub's "list releases" JSON)
+#   M/download/<tag>/<asset>         bitcoin-ghost-<tag>-x86_64-unknown-linux-gnu.tar.gz,
+#                                    SHA256SUMS.txt, SHA256SUMS.txt.asc
+#   M/release-key.asc                the throwaway public key that signed SHA256SUMS.txt
+# and is verified exactly as a real release is, against GHOST_TEST_RELEASE_KEY_FP instead of the
+# release key. The node's updater is pointed at the same mirror (a drop-in, below), so the rehearsal
+# covers automatic updates too. Both variables or neither; never on mainnet.
+if [[ -n "$TEST_RELEASE_MIRROR" || -n "$TEST_RELEASE_KEY_FP" ]]; then
+  [[ -n "$TEST_RELEASE_MIRROR" && -n "$TEST_RELEASE_KEY_FP" ]] \
+    || err "GHOST_TEST_RELEASE_MIRROR and GHOST_TEST_RELEASE_KEY_FP go together (test installs only)."
+  [[ "$NETWORK" != mainnet ]] || err "GHOST_TEST_RELEASE_MIRROR is for test installs on signet or regtest, never mainnet."
+  [[ "$TEST_RELEASE_KEY_FP" =~ ^[0-9A-F]{40}$ ]] || err "GHOST_TEST_RELEASE_KEY_FP must be a 40-hex uppercase fingerprint."
+  [[ "$TEST_RELEASE_KEY_FP" != "$GPG_KEY_FP" ]] || err "GHOST_TEST_RELEASE_KEY_FP is the release key: a test mirror is signed with a throwaway key."
+  TEST_RELEASE_MIRROR="${TEST_RELEASE_MIRROR%/}"
+  NP_RELEASES_API_URL="${TEST_RELEASE_MIRROR}/releases"
+  RELEASE_DOWNLOAD_URL="${TEST_RELEASE_MIRROR}/download"
+  RELEASE_KEY_URL="${TEST_RELEASE_MIRROR}/release-key.asc"
+  GPG_KEY_FP="$TEST_RELEASE_KEY_FP"
+  echo -e "\033[33mWARNING\033[0m: TEST RELEASE MIRROR ${TEST_RELEASE_MIRROR}, verified against ${GPG_KEY_FP}."
+  echo "         This node installs and updates from a test mirror, not from real releases."
+fi
+
 # The node pool release channel: np-latest or an exact np- tag, never an old-network tag.
 GHOST_VERSION_SPEC="$GHOST_VERSION"
 GHOST_VERSION="$(np_resolve_release "$GHOST_VERSION_SPEC")" || err "GHOST_VERSION='${GHOST_VERSION_SPEC}' refused (see above)."
 [[ "$GHOST_VERSION_SPEC" == "$GHOST_VERSION" ]] || log "GHOST_VERSION=${GHOST_VERSION_SPEC} resolved to ${GHOST_VERSION}"
-RELEASE_BASE="https://github.com/bitcoin-ghost/ghost/releases/download/${GHOST_VERSION}"
+RELEASE_BASE="${RELEASE_DOWNLOAD_URL}/${GHOST_VERSION}"
 POOL_TARBALL="bitcoin-ghost-${GHOST_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 # Automatic updates follow the same channel: the updater reads /etc/ghost/release-channel
 # (written below) and picks the newest np- release, never the old network's `releases/latest`.
@@ -996,6 +1068,13 @@ if [[ -n "$POOL_NAME" ]]; then
   fi
 fi
 
+# A re-run on a node that is running: noted before anything changes, so the node is restarted on
+# the new binaries and configs at the end (section 11). Nothing else here restarts it.
+NODE_WAS_RUNNING=false
+for u in ghostd ghost-mining sri-pool sri-translator; do
+  systemctl is-active --quiet "$u" 2>/dev/null && NODE_WAS_RUNNING=true
+done
+
 # ────────────────────────────── 1. packages ──────────────────────────────────
 log "Installing dependencies"
 export DEBIAN_FRONTEND=noninteractive
@@ -1063,7 +1142,9 @@ cd "$TMP"
 curl -fsSLO "${RELEASE_BASE}/${POOL_TARBALL}"
 curl -fsSLO "${RELEASE_BASE}/SHA256SUMS.txt"
 curl -fsSLO "${RELEASE_BASE}/SHA256SUMS.txt.asc"
-# Verify the GPG signature over the checksums, then the checksum of our tarball.
+# Verify the GPG signature over the checksums, then the checksum of our tarball. In a keyring of
+# its own, as the updater does, so root's keyring is never given an ultimately trusted key.
+export GNUPGHOME="$TMP/gnupg"; mkdir -m 700 "$GNUPGHOME"
 curl -fsSL "$RELEASE_KEY_URL" 2>/dev/null | gpg --quiet --import 2>/dev/null || true
 # Mark the pinned key trusted so gpg doesn't emit a (cosmetic) web-of-trust warning.
 echo "${GPG_KEY_FP}:6:" | gpg --quiet --import-ownertrust 2>/dev/null || true
@@ -1075,6 +1156,7 @@ else
   err "Release signature verification FAILED (expected signing key ${GPG_KEY_FP})."
 fi
 grep " ${POOL_TARBALL}\$" SHA256SUMS.txt | sha256sum -c - || err "Checksum verification FAILED for ${POOL_TARBALL}."
+unset GNUPGHOME
 tar -xzf "$POOL_TARBALL"
 # The node binary was `ghost-pool` up to and including v1.11.44 (#1018). A release that old is
 # refused rather than installed under the new name: that binary restarts itself and reads its own
@@ -1134,7 +1216,13 @@ cd /
 
 # ─────────────────────────── 4. fresh secrets ────────────────────────────────
 log "Generating fresh node secrets"
-RPCPW="$(openssl rand -hex 32)"
+# The RPC password is kept across a re-run like the secrets below. A fresh one every run left the
+# running ghostd on the old password while bitcoin.conf, and so every tool and check that reads
+# it (ghost-cli, the boot gate, the updater's health check), carried the new one.
+if [[ -f /etc/bitcoin/bitcoin.conf ]] && grep -qE '^rpcpassword=[0-9a-fA-F]{64}$' /etc/bitcoin/bitcoin.conf; then
+  RPCPW="$(sed -nE 's/^rpcpassword=([0-9a-fA-F]{64})$/\1/p' /etc/bitcoin/bitcoin.conf | head -1)"
+fi
+[[ -n "${RPCPW:-}" ]] || RPCPW="$(openssl rand -hex 32)"
 # internal_api_secret: the shared HMAC secret between ghost-mining and the node
 # dashboard. Generate ONCE and REUSE any existing value on re-runs, so an
 # upgrade/re-provision never rotates it out from under the dashboard (a rotated
@@ -1197,6 +1285,8 @@ fallbackfee=0.00001
 EOF
   # The assumevalid block is a mainnet block.
   [[ "$NETWORK" == mainnet ]] && echo "assumevalid=${ASSUMEVALID}"
+  [[ -n "$SIGNET_CHALLENGE" ]] && echo "signetchallenge=${SIGNET_CHALLENGE}"
+  for p in $BITCOIN_PEERS; do echo "addnode=${p}"; done
   # Node pool block reserve: room for the node pool's coinbase (up to 22 KB) in every template.
   # Must match NODE_POOL_BLOCK_RESERVED_WEIGHT in crates/ghost-common/src/node_pool_constants.rs.
   echo "blockreservedweight=90000"
@@ -1717,6 +1807,9 @@ Group=ghost
 ExecStart=/opt/ghost/bin/ghostd -conf=/etc/bitcoin/bitcoin.conf -datadir=/var/lib/bitcoin ${REAPER_FLAGS}
 Restart=on-failure
 RestartSec=30
+# Core flushes its chainstate on stop, which can outlast systemd's default 90 s; a SIGKILL there
+# costs a reindex. Bitcoin Core's own unit allows 600 s.
+TimeoutStopSec=600
 LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
@@ -1973,8 +2066,13 @@ RELEASES_API_URL="${GHOST_RELEASES_API_URL:-https://api.github.com/repos/bitcoin
 # NOTE: ghostd is no longer fetched from a standalone URL — it ships inside the
 # signed release tarball (below), so the old GHOSTD_URL side-channel is gone.
 # Release tarball base. When GHOST_RELEASE_BASE is set it is used verbatim;
-# otherwise it is constructed per-version from the GitHub releases download URL.
+# otherwise it is constructed per-version as <download URL>/<tag>, GitHub's layout.
 RELEASE_BASE_OVERRIDE="${GHOST_RELEASE_BASE:-}"
+# The download URL that tags hang off. Overridable, like the anchors above, only for a local test
+# mirror laid out the same way (the install rehearsal; install-node.sh writes these into a
+# `test-release-mirror.conf` drop-in of ghost-auto-update.service when installed against one).
+RELEASE_DOWNLOAD_URL="${GHOST_RELEASE_DOWNLOAD_URL:-https://github.com/bitcoin-ghost/ghost/releases/download}"
+PRODUCTION_GPG_KEY_FP="777FE81F8CC077FD3D08055E852C2B3190F5B928"
 
 # ───────────────────────────── managed paths ─────────────────────────────────
 CONF_FILE="${GHOST_AUTOUPDATE_CONF:-/etc/ghost/auto-update.conf}"
@@ -2181,18 +2279,34 @@ health_ghostd() {
   return 1
 }
 
+# ghost-mining's /health peer_count: the share-chain relay's peers, as pool_sv2 reports them.
+# Empty when ghost-mining does not answer or pool_sv2 did not (it reports null then).
+read_peer_count() {
+  curl -fsS --max-time 8 "http://127.0.0.1:8080/health?unsigned=true" 2>/dev/null \
+    | grep -oE '"peer_count"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1 || true
+}
+
+# PEERS_BEFORE is the peer count read before anything was stopped. A node pool node may have no
+# relay peers at all (the first node of a network, or one nobody has dialled yet), and requiring
+# more than zero rolled back every update on such a node, healthy or not. So ghost-mining must
+# answer with a count (pool_sv2 is up and reporting), and a node that had peers must have them
+# again: an update that cut the node off still rolls back.
 health_ghost_pool() {
-  local resp pc
+  local pc need=0
+  [[ "${PEERS_BEFORE:-}" =~ ^[0-9]+$ ]] && (( PEERS_BEFORE > 0 )) && need=1
   for _ in $(seq 1 30); do
-    resp="$(curl -fsS --max-time 8 "http://127.0.0.1:8080/health?unsigned=true" 2>/dev/null || true)"
-    pc="$(echo "$resp" | grep -oE '"peer_count"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1 || true)"
-    if [[ -n "$pc" && "$pc" -gt 0 ]]; then
-      log "health: ghost-mining /health peer_count=$pc"
+    pc="$(read_peer_count)"
+    if [[ -n "$pc" ]] && (( need == 0 || pc > 0 )); then
+      log "health: ghost-mining /health peer_count=$pc (before the update: ${PEERS_BEFORE:-unknown})"
       return 0
     fi
     sleep 2
   done
-  err "health: ghost-mining /health peer_count not > 0 (last='${pc:-none}')"
+  if (( need )); then
+    err "health: ghost-mining /health peer_count not > 0 (last='${pc:-none}'; it had ${PEERS_BEFORE} before the update)"
+  else
+    err "health: ghost-mining /health reports no peer count (last='${pc:-none}'): ghost-mining or pool_sv2 is not answering"
+  fi
   return 1
 }
 
@@ -2292,6 +2406,9 @@ main() {
     exit 0
   fi
   log "auto-update enabled${DRY_RUN:+ }$([[ "$DRY_RUN" == "true" ]] && echo '(dry-run)')"
+  if [[ "$GPG_KEY_FP" != "$PRODUCTION_GPG_KEY_FP" ]]; then
+    warn "TEST RELEASE MIRROR: releases are verified against ${GPG_KEY_FP}, not the release key — this node is not following real releases"
+  fi
 
   # 2. Resolve installed + latest versions.
   local installed latest install_sh
@@ -2361,7 +2478,7 @@ main() {
   if [[ -n "$RELEASE_BASE_OVERRIDE" ]]; then
     release_base="$RELEASE_BASE_OVERRIDE"
   else
-    release_base="https://github.com/bitcoin-ghost/ghost/releases/download/${latest}"
+    release_base="${RELEASE_DOWNLOAD_URL}/${latest}"
   fi
   tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
   gnupg="$tmp/gnupg"; mkdir -m700 "$gnupg"
@@ -2492,6 +2609,8 @@ main() {
   # 7. Stop services (reverse start order: translator, pool, pay, ghost-mining, ghostd), each
   #    verified inactive. Nothing has been swapped yet, so a refusal rolls back to a no-op.
   local STOP_FAILED="" START_FAILED=""
+  PEERS_BEFORE="$(read_peer_count)"
+  log "relay peers before the update: ${PEERS_BEFORE:-unknown}"
   stop_all || { err "$STOP_FAILED would not stop — rolling back"; rollback; write_status "rolled-back" "$STOP_FAILED failed to stop" "$latest"; exit 1; }
 
   # 8. Swap the verified binaries into place atomically (install = temp+rename).
@@ -3683,6 +3802,26 @@ echo "${GHOST_VERSION}" > /etc/ghost/version
 chmod 644 /etc/ghost/version
 chown root:root /etc/ghost/version
 
+# ⛔ TEST ONLY: a node installed from a test release mirror updates from the same mirror, against the
+# same throwaway key. Any other install removes the drop-in, so re-running the installer normally
+# puts the node back on real releases and the release key.
+TEST_MIRROR_DROPIN=/etc/systemd/system/ghost-auto-update.service.d/test-release-mirror.conf
+if [[ -n "$TEST_RELEASE_MIRROR" ]]; then
+  install -d -m 0755 /etc/systemd/system/ghost-auto-update.service.d
+  cat > "$TEST_MIRROR_DROPIN" <<EOF
+# ⛔ TEST RELEASE MIRROR, written by install-node.sh (GHOST_TEST_RELEASE_MIRROR). This node does not
+# follow real releases. Re-run the installer without GHOST_TEST_RELEASE_MIRROR to remove it.
+[Service]
+Environment=GHOST_NP_RELEASES_API_URL=${NP_RELEASES_API_URL}
+Environment=GHOST_RELEASE_DOWNLOAD_URL=${RELEASE_DOWNLOAD_URL}
+Environment=GHOST_RELEASE_KEY_URL=${RELEASE_KEY_URL}
+Environment=GHOST_GPG_KEY_FP=${GPG_KEY_FP}
+EOF
+  chmod 644 "$TEST_MIRROR_DROPIN"
+else
+  rm -f "$TEST_MIRROR_DROPIN"
+fi
+
 systemctl daemon-reload >/dev/null 2>&1 || true
 # Enable + start the timer ONLY when opted in. Default path: timer stays
 # installed-but-inactive, so the node can never self-upgrade.
@@ -4132,6 +4271,16 @@ fi
 # ─────────────────────────────── 11. start ───────────────────────────────────
 log "Starting services"
 systemctl daemon-reload
+# A re-run replaced the binaries and rewrote the configs under a running node, which kept running
+# the deleted binaries with the old configs until something restarted it. Restart it as a boot
+# does: the stratum stack and the node stop, ghostd restarts, and the gate (below) starts the rest
+# once ghostd answers.
+if [[ "$NODE_WAS_RUNNING" == true ]]; then
+  log "Re-run: restarting the node on the new binaries and configs"
+  systemctl stop sri-translator sri-pool ghost-mining >/dev/null 2>&1 || true
+  systemctl restart ghostd
+  systemctl stop ghost-mining-gate >/dev/null 2>&1 || true
+fi
 systemctl enable --now ghostd >/dev/null 2>&1
 # Nothing else is started or enabled here. The gate is the ONLY thing that starts
 # ghost-mining and the SV2 stratum stack, once ghostd has left initial block

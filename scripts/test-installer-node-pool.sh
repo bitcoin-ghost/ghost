@@ -152,6 +152,9 @@ OWNER[8566]=pool_sv2; OWNER[8332]=ghostd; CHAIN=main; pf
 has "ports held by this node pass (re-run)" "[PASS] port 8566 is held by this node's pool_sv2 (re-run)" "$out"
 has "a re-run's Bitcoin node answers" "[PASS] Bitcoin node answers on 127.0.0.1:8332 (chain main)" "$out"
 is "and that passes" 0 "$rc"
+# (that branch reads /etc/bitcoin/bitcoin.conf itself, so its message is checked in the source)
+is "an RPC port that refuses bitcoin.conf's password says how to repair it" 1 \
+   "$($G -c 'does not answer with /etc/bitcoin/bitcoin.conf.s credentials.*sudo systemctl restart ghostd, then re-run' "$INSTALLER" || true)"
 CHAIN=signet; pf
 has "a Bitcoin node on another chain fails" "[FAIL] Bitcoin node on 127.0.0.1:8332 runs chain 'signet', not mainnet" "$out"
 CHAIN=""; OWNER=()
@@ -182,6 +185,21 @@ has "a regtest genesis passes" "[PASS] share-chain genesis abcdcdcdcdcdcdcd… a
 has "regtest P2P port is checked" "[PASS] port 18444 is free" "$out"
 NETWORK=testnet; pf
 is "an unknown network fails" 1 "$rc"
+NETWORK=signet; FEE_ADDRESS=tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7; MEM=8000; DISK=100
+SIGNET_CHALLENGE=""; pf
+has "signet without a challenge warns it is the public signet" "[WARN] no --signet-challenge: this node joins the public signet" "$out"
+is "and passes" 0 "$rc"
+SIGNET_CHALLENGE="20$(printf 'ab%.0s' {1..32})7551"; BITCOIN_PEERS="seed.example:38333 10.0.0.2:38333"; pf
+has "a custom signet passes" "[PASS] custom signet, challenge 20abababababab" "$out"
+has "a Bitcoin peer passes" "[PASS] Bitcoin peer seed.example:38333" "$out"
+is "and passes" 0 "$rc"
+SIGNET_CHALLENGE="51x"; pf
+has "a challenge that is not hex fails" "[FAIL] signet challenge '51x' is not a hex script" "$out"
+SIGNET_CHALLENGE="51"; BITCOIN_PEERS="seed.example"; pf
+has "a Bitcoin peer without a port fails" "[FAIL] Bitcoin peer 'seed.example' is not host:port" "$out"
+NETWORK=regtest; FEE_ADDRESS=bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080; BITCOIN_PEERS=""; pf
+has "a challenge off signet fails" "[FAIL] --signet-challenge is for --network signet, not regtest" "$out"
+SIGNET_CHALLENGE=""; BITCOIN_PEERS=""
 
 echo "5. flags"
 arms="$(awk '/^while \[\[ \$# -gt 0 \]\]; do$/{on=1;next} on&&/^  esac$/{exit} on&&!/^  case /' "$INSTALLER" | $G -vE '^\s+-h\|--help|^\s+\*\)')"
@@ -193,12 +211,14 @@ parse() {
 $arms
         *) echo UNKNOWN; shift;;
       esac; done" 2>/dev/null
-      echo "$FEE_ADDRESS|$NETWORK|$RELAY_PEERS|$RELAY_PORT|$GENESIS_ANCHOR|$GENESIS_HEIGHT|$PREFLIGHT_ONLY|$CONFIG_FLAGS" )
+      echo "$FEE_ADDRESS|$NETWORK|$RELAY_PEERS|$RELAY_PORT|$GENESIS_ANCHOR|$GENESIS_HEIGHT|$PREFLIGHT_ONLY|$CONFIG_FLAGS${SIGNET_CHALLENGE:+|$SIGNET_CHALLENGE|$BITCOIN_PEERS}" )
 }
 is "--fee-address"        "x|mainnet||8566|||false|1" "$(parse --fee-address x)"
 is "--payout-address is its old name" "y|mainnet||8566|||false|1" "$(parse --payout-address y)"
 is "node pool flags" "x|regtest|a:1 b:2|9000|ab|7|true|7" \
    "$(parse --fee-address x --network regtest --relay-peer a:1 --relay-peer b:2 --relay-port 9000 --genesis-anchor ab --genesis-height 7 --preflight-only)"
+is "custom signet flags" "x|signet||8566|||false|5|51|s:1 t:2" \
+   "$(parse --fee-address x --network signet --signet-challenge 51 --bitcoin-peer s:1 --bitcoin-peer t:2)"
 for gone in --treasury-address --mining-mode --no-public-mining --capability --elder; do
     is "$gone is gone" 0 "$($G -cE "^[[:space:]]+${gone}\)" "$INSTALLER" || true)"
 done
@@ -258,6 +278,9 @@ validate="$(awk '/^np_hrp "\$NETWORK" >\/dev\/null \|\| err/{on=1} on{print} on&
 is "the validation step is present" yes "$([ -n "$validate" ] && echo yes)"
 old="$TMP/pool-config.toml"
 eval "$($G '^_trim() ' "$INSTALLER")"
+# The release constants the validation step reads (production values; no test mirror in the env).
+unset GHOST_TEST_RELEASE_MIRROR GHOST_TEST_RELEASE_KEY_FP
+eval "$($G -E '^(GPG_KEY_FP|RELEASE_KEY_URL|RELEASE_DOWNLOAD_URL|TEST_RELEASE_MIRROR|TEST_RELEASE_KEY_FP)=' "$INSTALLER")"
 validated() {
     ( log() { :; }; err() { echo "ERR $*"; exit 1; }; usage() { :; }
       np_preflight() { echo "PREFLIGHT"; }
@@ -309,6 +332,113 @@ hasnt "... with no warning that it is unavailable" "not available for node pool 
 is "the installer never tracks the latest release" 0 "$($G -c 'GHOST_VERSION=.*releases/latest' "$INSTALLER" || true)"
 is "the channel marker is written before the updater can be enabled" yes \
    "$(awk '/^cat > \/etc\/ghost\/release-channel /{m=NR} /systemctl enable --now ghost-auto-update.timer/{if(!t)t=NR} END{print (m && t && m<t)?"yes":"no"}' "$INSTALLER")"
+
+echo "7c. a custom signet survives a re-run"
+oldbc="$TMP/bitcoin.conf"
+signet_vars() {   # CHALLENGE_FLAG PEERS_FLAG: validation against $oldbc, prints challenge|peers
+    ( log() { :; }; err() { echo "ERR $*"; exit 1; }; usage() { :; }; np_preflight() { :; }
+      FEE_ADDRESS=tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7 NETWORK=signet
+      RELAY_PEERS="" RELAY_PORT=8566 GENESIS_ANCHOR="" GENESIS_HEIGHT="" PREFLIGHT_ONLY=false SYNC_MODE=ibd
+      ARCHIVE=false GHOST_VERSION=np-v9.9.9 AUTO_UPDATE=false SIGNET_CHALLENGE="$1" BITCOIN_PEERS="$2"
+      v="${validate//\/etc\/ghost\/pool-config.toml/$TMP/none}"
+      eval "${v//\/etc\/bitcoin\/bitcoin.conf/$oldbc}"
+      echo "$SIGNET_CHALLENGE|$BITCOIN_PEERS" ) 2>&1 | tail -1
+}
+printf 'chain=signet\n[signet]\nserver=1\nsignetchallenge=5175\naddnode=seed:38333\naddnode=10.0.0.9:38333\nprune=550\n' > "$oldbc"
+is "a re-run keeps the challenge and the Bitcoin peers" "5175|seed:38333 10.0.0.9:38333" "$(signet_vars '' '')"
+is "flags given this time win" "51|x:1" "$(signet_vars 51 x:1)"
+rm -f "$oldbc"
+is "a fresh install has neither" "|" "$(signet_vars '' '')"
+conf_block="$(awk '/^RPC_USER="ghostrpc_mainnet"$/{on=1} on{print} on&&/^} > \/etc\/bitcoin\/bitcoin.conf$/{exit}' "$INSTALLER")"
+is "the bitcoin.conf step is present" yes "$([ -n "$conf_block" ] && echo yes)"
+written() {   # NETWORK CHALLENGE PEERS: the bitcoin.conf the installer writes
+    ( NETWORK="$1" SIGNET_CHALLENGE="$2" BITCOIN_PEERS="$3" ARCHIVE=false SYNC_MODE=ibd RPCPW=pw NP_P2P_PORT=38333
+      ASSUMEVALID=00; set -e
+      eval "${conf_block//\/etc\/bitcoin\/bitcoin.conf/$TMP/written.conf}"
+      cat "$TMP/written.conf" )
+}
+w="$(written signet 5175 "seed:38333 10.0.0.9:38333")"
+has "the challenge is written" "signetchallenge=5175" "$w"
+has "each Bitcoin peer is an addnode" "addnode=seed:38333" "$w"
+has "... all of them" "addnode=10.0.0.9:38333" "$w"
+is "in the [signet] section" "[signet]" "$(printf '%s\n' "$w" | sed -n '2p')"
+w="$(written signet '' '')"
+hasnt "no challenge: the public signet" "signetchallenge" "$w"
+hasnt "no peers: no addnode" "addnode" "$w"
+has "and the file is still complete" "blockreservedweight=90000" "$w"
+
+echo "7d. a re-run restarts the node on what it wrote, with the same RPC password"
+secrets_block="$(awk '/^log "Generating fresh node secrets"$/{on=1;next} on&&/^if \[\[ -f \/etc\/ghost\/pool.toml \]\]/{exit} on' "$INSTALLER")"
+is "the RPC password step is present" yes "$([ -n "$secrets_block" ] && echo yes)"
+rpcpw() { ( unset RPCPW; eval "${secrets_block//\/etc\/bitcoin\/bitcoin.conf/$TMP/bc.conf}"; echo "$RPCPW" ); }
+pw="$(printf 'ab%.0s' {1..32})"
+printf 'chain=signet\n[signet]\nrpcuser=u\nrpcpassword=%s\n' "$pw" > "$TMP/bc.conf"
+is "a re-run keeps the RPC password" "$pw" "$(rpcpw)"
+rm -f "$TMP/bc.conf"
+fresh="$(rpcpw)"
+is "a fresh install makes a new one" yes "$([[ "$fresh" =~ ^[0-9a-f]{64}$ && "$fresh" != "$pw" ]] && echo yes)"
+start_block="$(awk '/^log "Starting services"$/{on=1;next} on{print} on&&/^systemctl enable --now ghost-mining-gate/{exit}' "$INSTALLER")"
+is "the start step is present" yes "$([ -n "$start_block" ] && echo yes)"
+started() {   # NODE_WAS_RUNNING: the systemctl calls of the start step, in order
+    ( calls=""; systemctl() { calls+="$*;"; }; log() { :; }; NODE_WAS_RUNNING="$1"
+      eval "$start_block"; echo "${calls//>\/dev\/null 2>&1/}" )
+}
+is "a fresh install starts ghostd and the gate, nothing else" \
+   "daemon-reload;enable --now ghostd;enable --now ghost-mining-gate;" "$(started false)"
+is "a re-run on a running node stops the stack, restarts ghostd, and lets the gate start the rest" \
+   "daemon-reload;stop sri-translator sri-pool ghost-mining;restart ghostd;stop ghost-mining-gate;enable --now ghostd;enable --now ghost-mining-gate;" \
+   "$(started true)"
+was_block="$(awk '/^NODE_WAS_RUNNING=false$/{on=1} on{print} on&&/^done$/{exit}' "$INSTALLER")"
+was() { ( systemctl() { [ "$1 $2" = "is-active --quiet" ] && [[ " $ACTIVE " == *" $3 "* ]]; }; ACTIVE="$1"; eval "$was_block"; echo "$NODE_WAS_RUNNING" ); }
+is "running: any of the node's units is active" true "$(was "sri-pool")"
+is "not running: none is" false "$(was "")"
+is "it is read before the installer changes anything" yes \
+   "$(awk '/^NODE_WAS_RUNNING=false$/{w=NR} /^apt-get update/{if(!a)a=NR} END{print (w && a && w<a)?"yes":"no"}' "$INSTALLER")"
+is "ghostd may take 600 s to flush on stop" 1 "$($G -c '^TimeoutStopSec=600$' "$INSTALLER" || true)"
+
+echo "7a. the test-only release mirror"
+TFP=0123456789ABCDEF0123456789ABCDEF01234567
+mirrored() {   # NETWORK MIRROR KEY_FP
+    ( log() { :; }; err() { echo "ERR $*"; exit 1; }; usage() { :; }; np_preflight() { :; }
+      FEE_ADDRESS=bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4 NETWORK="$1" RELAY_PEERS="" RELAY_PORT=8566
+      [ "$1" = signet ] && FEE_ADDRESS=tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7
+      GENESIS_ANCHOR="" GENESIS_HEIGHT="" PREFLIGHT_ONLY=false SYNC_MODE=ibd ARCHIVE=false
+      GHOST_VERSION=np-v9.9.9 AUTO_UPDATE=false TEST_RELEASE_MIRROR="$2" TEST_RELEASE_KEY_FP="$3"
+      eval "${validate//\/etc\/ghost\/pool-config.toml/$TMP/none}"
+      echo "$NP_RELEASES_API_URL|$RELEASE_BASE|$RELEASE_KEY_URL|$GPG_KEY_FP" ) 2>/dev/null | tail -1
+}
+prod_fp="$(sed -nE 's/^GPG_KEY_FP="([0-9A-F]{40})"$/\1/p' "$INSTALLER")"
+is "without a mirror: GitHub, the release key" \
+   "https://api.github.com/repos/bitcoin-ghost/ghost/releases?per_page=100|https://github.com/bitcoin-ghost/ghost/releases/download/np-v9.9.9|https://get.bitcoinghost.org/ghost-release-key.asc|$prod_fp" \
+   "$(mirrored signet '' '')"
+is "with a mirror: every URL and the key move to it" \
+   "http://m:8/r/releases|http://m:8/r/download/np-v9.9.9|http://m:8/r/release-key.asc|$TFP" \
+   "$(mirrored signet http://m:8/r/ "$TFP")"
+is "a mirror without its key is refused" "ERR GHOST_TEST_RELEASE_MIRROR and GHOST_TEST_RELEASE_KEY_FP go together (test installs only)." \
+   "$(mirrored signet http://m:8/r '')"
+is "a key without a mirror is refused" "ERR GHOST_TEST_RELEASE_MIRROR and GHOST_TEST_RELEASE_KEY_FP go together (test installs only)." \
+   "$(mirrored signet '' "$TFP")"
+is "a mirror on mainnet is refused" "ERR GHOST_TEST_RELEASE_MIRROR is for test installs on signet or regtest, never mainnet." \
+   "$(mirrored mainnet http://m:8/r "$TFP")"
+is "the release key cannot be the test key" "ERR GHOST_TEST_RELEASE_KEY_FP is the release key: a test mirror is signed with a throwaway key." \
+   "$(mirrored regtest http://m:8/r "$prod_fp")"
+is "a malformed fingerprint is refused" "ERR GHOST_TEST_RELEASE_KEY_FP must be a 40-hex uppercase fingerprint." \
+   "$(mirrored regtest http://m:8/r "${TFP,,}")"
+dropin_block="$(awk '/^TEST_MIRROR_DROPIN=/{on=1} on{print} on&&/^fi$/{exit}' "$INSTALLER")"
+is "the updater drop-in step is present" yes "$([ -n "$dropin_block" ] && echo yes)"
+dropin() {   # MIRROR: runs the step against $TMP/sd, prints the drop-in or "absent"
+    ( TEST_RELEASE_MIRROR="$1" NP_RELEASES_API_URL=http://m/releases RELEASE_DOWNLOAD_URL=http://m/download
+      RELEASE_KEY_URL=http://m/release-key.asc GPG_KEY_FP="$TFP"
+      eval "${dropin_block//\/etc\/systemd\/system/$TMP/sd}" )
+    cat "$TMP/sd/ghost-auto-update.service.d/test-release-mirror.conf" 2>/dev/null || echo absent
+}
+d="$(dropin http://m)"
+for v in GHOST_NP_RELEASES_API_URL=http://m/releases GHOST_RELEASE_DOWNLOAD_URL=http://m/download \
+         GHOST_RELEASE_KEY_URL=http://m/release-key.asc "GHOST_GPG_KEY_FP=$TFP"; do
+    has "a mirror install points the updater at it: ${v%%=*}" "Environment=$v" "$d"
+    has "... a variable the updater reads" "${v%%=*}:-" "$($G -F "${v%%=*}:-" "$REPO_ROOT/scripts/ghost-auto-update.sh")"
+done
+is "a normal re-run removes the drop-in" absent "$(dropin '')"
 
 echo "7b. slot-class sensing reaches pool_sv2"
 # The translator must negotiate the Ghost agent extension, or pool_sv2 never sees an SV1 miner's

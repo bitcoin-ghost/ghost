@@ -134,6 +134,8 @@ On a fresh install there is no Bitcoin node yet; ghostd is installed, and the in
 | `--relay-port <port>` | `8566` | The share-chain relay port peers dial. Opened on `ufw`. |
 | `--relay-peer <host:port>` | none | A relay peer to dial; repeat for more. More are learned from them. |
 | `--genesis-anchor <hex>`, `--genesis-height <n>` | the network's | The share chain's genesis anchor and its Bitcoin height. See *Share-chain genesis*, below. |
+| `--signet-challenge <hex>` | public signet | `--network signet` only: a custom signet's challenge (`signetchallenge`). Kept on a re-run. |
+| `--bitcoin-peer <host:port>` | none | A Bitcoin peer for ghostd to dial (`addnode`); repeat for more. Kept on a re-run. |
 | `--preflight-only` | | Run the preflight and exit. |
 | `--alert-webhook <url>` | none | Push endpoint for node alerts. Without it, `[alerts]` is written with `enabled = false`. |
 | `--alert-topic <name>` | `ghost-node` | Push topic. |
@@ -205,7 +207,7 @@ With `UNSET` the install completes, the preflight warns, the config carries a ma
 
 ### Networks
 
-`--network signet` or `regtest` writes `chain=<network>` and puts every `bitcoin.conf` setting in that chain's section, with the network's own P2P port (38333 or 18444); RPC stays on 8332. `pool.toml` gets `network = "<network>"`, and `assumevalid` is written only on mainnet.
+`--network signet` or `regtest` writes `chain=<network>` and puts every `bitcoin.conf` setting in that chain's section, with the network's own P2P port (38333 or 18444); RPC stays on 8332. `pool.toml` gets `network = "<network>"`, and `assumevalid` is written only on mainnet. `--network signet` alone is the public signet; a custom signet (the node pool's own test signet) takes `--signet-challenge <hex>`, and a node on it finds the chain only through peers that carry it, given with `--bitcoin-peer`. Both are read back from `bitcoin.conf` on a re-run, so a re-run without them stays on the same signet.
 
 ### Tor
 
@@ -228,7 +230,7 @@ Before step 1 the preflight runs (see *Preflight*, above); a FAIL stops the inst
 7. **Node identity.** Generates `/home/ghost/.ghost/node.key` with `ghost-mining --generate-identity` — unless one already exists, in which case it is kept.
 8. **SV2 keys.** Generates a fresh SV2 pool authority keypair for this node, and derives ghost-mining's template-server key from `node.key` so pool_sv2 can pin it.
 9. **Units.** Installs the units below, the firewall, the restart-loop watchdog and the auto-updater.
-10. **Start.** Enables and starts `ghostd` and `ghost-mining-gate`. Nothing else.
+10. **Start.** Enables and starts `ghostd` and `ghost-mining-gate`. Nothing else. On a re-run over a running node it first stops the stratum stack and the node and restarts `ghostd` (see *Re-running the installer*).
 
 ### Files
 
@@ -319,7 +321,7 @@ When the gate logs `ghostd synced — starting ghost-mining`, the node starts se
 ```bash
 sudo journalctl -u ghost-mining -f
 sudo journalctl -u sri-pool -u sri-translator -f
-curl -s 'http://127.0.0.1:8080/health?unsigned=true'      # peer_count should be above 0
+curl -s 'http://127.0.0.1:8080/health?unsigned=true'      # peer_count: share-chain relay peers (0 until a peer connects)
 sudo -u ghost /opt/ghost/bin/ghost-cli -conf=/etc/bitcoin/bitcoin.conf getblockchaininfo
 ```
 
@@ -348,7 +350,9 @@ The installer does not install the node dashboard. It writes `/etc/systemd/syste
 
 ### Re-running the installer
 
-Re-running keeps the things that identify the node: an existing `node.key` is kept, and `internal_api_secret`, `signing_key` and the SV2 authority keypair are read back from the existing `pool.toml` and `pool-config.toml` and reused, so SV2 miners that pinned the authority key keep working. Without the flags, the fee address, relay peers and a set share-chain genesis are also read back from `pool-config.toml`; an install from before the node pool, which has no fee address, uses its old payout address (`coinbase_reward_script`) as the fee address and says so. The relay store `/var/lib/ghost/node-pool.db` is never touched. Everything else is regenerated: `bitcoin.conf`, `pool.toml`, `pool-config.toml` and `translator-config.toml` are rewritten from the flags you pass this time, with a new RPC password. Hand edits to those files do not survive a re-run, and a re-run without the flags you used the first time sets those options back to their defaults.
+Re-running keeps the things that identify the node: an existing `node.key` is kept, and `internal_api_secret`, `signing_key` and the SV2 authority keypair are read back from the existing `pool.toml` and `pool-config.toml` and reused, so SV2 miners that pinned the authority key keep working. Without the flags, the fee address, relay peers and a set share-chain genesis are also read back from `pool-config.toml`; an install from before the node pool, which has no fee address, uses its old payout address (`coinbase_reward_script`) as the fee address and says so. The relay store `/var/lib/ghost/node-pool.db` is never touched. The RPC password in `bitcoin.conf` is kept too, and so are a custom signet's challenge and the Bitcoin peers (`--signet-challenge`, `--bitcoin-peer`). Everything else is regenerated: `bitcoin.conf`, `pool.toml`, `pool-config.toml` and `translator-config.toml` are rewritten from the flags you pass this time. Hand edits to those files do not survive a re-run, and a re-run without the flags you used the first time sets those options back to their defaults.
+
+If the node is running, a re-run restarts it at the end, as a boot does: `sri-translator`, `sri-pool` and `ghost-mining` stop, `ghostd` restarts, and the gate starts the other three again once ghostd answers. Without that, the node kept running the binaries the re-run had replaced, with the configs it had read at its last start.
 
 ## Automatic updates
 
@@ -374,7 +378,7 @@ When it is on, `ghost-auto-update.timer` runs `/opt/ghost/bin/ghost-auto-update.
 2. downloads the tarball, `SHA256SUMS.txt` and `SHA256SUMS.txt.asc`, and verifies the signature against the same pinned key and the tarball's checksum — on any failure no binary is touched;
 3. backs up the current binaries next to themselves as `*.bak.<timestamp>`;
 4. stops `sri-translator`, `sri-pool`, `ghost-mining` and `ghostd` in that order, swaps in the new `ghostd`, `ghost-mining`, `pool_sv2` and `translator_sv2` (and `ghost-cli` and `ghost-admin` where installed), and starts them again in the opposite order;
-5. checks that ghostd's RPC answers, that ghost-mining's `/health` reports more than zero peers, and that the stratum stack is listening on 34255 and 3333, and rolls all of them back to the backups if any check fails.
+5. checks that ghostd's RPC answers, that ghost-mining's `/health` reports a share-chain relay peer count (above zero if the node had relay peers before the update; a node with none, such as the first node of a network, is not rolled back for that), and that the stratum stack is listening on 34255 and 3333, and rolls all of them back to the backups if any check fails.
 
 The SV2 binaries always move with `ghost-mining`: a release that does not carry one your node runs is refused before anything is stopped.
 
