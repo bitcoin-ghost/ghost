@@ -112,6 +112,14 @@ pub enum ExportError {
          checkpoints are stored, and the export never falls back to an older one"
     )]
     NotFinalised(u64),
+    /// The database was migrated to the node pool (schema v65 or later, stored negated), so its
+    /// old tables are gone. The export reads the pre-cutover database, or its `.pre-v65` copy.
+    #[error(
+        "this database was migrated to the node pool (user_version {0}, schema v65 or later): its \
+         payout tables were dropped. Export from the old database, or from the `<db>.pre-v65` \
+         copy migration v65 took, never from a migrated one"
+    )]
+    Migrated(i64),
     /// The row predates adopt-on-finalise and carries no adopted lists.
     #[error("checkpoint at height {0} has no canonical_payout (a pre-adopt-on-finalise row)")]
     NoCanonical(u64),
@@ -555,6 +563,12 @@ pub fn build_ledger_export(
     allow_root_mismatch: bool,
 ) -> Result<LedgerExport> {
     let h = i64::try_from(height).map_err(|_| ExportError::NotFinalised(height))?;
+    // From v65 the node pool stores its schema version negated (so older binaries refuse the
+    // database at open); this export opens the file raw, so it checks for itself.
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version < 0 {
+        return Err(ExportError::Migrated(version));
+    }
     let has_table: bool = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'payout_ledger_checkpoints'",
@@ -1242,6 +1256,22 @@ mod tests {
         run(&opts(&f, "out", H, Some("1"))).unwrap();
         let err = run(&opts(&f, "out", H, Some("1"))).unwrap_err();
         assert!(matches!(err, ExportError::OutputExists(_)), "{err}");
+    }
+
+    /// A database migrated by the node pool's v65 (version stored negated, payout tables
+    /// dropped) is refused by name, not as a missing checkpoint.
+    #[test]
+    fn refuses_a_database_migrated_by_v65_by_name() {
+        let f = fixture();
+        {
+            let c = rusqlite::Connection::open(&f.db_path).unwrap();
+            c.execute_batch("DROP TABLE payout_ledger_checkpoints; PRAGMA user_version = -65;")
+                .unwrap();
+        }
+        let err = run(&opts(&f, "out", H, Some("1"))).unwrap_err();
+        assert!(matches!(err, ExportError::Migrated(-65)), "{err}");
+        assert!(err.to_string().contains(".pre-v65"), "{err}");
+        assert!(!f.root.join("out").join(LEDGER_BIN).exists());
     }
 
     #[test]
