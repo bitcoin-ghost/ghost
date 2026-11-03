@@ -67,6 +67,9 @@ PAIRS = {
     "BACKUP_RETENTION_SH_EOF":          "scripts/lib/backup-retention.sh",
     "GHOST_BACKUP_SERVICE_EOF":         "scripts/systemd/ghost-backup.service",
     "GHOST_BACKUP_TIMER_EOF":           "scripts/systemd/ghost-backup.timer",
+    # The node dashboard's unit. dashboard/RUN.md shows the same unit for a hand install; the
+    # one it showed before ordered itself after `ghost-node.service`, a unit no node has.
+    "GHOST_DASHBOARD_SERVICE_EOF":      "scripts/systemd/ghost-dashboard.service",
 }
 
 src = open(INSTALLER).read()

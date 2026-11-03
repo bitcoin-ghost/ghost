@@ -12,6 +12,12 @@
 # stop→verify-inactive→swap→start sequence, health-checks, and rolls back on any
 # failure.
 #
+# On a node pool node the node dashboard (/opt/ghost/dashboard) moves with the release too: the
+# release's `bitcoin-ghost-<tag>-dashboard.tar.gz`, checked against the same signed SHA256SUMS.txt,
+# replaces the tree once the node's own health checks have passed, and ghost-dashboard restarts on
+# it. A dashboard that then does not answer is put back by itself; it never rolls back the node.
+# A release without a dashboard leaves the installed one as it is.
+#
 # ⛔ Two release channels share one GitHub repository. Which one a node follows is decided by
 # /etc/ghost/release-channel, written by the node pool installer:
 #   * `node-pool`  — the newest published `np-vX.Y.Z` release, picked from the release LIST.
@@ -67,6 +73,8 @@ STATUS_FILE="${GHOST_AUTOUPDATE_STATUS:-/var/lib/ghost/auto-update.status}"
 BIN_DIR="${GHOST_BIN_DIR:-/opt/ghost/bin}"
 BITCOIN_CONF="${GHOST_BITCOIN_CONF:-/etc/bitcoin/bitcoin.conf}"
 SYSTEMCTL="${GHOST_SYSTEMCTL:-systemctl}"
+DASHBOARD_DIR="${GHOST_DASHBOARD_DIR:-/opt/ghost/dashboard}"
+DASHBOARD_URL="${GHOST_DASHBOARD_URL:-http://127.0.0.1:3000/login}"
 
 # ──────────────────────────────── options ────────────────────────────────────
 DRY_RUN="${GHOST_AUTOUPDATE_DRYRUN:-false}"
@@ -377,6 +385,60 @@ start_all() {
   return 0
 }
 
+# ─────────────────────────────── dashboard ───────────────────────────────────
+
+# health_dashboard — the dashboard answers its login page. GHOST_DASHBOARD_HEALTH_OVERRIDE stands in
+# for it in tests, as GHOST_HEALTHCHECK_OVERRIDE does for the node.
+health_dashboard() {
+  if [[ -n "${GHOST_DASHBOARD_HEALTH_OVERRIDE:-}" ]]; then
+    bash -c "$GHOST_DASHBOARD_HEALTH_OVERRIDE"
+    return $?
+  fi
+  local code
+  for _ in $(seq 1 30); do
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$DASHBOARD_URL" 2>/dev/null || true)"
+    [[ "$code" == 200 ]] && { log "health: dashboard answers ($DASHBOARD_URL)"; return 0; }
+    sleep 2
+  done
+  err "health: dashboard does not answer $DASHBOARD_URL (last='${code:-none}')"
+  return 1
+}
+
+# swap_dashboard NEW_TREE STAMP — replace the dashboard tree, restart it, and put the previous tree
+# back if it does not answer. Prints the outcome for the status line. Never fails the update.
+swap_dashboard() {
+  local new="$1" ts="$2" bak="${DASHBOARD_DIR}.bak.$2"
+  $SYSTEMCTL stop ghost-dashboard.service >/dev/null 2>&1 || true
+  rm -rf "${DASHBOARD_DIR}.new"
+  if ! cp -a "$new" "${DASHBOARD_DIR}.new" || ! mv "$DASHBOARD_DIR" "$bak" || ! mv "${DASHBOARD_DIR}.new" "$DASHBOARD_DIR"; then
+    err "dashboard: could not put the new tree in place — keeping the installed one"
+    [[ -d "$DASHBOARD_DIR" ]] || mv "$bak" "$DASHBOARD_DIR" 2>/dev/null || true
+    rm -rf "${DASHBOARD_DIR}.new"
+    $SYSTEMCTL start ghost-dashboard.service >/dev/null 2>&1 || true
+    echo "dashboard kept (swap failed)"; return 0
+  fi
+  if [[ "$(id -u)" -eq 0 ]]; then
+    chown -R root:root "$DASHBOARD_DIR" 2>/dev/null || true
+    install -d -o ghost -g ghost -m 0755 "$DASHBOARD_DIR/.next/cache" 2>/dev/null || true
+  fi
+  log "swapped $DASHBOARD_DIR (previous tree: $bak)"
+  $SYSTEMCTL start ghost-dashboard.service >/dev/null 2>&1 || true
+  if health_dashboard; then
+    # One previous tree is kept for a manual rollback; older ones go (each is a whole build).
+    local old
+    for old in "${DASHBOARD_DIR}".bak.*; do
+      [[ -d "$old" && "$old" != "$bak" ]] && rm -rf "$old"
+    done
+    echo "dashboard updated"; return 0
+  fi
+  err "dashboard: the new one does not answer — putting the previous one back"
+  $SYSTEMCTL stop ghost-dashboard.service >/dev/null 2>&1 || true
+  rm -rf "$DASHBOARD_DIR" && mv "$bak" "$DASHBOARD_DIR"
+  $SYSTEMCTL start ghost-dashboard.service >/dev/null 2>&1 || true
+  echo "dashboard rolled back"
+  return 0
+}
+
 # ──────────────────────────────── main ───────────────────────────────────────
 
 main() {
@@ -520,6 +582,28 @@ main() {
   [[ -n "$new_pool" ]] || { err "verified tarball did not contain ghost-mining"; write_status "error" "tarball missing ghost-mining" "$latest"; exit 1; }
   [[ -n "$new_ghostd" ]] || { err "verified tarball did not contain ghostd (release predates the unified build?)"; write_status "error" "tarball missing ghostd" "$latest"; exit 1; }
 
+  # 5a. The node dashboard (node pool channel, and only where one is installed). Verified against
+  #     the same signed manifest before anything is stopped; a mismatch stops the whole update.
+  local new_dash="" dash_tar="bitcoin-ghost-${latest}-dashboard.tar.gz"
+  if [[ "$CHANNEL" == node-pool && -d "$DASHBOARD_DIR" ]]; then
+    if grep -q " ${dash_tar}\$" "$tmp/SHA256SUMS.txt"; then
+      curl -fsSL --max-time 600 "${release_base}/${dash_tar}" -o "$tmp/$dash_tar" \
+        || { err "download $dash_tar failed"; write_status "error" "dashboard download failed" "$latest"; exit 1; }
+      if ! ( cd "$tmp" && grep " ${dash_tar}\$" SHA256SUMS.txt | sha256sum -c - >/dev/null 2>&1 ); then
+        err "VERIFY FAILED: dashboard SHA256 mismatch — ABORTING, nothing touched."
+        write_status "verify-failed" "dashboard checksum mismatch for $latest" "$latest"
+        exit 1
+      fi
+      log "VERIFY ok: dashboard checksum matches SHA256SUMS.txt"
+      mkdir -p "$tmp/dash" && tar -xzf "$tmp/$dash_tar" -C "$tmp/dash"
+      [[ -f "$tmp/dash/ghost-dashboard/server.js" ]] \
+        || { err "$dash_tar does not carry ghost-dashboard/server.js"; write_status "error" "dashboard archive malformed" "$latest"; exit 1; }
+      new_dash="$tmp/dash/ghost-dashboard"
+    else
+      warn "release $latest ships no dashboard — the installed one is left as it is"
+    fi
+  fi
+
   # Build the swap plan: (dest <- src), only for binaries currently installed
   # (so we never introduce ghost-pay onto a node that opted out of it).
   local -a SWAP_DEST=() SWAP_SRC=()
@@ -562,6 +646,7 @@ main() {
     log "DRY-RUN: verification PASSED for $latest. Would back up + swap:"
     local k
     for k in "${!SWAP_DEST[@]}"; do log "DRY-RUN:   ${SWAP_DEST[$k]} <- ${SWAP_SRC[$k]}"; done
+    [[ -z "$new_dash" ]] || log "DRY-RUN:   $DASHBOARD_DIR <- $dash_tar"
     log "DRY-RUN: would then restart services + health-check, rolling back on failure."
     write_status "dry-run" "verification passed; swap skipped (dry-run) for $latest" "$latest"
     exit 0
@@ -621,8 +706,10 @@ main() {
   # 10. Health-check; roll back on any failure.
   if run_health_checks; then
     echo "$latest" > "$VERSION_FILE"; chmod 644 "$VERSION_FILE" 2>/dev/null || true
-    log "UPDATE COMPLETE: now running $latest (backups: *.bak.${ts})"
-    write_status "updated" "updated $installed -> $latest" "$latest"
+    local dash_note=""
+    [[ -z "$new_dash" ]] || dash_note="; $(swap_dashboard "$new_dash" "$ts")"
+    log "UPDATE COMPLETE: now running $latest (backups: *.bak.${ts})${dash_note}"
+    write_status "updated" "updated $installed -> $latest${dash_note}" "$latest"
     exit 0
   else
     err "health checks FAILED after swap — rolling back"

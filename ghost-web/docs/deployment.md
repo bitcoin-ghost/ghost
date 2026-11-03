@@ -16,7 +16,7 @@ Four services on one machine, all installed by `scripts/install-node.sh`:
                    ┌────────▼────────┐
                    │  ghost-mining   │   block templates, HTTP API,
                    │  HTTP 8080      │   Template Distribution (TDP)
-                   │  TDP 8442       │
+                   │  TDP 8442 (lo)  │
                    └────────┬────────┘
                             │ TDP
                    ┌────────▼────────┐
@@ -36,9 +36,9 @@ Four services on one machine, all installed by `scripts/install-node.sh`:
                       └──────────┘
 ```
 
-The systemd units are `ghostd`, `ghost-mining`, `sri-pool` and `sri-translator`, plus a fifth, `ghost-mining-gate`, which starts the last three once ghostd has synced (see *The boot gate*, below).
+The systemd units are `ghostd`, `ghost-mining`, `sri-pool` and `sri-translator`, plus `ghost-mining-gate`, which starts the last three once ghostd has synced (see *The boot gate*, below), and `ghost-dashboard`, the operator dashboard on 127.0.0.1:3000 (see *Node dashboard*, below).
 
-Every binary comes from the signed release tarball. For each release that tarball holds `ghostd`, `ghost-cli` (the ghostd RPC client, like `bitcoin-cli`), `ghost-mining`, `ghost-admin`, `pool_sv2`, `translator_sv2` and `ghost-pool` (a hard link to `ghost-mining`, kept so older installers still find it). The installer installs `ghostd`, `ghost-cli`, `ghost-mining`, `ghost-admin`, `pool_sv2` and `translator_sv2` into `/opt/ghost/bin`; it does not install the `ghost-pool` link.
+Every binary comes from the signed release tarball. For each release that tarball holds `ghostd`, `ghost-cli` (the ghostd RPC client, like `bitcoin-cli`), `ghost-mining`, `ghost-admin`, `pool_sv2`, `translator_sv2` and `ghost-pool` (a hard link to `ghost-mining`, kept so older installers still find it). The installer installs `ghostd`, `ghost-cli`, `ghost-mining`, `ghost-admin`, `pool_sv2` and `translator_sv2` into `/opt/ghost/bin`; it does not install the `ghost-pool` link. A node pool release also carries the node dashboard, `bitcoin-ghost-<tag>-dashboard.tar.gz`, covered by the same signed `SHA256SUMS.txt`.
 
 ## Before you start
 
@@ -117,7 +117,7 @@ Every install starts with a preflight, before anything on the machine is changed
 | Fee address | not P2SH/P2WPKH/P2WSH/P2TR, wrong network, bad checksum | |
 | RAM | below the network's floor (mainnet 7 GB) | below the recommended size (mainnet 15 GB) |
 | Disk | free space on `/var/lib` below the floor for the network and sync mode | |
-| Ports | ghostd P2P, 8332, 8080, 8442, 3333, 4444, 34255, 9090 or the relay port is held by a process that is not this node's own (a re-run is fine) | |
+| Ports | ghostd P2P, 8332, 8080, 8442, 3333, 4444, 34255, 9090 or the relay port is held by a process that is not this node's own (a re-run is fine) | 3000 (the dashboard) is held by another program: the node installs, the dashboard stays down until the port is free |
 | Bitcoin node | a node already answering on 127.0.0.1:8332 runs another chain, or the RPC port listens but refuses `bitcoin.conf`'s credentials | |
 | Relay | a `--relay-peer` is not `host:port` | no peers given; a peer does not resolve |
 | Genesis | `--genesis-anchor` is not 64 hex characters, or all zeros | no share-chain genesis is published for the network (see below) |
@@ -221,16 +221,17 @@ In order:
 
 Before step 1 the preflight runs (see *Preflight*, above); a FAIL stops the install there, before anything is installed.
 
-1. **Packages.** `apt-get install` of the libevent and ZeroMQ runtime libraries, `ufw`, `openssl`, `curl`, `gnupg`, `tar` (and `tor` with `--tor`).
+1. **Packages.** `apt-get install` of the libevent, ZeroMQ and SQLite (`libsqlite3-0`) runtime libraries, `ufw`, `openssl`, `curl`, `gnupg`, `tar` (and `tor` with `--tor`).
 2. **User and directories.** Creates the system user `ghost` with home `/home/ghost`, and `/opt/ghost/bin`, `/etc/ghost`, `/etc/bitcoin`, `/var/lib/bitcoin`, `/var/lib/ghost`, `/home/ghost/.ghost/data`. If you ran it via `sudo`, your own user is added to `systemd-journal` so `journalctl` works without sudo after your next login.
 3. **Persistent journal.** Writes `/etc/systemd/journald.conf.d/10-ghost.conf`: `Storage=persistent`, 2 GB cap, 1 GB kept free, two weeks' retention. Without it the journal lives in RAM and a reboot erases the evidence you need.
-4. **Download and verify.** Fetches `bitcoin-ghost-<version>-x86_64-unknown-linux-gnu.tar.gz`, `SHA256SUMS.txt` and `SHA256SUMS.txt.asc` from the GitHub release, imports the release key from `https://get.bitcoinghost.org/ghost-release-key.asc`, and requires a valid signature from exactly `777FE81F8CC077FD3D08055E852C2B3190F5B928` before checking the tarball's SHA256. Any failure stops the install before a binary is written.
+4. **Download and verify.** Fetches `bitcoin-ghost-<version>-x86_64-unknown-linux-gnu.tar.gz`, `SHA256SUMS.txt` and `SHA256SUMS.txt.asc` from the GitHub release, imports the release key from `https://get.bitcoinghost.org/ghost-release-key.asc`, and requires a valid signature from exactly `777FE81F8CC077FD3D08055E852C2B3190F5B928` before checking the tarball's SHA256. The dashboard bundle is fetched from the same release and checked against the same signed `SHA256SUMS.txt`. Any failure stops the install before a binary is written. (A release that carries no dashboard installs the node alone and says so.)
 5. **Secrets.** Generates a fresh RPC password, `internal_api_secret` and `signing_key`, all on this machine. Nothing is shared with any other node.
 6. **Configs.** Writes `/etc/bitcoin/bitcoin.conf` and `/etc/ghost/pool.toml` (both `ghost`-owned, mode 600), `/etc/ghost/translator-config.toml` (644) and `/etc/ghost/pool-config.toml` (root-only 600; it holds the SV2 authority secret).
 7. **Node identity.** Generates `/home/ghost/.ghost/node.key` with `ghost-mining --generate-identity` — unless one already exists, in which case it is kept.
 8. **SV2 keys.** Generates a fresh SV2 pool authority keypair for this node, and derives ghost-mining's template-server key from `node.key` so pool_sv2 can pin it.
 9. **Units.** Installs the units below, the firewall, the restart-loop watchdog and the auto-updater.
-10. **Start.** Enables and starts `ghostd` and `ghost-mining-gate`. Nothing else. On a re-run over a running node it first stops the stratum stack and the node and restarts `ghostd` (see *Re-running the installer*).
+10. **Dashboard.** Installs Node.js (`v22.23.4`, the official nodejs.org build, checked against a pinned SHA-256; Ubuntu's own `nodejs` is too old) under `/opt/ghost/node`, the dashboard under `/opt/ghost/dashboard`, `ghost-dashboard.service`, and a generated password in `/etc/ghost/dashboard.env` (see *Node dashboard*).
+11. **Start.** Enables and starts `ghostd` and `ghost-mining-gate`, then (re)starts `ghost-dashboard`. Nothing else. On a re-run over a running node it first stops the stratum stack and the node and restarts `ghostd` (see *Re-running the installer*).
 
 ### Files
 
@@ -249,6 +250,9 @@ Before step 1 the preflight runs (see *Preflight*, above); a FAIL stops the inst
 | `/etc/ghost/release-channel` | Release channel marker: `node-pool`. The updater follows np- releases only while it says so |
 | `/etc/ghost/backup.conf` | Optional off-node backup destination. Not present unless you configure one |
 | `/etc/ghost/version` | Installed release version |
+| `/etc/ghost/dashboard.env` | The dashboard's password (`DASHBOARD_PASSWORD`), root-only 600 |
+| `/opt/ghost/dashboard` | The node dashboard (Next.js standalone build) |
+| `/opt/ghost/node` | The Node.js runtime the dashboard runs on (a link to `/opt/ghost/node-v22.23.4`) |
 
 ### Units
 
@@ -263,6 +267,7 @@ Before step 1 the preflight runs (see *Preflight*, above); a FAIL stops the inst
 | `ghost-restart-watch.timer` | root | yes | systemd |
 | `ghost-auto-update.timer` | root | only with `--auto-update` | systemd |
 | `ghost-backup.timer` | ghost | unless `--no-backups` | systemd |
+| `ghost-dashboard` | `ghost` | yes | systemd (does not wait for the gate; shows the node as unavailable until it answers) |
 
 ### The boot gate
 
@@ -280,13 +285,12 @@ The installer enables `ufw` and allows:
 | 8333/tcp | ghostd P2P | 38333 on signet, 18444 on regtest. Removed with `--tor-only` |
 | 8566/tcp | Node pool share-chain relay | `--relay-port` |
 | 8080/tcp | ghost-mining HTTP API | |
-| 8442/tcp | ghost-mining TDP | |
 
-8555–8562 (the old mesh), 8563 (Noise mesh) and 8443 (verification HTTPS) are **not** opened, and a rule an older install left is deleted: ghost-mining no longer runs the old mesh, and a node pool node must never be reachable by the old network's mesh.
+8555–8562 (the old mesh), 8563 (Noise mesh), 8443 (verification HTTPS) and 8442 (TDP) are **not** opened, and a rule an older install left is deleted on a re-run: ghost-mining no longer runs the old mesh, and a node pool node must never be reachable by the old network's mesh. ghost-mining's template server (TDP, 8442) serves only the node's own pool_sv2, so it listens on `127.0.0.1` (`--tdp-bind 127.0.0.1` in the unit); its verification HTTPS listener (8443), a leftover of the old mesh, also listens on `127.0.0.1` only.
 
 Three more ports are always open: 3333/tcp (SV1), 34255/tcp (SV2) and 4444/tcp (farm tier). `ghost-mining-firewall.path` re-runs `/opt/ghost/bin/reconcile-mining-firewall.sh` whenever `pool.toml` changes, so a rule removed by hand, or closed by an older private or solo install, is put back.
 
-RPC (8332), ZMQ (28332–28334) and pool_sv2's monitoring endpoint (9090) are bound to `127.0.0.1`.
+RPC (8332), ZMQ (28332–28334), pool_sv2's monitoring endpoint (9090), the TDP server (8442), ghost-mining's verification HTTPS (8443) and the dashboard (3000) are bound to `127.0.0.1`. The translator's monitoring endpoint (9092) listens on all interfaces but has no firewall rule.
 
 ## After the install
 
@@ -305,7 +309,11 @@ The installer ends by printing the Node ID and each service's state:
      ghost-mining:    inactive  (started by the gate)
      sri-pool:        inactive  ...
      sri-translator:  inactive  ...
+     dashboard:       active  http://127.0.0.1:3000 on this machine (ssh -L 3000:127.0.0.1:3000 <you>@<ip>, then open http://localhost:3000)
+     Dashboard password: sudo grep DASHBOARD_PASSWORD /etc/ghost/dashboard.env
 ```
+
+The installer never prints the dashboard password (or any other secret); the last line says where to read it.
 
 `inactive` is expected for the last three until ghostd finishes syncing.
 
@@ -346,13 +354,53 @@ The node pool flags (`--fee-address`, `--relay-port`, `--relay-peer`, `--genesis
 
 Older installs may carry keys for removed features (`[network] mining_mode`, `private_mining_password`, `solo_payout_address`, `[pool] treasury_address`, `node_payout_address`, `[coordinator]`, `[ghost_pay]`); they are read and ignored, and the installer no longer writes them.
 
-The installer does not install the node dashboard. It writes `/etc/systemd/system/ghost-dashboard.service.d/internal-auth.conf` so that a dashboard installed later signs its requests with the same `internal_api_secret`. See [Node dashboard](#node-dashboard).
+The dashboard signs its requests to ghost-mining with `internal_api_secret`, which the installer copies into `/etc/systemd/system/ghost-dashboard.service.d/internal-auth.conf` on every run, so the two never drift (see *Node dashboard*, below).
 
 ### Re-running the installer
 
 Re-running keeps the things that identify the node: an existing `node.key` is kept, and `internal_api_secret`, `signing_key` and the SV2 authority keypair are read back from the existing `pool.toml` and `pool-config.toml` and reused, so SV2 miners that pinned the authority key keep working. Without the flags, the fee address, relay peers and a set share-chain genesis are also read back from `pool-config.toml`; an install from before the node pool, which has no fee address, uses its old payout address (`coinbase_reward_script`) as the fee address and says so. The relay store `/var/lib/ghost/node-pool.db` is never touched. The RPC password in `bitcoin.conf` is kept too, and so are a custom signet's challenge and the Bitcoin peers (`--signet-challenge`, `--bitcoin-peer`). Everything else is regenerated: `bitcoin.conf`, `pool.toml`, `pool-config.toml` and `translator-config.toml` are rewritten from the flags you pass this time. Hand edits to those files do not survive a re-run, and a re-run without the flags you used the first time sets those options back to their defaults.
 
-If the node is running, a re-run restarts it at the end, as a boot does: `sri-translator`, `sri-pool` and `ghost-mining` stop, `ghostd` restarts, and the gate starts the other three again once ghostd answers. Without that, the node kept running the binaries the re-run had replaced, with the configs it had read at its last start.
+**A re-run restarts the node.** If the node is running, a re-run restarts it at the end, as a boot does: `sri-translator`, `sri-pool` and `ghost-mining` stop, `ghostd` restarts, and the gate starts the other three again once ghostd answers. Without that, the node kept running the binaries the re-run had replaced, with the configs it had read at its last start. Miners connected to it are dropped and reconnect once the stack is back. The dashboard is restarted on the tree just installed; its password (`/etc/ghost/dashboard.env`) is kept, and so is a `DASHBOARD_PASSWORD` you set yourself in a `ghost-dashboard.service.d` drop-in.
+
+A re-run over a node installed before the template server moved to loopback deletes that install's `8442/tcp` firewall rule.
+
+## Node dashboard
+
+The installer installs the operator dashboard with the node, from the same signed release. It shows the node pool's health, the Bitcoin node's sync, connected miners and their slot classes, the ledger, pool blocks and the share chain.
+
+- **Where it listens.** `127.0.0.1:3000` only, and the firewall has no rule for it. Reach it through an SSH tunnel from your own computer: `ssh -L 3000:127.0.0.1:3000 <you>@<node>`, then open http://localhost:3000.
+- **The password.** Generated once, on the node, into `/etc/ghost/dashboard.env` (root-only, mode 600), which the unit reads with `EnvironmentFile=`. Read it with `sudo grep DASHBOARD_PASSWORD /etc/ghost/dashboard.env`. To change it, edit that file and `sudo systemctl restart ghost-dashboard`. It is a file rather than an `Environment=` line because systemd shows `Environment=` values to every local user (`systemctl show`).
+- **What runs it.** `ghost-dashboard.service`, as `ghost`, `node server.js` in `/opt/ghost/dashboard` on the Node.js runtime in `/opt/ghost/node` (pinned `v22.23.4`, from nodejs.org, checked against a pinned SHA-256 before it is unpacked). Ubuntu's own `nodejs` package is not used: on 24.04 it is version 18, and the dashboard needs 22 or later.
+- **Updates.** With automatic updates on, the dashboard moves with each node pool release (see below). A re-run of the installer reinstalls it from the release it installs.
+- **Logs.** `sudo journalctl -u ghost-dashboard -f`.
+
+`dashboard/RUN.md` in the bundle describes running it by hand, for a machine the installer did not set up.
+
+## Removing the node
+
+```bash
+sudo bash install-node.sh --uninstall            # asks first; --yes to skip the question
+sudo bash install-node.sh --uninstall --purge    # also deletes the node's data
+```
+
+`--uninstall` stops, disables and removes every unit, timer and drop-in the installer wrote (the node, the stratum stack, the gate, the dashboard, the updater, the watchdog, the backup job and the firewall reconcile), deletes `/opt/ghost` (binaries, helper scripts, the dashboard and its Node.js), removes the firewall rules the installer opened (the Bitcoin P2P port, the relay port, 8080, 3333, 4444, 34255, and an old 8442), its sudoers files (`/etc/sudoers.d/ghost-autoupdate`, `ghost-backup-offsite`), the release channel marker, `/etc/ghost/version`, `/etc/ghost/auto-update.conf` and the journald drop-in.
+
+It **keeps the node's data**, and lists what it kept and where when it finishes:
+
+| Kept | What is in it |
+|---|---|
+| `/var/lib/bitcoin` | The chain (ghostd's data directory) |
+| `/var/lib/ghost` | `node-pool.db` (the share chain and the ledger), miner stats |
+| `/home/ghost` | `.ghost/node.key` (the node's identity), ghost-mining's database |
+| `/etc/ghost` | `pool.toml`, `pool-config.toml` (the SV2 authority key, the fee address, relay peers, genesis), `translator-config.toml`, `dashboard.env` |
+| `/etc/bitcoin` | `bitcoin.conf` (the RPC password, a custom signet's challenge, Bitcoin peers) |
+| `/var/backups/ghost`, `/var/lib/ghost-backup` | Nightly backups, the off-node backup key and status |
+
+The `ghost` user, `ufw` (still enabled, with 22/tcp open, so ssh keeps working) and the apt packages are left as they are. Installing again over what was kept is a re-run: the same node ID, keys, fee address, relay peers and ledger.
+
+`--purge` also deletes everything in that table and the `ghost` user. Back up `node.key` and `node-pool.db` first if you might want this node back: nothing else can recreate them.
+
+Without `--yes` it asks you to type `uninstall` (or `purge`) on the terminal; with no terminal and no `--yes` it refuses and changes nothing.
 
 ## Automatic updates
 
@@ -378,7 +426,8 @@ When it is on, `ghost-auto-update.timer` runs `/opt/ghost/bin/ghost-auto-update.
 2. downloads the tarball, `SHA256SUMS.txt` and `SHA256SUMS.txt.asc`, and verifies the signature against the same pinned key and the tarball's checksum — on any failure no binary is touched;
 3. backs up the current binaries next to themselves as `*.bak.<timestamp>`;
 4. stops `sri-translator`, `sri-pool`, `ghost-mining` and `ghostd` in that order, swaps in the new `ghostd`, `ghost-mining`, `pool_sv2` and `translator_sv2` (and `ghost-cli` and `ghost-admin` where installed), and starts them again in the opposite order;
-5. checks that ghostd's RPC answers, that ghost-mining's `/health` reports a share-chain relay peer count (above zero if the node had relay peers before the update; a node with none, such as the first node of a network, is not rolled back for that), and that the stratum stack is listening on 34255 and 3333, and rolls all of them back to the backups if any check fails.
+5. checks that ghostd's RPC answers, that ghost-mining's `/health` reports a share-chain relay peer count (above zero if the node had relay peers before the update; a node with none, such as the first node of a network, is not rolled back for that), and that the stratum stack is listening on 34255 and 3333, and rolls all of them back to the backups if any check fails;
+6. on a node pool node, once those checks pass, replaces `/opt/ghost/dashboard` with the release's dashboard (verified against the same signed `SHA256SUMS.txt` in step 2, before anything was stopped), restarts `ghost-dashboard` and checks that it answers. A dashboard that does not answer is put back by itself; it never rolls the node back. The previous tree is kept once as `/opt/ghost/dashboard.bak.<timestamp>`. A release without a dashboard leaves the installed one as it is.
 
 The SV2 binaries always move with `ghost-mining`: a release that does not carry one your node runs is refused before anything is stopped.
 
@@ -431,9 +480,10 @@ systemd restarts a crashing service for ever and reports it `active` between cra
 | ghost-mining, sri-pool, sri-translator all `inactive` | Expected until ghostd is synced. `sudo journalctl -u ghost-mining-gate -f` — it logs `waiting for ghostd to finish initial sync...` until then. |
 | ghostd not syncing | `sudo journalctl -u ghostd -n 100`; `sudo -u ghost /opt/ghost/bin/ghost-cli -conf=/etc/bitcoin/bitcoin.conf getblockchaininfo` |
 | ghost-mining exits at startup | `sudo journalctl -u ghost-mining -n 100` — most config errors are explicit |
-| No share-chain relay peers (`ghost-admin node status`) | Inbound 8566 (or your `--relay-port`) blocked upstream of `ufw` (a provider firewall or security group), or no `--relay-peer` given |
+| No share-chain relay peers (`/opt/ghost/bin/ghost-admin node status`, which asks this machine's API at `http://127.0.0.1:8080` unless given `--url` or `GHOST_POOL_URL`) | Inbound 8566 (or your `--relay-port`) blocked upstream of `ufw` (a provider firewall or security group), or no `--relay-peer` given |
 | Miners can't connect | `sudo journalctl -u sri-pool -u sri-translator -n 100`; `sudo ufw status` should show 3333, 4444 and 34255. |
 | A service keeps restarting, or is up but serving nothing | `sudo /opt/ghost/bin/ghost-restart-watch.sh --check` |
+| The dashboard does not load | `systemctl status ghost-dashboard`; `sudo journalctl -u ghost-dashboard -n 50`. It listens on 127.0.0.1 only: open it through `ssh -L 3000:127.0.0.1:3000 …`, not the node's public address. |
 | An automatic update rolled back | `cat /var/lib/ghost/auto-update.status`; `sudo journalctl -u ghost-auto-update -n 100` |
 | The off-node backup copy failed | `sudo /opt/ghost/bin/ghost-backup-offsite show` (see `last_result`); `sudo /opt/ghost/bin/ghost-backup-offsite test`; `sudo journalctl -u ghost-backup -n 100` |
 

@@ -458,6 +458,78 @@ is "no SEED_NODES list is left" 0 "$($G -c 'SEED_NODES' "$INSTALLER" || true)"
 is "the old mesh ports are not opened" 0 "$($G -cE '^ufw allow (8555|8563|8443)' "$INSTALLER" || true)"
 is "they are closed on a re-run" 3 "$($G -cE '^ufw delete allow (8555:8562|8563|8443)/tcp' "$INSTALLER" || true)"
 
+
+echo "9. loopback-only listeners: the template server, verification HTTPS and the dashboard"
+is "8442 (TDP) is not opened" 0 "$($G -cE '^ufw allow 8442' "$INSTALLER" || true)"
+is "an 8442 rule an older install opened is removed" 1 "$($G -cE '^ufw delete allow 8442/tcp' "$INSTALLER" || true)"
+is "ghost-mining's TDP server binds loopback" 1 \
+   "$($G -cE '^ExecStart=/opt/ghost/bin/ghost-mining .*--tdp-port 8442 --tdp-bind 127\.0\.0\.1 ' "$INSTALLER" || true)"
+is "the dashboard port is never opened" 0 "$($G -cE 'ufw allow .*3000' "$INSTALLER" || true)"
+unit="$(cat "$REPO_ROOT/scripts/systemd/ghost-dashboard.service")"
+has "the dashboard binds loopback" "Environment=HOSTNAME=127.0.0.1" "$unit"
+has "it runs the pinned Node.js, not apt's" "ExecStart=/opt/ghost/node/bin/node server.js" "$unit"
+hasnt "it is not ordered after a unit no node has" "ghost-node.service" "$unit"
+has "its password comes from a root-only file, not an Environment= line" "EnvironmentFile=-/etc/ghost/dashboard.env" "$unit"
+hasnt "no password in the unit" "DASHBOARD_PASSWORD=" "$unit"
+pf_dashboard_active() { [ "${DASH_ACTIVE:-no}" = yes ]; }
+NETWORK=mainnet; FEE_ADDRESS=bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4; SIGNET_CHALLENGE=""; BITCOIN_PEERS=""; pf
+has "a free dashboard port passes" "[PASS] port 3000 is free (node dashboard, loopback only)" "$out"
+OWNER[3000]=node; DASH_ACTIVE=yes; pf
+has "the node's own dashboard on it is a re-run" "[PASS] port 3000 is held by this node's dashboard (re-run)" "$out"
+OWNER[3000]=grafana; DASH_ACTIVE=no; pf
+has "another program on it only warns" "[WARN] port 3000 is in use by grafana: the node dashboard will not start until it is free" "$out"
+is "... and the install goes on" 0 "$rc"
+OWNER=()
+
+echo "10. the dashboard and its runtime"
+has "libsqlite3-0 is installed explicitly" "libsqlite3-0" "$($G -A3 '^apt-get install -y -qq \\$' "$INSTALLER")"
+nv="$(sed -nE 's/^NODEJS_VERSION="(v[0-9]+)\..*/\1/p' "$INSTALLER")"
+is "Node.js is pinned to 22 or later" yes "$([[ "${nv#v}" -ge 22 ]] 2>/dev/null && echo yes)"
+is "... to an exact version" 1 "$($G -cE '^NODEJS_VERSION="v[0-9]+\.[0-9]+\.[0-9]+"$' "$INSTALLER" || true)"
+is "... with its SHA-256" 1 "$($G -cE '^NODEJS_SHA256="[0-9a-f]{64}"$' "$INSTALLER" || true)"
+is "... checked before it is unpacked" yes \
+   "$(awk '/NODEJS_SHA256\}  \$TMP\/\$NODEJS_TARBALL" \| sha256sum -c/{c=NR} /tar -xzf "\$TMP\/\$NODEJS_TARBALL"/{x=NR} END{print (c && x && c<x)?"yes":"no"}' "$INSTALLER")"
+is "the dashboard is fetched after the release signature is verified" yes \
+   "$(awk '/VALIDSIG \$\{GPG_KEY_FP\}/{if(!v)v=NR} /curl -fsSLO "\$\{RELEASE_BASE\}\/\$\{DASHBOARD_TARBALL\}"/{d=NR} END{print (v && d && v<d)?"yes":"no"}' "$INSTALLER")"
+dl_block="$(awk '/^DASHBOARD_SRC=""$/{on=1} on{print} on&&/^fi$/{exit}' "$INSTALLER")"
+is "the dashboard download step is present" yes "$([ -n "$dl_block" ] && echo yes)"
+REL="$TMP/rel"; mkdir -p "$REL/stage/ghost-dashboard"; echo 'console.log(1)' > "$REL/stage/ghost-dashboard/server.js"
+tar -czf "$REL/bitcoin-ghost-np-v9.9.9-dashboard.tar.gz" -C "$REL/stage" ghost-dashboard
+fetched() {   # SUMS: runs the step in a fresh dir with SHA256SUMS.txt = SUMS, prints DASHBOARD_SRC or the error
+    local w="$TMP/dl.$RANDOM"; mkdir -p "$w"; printf '%s' "$1" > "$w/SHA256SUMS.txt"
+    ( cd "$w"; err() { echo "ERR $*" >&2; exit 1; }; log() { :; }
+      curl() { local a="${*: -1}"; cp "$REL/${a##*/}" .; }
+      GHOST_VERSION=np-v9.9.9 DASHBOARD_TARBALL=bitcoin-ghost-np-v9.9.9-dashboard.tar.gz RELEASE_BASE=http://m/np-v9.9.9
+      eval "${dl_block//\$TMP/$w}" >/dev/null; echo "SRC=${DASHBOARD_SRC#"$w"/}" ) 2>&1 | $G -E '^(SRC=|ERR )' 
+}
+good="$(cd "$REL" && sha256sum bitcoin-ghost-np-v9.9.9-dashboard.tar.gz)"
+is "a dashboard in the signed manifest is installed" "SRC=dashboard/ghost-dashboard" "$(fetched "$good"$'\n')"
+has "one whose checksum does not match stops the install" "ERR Checksum verification FAILED for bitcoin-ghost-np-v9.9.9-dashboard.tar.gz." \
+   "$(fetched "$(printf '%064d' 0)  bitcoin-ghost-np-v9.9.9-dashboard.tar.gz"$'\n')"
+is "a release without one installs the node alone" "SRC=" "$(fetched "$(printf '%064d' 0)  other.tar.gz"$'\n')"
+pw_block="$(awk '/^  # The password\. /{on=1} on{print} on&&/^  \[\[ -e "\$DASHBOARD_ENV" \]\]/{exit}' "$INSTALLER")"
+is "the password step is present" yes "$([ -n "$pw_block" ] && echo yes)"
+password() {   # runs the step against $TMP/pw, prints the note; the env file is left there
+    ( chown() { :; }; DASHBOARD_ENV="$TMP/pw/dashboard.env"
+      b="${pw_block//\/etc\/systemd\/system\/ghost-dashboard.service.d/$TMP/pw/dropins}"
+      eval "$b"; echo "$DASHBOARD_PW_NOTE" )
+}
+rm -rf "$TMP/pw"; mkdir -p "$TMP/pw/dropins"
+note="$(password)"
+is "a fresh install generates one" yes "$($G -qE '^DASHBOARD_PASSWORD=[0-9a-f]{32}$' "$TMP/pw/dashboard.env" && echo yes)"
+is "... readable by root only" 600 "$(stat -c %a "$TMP/pw/dashboard.env")"
+has "... and says where it is, not what it is" "sudo grep DASHBOARD_PASSWORD $TMP/pw/dashboard.env" "$note"
+hasnt "... the value never in the note" "$(sed -n 's/^DASHBOARD_PASSWORD=//p' "$TMP/pw/dashboard.env")" "$note"
+sed -i 's/^DASHBOARD_PASSWORD=.*/DASHBOARD_PASSWORD=my own choice/' "$TMP/pw/dashboard.env"
+password >/dev/null
+is "a re-run keeps it, changed by hand or not" "DASHBOARD_PASSWORD=my own choice" "$($G '^DASHBOARD_PASSWORD=' "$TMP/pw/dashboard.env")"
+rm -f "$TMP/pw/dashboard.env"; printf '[Service]\nEnvironment=DASHBOARD_PASSWORD=x\n' > "$TMP/pw/dropins/override.conf"
+note="$(password)"
+is "an operator's own drop-in password is kept and no file is written" absent "$([ -e "$TMP/pw/dashboard.env" ] && echo present || echo absent)"
+has "... and the note says so" "your own" "$note"
+is "the dashboard is restarted on a re-run" 1 "$($G -c '^  systemctl restart ghost-dashboard ' "$INSTALLER" || true)"
+is "nothing prints the dashboard password" 0 "$($G -cE 'echo.*\$\(?(sed|grep|cat)[^|]*dashboard\.env|cat .*dashboard\.env' "$INSTALLER" || true)"
+
 echo
 echo "test-installer-node-pool: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

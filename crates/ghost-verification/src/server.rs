@@ -2387,6 +2387,25 @@ pub async fn start_server(
     port: u16,
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> GhostResult<()> {
+    start_server_on(
+        state,
+        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        port,
+        tls_config,
+    )
+    .await
+}
+
+/// [`start_server`] on one address instead of every interface. ghost-mining binds its
+/// verification HTTPS listener (8443) to loopback with it: that listener served the old mesh's
+/// peer challenges, nothing off the machine uses it on a node pool node, and the firewall was
+/// the only thing keeping it from the world.
+pub async fn start_server_on(
+    state: Arc<VerificationState>,
+    bind: std::net::IpAddr,
+    port: u16,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> GhostResult<()> {
     // VF-C2: Validate internal API auth requirement
     if state.require_internal_auth && state.internal_auth.is_none() {
         return Err(GhostError::Config(
@@ -2577,9 +2596,9 @@ pub async fn start_server(
         .layer(cors)
         .layer(DefaultBodyLimit::max(1024 * 1024)); // 1MB limit
 
-    let addr = format!("0.0.0.0:{}", port);
+    let addr = std::net::SocketAddr::new(bind, port);
 
-    let listener = TcpListener::bind(&addr)
+    let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| GhostError::Internal(format!("Failed to bind: {}", e)))?;
 
