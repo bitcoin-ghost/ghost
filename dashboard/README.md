@@ -197,53 +197,37 @@ Three details are load-bearing, and each has bitten us:
   reached over an SSH tunnel. Auth does not depend on this (the JWT fails
   closed regardless), but binding publicly removes a layer for no benefit.
 
-Secrets do **not** belong in this unit — keep them in a root-only drop-in at
-`/etc/systemd/system/ghost-dashboard.service.d/override.conf`, which is where
-`DASHBOARD_PASSWORD`, `DASHBOARD_TOKEN_TTL_SECS` and `INTERNAL_AUTH_KEY` live:
+Secrets do **not** belong in this unit. `DASHBOARD_PASSWORD` lives in
+`/etc/ghost/dashboard.env` (root-only, 600), which the unit reads with
+`EnvironmentFile=`: systemd shows `Environment=` values to every local user
+(`systemctl show`) and never shows a file's contents. `INTERNAL_AUTH_KEY` is in
+the `internal-auth.conf` drop-in, which `install-node.sh` keeps equal to
+`pool.toml`'s `internal_api_secret`.
 
-```ini
-[Service]
-Environment=DASHBOARD_PASSWORD=<value>
-```
+### On a node
 
-### With ghost-node
-
-When deployed alongside ghost-node, the dashboard is accessible at the node's IP on port 3000. Ensure the ghost-node API is running on port 8080.
+`install-node.sh` installs the dashboard with the node, from the same signed
+release (`bitcoin-ghost-<tag>-dashboard.tar.gz`, packed by
+`scripts/package-dashboard.sh`), with Node.js under `/opt/ghost/node`, as
+`ghost-dashboard.service` (`scripts/systemd/ghost-dashboard.service`). The
+auto-updater moves it with each node pool release. See `RUN.md`.
 
 ## Password recovery
 
-Auth is a single `DASHBOARD_PASSWORD`, read from the dashboard's systemd
-drop-in (`/etc/systemd/system/ghost-dashboard.service.d/override.conf`), and
-the dashboard binds loopback. So a forgotten password can lock the operator
-out — there is **no web-based reset**, because a web endpoint that reset the
-password would be an authentication bypass (anyone who could reach the login
-page could take over the node).
-
-Instead, the recovery credential is **node access itself**: reaching the
-dashboard already implies SSH or local access to the node, and only someone
-with that access should be able to reset the password. Run this on the node,
-as root:
+Auth is a single `DASHBOARD_PASSWORD`, and the dashboard binds loopback. There
+is **no web-based reset**, because a web endpoint that reset the password would
+be an authentication bypass (anyone who could reach the login page could take
+over the node). The recovery credential is **node access itself**: the
+installer generated the password on the node, and reading it needs root there:
 
 ```bash
-sudo scripts/agathion-reset-password.sh
+sudo grep DASHBOARD_PASSWORD /etc/ghost/dashboard.env
 ```
 
-It:
-
-- Generates a strong password (or accepts one via `--password <value>`).
-- Writes it to the systemd drop-in as the `DASHBOARD_PASSWORD=` line,
-  **preserving every other `Environment=` entry**, and creates the drop-in if
-  it does not exist yet.
-- Drops any explicit `DASHBOARD_JWT_SECRET=` so the JWT signing secret
-  re-derives from the new password — this plus the restart invalidates all
-  existing `ghost-session` cookies (old sessions die).
-- Runs `systemctl daemon-reload && systemctl restart ghost-dashboard`.
-- Prints the new password.
-
-The script backs up the drop-in before editing it and is idempotent (re-running
-just sets a fresh password). Useful flags: `--no-restart` (write only),
-`--service <name>` (non-default unit name), `--help`. The login page's "Forgot
-password?" link points operators here.
+To set a new one, edit that file and `sudo systemctl restart ghost-dashboard`.
+With `DASHBOARD_JWT_SECRET` unset (the default), the signing secret derives from
+the password, so a new password also ends every existing session. The login
+page's "Forgot password?" link says the same.
 
 ## Technology Stack
 
