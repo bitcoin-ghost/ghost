@@ -46,7 +46,7 @@ is "the write step is present" yes "$([ -n "$step" ] && echo yes)"
 conf="$TMP/bitcoin.conf"
 run_step() {
     # shellcheck disable=SC2034  # read by the extracted step
-    ( NETWORK="$1" ARCHIVE=false SYNC_MODE=ibd RPCPW=pw NP_P2P_PORT="$2" ASSUMEVALID=00ab
+    ( NETWORK="$1" SIGNET_CHALLENGE="" BITCOIN_PEERS="" ARCHIVE=false SYNC_MODE=ibd RPCPW=pw NP_P2P_PORT="$2" ASSUMEVALID=00ab
       eval "${step//\/etc\/bitcoin\/bitcoin.conf/$conf}" )
 }
 for n in mainnet:8333 signet:38333 regtest:18444; do
