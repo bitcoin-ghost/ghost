@@ -29,6 +29,8 @@ trap 'rm -rf "$TMP"' EXIT
 pass=0; fail=0
 is() { if [ "$2" = "$3" ]; then printf "  [ok ] %s\n" "$1"; pass=$((pass+1));
        else printf "  [BAD] %s\n        wanted: %s\n        got:    %s\n" "$1" "$2" "$3"; fail=$((fail+1)); fi; }
+has() { if printf '%s\n' "$3" | $G -qF -- "$2"; then printf "  [ok ] %s\n" "$1"; pass=$((pass+1));
+        else printf "  [BAD] %s\n        wanted a line with: %s\n        in: %s\n" "$1" "$2" "$3"; fail=$((fail+1)); fi; }
 
 # --- a signed release, v1.0.1 ----------------------------------------------------------------
 export GNUPGHOME="$TMP/signer"; mkdir -m700 "$GNUPGHOME"
@@ -149,6 +151,25 @@ is "ghost-mining swapped"          new-ghost-mining  "$(ver ghost-mining)"
 is "pool_sv2 not installed"        absent            "$(ver pool_sv2)"
 is "translator_sv2 not installed"  absent            "$(ver translator_sv2)"
 is "start order"                   "ghostd ghost-mining" "$(order start)"
+
+echo "E. the relay-peer health check: a node pool node may have no peers"
+# read_peer_count and health_ghost_pool, run against a stand-in for ghost-mining's /health.
+fns="$(awk '/^read_peer_count\(\) \{$/,/^\}$/{print} /^health_ghost_pool\(\) \{$/,/^\}$/{print}' "$UPDATER")"
+is "both functions are present" 2 "$(printf '%s\n' "$fns" | $G -cE '^(read_peer_count|health_ghost_pool)\(\) \{$' || true)"
+peers_health() {   # BEFORE AFTER_JSON: health_ghost_pool's verdict
+    ( log() { :; }; err() { echo "ERR $*"; }; sleep() { :; }; seq() { echo 1; echo 2; }
+      curl() { [ -n "$HEALTH" ] && printf '%s' "$HEALTH"; }
+      eval "$fns"; PEERS_BEFORE="$1" HEALTH="$2"
+      if health_ghost_pool; then echo ok; fi ) 2>&1 | tail -1
+}
+is "no peers before, none after: healthy"              ok "$(peers_health 0 '{"response":{"peer_count":0}}')"
+is "peers before and after: healthy"                   ok "$(peers_health 2 '{"response":{"peer_count":1}}')"
+has "peers before, none after: rolls back"             "it had 2 before the update" "$(peers_health 2 '{"response":{"peer_count":0}}')"
+has "no count at all (pool_sv2 down): rolls back"      "reports no peer count" "$(peers_health 0 '{"response":{"peer_count":null}}')"
+has "ghost-mining not answering: rolls back"           "reports no peer count" "$(peers_health 0 '')"
+is "unknown before (ghost-mining was down): a count is enough" ok "$(peers_health '' '{"response":{"peer_count":0}}')"
+is "the count is read before anything is stopped" yes \
+   "$(awk '/^  PEERS_BEFORE="\$\(read_peer_count\)"$/{p=NR} /^  stop_all \|\| \{/{if(!s)s=NR} END{print (p && s && p<s)?"yes":"no"}' "$UPDATER")"
 
 echo
 echo "test-auto-update-swap: $pass passed, $fail failed"

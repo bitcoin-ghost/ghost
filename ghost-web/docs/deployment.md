@@ -321,7 +321,7 @@ When the gate logs `ghostd synced — starting ghost-mining`, the node starts se
 ```bash
 sudo journalctl -u ghost-mining -f
 sudo journalctl -u sri-pool -u sri-translator -f
-curl -s 'http://127.0.0.1:8080/health?unsigned=true'      # peer_count should be above 0
+curl -s 'http://127.0.0.1:8080/health?unsigned=true'      # peer_count: share-chain relay peers (0 until a peer connects)
 sudo -u ghost /opt/ghost/bin/ghost-cli -conf=/etc/bitcoin/bitcoin.conf getblockchaininfo
 ```
 
@@ -378,7 +378,7 @@ When it is on, `ghost-auto-update.timer` runs `/opt/ghost/bin/ghost-auto-update.
 2. downloads the tarball, `SHA256SUMS.txt` and `SHA256SUMS.txt.asc`, and verifies the signature against the same pinned key and the tarball's checksum — on any failure no binary is touched;
 3. backs up the current binaries next to themselves as `*.bak.<timestamp>`;
 4. stops `sri-translator`, `sri-pool`, `ghost-mining` and `ghostd` in that order, swaps in the new `ghostd`, `ghost-mining`, `pool_sv2` and `translator_sv2` (and `ghost-cli` and `ghost-admin` where installed), and starts them again in the opposite order;
-5. checks that ghostd's RPC answers, that ghost-mining's `/health` reports more than zero peers, and that the stratum stack is listening on 34255 and 3333, and rolls all of them back to the backups if any check fails.
+5. checks that ghostd's RPC answers, that ghost-mining's `/health` reports a share-chain relay peer count (above zero if the node had relay peers before the update; a node with none, such as the first node of a network, is not rolled back for that), and that the stratum stack is listening on 34255 and 3333, and rolls all of them back to the backups if any check fails.
 
 The SV2 binaries always move with `ghost-mining`: a release that does not carry one your node runs is refused before anything is stopped.
 

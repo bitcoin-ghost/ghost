@@ -265,18 +265,34 @@ health_ghostd() {
   return 1
 }
 
+# ghost-mining's /health peer_count: the share-chain relay's peers, as pool_sv2 reports them.
+# Empty when ghost-mining does not answer or pool_sv2 did not (it reports null then).
+read_peer_count() {
+  curl -fsS --max-time 8 "http://127.0.0.1:8080/health?unsigned=true" 2>/dev/null \
+    | grep -oE '"peer_count"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1 || true
+}
+
+# PEERS_BEFORE is the peer count read before anything was stopped. A node pool node may have no
+# relay peers at all (the first node of a network, or one nobody has dialled yet), and requiring
+# more than zero rolled back every update on such a node, healthy or not. So ghost-mining must
+# answer with a count (pool_sv2 is up and reporting), and a node that had peers must have them
+# again: an update that cut the node off still rolls back.
 health_ghost_pool() {
-  local resp pc
+  local pc need=0
+  [[ "${PEERS_BEFORE:-}" =~ ^[0-9]+$ ]] && (( PEERS_BEFORE > 0 )) && need=1
   for _ in $(seq 1 30); do
-    resp="$(curl -fsS --max-time 8 "http://127.0.0.1:8080/health?unsigned=true" 2>/dev/null || true)"
-    pc="$(echo "$resp" | grep -oE '"peer_count"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1 || true)"
-    if [[ -n "$pc" && "$pc" -gt 0 ]]; then
-      log "health: ghost-mining /health peer_count=$pc"
+    pc="$(read_peer_count)"
+    if [[ -n "$pc" ]] && (( need == 0 || pc > 0 )); then
+      log "health: ghost-mining /health peer_count=$pc (before the update: ${PEERS_BEFORE:-unknown})"
       return 0
     fi
     sleep 2
   done
-  err "health: ghost-mining /health peer_count not > 0 (last='${pc:-none}')"
+  if (( need )); then
+    err "health: ghost-mining /health peer_count not > 0 (last='${pc:-none}'; it had ${PEERS_BEFORE} before the update)"
+  else
+    err "health: ghost-mining /health reports no peer count (last='${pc:-none}'): ghost-mining or pool_sv2 is not answering"
+  fi
   return 1
 }
 
@@ -579,6 +595,8 @@ main() {
   # 7. Stop services (reverse start order: translator, pool, pay, ghost-mining, ghostd), each
   #    verified inactive. Nothing has been swapped yet, so a refusal rolls back to a no-op.
   local STOP_FAILED="" START_FAILED=""
+  PEERS_BEFORE="$(read_peer_count)"
+  log "relay peers before the update: ${PEERS_BEFORE:-unknown}"
   stop_all || { err "$STOP_FAILED would not stop — rolling back"; rollback; write_status "rolled-back" "$STOP_FAILED failed to stop" "$latest"; exit 1; }
 
   # 8. Swap the verified binaries into place atomically (install = temp+rename).
