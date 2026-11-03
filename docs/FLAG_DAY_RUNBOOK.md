@@ -21,7 +21,7 @@ Nothing below is to be run until every one of these is set. They are not default
 | `<NP_VERSION>` | The node pool release carrying `MAINNET_START` | Cut after step 4 |
 | `<OLD_NODES>` | Old nodes that export (vm1..vm8) | Every node that still holds the checkpoint at F |
 | `<NEW_NODES>` | Node pool servers | Own servers; never co-hosted with an old node |
-| `<P2PKH_POLICY>` | How balances held by P2PKH addresses are carried | The node pool pays only P2SH, P2WPKH, P2WSH and P2TR; the import refuses any other row (step 3). **Decided 2026-11-03:** one P2PKH payee (`148WRj…CXTN`, 0.7% of owed work on 11-03); the user gets a segwit/taproot address from its owner. No re-keying tool exists (a re-keyed row changes the export digest the old nodes agree on), so unless one is built the row is left out of the import and its owner is paid the exported amount once, by hand, after launch |
+| `<P2PKH_POLICY>` | How balances held by P2PKH addresses are carried | The node pool pays only P2SH, P2WPKH, P2WSH and P2TR; the import refuses any other row (step 3). **Decided 2026-11-03:** one P2PKH payee (`148WRj…CXTN`, 0.7% of owed work on 11-03); the user decided to **delete it**. The exporter (`feat/ledger-export-fixes` 91798e320) drops every non-payee-class row from `miners`, `genesis_table` and `totals`, lists it in `deleted` and `warnings` (outside the digest), so all nodes still agree and the import accepts the export |
 
 Paths on an old node: `ghost-mining` runs as `ghost` with `--data-dir /home/ghost/.ghost`, so the
 database is `/home/ghost/.ghost/ghost.db`. On a node pool node the relay's store is
