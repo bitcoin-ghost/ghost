@@ -119,9 +119,9 @@ About 5,000 new lines, removals of about 140,000 lines, and 16-22 weeks end to e
 2. Hardware access for the signet stage of Phase 3.
 3. A real outside operator for the ninth-node stage.
 4. Every merge, roll, and the freeze height.
-5. The work-to-sats rate and the export source (full shard table recommended; not built: the exporter reads checkpoints only, the top 200).
-6. (2026-11-03) How balances held by P2PKH addresses are carried: the node pool cannot pay P2PKH (spec 2.1) and the import refuses such rows. The old fleet accepted P2PKH; the rehearsal population had 15%.
-7. (2026-11-03) Whether `MAINNET_START` may leave the table digest to config, so the release can be cut before the freeze (today the release must follow the export, and work the old fleet credits between the freeze and the repoint is not exported).
+5. The work-to-sats rate, given at export time. Export source **decided 2026-11-03: the checkpoint export** (3 addresses owed on the live fleet, all inside the top 200; a full-shard-table source is not built).
+6. (2026-11-03) P2PKH balances: **decided 2026-11-03, deleted.** The exporter drops rows the node pool cannot pay and lists them outside the digest (`feat/ledger-export-fixes` 91798e320). One live address (0.7% of owed work on 11-03).
+7. (2026-11-03) Recommended: keep the digest compiled in (the old network freezes at the export and is shut down after migration, so the only cost is the release build, about an hour, between export and install). Whether `MAINNET_START` may leave the table digest to config, so the release can be cut before the freeze (today the release must follow the export, and work the old fleet credits between the freeze and the repoint is not exported).
 
 ## 6. Open design items for spec freeze
 - **SV2 standard channels are allowed (decided 11-02).** An SV2 miner on a standard channel receives only a header, so it always gets the full 500-output class. W2.3 must stamp the per-channel tag in the pool-built coinbase.
