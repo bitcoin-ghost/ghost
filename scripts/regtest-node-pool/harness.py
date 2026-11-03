@@ -680,6 +680,11 @@ authority_pubkey = "{POOL_PUB}"
 class Harness:
     def __init__(self, args):
         self.args = args
+        # A run's stores (and its genesis import, which runs once) belong to that run: a reused
+        # work dir would start every node on the last run's state. Refuse one that is not empty.
+        if args.workdir and os.path.isdir(args.workdir) and os.listdir(args.workdir):
+            raise SystemExit(f"work dir {args.workdir} is not empty (a previous run's?); pass a new "
+                             "one, or none for a fresh temporary dir")
         self.work = args.workdir or tempfile.mkdtemp(prefix="np-regtest-")
         os.makedirs(self.work, exist_ok=True)
         self.nodes = []
