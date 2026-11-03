@@ -213,8 +213,17 @@ struct State {
     first_earning: Option<u32>,
     void_warned: Option<u32>,
     /// A new tip whose template was not served: its `SetNewPrevHash` waits here, unsent, until
-    /// the table arrives ([`NodePool::take_pending_tip`]).
+    /// the table arrives ([`NodePool::hold_tip`]).
     pending_tip: Option<SetNewPrevHash<'static>>,
+    /// Future templates that arrived while a tip was held, in arrival order. Serving the held tip
+    /// activates its replayed template, and activating a template drops every other future job
+    /// in every channel: these are given back to the channels right after, so the
+    /// `SetNewPrevHash` that names one of them finds it (the soak's crash, `template 6776`).
+    held_futures: Vec<NewTemplate<'static>>,
+    /// The last template a tip was held for repair after a channel did not hold it
+    /// ([`NodePool::hold_tip_for_repair`]): one repair per template, so a channel that fails
+    /// again does not hold every tip for ever.
+    repaired: Option<u64>,
 }
 
 /// A cached table's key: the job's parent anchor and height.
@@ -399,6 +408,10 @@ impl NodePool {
     /// cached. `None` when there is no relay, it does not answer in time, or it does not hold
     /// `parent`.
     pub async fn fetch_table(&self, parent: [u8; 32], h: u32) -> Option<Arc<Table>> {
+        #[cfg(feature = "np-fault-injection")]
+        if crate::node_pool_fault::table_withheld(h) {
+            return None;
+        }
         if let Some(t) = self.cached_table(&parent, h) {
             return Some(t);
         }
@@ -578,9 +591,33 @@ impl NodePool {
     }
 
     /// A new tip whose template was not served: its `SetNewPrevHash` waits until the table
-    /// arrives. Replaces any older one.
+    /// arrives. Replaces any older one, and with it every held future template it supersedes
+    /// (template ids only grow).
     pub fn hold_tip(&self, tip: SetNewPrevHash<'static>) {
-        self.lock().pending_tip = Some(tip);
+        let mut st = self.lock();
+        st.held_futures.retain(|t| t.template_id > tip.template_id);
+        st.pending_tip = Some(tip);
+    }
+
+    /// A `SetNewPrevHash` some channel could not take (it did not hold the template it names):
+    /// hold the tip so the next tick rebuilds it for every channel from the active template, as
+    /// for a tip held for its table. Only when the active template is the one the tip names
+    /// (else the rebuild would put the new prev hash on another template's job), and once per
+    /// template. Returns whether the tip is held.
+    pub fn hold_tip_for_repair(&self, tip: SetNewPrevHash<'static>) -> bool {
+        {
+            let mut st = self.lock();
+            let known = st
+                .active_template
+                .as_ref()
+                .is_some_and(|t| t.template_id == tip.template_id);
+            if !known || st.repaired == Some(tip.template_id) {
+                return false;
+            }
+            st.repaired = Some(tip.template_id);
+        }
+        self.hold_tip(tip);
+        true
     }
 
     /// The tip waiting for its table, if any.
@@ -588,9 +625,39 @@ impl NodePool {
         self.lock().pending_tip.clone()
     }
 
-    /// Stop holding a tip: it was served, or a newer tip replaced it.
+    /// Stop holding a tip: it was served, or a newer tip replaced it. The future templates kept
+    /// for its replay go with it.
     pub fn clear_pending_tip(&self) {
-        self.lock().pending_tip = None;
+        let mut st = self.lock();
+        st.pending_tip = None;
+        st.held_futures.clear();
+    }
+
+    /// A future template arrived: while a tip is held, keep it for the replay after the held tip
+    /// is served ([`NodePool::take_held_tip`]). Returns whether it was kept.
+    pub fn note_future_template(&self, template: &NewTemplate<'_>) -> bool {
+        let mut st = self.lock();
+        let Some(tip) = st.pending_tip.as_ref() else {
+            return false;
+        };
+        if !template.future_template || template.template_id <= tip.template_id {
+            return false;
+        }
+        let t = template.clone().into_static();
+        st.held_futures.retain(|h| h.template_id != t.template_id);
+        st.held_futures.push(t);
+        while st.held_futures.len() > FUTURE_TEMPLATES_KEPT {
+            st.held_futures.remove(0);
+        }
+        true
+    }
+
+    /// Stop holding the tip to serve it: the held `SetNewPrevHash` and the future templates that
+    /// arrived since, in arrival order, to be given back to the channels after it.
+    pub fn take_held_tip(&self) -> Option<(SetNewPrevHash<'static>, Vec<NewTemplate<'static>>)> {
+        let mut st = self.lock();
+        let tip = st.pending_tip.take()?;
+        Some((tip, std::mem::take(&mut st.held_futures)))
     }
 
     /// What a template gives the coinbase: its height, its witness commitment (its only output)

@@ -13,8 +13,18 @@
 //!   more than the ledger owes it while treasury plus miners still make the subsidy.
 //!
 //! Anything else, or unset, changes nothing.
+//!
+//! `GHOST_NP_TABLE_LATE_MS=N` makes the relay's snapshot table late: a table for a job height is
+//! withheld for N ms after pool_sv2 first asks for that height, as a relay held up by slow
+//! settlement would (24 h soak, node0). Past `TABLE_WAIT` (2 s) the new tip's first template is
+//! not served and the tip is held until the table comes: the held-tip path, on every Bitcoin
+//! block. Unset or 0: tables are never late.
 
-use std::sync::OnceLock;
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 use ghost_common::canonical_payout::CoinbaseOutput;
 use tracing::warn;
@@ -55,6 +65,48 @@ fn parse(v: Option<&str>) -> Fault {
         Some("overpay") => Fault::Overpay,
         _ => Fault::None,
     }
+}
+
+fn table_late() -> Option<Duration> {
+    static LATE: OnceLock<Option<Duration>> = OnceLock::new();
+    *LATE.get_or_init(|| {
+        let late = parse_late(std::env::var("GHOST_NP_TABLE_LATE_MS").ok().as_deref());
+        if let Some(d) = late {
+            warn!(
+                late_ms = d.as_millis() as u64,
+                "NODE_POOL_FAULT: this pool_sv2 withholds every snapshot table (test build)"
+            );
+        }
+        late
+    })
+}
+
+fn parse_late(v: Option<&str>) -> Option<Duration> {
+    v?.trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+}
+
+/// Whether the table for job height `h` is still withheld (`GHOST_NP_TABLE_LATE_MS`).
+pub fn table_withheld(h: u32) -> bool {
+    static FIRST_ASKED: OnceLock<Mutex<HashMap<u32, Instant>>> = OnceLock::new();
+    let Some(late) = table_late() else {
+        return false;
+    };
+    let mut asked = FIRST_ASKED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    withheld_at(&mut asked, h, late, Instant::now())
+}
+
+fn withheld_at(asked: &mut HashMap<u32, Instant>, h: u32, late: Duration, now: Instant) -> bool {
+    let first = *asked.entry(h).or_insert(now);
+    // Heights only grow: forget the old ones.
+    asked.retain(|k, _| k.saturating_add(16) >= h);
+    now.duration_since(first) < late
 }
 
 /// The script a wrong-treasury node pays instead of the treasury.
@@ -171,6 +223,32 @@ mod tests {
             (0, vec![0x6a, 0x01]),
             (0, vec![0x6a, 0x02]),
         ]
+    }
+
+    #[test]
+    fn a_late_table_is_withheld_for_its_delay_from_the_first_ask() {
+        assert_eq!(parse_late(Some("2500")), Some(Duration::from_millis(2500)));
+        assert_eq!(parse_late(Some("0")), None);
+        assert_eq!(parse_late(Some("x")), None);
+        assert_eq!(parse_late(None), None);
+        let late = Duration::from_millis(2500);
+        let mut asked = HashMap::new();
+        let t0 = Instant::now();
+        assert!(withheld_at(&mut asked, 100, late, t0));
+        assert!(withheld_at(
+            &mut asked,
+            100,
+            late,
+            t0 + Duration::from_millis(2499)
+        ));
+        assert!(!withheld_at(&mut asked, 100, late, t0 + late));
+        // A new height starts its own delay.
+        let t1 = t0 + Duration::from_secs(10);
+        assert!(withheld_at(&mut asked, 101, late, t1));
+        assert!(
+            !withheld_at(&mut asked, 100, late, t1),
+            "the old height stays released"
+        );
     }
 
     #[test]

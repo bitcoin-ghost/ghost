@@ -48,6 +48,8 @@ use crate::{
     utils::DownstreamMessage,
 };
 
+#[cfg(test)]
+mod held_tip_tests;
 mod mining_message_handler;
 mod node_pool_jobs;
 mod template_distribution_message_handler;
@@ -301,6 +303,56 @@ impl ChannelManager {
         };
 
         Ok(channel_manager)
+    }
+
+    /// A channel manager over `node_pool` with no template provider, relay or listener behind
+    /// it, for tests that drive its handlers directly. Returns it and the receiving end of the
+    /// template provider channel.
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        node_pool: crate::node_pool::NodePool,
+        api: crate::node_pool_api::NodePoolApi,
+    ) -> Self {
+        let (tp_sender, tp_receiver) = unbounded();
+        let (_, downstream_receiver) = unbounded();
+        let factory = || {
+            ExtendedExtranonce::new(
+                0..0,
+                0..POOL_ALLOCATION_BYTES,
+                POOL_ALLOCATION_BYTES..POOL_ALLOCATION_BYTES + CLIENT_SEARCH_SPACE_BYTES,
+                Some(vec![1]),
+            )
+            .expect("valid ranges")
+        };
+        ChannelManager {
+            channel_manager_data: Arc::new(Mutex::new(ChannelManagerData {
+                downstream: HashMap::new(),
+                extranonce_prefix_factory_extended: factory(),
+                extranonce_prefix_factory_standard: factory(),
+                downstream_id_factory: AtomicUsize::new(1),
+                vardiff: HashMap::new(),
+                last_future_template: None,
+                last_new_prev_hash: None,
+            })),
+            channel_manager_channel: ChannelManagerChannel {
+                tp_sender,
+                tp_receiver,
+                downstream_sender: Arc::new(Mutex::new(HashMap::new())),
+                downstream_receiver,
+            },
+            pool_tag_string: String::new(),
+            share_batch_size: 100,
+            shares_per_minute: 6.0,
+            coinbase_reward_script: CoinbaseRewardScript::from_descriptor(
+                "addr(bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4)",
+            )
+            .expect("a valid descriptor"),
+            supported_extensions: vec![],
+            required_extensions: vec![],
+            share_webhook_sender: None,
+            node_pool: Arc::new(node_pool),
+            node_pool_api: Arc::new(api),
+        }
     }
 
     // Bootstraps a group channel with the given parameters.

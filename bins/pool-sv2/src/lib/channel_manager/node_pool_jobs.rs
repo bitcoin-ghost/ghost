@@ -181,11 +181,17 @@ impl ChannelManager {
     /// every channel gets a job on the active template and then its `SetNewPrevHash`, as if the
     /// template provider had sent them just now. Returns whether a tip is still held, or was
     /// just served (either way the caller's own rebuild is not needed).
+    ///
+    /// Activating the replayed template drops every other future job in every channel (the job
+    /// store keeps one future generation). A future template that arrived during the hold, whose
+    /// `SetNewPrevHash` is still to come, is therefore given back to the channels right after,
+    /// in arrival order: without that, its `SetNewPrevHash` named a template no channel held and
+    /// the whole pool shut down (24 h soak, node0, templates 6775/6776).
     pub(crate) async fn node_pool_serve_held_tip(&self) -> bool {
         let np = self.node_pool.clone();
-        let Some(tip) = np.pending_tip() else {
+        if np.pending_tip().is_none() {
             return false;
-        };
+        }
         let Some(active) = np.active_template() else {
             return true;
         };
@@ -194,8 +200,9 @@ impl ChannelManager {
         if !np.prepare_job_basis(&future).await {
             return true;
         }
-        np.clear_pending_tip();
-        let mut tip = tip;
+        let Some((mut tip, queued)) = np.take_held_tip() else {
+            return true;
+        };
         tip.template_id = active.template_id;
         let mut cm = self.clone();
         if let Err(e) = cm.handle_new_template(None, future, None).await {
@@ -210,6 +217,24 @@ impl ChannelManager {
             template_id = active.template_id,
             "NODE_POOL: the held tip is served: its snapshot table arrived"
         );
+        for t in queued {
+            if t.template_id == active.template_id {
+                continue;
+            }
+            let id = t.template_id;
+            match cm.handle_new_template(None, t, None).await {
+                Ok(()) => info!(
+                    template_id = id,
+                    "NODE_POOL: a future template that arrived during the hold is given back to \
+                     the channels"
+                ),
+                Err(e) => error!(
+                    template_id = id,
+                    error = ?e,
+                    "NODE_POOL: replaying a future template that arrived during the hold failed"
+                ),
+            }
+        }
         true
     }
 
