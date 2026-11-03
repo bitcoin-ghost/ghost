@@ -152,6 +152,9 @@ OWNER[8566]=pool_sv2; OWNER[8332]=ghostd; CHAIN=main; pf
 has "ports held by this node pass (re-run)" "[PASS] port 8566 is held by this node's pool_sv2 (re-run)" "$out"
 has "a re-run's Bitcoin node answers" "[PASS] Bitcoin node answers on 127.0.0.1:8332 (chain main)" "$out"
 is "and that passes" 0 "$rc"
+# (that branch reads /etc/bitcoin/bitcoin.conf itself, so its message is checked in the source)
+is "an RPC port that refuses bitcoin.conf's password says how to repair it" 1 \
+   "$($G -c 'does not answer with /etc/bitcoin/bitcoin.conf.s credentials.*sudo systemctl restart ghostd, then re-run' "$INSTALLER" || true)"
 CHAIN=signet; pf
 has "a Bitcoin node on another chain fails" "[FAIL] Bitcoin node on 127.0.0.1:8332 runs chain 'signet', not mainnet" "$out"
 CHAIN=""; OWNER=()

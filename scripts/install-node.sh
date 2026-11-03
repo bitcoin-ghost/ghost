@@ -562,7 +562,7 @@ np_preflight() {
       pf_line FAIL "Bitcoin node on 127.0.0.1:8332 runs chain '${chain}', not ${NETWORK}"
     fi
   elif [[ -r /etc/bitcoin/bitcoin.conf ]] && [[ -n "$(pf_port_owner 8332)" ]]; then
-    pf_line FAIL "Bitcoin RPC port 8332 is listening but does not answer with /etc/bitcoin/bitcoin.conf's credentials"
+    pf_line FAIL "Bitcoin RPC port 8332 is listening but does not answer with /etc/bitcoin/bitcoin.conf's credentials (a re-run by an older installer changed the password under a running ghostd: sudo systemctl restart ghostd, then re-run)"
   else
     pf_line PASS "no Bitcoin node yet: ghostd is installed and checked again once started"
   fi
