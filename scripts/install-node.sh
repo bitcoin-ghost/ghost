@@ -1068,6 +1068,13 @@ if [[ -n "$POOL_NAME" ]]; then
   fi
 fi
 
+# A re-run on a node that is running: noted before anything changes, so the node is restarted on
+# the new binaries and configs at the end (section 11). Nothing else here restarts it.
+NODE_WAS_RUNNING=false
+for u in ghostd ghost-mining sri-pool sri-translator; do
+  systemctl is-active --quiet "$u" 2>/dev/null && NODE_WAS_RUNNING=true
+done
+
 # ────────────────────────────── 1. packages ──────────────────────────────────
 log "Installing dependencies"
 export DEBIAN_FRONTEND=noninteractive
@@ -1209,7 +1216,13 @@ cd /
 
 # ─────────────────────────── 4. fresh secrets ────────────────────────────────
 log "Generating fresh node secrets"
-RPCPW="$(openssl rand -hex 32)"
+# The RPC password is kept across a re-run like the secrets below. A fresh one every run left the
+# running ghostd on the old password while bitcoin.conf, and so every tool and check that reads
+# it (ghost-cli, the boot gate, the updater's health check), carried the new one.
+if [[ -f /etc/bitcoin/bitcoin.conf ]] && grep -qE '^rpcpassword=[0-9a-fA-F]{64}$' /etc/bitcoin/bitcoin.conf; then
+  RPCPW="$(sed -nE 's/^rpcpassword=([0-9a-fA-F]{64})$/\1/p' /etc/bitcoin/bitcoin.conf | head -1)"
+fi
+[[ -n "${RPCPW:-}" ]] || RPCPW="$(openssl rand -hex 32)"
 # internal_api_secret: the shared HMAC secret between ghost-mining and the node
 # dashboard. Generate ONCE and REUSE any existing value on re-runs, so an
 # upgrade/re-provision never rotates it out from under the dashboard (a rotated
@@ -1794,6 +1807,9 @@ Group=ghost
 ExecStart=/opt/ghost/bin/ghostd -conf=/etc/bitcoin/bitcoin.conf -datadir=/var/lib/bitcoin ${REAPER_FLAGS}
 Restart=on-failure
 RestartSec=30
+# Core flushes its chainstate on stop, which can outlast systemd's default 90 s; a SIGKILL there
+# costs a reindex. Bitcoin Core's own unit allows 600 s.
+TimeoutStopSec=600
 LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
@@ -4237,6 +4253,16 @@ fi
 # ─────────────────────────────── 11. start ───────────────────────────────────
 log "Starting services"
 systemctl daemon-reload
+# A re-run replaced the binaries and rewrote the configs under a running node, which kept running
+# the deleted binaries with the old configs until something restarted it. Restart it as a boot
+# does: the stratum stack and the node stop, ghostd restarts, and the gate (below) starts the rest
+# once ghostd answers.
+if [[ "$NODE_WAS_RUNNING" == true ]]; then
+  log "Re-run: restarting the node on the new binaries and configs"
+  systemctl stop sri-translator sri-pool ghost-mining >/dev/null 2>&1 || true
+  systemctl restart ghostd
+  systemctl stop ghost-mining-gate >/dev/null 2>&1 || true
+fi
 systemctl enable --now ghostd >/dev/null 2>&1
 # Nothing else is started or enabled here. The gate is the ONLY thing that starts
 # ghost-mining and the SV2 stratum stack, once ghostd has left initial block

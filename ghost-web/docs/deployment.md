@@ -230,7 +230,7 @@ Before step 1 the preflight runs (see *Preflight*, above); a FAIL stops the inst
 7. **Node identity.** Generates `/home/ghost/.ghost/node.key` with `ghost-mining --generate-identity` — unless one already exists, in which case it is kept.
 8. **SV2 keys.** Generates a fresh SV2 pool authority keypair for this node, and derives ghost-mining's template-server key from `node.key` so pool_sv2 can pin it.
 9. **Units.** Installs the units below, the firewall, the restart-loop watchdog and the auto-updater.
-10. **Start.** Enables and starts `ghostd` and `ghost-mining-gate`. Nothing else.
+10. **Start.** Enables and starts `ghostd` and `ghost-mining-gate`. Nothing else. On a re-run over a running node it first stops the stratum stack and the node and restarts `ghostd` (see *Re-running the installer*).
 
 ### Files
 
@@ -350,7 +350,9 @@ The installer does not install the node dashboard. It writes `/etc/systemd/syste
 
 ### Re-running the installer
 
-Re-running keeps the things that identify the node: an existing `node.key` is kept, and `internal_api_secret`, `signing_key` and the SV2 authority keypair are read back from the existing `pool.toml` and `pool-config.toml` and reused, so SV2 miners that pinned the authority key keep working. Without the flags, the fee address, relay peers and a set share-chain genesis are also read back from `pool-config.toml`; an install from before the node pool, which has no fee address, uses its old payout address (`coinbase_reward_script`) as the fee address and says so. The relay store `/var/lib/ghost/node-pool.db` is never touched. Everything else is regenerated: `bitcoin.conf`, `pool.toml`, `pool-config.toml` and `translator-config.toml` are rewritten from the flags you pass this time, with a new RPC password. Hand edits to those files do not survive a re-run, and a re-run without the flags you used the first time sets those options back to their defaults.
+Re-running keeps the things that identify the node: an existing `node.key` is kept, and `internal_api_secret`, `signing_key` and the SV2 authority keypair are read back from the existing `pool.toml` and `pool-config.toml` and reused, so SV2 miners that pinned the authority key keep working. Without the flags, the fee address, relay peers and a set share-chain genesis are also read back from `pool-config.toml`; an install from before the node pool, which has no fee address, uses its old payout address (`coinbase_reward_script`) as the fee address and says so. The relay store `/var/lib/ghost/node-pool.db` is never touched. The RPC password in `bitcoin.conf` is kept too, and so are a custom signet's challenge and the Bitcoin peers (`--signet-challenge`, `--bitcoin-peer`). Everything else is regenerated: `bitcoin.conf`, `pool.toml`, `pool-config.toml` and `translator-config.toml` are rewritten from the flags you pass this time. Hand edits to those files do not survive a re-run, and a re-run without the flags you used the first time sets those options back to their defaults.
+
+If the node is running, a re-run restarts it at the end, as a boot does: `sri-translator`, `sri-pool` and `ghost-mining` stop, `ghostd` restarts, and the gate starts the other three again once ghostd answers. Without that, the node kept running the binaries the re-run had replaced, with the configs it had read at its last start.
 
 ## Automatic updates
 

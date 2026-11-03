@@ -364,6 +364,35 @@ hasnt "no challenge: the public signet" "signetchallenge" "$w"
 hasnt "no peers: no addnode" "addnode" "$w"
 has "and the file is still complete" "blockreservedweight=90000" "$w"
 
+echo "7d. a re-run restarts the node on what it wrote, with the same RPC password"
+secrets_block="$(awk '/^log "Generating fresh node secrets"$/{on=1;next} on&&/^if \[\[ -f \/etc\/ghost\/pool.toml \]\]/{exit} on' "$INSTALLER")"
+is "the RPC password step is present" yes "$([ -n "$secrets_block" ] && echo yes)"
+rpcpw() { ( unset RPCPW; eval "${secrets_block//\/etc\/bitcoin\/bitcoin.conf/$TMP/bc.conf}"; echo "$RPCPW" ); }
+pw="$(printf 'ab%.0s' {1..32})"
+printf 'chain=signet\n[signet]\nrpcuser=u\nrpcpassword=%s\n' "$pw" > "$TMP/bc.conf"
+is "a re-run keeps the RPC password" "$pw" "$(rpcpw)"
+rm -f "$TMP/bc.conf"
+fresh="$(rpcpw)"
+is "a fresh install makes a new one" yes "$([[ "$fresh" =~ ^[0-9a-f]{64}$ && "$fresh" != "$pw" ]] && echo yes)"
+start_block="$(awk '/^log "Starting services"$/{on=1;next} on{print} on&&/^systemctl enable --now ghost-mining-gate/{exit}' "$INSTALLER")"
+is "the start step is present" yes "$([ -n "$start_block" ] && echo yes)"
+started() {   # NODE_WAS_RUNNING: the systemctl calls of the start step, in order
+    ( calls=""; systemctl() { calls+="$*;"; }; log() { :; }; NODE_WAS_RUNNING="$1"
+      eval "$start_block"; echo "${calls//>\/dev\/null 2>&1/}" )
+}
+is "a fresh install starts ghostd and the gate, nothing else" \
+   "daemon-reload;enable --now ghostd;enable --now ghost-mining-gate;" "$(started false)"
+is "a re-run on a running node stops the stack, restarts ghostd, and lets the gate start the rest" \
+   "daemon-reload;stop sri-translator sri-pool ghost-mining;restart ghostd;stop ghost-mining-gate;enable --now ghostd;enable --now ghost-mining-gate;" \
+   "$(started true)"
+was_block="$(awk '/^NODE_WAS_RUNNING=false$/{on=1} on{print} on&&/^done$/{exit}' "$INSTALLER")"
+was() { ( systemctl() { [ "$1 $2" = "is-active --quiet" ] && [[ " $ACTIVE " == *" $3 "* ]]; }; ACTIVE="$1"; eval "$was_block"; echo "$NODE_WAS_RUNNING" ); }
+is "running: any of the node's units is active" true "$(was "sri-pool")"
+is "not running: none is" false "$(was "")"
+is "it is read before the installer changes anything" yes \
+   "$(awk '/^NODE_WAS_RUNNING=false$/{w=NR} /^apt-get update/{if(!a)a=NR} END{print (w && a && w<a)?"yes":"no"}' "$INSTALLER")"
+is "ghostd may take 600 s to flush on stop" 1 "$($G -c '^TimeoutStopSec=600$' "$INSTALLER" || true)"
+
 echo "7a. the test-only release mirror"
 TFP=0123456789ABCDEF0123456789ABCDEF01234567
 mirrored() {   # NETWORK MIRROR KEY_FP
