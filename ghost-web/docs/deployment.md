@@ -134,6 +134,8 @@ On a fresh install there is no Bitcoin node yet; ghostd is installed, and the in
 | `--relay-port <port>` | `8566` | The share-chain relay port peers dial. Opened on `ufw`. |
 | `--relay-peer <host:port>` | none | A relay peer to dial; repeat for more. More are learned from them. |
 | `--genesis-anchor <hex>`, `--genesis-height <n>` | the network's | The share chain's genesis anchor and its Bitcoin height. See *Share-chain genesis*, below. |
+| `--signet-challenge <hex>` | public signet | `--network signet` only: a custom signet's challenge (`signetchallenge`). Kept on a re-run. |
+| `--bitcoin-peer <host:port>` | none | A Bitcoin peer for ghostd to dial (`addnode`); repeat for more. Kept on a re-run. |
 | `--preflight-only` | | Run the preflight and exit. |
 | `--alert-webhook <url>` | none | Push endpoint for node alerts. Without it, `[alerts]` is written with `enabled = false`. |
 | `--alert-topic <name>` | `ghost-node` | Push topic. |
@@ -205,7 +207,7 @@ With `UNSET` the install completes, the preflight warns, the config carries a ma
 
 ### Networks
 
-`--network signet` or `regtest` writes `chain=<network>` and puts every `bitcoin.conf` setting in that chain's section, with the network's own P2P port (38333 or 18444); RPC stays on 8332. `pool.toml` gets `network = "<network>"`, and `assumevalid` is written only on mainnet.
+`--network signet` or `regtest` writes `chain=<network>` and puts every `bitcoin.conf` setting in that chain's section, with the network's own P2P port (38333 or 18444); RPC stays on 8332. `pool.toml` gets `network = "<network>"`, and `assumevalid` is written only on mainnet. `--network signet` alone is the public signet; a custom signet (the node pool's own test signet) takes `--signet-challenge <hex>`, and a node on it finds the chain only through peers that carry it, given with `--bitcoin-peer`. Both are read back from `bitcoin.conf` on a re-run, so a re-run without them stays on the same signet.
 
 ### Tor
 

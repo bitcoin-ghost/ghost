@@ -57,6 +57,11 @@ NETWORK="mainnet"          # mainnet | signet | regtest
 # and pool_sv2 refuses to start until it is set.
 RELAY_PORT="8566"
 RELAY_PEERS=""
+# A custom signet (`signetchallenge`, hex) and Bitcoin peers to dial (`addnode`, host:port). The
+# node pool's own signet is a custom one, and a node on it finds the chain only through peers that
+# carry it; without a challenge `--network signet` is the public signet.
+SIGNET_CHALLENGE=""
+BITCOIN_PEERS=""
 GENESIS_ANCHOR=""
 GENESIS_HEIGHT=""
 PREFLIGHT_ONLY="false"
@@ -107,6 +112,9 @@ Node pool:
                                 for mainnet or signet yet: without these the node is
                                 installed with an UNSET placeholder and pool_sv2 refuses to
                                 start until it is set.
+  --signet-challenge <hex>    signet only: a custom signet's challenge script (signetchallenge).
+                                Default: the public signet.
+  --bitcoin-peer <host:port>  A Bitcoin peer for ghostd to dial (addnode); repeat for more.
   --preflight-only            Run the preflight checks and exit; change nothing.
 
 Strongly recommended:
@@ -177,6 +185,8 @@ while [[ $# -gt 0 ]]; do
     --relay-peer)     RELAY_PEERS="${RELAY_PEERS:+$RELAY_PEERS }$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --genesis-anchor) GENESIS_ANCHOR="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --genesis-height) GENESIS_HEIGHT="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --signet-challenge) SIGNET_CHALLENGE="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --bitcoin-peer)   BITCOIN_PEERS="${BITCOIN_PEERS:+$BITCOIN_PEERS }$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --preflight-only) PREFLIGHT_ONLY="true"; shift;;
     --alert-webhook)  ALERT_WEBHOOK="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --alert-topic)    ALERT_TOPIC="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
@@ -572,6 +582,25 @@ np_preflight() {
       fi
     done
   fi
+  # ghostd's chain: a custom signet's challenge, and Bitcoin peers to dial.
+  if [[ -n "${SIGNET_CHALLENGE:-}" ]]; then
+    if [[ "$NETWORK" != signet ]]; then
+      pf_line FAIL "--signet-challenge is for --network signet, not ${NETWORK}"
+    elif [[ "$SIGNET_CHALLENGE" =~ ^([0-9a-fA-F]{2}){1,520}$ ]]; then
+      pf_line PASS "custom signet, challenge ${SIGNET_CHALLENGE:0:16}…"
+    else
+      pf_line FAIL "signet challenge '${SIGNET_CHALLENGE}' is not a hex script"
+    fi
+  elif [[ "$NETWORK" == signet ]]; then
+    pf_line WARN "no --signet-challenge: this node joins the public signet"
+  fi
+  for p in ${BITCOIN_PEERS:-}; do
+    if [[ "$p" =~ ^([^[:space:]=]+):([0-9]{1,5})$ ]] && (( BASH_REMATCH[2] > 0 && BASH_REMATCH[2] < 65536 )); then
+      pf_line PASS "Bitcoin peer ${p}"
+    else
+      pf_line FAIL "Bitcoin peer '${p}' is not host:port"
+    fi
+  done
   if [[ "$GENESIS_ANCHOR" == UNSET ]]; then
     pf_line WARN "no share-chain genesis is published for ${NETWORK}: pool_sv2 will refuse to start until one is set (--genesis-anchor/--genesis-height)"
   elif [[ "$NETWORK" == mainnet && "$GENESIS_ANCHOR" =~ ^[0-9a-fA-F]{64}$ && ! "$GENESIS_ANCHOR" =~ ^0{64}$
@@ -907,6 +936,17 @@ if [[ -z "$RELAY_PEERS" ]]; then
   RELAY_PEERS="$(old_key peers | tr -d '[]",')"
   RELAY_PEERS="$(_trim "$RELAY_PEERS")"
 fi
+# bitcoin.conf is rewritten on every run, so a custom signet's challenge and the Bitcoin peers are
+# read back from it when the flags do not say otherwise. Losing the challenge would move the node
+# to the public signet, a different chain.
+OLD_BITCOIN_CONF=/etc/bitcoin/bitcoin.conf
+if [[ -z "$SIGNET_CHALLENGE" && "$NETWORK" == signet && -r "$OLD_BITCOIN_CONF" ]]; then
+  SIGNET_CHALLENGE="$(sed -nE 's/^signetchallenge=([0-9a-fA-F]+)$/\1/p' "$OLD_BITCOIN_CONF" | head -1)"
+  [[ -n "$SIGNET_CHALLENGE" ]] && log "Keeping the custom signet challenge from ${OLD_BITCOIN_CONF}"
+fi
+if [[ -z "$BITCOIN_PEERS" && -r "$OLD_BITCOIN_CONF" ]]; then
+  BITCOIN_PEERS="$(sed -nE 's/^addnode=(.+)$/\1/p' "$OLD_BITCOIN_CONF" | paste -sd' ' -)"
+fi
 np_network_defaults "$NETWORK" "$SYNC_MODE" "$ARCHIVE"
 if [[ -n "$GENESIS_ANCHOR" && -z "$GENESIS_HEIGHT" ]]; then
   err "--genesis-anchor needs --genesis-height: the anchor's Bitcoin height is part of the genesis."
@@ -1232,6 +1272,8 @@ fallbackfee=0.00001
 EOF
   # The assumevalid block is a mainnet block.
   [[ "$NETWORK" == mainnet ]] && echo "assumevalid=${ASSUMEVALID}"
+  [[ -n "$SIGNET_CHALLENGE" ]] && echo "signetchallenge=${SIGNET_CHALLENGE}"
+  for p in $BITCOIN_PEERS; do echo "addnode=${p}"; done
   # Node pool block reserve: room for the node pool's coinbase (up to 22 KB) in every template.
   # Must match NODE_POOL_BLOCK_RESERVED_WEIGHT in crates/ghost-common/src/node_pool_constants.rs.
   echo "blockreservedweight=90000"

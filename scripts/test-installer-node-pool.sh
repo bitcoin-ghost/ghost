@@ -182,6 +182,21 @@ has "a regtest genesis passes" "[PASS] share-chain genesis abcdcdcdcdcdcdcd… a
 has "regtest P2P port is checked" "[PASS] port 18444 is free" "$out"
 NETWORK=testnet; pf
 is "an unknown network fails" 1 "$rc"
+NETWORK=signet; FEE_ADDRESS=tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7; MEM=8000; DISK=100
+SIGNET_CHALLENGE=""; pf
+has "signet without a challenge warns it is the public signet" "[WARN] no --signet-challenge: this node joins the public signet" "$out"
+is "and passes" 0 "$rc"
+SIGNET_CHALLENGE="20$(printf 'ab%.0s' {1..32})7551"; BITCOIN_PEERS="seed.example:38333 10.0.0.2:38333"; pf
+has "a custom signet passes" "[PASS] custom signet, challenge 20abababababab" "$out"
+has "a Bitcoin peer passes" "[PASS] Bitcoin peer seed.example:38333" "$out"
+is "and passes" 0 "$rc"
+SIGNET_CHALLENGE="51x"; pf
+has "a challenge that is not hex fails" "[FAIL] signet challenge '51x' is not a hex script" "$out"
+SIGNET_CHALLENGE="51"; BITCOIN_PEERS="seed.example"; pf
+has "a Bitcoin peer without a port fails" "[FAIL] Bitcoin peer 'seed.example' is not host:port" "$out"
+NETWORK=regtest; FEE_ADDRESS=bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080; BITCOIN_PEERS=""; pf
+has "a challenge off signet fails" "[FAIL] --signet-challenge is for --network signet, not regtest" "$out"
+SIGNET_CHALLENGE=""; BITCOIN_PEERS=""
 
 echo "5. flags"
 arms="$(awk '/^while \[\[ \$# -gt 0 \]\]; do$/{on=1;next} on&&/^  esac$/{exit} on&&!/^  case /' "$INSTALLER" | $G -vE '^\s+-h\|--help|^\s+\*\)')"
@@ -193,12 +208,14 @@ parse() {
 $arms
         *) echo UNKNOWN; shift;;
       esac; done" 2>/dev/null
-      echo "$FEE_ADDRESS|$NETWORK|$RELAY_PEERS|$RELAY_PORT|$GENESIS_ANCHOR|$GENESIS_HEIGHT|$PREFLIGHT_ONLY|$CONFIG_FLAGS" )
+      echo "$FEE_ADDRESS|$NETWORK|$RELAY_PEERS|$RELAY_PORT|$GENESIS_ANCHOR|$GENESIS_HEIGHT|$PREFLIGHT_ONLY|$CONFIG_FLAGS${SIGNET_CHALLENGE:+|$SIGNET_CHALLENGE|$BITCOIN_PEERS}" )
 }
 is "--fee-address"        "x|mainnet||8566|||false|1" "$(parse --fee-address x)"
 is "--payout-address is its old name" "y|mainnet||8566|||false|1" "$(parse --payout-address y)"
 is "node pool flags" "x|regtest|a:1 b:2|9000|ab|7|true|7" \
    "$(parse --fee-address x --network regtest --relay-peer a:1 --relay-peer b:2 --relay-port 9000 --genesis-anchor ab --genesis-height 7 --preflight-only)"
+is "custom signet flags" "x|signet||8566|||false|5|51|s:1 t:2" \
+   "$(parse --fee-address x --network signet --signet-challenge 51 --bitcoin-peer s:1 --bitcoin-peer t:2)"
 for gone in --treasury-address --mining-mode --no-public-mining --capability --elder; do
     is "$gone is gone" 0 "$($G -cE "^[[:space:]]+${gone}\)" "$INSTALLER" || true)"
 done
@@ -312,6 +329,40 @@ hasnt "... with no warning that it is unavailable" "not available for node pool 
 is "the installer never tracks the latest release" 0 "$($G -c 'GHOST_VERSION=.*releases/latest' "$INSTALLER" || true)"
 is "the channel marker is written before the updater can be enabled" yes \
    "$(awk '/^cat > \/etc\/ghost\/release-channel /{m=NR} /systemctl enable --now ghost-auto-update.timer/{if(!t)t=NR} END{print (m && t && m<t)?"yes":"no"}' "$INSTALLER")"
+
+echo "7c. a custom signet survives a re-run"
+oldbc="$TMP/bitcoin.conf"
+signet_vars() {   # CHALLENGE_FLAG PEERS_FLAG: validation against $oldbc, prints challenge|peers
+    ( log() { :; }; err() { echo "ERR $*"; exit 1; }; usage() { :; }; np_preflight() { :; }
+      FEE_ADDRESS=tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7 NETWORK=signet
+      RELAY_PEERS="" RELAY_PORT=8566 GENESIS_ANCHOR="" GENESIS_HEIGHT="" PREFLIGHT_ONLY=false SYNC_MODE=ibd
+      ARCHIVE=false GHOST_VERSION=np-v9.9.9 AUTO_UPDATE=false SIGNET_CHALLENGE="$1" BITCOIN_PEERS="$2"
+      v="${validate//\/etc\/ghost\/pool-config.toml/$TMP/none}"
+      eval "${v//\/etc\/bitcoin\/bitcoin.conf/$oldbc}"
+      echo "$SIGNET_CHALLENGE|$BITCOIN_PEERS" ) 2>&1 | tail -1
+}
+printf 'chain=signet\n[signet]\nserver=1\nsignetchallenge=5175\naddnode=seed:38333\naddnode=10.0.0.9:38333\nprune=550\n' > "$oldbc"
+is "a re-run keeps the challenge and the Bitcoin peers" "5175|seed:38333 10.0.0.9:38333" "$(signet_vars '' '')"
+is "flags given this time win" "51|x:1" "$(signet_vars 51 x:1)"
+rm -f "$oldbc"
+is "a fresh install has neither" "|" "$(signet_vars '' '')"
+conf_block="$(awk '/^RPC_USER="ghostrpc_mainnet"$/{on=1} on{print} on&&/^} > \/etc\/bitcoin\/bitcoin.conf$/{exit}' "$INSTALLER")"
+is "the bitcoin.conf step is present" yes "$([ -n "$conf_block" ] && echo yes)"
+written() {   # NETWORK CHALLENGE PEERS: the bitcoin.conf the installer writes
+    ( NETWORK="$1" SIGNET_CHALLENGE="$2" BITCOIN_PEERS="$3" ARCHIVE=false SYNC_MODE=ibd RPCPW=pw NP_P2P_PORT=38333
+      ASSUMEVALID=00; set -e
+      eval "${conf_block//\/etc\/bitcoin\/bitcoin.conf/$TMP/written.conf}"
+      cat "$TMP/written.conf" )
+}
+w="$(written signet 5175 "seed:38333 10.0.0.9:38333")"
+has "the challenge is written" "signetchallenge=5175" "$w"
+has "each Bitcoin peer is an addnode" "addnode=seed:38333" "$w"
+has "... all of them" "addnode=10.0.0.9:38333" "$w"
+is "in the [signet] section" "[signet]" "$(printf '%s\n' "$w" | sed -n '2p')"
+w="$(written signet '' '')"
+hasnt "no challenge: the public signet" "signetchallenge" "$w"
+hasnt "no peers: no addnode" "addnode" "$w"
+has "and the file is still complete" "blockreservedweight=90000" "$w"
 
 echo "7a. the test-only release mirror"
 TFP=0123456789ABCDEF0123456789ABCDEF01234567
