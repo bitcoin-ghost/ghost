@@ -51,7 +51,7 @@ use ghost_common::zmq::{ZmqConfig, ZmqSubscriber};
 use ghost_policy::PolicyProfile;
 use ghost_reaper::ReaperConfig;
 use ghost_storage::Database;
-use ghost_verification::{start_server, GspHandler, VerificationState};
+use ghost_verification::{start_server, start_server_on, GspHandler, VerificationState};
 
 use ghost_pool::capacity;
 use ghost_pool::reorg::{ReorgConfig, ReorgHandler};
@@ -267,6 +267,11 @@ struct Args {
     /// TDP server port (default: 8442)
     #[arg(long, default_value = "8442")]
     tdp_port: u16,
+
+    /// Address the TDP server listens on (default: 127.0.0.1). Only the node's own pool_sv2
+    /// connects to it; give 0.0.0.0 only for a pool_sv2 on another machine.
+    #[arg(long, default_value = "127.0.0.1")]
+    tdp_bind: std::net::IpAddr,
 
     /// Disable native stratum server (use when running with SRI pool via TDP)
     #[arg(long)]
@@ -1928,7 +1933,15 @@ async fn main() -> Result<()> {
     if let Some(tls) = tls_server_config {
         let state_for_https = Arc::clone(&verification_state);
         tokio::spawn(async move {
-            if let Err(e) = start_server(state_for_https, verification_https_port, Some(tls)).await
+            // Loopback only: this listener served the old mesh's peer challenges, and nothing off
+            // the machine uses it on a node pool node.
+            if let Err(e) = start_server_on(
+                state_for_https,
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                verification_https_port,
+                Some(tls),
+            )
+            .await
             {
                 error!(
                     error = %e,
@@ -1938,7 +1951,7 @@ async fn main() -> Result<()> {
             }
         });
         info!(
-            "Verification HTTPS listening on port {} (identity-pinned TLS for peer mesh)",
+            "Verification HTTPS listening on 127.0.0.1:{} (identity-pinned TLS)",
             verification_https_port
         );
     }
@@ -2002,6 +2015,7 @@ async fn main() -> Result<()> {
             )
         })?;
         tdp_config.port = args.tdp_port;
+        tdp_config.listen_addr = args.tdp_bind.to_string();
         tdp_config.max_connections = 10;
         tdp_config.timeout_secs = 30;
 
@@ -2023,7 +2037,8 @@ async fn main() -> Result<()> {
         });
 
         info!(
-            "TDP server listening on port {} (Template Distribution Protocol for SRI pool)",
+            "TDP server listening on {}:{} (Template Distribution Protocol for SRI pool)",
+            args.tdp_bind,
             args.tdp_port
         );
     }
@@ -2208,7 +2223,7 @@ async fn main() -> Result<()> {
     info!("Ghost Pool is ready!");
     info!("  Stratum:    via SRI (connect to TDP)");
     if args.tdp_enabled {
-        info!("  TDP:        0.0.0.0:{}", args.tdp_port);
+        info!("  TDP:        {}:{}", args.tdp_bind, args.tdp_port);
     }
     info!("  HTTP API:   0.0.0.0:{}", http_port);
     info!("  Policy:     {}", policy.name);
