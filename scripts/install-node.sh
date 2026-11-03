@@ -156,6 +156,14 @@ Options:
   --non-interactive           Never prompt; use flags/defaults only (for scripts)
   -h, --help                  This help.
 
+Removing the node:
+  --uninstall                 Stop and remove the node's services, timers, binaries, dashboard,
+                                firewall rules (22/tcp stays), sudoers files and release channel.
+                                KEEPS its data: the chain, node-pool.db, node.key, the configs and
+                                the backups; installing again reuses them. Asks for confirmation.
+  --purge                     With --uninstall: delete that data too. Cannot be undone.
+  --yes                       With --uninstall: do not ask (for scripts).
+
 Environment:
   GHOST_VERSION=<release>     Required. np-latest (the newest node pool release) or an exact
                                 np-v<x.y.z> tag. Old-network tags (v1.11.x) are refused.
@@ -163,6 +171,12 @@ Environment:
 With no config flags on an interactive terminal, a guided setup wizard runs.
 Every install runs a preflight first (fee address, RAM, disk, ports, Bitcoin node,
 relay); a failed check stops it before anything is changed.
+
+The node dashboard is installed with the node and listens on 127.0.0.1:3000 only (reach it
+through an SSH tunnel). Its password is in /etc/ghost/dashboard.env (root-only).
+
+Re-running the installer on a node keeps its identity, keys, settings and ledger, and
+restarts the node (and the dashboard) on what it wrote.
 EOF
 }
 
@@ -173,6 +187,9 @@ EOF
 # always has.
 CONFIG_FLAGS=0
 NON_INTERACTIVE="false"
+UNINSTALL="false"
+PURGE="false"
+ASSUME_YES="false"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --fee-address)    FEE_ADDRESS="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
@@ -204,6 +221,9 @@ while [[ $# -gt 0 ]]; do
     --no-backups)     BACKUPS="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --node-pool)      shift;;   # the only mode now; kept so old command lines still run
     --non-interactive) NON_INTERACTIVE="true"; shift;;
+    --uninstall)      UNINSTALL="true"; shift;;
+    --purge)          PURGE="true"; shift;;
+    --yes)            ASSUME_YES="true"; shift;;
     -h|--help)        usage; exit 0;;
     *) echo "Unknown option: $1" >&2; usage; exit 1;;
   esac
@@ -515,6 +535,7 @@ pf_bitcoin_chain() {
     http://127.0.0.1:8332/ 2>/dev/null | grep -oE '"chain":[[:space:]]*"[a-z0-9]+"' | grep -oE '"[a-z0-9]+"$' | tr -d '"' || true
 }
 pf_resolves() { getent hosts "$1" >/dev/null 2>&1; }
+pf_dashboard_active() { systemctl is-active --quiet ghost-dashboard 2>/dev/null; }
 # The chain name bitcoind reports for a network.
 np_core_chain() { case "$1" in mainnet) echo main;; signet) echo signet;; regtest) echo regtest;; esac; }
 
@@ -552,6 +573,12 @@ np_preflight() {
       *) pf_line FAIL "port ${p} is in use by ${owner}; this node needs it";;
     esac
   done
+
+  # The dashboard's loopback port. Someone else on it only keeps the dashboard down, not the node.
+  owner="$(pf_port_owner 3000)"
+  if [[ -z "$owner" ]]; then pf_line PASS "port 3000 is free (node dashboard, loopback only)"
+  elif pf_dashboard_active; then pf_line PASS "port 3000 is held by this node's dashboard (re-run)"
+  else pf_line WARN "port 3000 is in use by ${owner}: the node dashboard will not start until it is free"; fi
 
   # The Bitcoin node. A re-run talks to the one already installed; a fresh install has none yet.
   chain="$(pf_bitcoin_chain)"
@@ -908,6 +935,119 @@ run_wizard() {
 
 [[ $EUID -eq 0 ]] || err "Run as root (sudo)."
 
+# >>> NP_UNINSTALL
+# --uninstall: take the node off this machine and keep its data; --purge takes the data too.
+# Removed: every unit, timer and drop-in this installer writes, /opt/ghost (binaries, helper
+# scripts, the dashboard and its Node.js runtime), the firewall rules it opened (22/tcp stays, so
+# ssh keeps working, and ufw stays enabled), its sudoers files, the release channel marker, the
+# installed-version file, the auto-update opt-in and the journald drop-in.
+# Kept unless --purge: the chain (/var/lib/bitcoin), the share-chain relay's store and the node's
+# other state (/var/lib/ghost), node.key and ghost-mining's database (/home/ghost/.ghost), the
+# configs that carry the node's keys and settings (/etc/ghost, /etc/bitcoin), the nightly backups
+# (/var/backups/ghost, /var/lib/ghost-backup) and the ghost user. Installing again over what was
+# kept reuses the node's identity, keys, fee address, peers and ledger, as a re-run does.
+# Kept between these markers so scripts/test-installer-uninstall.sh can run it against a throwaway
+# root (UNINSTALL_ROOT) with systemctl, ufw and userdel stood in for.
+UNINSTALL_ROOT="${UNINSTALL_ROOT:-}"
+NP_UNITS=(ghost-dashboard.service sri-translator.service sri-pool.service ghost-mining.service
+  ghost-mining-gate.service ghostd.service ghost-auto-update.timer ghost-auto-update.service
+  ghost-restart-watch.timer ghost-restart-watch.service ghost-backup.timer ghost-backup.service
+  ghost-mining-firewall.path ghost-mining-firewall.service)
+NP_UNIT_DROPINS=(ghost-dashboard.service.d ghost-mining.service.d ghost-auto-update.service.d)
+NP_DATA=(/var/lib/bitcoin /var/lib/ghost /home/ghost /etc/ghost /etc/bitcoin /var/backups/ghost
+  /var/lib/ghost-backup)
+NP_REMOVED_FILES=(/etc/sudoers.d/ghost-autoupdate /etc/sudoers.d/ghost-backup-offsite
+  /etc/ghost/release-channel /etc/ghost/version /etc/ghost/auto-update.conf
+  /etc/systemd/journald.conf.d/10-ghost.conf)
+
+# The TCP ports this installer opens: the Bitcoin P2P port and the relay port as configured
+# (all three networks' P2P defaults when the config is gone), the API, the stratum ports, and 8442,
+# which installs before the TDP server moved to loopback opened. Never 22.
+np_opened_ports() {
+  local r="$UNINSTALL_ROOT" p2p relay
+  p2p="$(sed -nE 's/^port=([0-9]+)$/\1/p' "$r/etc/bitcoin/bitcoin.conf" 2>/dev/null | head -1)"
+  relay="$(sed -nE 's/^listen = "[^"]*:([0-9]+)"$/\1/p' "$r/etc/ghost/pool-config.toml" 2>/dev/null | head -1)"
+  if [[ -n "$p2p" ]]; then echo "$p2p"; else printf '%s\n' 8333 38333 18444; fi
+  printf '%s\n' "${relay:-8566}" 8080 3333 34255 4444 8442
+}
+
+np_uninstall() {
+  local r="$UNINSTALL_ROOT" u p f d answer word=uninstall
+  [[ "$PURGE" == true ]] && word=purge
+  echo "This removes the Bitcoin Ghost node from this machine: its services, timers, binaries"
+  echo "(/opt/ghost), dashboard, firewall rules (except 22/tcp), sudoers files and release channel."
+  if [[ "$PURGE" == true ]]; then
+    echo "--purge: it ALSO DELETES the node's data, which cannot be undone:"
+    for d in "${NP_DATA[@]}"; do echo "    $d"; done
+    echo "  node.key (the node's identity) and the share-chain ledger are in there. Back them up first."
+  else
+    echo "The node's data is kept: the chain, node-pool.db, node.key, the configs and the backups."
+  fi
+  if [[ "$ASSUME_YES" != true ]]; then
+    # Never `read` stdin: under `curl … | sudo bash` stdin is this script (see --sync haze).
+    { true </dev/tty; } 2>/dev/null || err "--uninstall needs confirmation and there is no terminal to ask. Re-run with --yes."
+    read -rp "Type '${word}' to continue: " answer </dev/tty || answer=""
+    [[ "$answer" == "$word" ]] || err "Aborted. Nothing was changed."
+  fi
+
+  log "Stopping and removing the node's services"
+  for u in "${NP_UNITS[@]}"; do
+    systemctl disable --now "$u" >/dev/null 2>&1 || true
+  done
+  for u in "${NP_UNITS[@]}"; do rm -f "$r/etc/systemd/system/$u"; done
+  for d in "${NP_UNIT_DROPINS[@]}"; do rm -rf "${r:?}/etc/systemd/system/$d"; done
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl reset-failed >/dev/null 2>&1 || true
+
+  log "Removing /opt/ghost (binaries, helper scripts, dashboard, Node.js runtime)"
+  rm -rf "${r:?}/opt/ghost"
+
+  log "Removing the firewall rules the installer opened (22/tcp is left open)"
+  for p in $(np_opened_ports | sort -un); do
+    ufw delete allow "${p}/tcp" >/dev/null 2>&1 || true
+  done
+
+  log "Removing sudoers files, the release channel, the version and auto-update files"
+  for f in "${NP_REMOVED_FILES[@]}"; do rm -f "$r$f"; done
+
+  if [[ "$PURGE" == true ]]; then
+    log "Purging the node's data"
+    for d in "${NP_DATA[@]}"; do rm -rf "${r:?}$d"; done
+    if id ghost >/dev/null 2>&1; then userdel ghost >/dev/null 2>&1 || true; fi
+    echo
+    echo "  Bitcoin Ghost node removed, data included. Nothing of it is left in:"
+    for d in "${NP_DATA[@]}"; do echo "    $d"; done
+  else
+    echo
+    echo "  Bitcoin Ghost node removed. Kept (installing again reuses all of it):"
+    for d in "${NP_DATA[@]}"; do
+      [[ -e "$r$d" ]] || continue
+      printf '    %-22s %6s  %s\n' "$d" "$(du -sh "$r$d" 2>/dev/null | cut -f1)" "$(np_kept_what "$d")"
+    done
+    echo "  Also kept: the ghost user, ufw (enabled, 22/tcp open), and the apt packages it installed."
+    echo "  To delete the data as well: re-run with --uninstall --purge."
+  fi
+}
+
+np_kept_what() {
+  case "$1" in
+    /var/lib/bitcoin)      echo "the chain (ghostd's data directory)";;
+    /var/lib/ghost)        echo "node-pool.db (share chain and ledger), miner stats";;
+    /home/ghost)           echo ".ghost/node.key (node identity), ghost-mining's database";;
+    /etc/ghost)            echo "pool.toml, pool-config.toml (SV2 key, fee address), dashboard.env";;
+    /etc/bitcoin)          echo "bitcoin.conf (RPC password, signet challenge, peers)";;
+    /var/backups/ghost)    echo "nightly database backups";;
+    /var/lib/ghost-backup) echo "off-node backup key and status";;
+  esac
+}
+# <<< NP_UNINSTALL
+
+if [[ "$UNINSTALL" == true ]]; then
+  np_uninstall
+  exit 0
+fi
+[[ "$PURGE" != true ]] || err "--purge goes with --uninstall."
+
 # Enter the wizard ONLY with no config flags, an interactive terminal, and no
 # --non-interactive. Otherwise fall straight through to the flag/validation path
 # exactly as before.
@@ -1001,6 +1141,7 @@ GHOST_VERSION="$(np_resolve_release "$GHOST_VERSION_SPEC")" || err "GHOST_VERSIO
 [[ "$GHOST_VERSION_SPEC" == "$GHOST_VERSION" ]] || log "GHOST_VERSION=${GHOST_VERSION_SPEC} resolved to ${GHOST_VERSION}"
 RELEASE_BASE="${RELEASE_DOWNLOAD_URL}/${GHOST_VERSION}"
 POOL_TARBALL="bitcoin-ghost-${GHOST_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+DASHBOARD_TARBALL="bitcoin-ghost-${GHOST_VERSION}-dashboard.tar.gz"
 # Automatic updates follow the same channel: the updater reads /etc/ghost/release-channel
 # (written below) and picks the newest np- release, never the old network's `releases/latest`.
 
@@ -1081,7 +1222,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq \
   libevent-2.1-7 libevent-extra-2.1-7 libevent-pthreads-2.1-7 libevent-openssl-2.1-7 \
-  libzmq5 ca-certificates ufw openssl curl gnupg tar >/dev/null
+  libzmq5 libsqlite3-0 ca-certificates ufw openssl curl gnupg tar >/dev/null
 # Tor — only when routing over Tor. DEBIAN_FRONTEND is already exported above.
 if [[ "$TOR" == "true" ]]; then
   log "Installing Tor"
@@ -1157,6 +1298,19 @@ else
 fi
 grep " ${POOL_TARBALL}\$" SHA256SUMS.txt | sha256sum -c - || err "Checksum verification FAILED for ${POOL_TARBALL}."
 unset GNUPGHOME
+# The node dashboard ships in the same release, covered by the same signed SHA256SUMS.txt. A
+# release without it (none before the node pool dashboard was packaged) installs the node alone.
+DASHBOARD_SRC=""
+if grep -q " ${DASHBOARD_TARBALL}\$" SHA256SUMS.txt; then
+  curl -fsSLO "${RELEASE_BASE}/${DASHBOARD_TARBALL}"
+  grep " ${DASHBOARD_TARBALL}\$" SHA256SUMS.txt | sha256sum -c - || err "Checksum verification FAILED for ${DASHBOARD_TARBALL}."
+  mkdir -p "$TMP/dashboard"
+  tar -xzf "$DASHBOARD_TARBALL" -C "$TMP/dashboard"
+  [[ -f "$TMP/dashboard/ghost-dashboard/server.js" ]] || err "${DASHBOARD_TARBALL} does not carry ghost-dashboard/server.js."
+  DASHBOARD_SRC="$TMP/dashboard/ghost-dashboard"
+else
+  log "${GHOST_VERSION} ships no node dashboard (${DASHBOARD_TARBALL}) — installing the node without it"
+fi
 tar -xzf "$POOL_TARBALL"
 # The node binary was `ghost-pool` up to and including v1.11.44 (#1018). A release that old is
 # refused rather than installed under the new name: that binary restarts itself and reads its own
@@ -1824,7 +1978,7 @@ Type=simple
 User=ghost
 Group=ghost
 WorkingDirectory=/var/lib/ghost
-ExecStart=/opt/ghost/bin/ghost-mining --config /etc/ghost/pool.toml --tdp-enabled --tdp-port 8442 --stratum-port 3333
+ExecStart=/opt/ghost/bin/ghost-mining --config /etc/ghost/pool.toml --tdp-enabled --tdp-port 8442 --tdp-bind 127.0.0.1 --stratum-port 3333
 Environment=RUST_LOG=info
 Restart=on-failure
 RestartSec=15
@@ -1923,13 +2077,15 @@ ufw allow 22/tcp        >/dev/null 2>&1   # ssh FIRST so we don't lock out
 ufw allow "${NP_P2P_PORT}/tcp" >/dev/null 2>&1   # bitcoin P2P
 ufw allow "${RELAY_PORT}/tcp" >/dev/null 2>&1   # node pool share-chain relay
 ufw allow 8080/tcp      >/dev/null 2>&1   # ghost API
-ufw allow 8442/tcp      >/dev/null 2>&1   # TDP
 # The old mesh (8555-8562 ZMQ, 8563 Noise) and verification HTTPS (8443) stay CLOSED. ghost-mining
-# no longer listens on them, and a node pool node must never be reachable by the old fleet's
-# mesh, which keeps running `main`. A rule left by an older install is removed.
+# no longer runs the old mesh and binds 8443 to loopback, and a node pool node must never be
+# reachable by the old fleet's mesh, which keeps running `main`. The template server (TDP, 8442)
+# is for the node's own pool_sv2 only and listens on 127.0.0.1 (`--tdp-bind`), so it is not opened
+# either. A rule left by an older install is removed. The dashboard (3000) is loopback-only too.
 ufw delete allow 8555:8562/tcp >/dev/null 2>&1 || true
 ufw delete allow 8563/tcp      >/dev/null 2>&1 || true
 ufw delete allow 8443/tcp      >/dev/null 2>&1 || true
+ufw delete allow 8442/tcp      >/dev/null 2>&1 || true
 # Tor-only: clearnet P2P is disabled (onlynet=onion), so close 8333 — inbound
 # peering happens over the onion. Hybrid leaves the rule above in place (still
 # reachable on clearnet). Idempotent: `ufw delete` is a no-op if absent.
@@ -2026,6 +2182,12 @@ cat > /opt/ghost/bin/ghost-auto-update.sh <<'GHOST_AUTOUPDATE_SH_EOF'
 # stop→verify-inactive→swap→start sequence, health-checks, and rolls back on any
 # failure.
 #
+# On a node pool node the node dashboard (/opt/ghost/dashboard) moves with the release too: the
+# release's `bitcoin-ghost-<tag>-dashboard.tar.gz`, checked against the same signed SHA256SUMS.txt,
+# replaces the tree once the node's own health checks have passed, and ghost-dashboard restarts on
+# it. A dashboard that then does not answer is put back by itself; it never rolls back the node.
+# A release without a dashboard leaves the installed one as it is.
+#
 # ⛔ Two release channels share one GitHub repository. Which one a node follows is decided by
 # /etc/ghost/release-channel, written by the node pool installer:
 #   * `node-pool`  — the newest published `np-vX.Y.Z` release, picked from the release LIST.
@@ -2081,6 +2243,8 @@ STATUS_FILE="${GHOST_AUTOUPDATE_STATUS:-/var/lib/ghost/auto-update.status}"
 BIN_DIR="${GHOST_BIN_DIR:-/opt/ghost/bin}"
 BITCOIN_CONF="${GHOST_BITCOIN_CONF:-/etc/bitcoin/bitcoin.conf}"
 SYSTEMCTL="${GHOST_SYSTEMCTL:-systemctl}"
+DASHBOARD_DIR="${GHOST_DASHBOARD_DIR:-/opt/ghost/dashboard}"
+DASHBOARD_URL="${GHOST_DASHBOARD_URL:-http://127.0.0.1:3000/login}"
 
 # ──────────────────────────────── options ────────────────────────────────────
 DRY_RUN="${GHOST_AUTOUPDATE_DRYRUN:-false}"
@@ -2391,6 +2555,60 @@ start_all() {
   return 0
 }
 
+# ─────────────────────────────── dashboard ───────────────────────────────────
+
+# health_dashboard — the dashboard answers its login page. GHOST_DASHBOARD_HEALTH_OVERRIDE stands in
+# for it in tests, as GHOST_HEALTHCHECK_OVERRIDE does for the node.
+health_dashboard() {
+  if [[ -n "${GHOST_DASHBOARD_HEALTH_OVERRIDE:-}" ]]; then
+    bash -c "$GHOST_DASHBOARD_HEALTH_OVERRIDE"
+    return $?
+  fi
+  local code
+  for _ in $(seq 1 30); do
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$DASHBOARD_URL" 2>/dev/null || true)"
+    [[ "$code" == 200 ]] && { log "health: dashboard answers ($DASHBOARD_URL)"; return 0; }
+    sleep 2
+  done
+  err "health: dashboard does not answer $DASHBOARD_URL (last='${code:-none}')"
+  return 1
+}
+
+# swap_dashboard NEW_TREE STAMP — replace the dashboard tree, restart it, and put the previous tree
+# back if it does not answer. Prints the outcome for the status line. Never fails the update.
+swap_dashboard() {
+  local new="$1" ts="$2" bak="${DASHBOARD_DIR}.bak.$2"
+  $SYSTEMCTL stop ghost-dashboard.service >/dev/null 2>&1 || true
+  rm -rf "${DASHBOARD_DIR}.new"
+  if ! cp -a "$new" "${DASHBOARD_DIR}.new" || ! mv "$DASHBOARD_DIR" "$bak" || ! mv "${DASHBOARD_DIR}.new" "$DASHBOARD_DIR"; then
+    err "dashboard: could not put the new tree in place — keeping the installed one"
+    [[ -d "$DASHBOARD_DIR" ]] || mv "$bak" "$DASHBOARD_DIR" 2>/dev/null || true
+    rm -rf "${DASHBOARD_DIR}.new"
+    $SYSTEMCTL start ghost-dashboard.service >/dev/null 2>&1 || true
+    echo "dashboard kept (swap failed)"; return 0
+  fi
+  if [[ "$(id -u)" -eq 0 ]]; then
+    chown -R root:root "$DASHBOARD_DIR" 2>/dev/null || true
+    install -d -o ghost -g ghost -m 0755 "$DASHBOARD_DIR/.next/cache" 2>/dev/null || true
+  fi
+  log "swapped $DASHBOARD_DIR (previous tree: $bak)"
+  $SYSTEMCTL start ghost-dashboard.service >/dev/null 2>&1 || true
+  if health_dashboard; then
+    # One previous tree is kept for a manual rollback; older ones go (each is a whole build).
+    local old
+    for old in "${DASHBOARD_DIR}".bak.*; do
+      [[ -d "$old" && "$old" != "$bak" ]] && rm -rf "$old"
+    done
+    echo "dashboard updated"; return 0
+  fi
+  err "dashboard: the new one does not answer — putting the previous one back"
+  $SYSTEMCTL stop ghost-dashboard.service >/dev/null 2>&1 || true
+  rm -rf "$DASHBOARD_DIR" && mv "$bak" "$DASHBOARD_DIR"
+  $SYSTEMCTL start ghost-dashboard.service >/dev/null 2>&1 || true
+  echo "dashboard rolled back"
+  return 0
+}
+
 # ──────────────────────────────── main ───────────────────────────────────────
 
 main() {
@@ -2534,6 +2752,28 @@ main() {
   [[ -n "$new_pool" ]] || { err "verified tarball did not contain ghost-mining"; write_status "error" "tarball missing ghost-mining" "$latest"; exit 1; }
   [[ -n "$new_ghostd" ]] || { err "verified tarball did not contain ghostd (release predates the unified build?)"; write_status "error" "tarball missing ghostd" "$latest"; exit 1; }
 
+  # 5a. The node dashboard (node pool channel, and only where one is installed). Verified against
+  #     the same signed manifest before anything is stopped; a mismatch stops the whole update.
+  local new_dash="" dash_tar="bitcoin-ghost-${latest}-dashboard.tar.gz"
+  if [[ "$CHANNEL" == node-pool && -d "$DASHBOARD_DIR" ]]; then
+    if grep -q " ${dash_tar}\$" "$tmp/SHA256SUMS.txt"; then
+      curl -fsSL --max-time 600 "${release_base}/${dash_tar}" -o "$tmp/$dash_tar" \
+        || { err "download $dash_tar failed"; write_status "error" "dashboard download failed" "$latest"; exit 1; }
+      if ! ( cd "$tmp" && grep " ${dash_tar}\$" SHA256SUMS.txt | sha256sum -c - >/dev/null 2>&1 ); then
+        err "VERIFY FAILED: dashboard SHA256 mismatch — ABORTING, nothing touched."
+        write_status "verify-failed" "dashboard checksum mismatch for $latest" "$latest"
+        exit 1
+      fi
+      log "VERIFY ok: dashboard checksum matches SHA256SUMS.txt"
+      mkdir -p "$tmp/dash" && tar -xzf "$tmp/$dash_tar" -C "$tmp/dash"
+      [[ -f "$tmp/dash/ghost-dashboard/server.js" ]] \
+        || { err "$dash_tar does not carry ghost-dashboard/server.js"; write_status "error" "dashboard archive malformed" "$latest"; exit 1; }
+      new_dash="$tmp/dash/ghost-dashboard"
+    else
+      warn "release $latest ships no dashboard — the installed one is left as it is"
+    fi
+  fi
+
   # Build the swap plan: (dest <- src), only for binaries currently installed
   # (so we never introduce ghost-pay onto a node that opted out of it).
   local -a SWAP_DEST=() SWAP_SRC=()
@@ -2576,6 +2816,7 @@ main() {
     log "DRY-RUN: verification PASSED for $latest. Would back up + swap:"
     local k
     for k in "${!SWAP_DEST[@]}"; do log "DRY-RUN:   ${SWAP_DEST[$k]} <- ${SWAP_SRC[$k]}"; done
+    [[ -z "$new_dash" ]] || log "DRY-RUN:   $DASHBOARD_DIR <- $dash_tar"
     log "DRY-RUN: would then restart services + health-check, rolling back on failure."
     write_status "dry-run" "verification passed; swap skipped (dry-run) for $latest" "$latest"
     exit 0
@@ -2635,8 +2876,10 @@ main() {
   # 10. Health-check; roll back on any failure.
   if run_health_checks; then
     echo "$latest" > "$VERSION_FILE"; chmod 644 "$VERSION_FILE" 2>/dev/null || true
-    log "UPDATE COMPLETE: now running $latest (backups: *.bak.${ts})"
-    write_status "updated" "updated $installed -> $latest" "$latest"
+    local dash_note=""
+    [[ -z "$new_dash" ]] || dash_note="; $(swap_dashboard "$new_dash" "$ts")"
+    log "UPDATE COMPLETE: now running $latest (backups: *.bak.${ts})${dash_note}"
+    write_status "updated" "updated $installed -> $latest${dash_note}" "$latest"
     exit 0
   else
     err "health checks FAILED after swap — rolling back"
@@ -4268,6 +4511,108 @@ else
   log "nightly backups disabled (--no-backups) — enable later: systemctl enable --now ghost-backup.timer"
 fi
 
+# ───────────────────────────── 10c. node dashboard ───────────────────────────
+# The operator dashboard (dashboard/, a Next.js standalone build) from this release, run by a
+# Node.js runtime of its own under /opt/ghost/node. Ubuntu's apt nodejs is 18 on 24.04 and the
+# dashboard needs 22 or later, so the official nodejs.org build is used, pinned to one version and
+# checked against the SHA-256 below before anything is unpacked. The hash is the one in that
+# release's SHASUMS256.txt, whose signature verified against Node.js release key
+# 5BE8A3F6C8A5C01D106C0AD820B1A390B168D356 when it was pinned. Bump the version and the hash
+# together.
+#
+# The dashboard listens on 127.0.0.1:3000 only and no firewall rule is opened for it: reach it
+# through an SSH tunnel (ssh -L 3000:127.0.0.1:3000 <you>@<node>). Its password is generated here
+# once, into /etc/ghost/dashboard.env (root-only), which the unit reads with EnvironmentFile=. Not
+# an Environment= line in a drop-in: systemd shows those to every local user (`systemctl show
+# ghost-dashboard -p Environment`), and it never shows a file's contents. Kept on a re-run and on
+# --uninstall, so the password survives both.
+NODEJS_VERSION="v22.23.4"
+NODEJS_TARBALL="node-${NODEJS_VERSION}-linux-x64.tar.gz"
+NODEJS_SHA256="b8492284c76a54baf58d61668dd0e41ee0fc98adabf9503d30f05d08f55b4406"
+NODEJS_URL="https://nodejs.org/dist/${NODEJS_VERSION}/${NODEJS_TARBALL}"
+# A test mirror serves the same tarball (the pinned hash still decides), so a rehearsal fetches
+# nothing from outside it.
+[[ -n "$TEST_RELEASE_MIRROR" ]] && NODEJS_URL="${TEST_RELEASE_MIRROR}/nodejs/${NODEJS_TARBALL}"
+DASHBOARD_ENV=/etc/ghost/dashboard.env
+DASHBOARD_PW_NOTE=""
+if [[ -n "$DASHBOARD_SRC" ]]; then
+  log "Installing the node dashboard (Node.js ${NODEJS_VERSION})"
+  if [[ "$(/opt/ghost/node/bin/node --version 2>/dev/null || true)" != "$NODEJS_VERSION" ]]; then
+    curl -fsSL "$NODEJS_URL" -o "$TMP/$NODEJS_TARBALL" || err "Could not download Node.js from ${NODEJS_URL}."
+    echo "${NODEJS_SHA256}  $TMP/$NODEJS_TARBALL" | sha256sum -c - >/dev/null \
+      || err "Checksum verification FAILED for ${NODEJS_TARBALL} (expected ${NODEJS_SHA256})."
+    rm -rf "/opt/ghost/node-${NODEJS_VERSION}.new"
+    mkdir -p "/opt/ghost/node-${NODEJS_VERSION}.new"
+    tar -xzf "$TMP/$NODEJS_TARBALL" -C "/opt/ghost/node-${NODEJS_VERSION}.new" --strip-components=1 --no-same-owner
+    rm -rf "/opt/ghost/node-${NODEJS_VERSION}"
+    mv "/opt/ghost/node-${NODEJS_VERSION}.new" "/opt/ghost/node-${NODEJS_VERSION}"
+    ln -sfn "node-${NODEJS_VERSION}" /opt/ghost/node
+  fi
+  # Runtimes an earlier install pinned, now unused.
+  for old in /opt/ghost/node-v*; do
+    [[ -d "$old" && "$old" != "/opt/ghost/node-${NODEJS_VERSION}" ]] && rm -rf "$old"
+  done
+  [[ "$(/opt/ghost/node/bin/node --version 2>/dev/null || true)" == "$NODEJS_VERSION" ]] \
+    || err "Node.js ${NODEJS_VERSION} did not install under /opt/ghost/node."
+
+  # The dashboard tree, replaced whole; root-owned, readable by the ghost user that runs it.
+  rm -rf /opt/ghost/dashboard.new
+  cp -a "$DASHBOARD_SRC" /opt/ghost/dashboard.new
+  chown -R root:root /opt/ghost/dashboard.new
+  chmod -R go-w,a+rX /opt/ghost/dashboard.new
+  rm -rf /opt/ghost/dashboard
+  mv /opt/ghost/dashboard.new /opt/ghost/dashboard
+  # Next.js writes its cache beside the build.
+  install -d -o ghost -g ghost -m 0755 /opt/ghost/dashboard/.next/cache
+
+  # The password. An operator's own DASHBOARD_PASSWORD in a drop-in (the old manual setup) is kept
+  # and wins; otherwise one is generated once and kept across re-runs.
+  if grep -qsE '^Environment="?DASHBOARD_PASSWORD=' /etc/systemd/system/ghost-dashboard.service.d/*.conf; then
+    DASHBOARD_PW_NOTE="your own, set in /etc/systemd/system/ghost-dashboard.service.d/"
+  else
+    if ! grep -qsE '^DASHBOARD_PASSWORD=.+' "$DASHBOARD_ENV"; then
+      ( umask 077
+        printf '# Bitcoin Ghost node dashboard. Written once by install-node.sh; read by ghost-dashboard.service.\n# Change the password here, then: sudo systemctl restart ghost-dashboard\nDASHBOARD_PASSWORD=%s\n' \
+          "$(openssl rand -hex 16)" > "$DASHBOARD_ENV" )
+    fi
+    DASHBOARD_PW_NOTE="sudo grep DASHBOARD_PASSWORD ${DASHBOARD_ENV}"
+  fi
+  [[ -e "$DASHBOARD_ENV" ]] && { chown root:root "$DASHBOARD_ENV"; chmod 600 "$DASHBOARD_ENV"; }
+
+  cat > /etc/systemd/system/ghost-dashboard.service <<'GHOST_DASHBOARD_SERVICE_EOF'
+[Unit]
+Description=Bitcoin Ghost node dashboard
+# Ordering only: the dashboard shows the node as unavailable until ghost-mining answers, and it
+# must never start the node ahead of ghost-mining-gate.
+After=network-online.target ghost-mining.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ghost
+Group=ghost
+WorkingDirectory=/opt/ghost/dashboard
+# `node server.js`, never `next start`: server.js is the custom server that authenticates the
+# /api/ws relay, and the standalone build has no `next start`.
+ExecStart=/opt/ghost/node/bin/node server.js
+Environment=NODE_ENV=production
+Environment=PORT=3000
+# Loopback only, no firewall rule: reach it through an SSH tunnel.
+Environment=HOSTNAME=127.0.0.1
+Environment=NEXT_PUBLIC_API_URL=http://127.0.0.1:8080
+# DASHBOARD_PASSWORD, generated by the installer, root-only. INTERNAL_AUTH_KEY comes from the
+# internal-auth.conf drop-in, which the installer keeps equal to pool.toml's internal_api_secret.
+EnvironmentFile=-/etc/ghost/dashboard.env
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+GHOST_DASHBOARD_SERVICE_EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable ghost-dashboard >/dev/null 2>&1 || true
+fi
+
 # ─────────────────────────────── 11. start ───────────────────────────────────
 log "Starting services"
 systemctl daemon-reload
@@ -4288,6 +4633,11 @@ systemctl enable --now ghostd >/dev/null 2>&1
 # here used to start ghost-mining with it, which put a node at chain height 0 on the
 # live mesh seconds into the install (#1020). scripts/test-boot-gate.sh holds this.
 systemctl enable --now ghost-mining-gate >/dev/null 2>&1
+# The dashboard does not wait for the gate: it shows the node as unavailable until it answers.
+# Restarted on a re-run so it runs the tree just installed.
+if [[ -n "$DASHBOARD_SRC" ]]; then
+  systemctl restart ghost-dashboard >/dev/null 2>&1 || log "WARNING: ghost-dashboard did not start: sudo journalctl -u ghost-dashboard -n 50"
+fi
 sleep 5
 
 # The Bitcoin node, checked again now that it runs: the preflight could only see one a re-run had
@@ -4310,6 +4660,12 @@ GENESIS_STATUS="${GENESIS_ANCHOR:0:16}… at height ${GENESIS_HEIGHT}"
 
 NODE_ID="$(sudo -u ghost /opt/ghost/bin/ghost-mining --config /etc/ghost/pool.toml --show-identity 2>/dev/null | grep -i 'Node ID' | head -1 || true)"
 MINER_POINTER="Point a miner at:  stratum+tcp://${PUBIP}:3333"
+if [[ -n "$DASHBOARD_SRC" ]]; then
+  DASHBOARD_STATUS="$(systemctl is-active ghost-dashboard)  http://127.0.0.1:3000 on this machine (ssh -L 3000:127.0.0.1:3000 <you>@${PUBIP}, then open http://localhost:3000)
+     Dashboard password: ${DASHBOARD_PW_NOTE}"
+else
+  DASHBOARD_STATUS="not installed (${GHOST_VERSION} ships no dashboard)"
+fi
 cat <<EOF
 
   ✅ Bitcoin Ghost node installed (${NETWORK}).
@@ -4324,6 +4680,7 @@ cat <<EOF
      ghost-mining:    $(systemctl is-active ghost-mining)  (started by the gate)
      sri-pool:        $(systemctl is-active sri-pool)  (SV2 pool — started by the gate, after ghost-mining)
      sri-translator:  $(systemctl is-active sri-translator)  (SV1->SV2 — started by the gate; serves miners on port 3333)
+     dashboard:       ${DASHBOARD_STATUS}
 
   "inactive" is expected for the last three until ghostd finishes syncing. The gate
   then starts ghost-mining AUTOMATICALLY, followed by the
