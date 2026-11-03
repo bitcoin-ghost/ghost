@@ -13,7 +13,7 @@ Nothing below is to be run until every one of these is set. They are not default
 |---|---|---|
 | `<FREEZE_HEIGHT>` (F) | Export height: the old ledger's last counted state | Must be a height with a **finalised** checkpoint held byte-identical by every exporting node (step 2). Since a 4-node fleet finalises nothing new (plan, "Old fleet with 4 nodes"), choose it while 8 nodes still run, or from what is already finalised |
 | `<SATS_PER_WORK>` | Work-to-sats rate | `N`, `N/D` or `I.F`, exact; never defaulted |
-| `<EXPORT_SOURCE>` | Which old table the balances come from | The exporter reads **finalised checkpoints only**: since 963,388 the top 200 balances (see "What the export carries"). A full-shard-table source is not built |
+| `<EXPORT_SOURCE>` | Which old table the balances come from | The exporter reads **finalised checkpoints only**: since 963,388 the top 200 balances (see "What the export carries"). **Decided 2026-11-03: checkpoint export.** The live fleet owed 3 addresses on 11-03 (public `/api/v1/pool/next_payout`), all inside the top 200; a full-shard-table source is not built. Check at F that the payee count matches `next_payout` |
 | `<TREASURY_ADDRESS>` | Compiled treasury | Plan section 5 item 1 |
 | `<GENESIS_ANCHOR>` | Mainnet share-chain genesis anchor, 64 hex | Compiled into `MAINNET_START` |
 | `<GENESIS_HEIGHT>` (G) | Its `btc_height` | `G + 21 <= R`. Rehearsed with `G = F` |
@@ -21,7 +21,7 @@ Nothing below is to be run until every one of these is set. They are not default
 | `<NP_VERSION>` | The node pool release carrying `MAINNET_START` | Cut after step 4 |
 | `<OLD_NODES>` | Old nodes that export (vm1..vm8) | Every node that still holds the checkpoint at F |
 | `<NEW_NODES>` | Node pool servers | Own servers; never co-hosted with an old node |
-| `<P2PKH_POLICY>` | How balances held by P2PKH addresses are carried | The node pool pays only P2SH, P2WPKH, P2WSH and P2TR; the import refuses any other row (step 3) |
+| `<P2PKH_POLICY>` | How balances held by P2PKH addresses are carried | The node pool pays only P2SH, P2WPKH, P2WSH and P2TR; the import refuses any other row (step 3). **Decided 2026-11-03:** one P2PKH payee (`148WRj…CXTN`, 0.7% of owed work on 11-03); the user gets a segwit/taproot address from its owner and the row is re-keyed before step 3 |
 
 Paths on an old node: `ghost-mining` runs as `ghost` with `--data-dir /home/ghost/.ghost`, so the
 database is `/home/ghost/.ghost/ghost.db`. On a node pool node the relay's store is
@@ -41,7 +41,9 @@ genesis table is imported there, **not** into `ghost.db`.
 ## 1. Freeze
 
 There is no freeze switch in the old release: nothing stops it crediting work after F. The freeze
-is the choice of F plus the export taken at exactly F; the old fleet keeps running, untouched.
+is the choice of F plus the export taken at exactly F. **Decided 2026-11-03:** the old network freezes
+at the export; the user shuts the old nodes down once the migration is done (after step 6), so work
+after F is only the short window up to repoint.
 
 - **Command** (each old node): `sudo -u ghost /opt/ghost/bin/ghost-cli -conf=/etc/bitcoin/bitcoin.conf getblockcount`
 - **Expect**: a height above F.
