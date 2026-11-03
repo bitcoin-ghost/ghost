@@ -964,6 +964,127 @@ fn get_btc_block_conn(conn: &Connection, hash: &[u8; 32]) -> GhostResult<Option<
     .transpose()
 }
 
+fn insert_anchor_conn(tx: &Connection, a: &NpAnchorRecord) -> GhostResult<InsertOutcome> {
+    tx.execute(
+        &format!(
+            "INSERT OR IGNORE INTO np_anchors ({ANCHOR_COLS}) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+        ),
+        params![
+            a.hash.to_vec(),
+            a.parent.map(|p| p.to_vec()),
+            a.height as i64,
+            a.t_net as i64,
+            a.btc_height as i64,
+            a.cum_work.to_be_bytes().to_vec(),
+            a.batch_root.to_vec(),
+            a.received_at,
+        ],
+    )
+    .map_err(db_err)?;
+    let inserted = wrote(tx);
+    match get_anchor_conn(tx, &a.hash)? {
+        Some(held) if same_anchor(&held, a) => Ok(if inserted {
+            InsertOutcome::Inserted
+        } else {
+            InsertOutcome::AlreadyPresent
+        }),
+        Some(_) => Err(GhostError::Database(format!(
+            "np anchor {} is already held with different contents",
+            hex::encode(a.hash)
+        ))),
+        None => Err(GhostError::Database(format!(
+            "np anchor {} was not stored (insert ignored, no row present)",
+            hex::encode(a.hash)
+        ))),
+    }
+}
+
+fn insert_batch_conn(
+    tx: &Connection,
+    anchor_hash: &AnchorHash,
+    shares: &[NpBatchShare],
+    received_at: i64,
+) -> GhostResult<InsertOutcome> {
+    let wanted: Vec<(ShareId, u8, u128)> = shares
+        .iter()
+        .map(|s| (s.share.share_id, s.credited_tier, s.face))
+        .collect();
+    let faces = shares
+        .iter()
+        .map(|s| face_u128_to_blob(s.face))
+        .collect::<GhostResult<Vec<_>>>()?;
+    let anchor = get_anchor_conn(tx, anchor_hash)?.ok_or_else(|| {
+        GhostError::Database(format!(
+            "np batch for unknown anchor {}",
+            hex::encode(anchor_hash)
+        ))
+    })?;
+    tx.execute(
+        "INSERT OR IGNORE INTO np_batches (anchor_hash, batch_root, share_count, \
+         btc_height, received_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            anchor_hash.to_vec(),
+            anchor.batch_root.to_vec(),
+            shares.len() as i64,
+            anchor.btc_height as i64,
+            received_at,
+        ],
+    )
+    .map_err(db_err)?;
+    if !wrote(tx) {
+        let held: Option<i64> = tx
+            .query_row(
+                "SELECT share_count FROM np_batches WHERE anchor_hash = ?1",
+                params![anchor_hash.to_vec()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        if held.is_none() {
+            return Err(GhostError::Database(format!(
+                "np batch {} was not stored (insert ignored, no row present)",
+                hex::encode(anchor_hash)
+            )));
+        }
+        let held_members = batch_members_conn(tx, anchor_hash)?;
+        if held != Some(shares.len() as i64) || held_members != wanted {
+            return Err(GhostError::Database(format!(
+                "np batch {} is already held with a different share list",
+                hex::encode(anchor_hash)
+            )));
+        }
+        for s in shares {
+            if get_share_conn(tx, &s.share.share_id)?.as_ref() != Some(&s.share) {
+                return Err(GhostError::Database(format!(
+                    "np batch {}: share {} differs from the held copy",
+                    hex::encode(anchor_hash),
+                    hex::encode(s.share.share_id)
+                )));
+            }
+        }
+        return Ok(InsertOutcome::AlreadyPresent);
+    }
+    for (i, (s, face)) in shares.iter().zip(&faces).enumerate() {
+        insert_share_conn(tx, &s.share)?;
+        // A fresh batch in this transaction: a conflict here is a duplicate share in the
+        // list, and the plain INSERT surfaces it as an error that rolls the batch back.
+        tx.execute(
+            "INSERT INTO np_batch_shares (anchor_hash, position, share_id, \
+             credited_tier, face) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                anchor_hash.to_vec(),
+                i as i64,
+                s.share.share_id.to_vec(),
+                s.credited_tier as i64,
+                face.to_vec(),
+            ],
+        )
+        .map_err(db_err)?;
+    }
+    Ok(InsertOutcome::Inserted)
+}
+
 impl Database {
     // -----------------------------------------------------------------------------------------
     // Anchors
@@ -972,41 +1093,7 @@ impl Database {
     /// Store an anchor header. Idempotent: the same anchor again (whatever its `received_at`)
     /// is [`InsertOutcome::AlreadyPresent`]; a different anchor under the same hash is an error.
     pub fn np_insert_anchor(&self, a: &NpAnchorRecord) -> GhostResult<InsertOutcome> {
-        self.transaction(|tx| {
-            tx.execute(
-                &format!(
-                    "INSERT OR IGNORE INTO np_anchors ({ANCHOR_COLS}) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
-                ),
-                params![
-                    a.hash.to_vec(),
-                    a.parent.map(|p| p.to_vec()),
-                    a.height as i64,
-                    a.t_net as i64,
-                    a.btc_height as i64,
-                    a.cum_work.to_be_bytes().to_vec(),
-                    a.batch_root.to_vec(),
-                    a.received_at,
-                ],
-            )
-            .map_err(db_err)?;
-            let inserted = wrote(tx);
-            match get_anchor_conn(tx, &a.hash)? {
-                Some(held) if same_anchor(&held, a) => Ok(if inserted {
-                    InsertOutcome::Inserted
-                } else {
-                    InsertOutcome::AlreadyPresent
-                }),
-                Some(_) => Err(GhostError::Database(format!(
-                    "np anchor {} is already held with different contents",
-                    hex::encode(a.hash)
-                ))),
-                None => Err(GhostError::Database(format!(
-                    "np anchor {} was not stored (insert ignored, no row present)",
-                    hex::encode(a.hash)
-                ))),
-            }
-        })
+        self.transaction(|tx| insert_anchor_conn(tx, a))
     }
 
     /// One anchor, if held.
@@ -1049,84 +1136,30 @@ impl Database {
         shares: &[NpBatchShare],
         received_at: i64,
     ) -> GhostResult<InsertOutcome> {
-        let wanted: Vec<(ShareId, u8, u128)> = shares
-            .iter()
-            .map(|s| (s.share.share_id, s.credited_tier, s.face))
-            .collect();
-        let faces = shares
-            .iter()
-            .map(|s| face_u128_to_blob(s.face))
-            .collect::<GhostResult<Vec<_>>>()?;
+        self.transaction(|tx| insert_batch_conn(tx, anchor_hash, shares, received_at))
+    }
+
+    /// An anchor this node accepted, stored in ONE transaction: its own share
+    /// ([`Database::np_insert_share`]), its header ([`Database::np_insert_anchor`]) and its batch
+    /// ([`Database::np_insert_batch`]), with the same checks and the same idempotence. All or
+    /// nothing: a refused batch leaves no header behind.
+    ///
+    /// One commit instead of three: each commit is an fsync under `synchronous = FULL`, and on a
+    /// loaded disk one fsync measured 437-1,316 ms (24 h soak, node0). The relay stores an
+    /// anchor on the same task that answers pool_sv2's table requests, so three in a row held a
+    /// new tip's table past its 2 s budget.
+    pub fn np_insert_anchor_with_batch(
+        &self,
+        own_share: &NpShareRecord,
+        anchor: &NpAnchorRecord,
+        shares: &[NpBatchShare],
+        received_at: i64,
+    ) -> GhostResult<(InsertOutcome, InsertOutcome)> {
         self.transaction(|tx| {
-            let anchor = get_anchor_conn(tx, anchor_hash)?.ok_or_else(|| {
-                GhostError::Database(format!(
-                    "np batch for unknown anchor {}",
-                    hex::encode(anchor_hash)
-                ))
-            })?;
-            tx.execute(
-                "INSERT OR IGNORE INTO np_batches (anchor_hash, batch_root, share_count, \
-                 btc_height, received_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    anchor_hash.to_vec(),
-                    anchor.batch_root.to_vec(),
-                    shares.len() as i64,
-                    anchor.btc_height as i64,
-                    received_at,
-                ],
-            )
-            .map_err(db_err)?;
-            if !wrote(tx) {
-                let held: Option<i64> = tx
-                    .query_row(
-                        "SELECT share_count FROM np_batches WHERE anchor_hash = ?1",
-                        params![anchor_hash.to_vec()],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                    .map_err(db_err)?;
-                if held.is_none() {
-                    return Err(GhostError::Database(format!(
-                        "np batch {} was not stored (insert ignored, no row present)",
-                        hex::encode(anchor_hash)
-                    )));
-                }
-                let held_members = batch_members_conn(tx, anchor_hash)?;
-                if held != Some(shares.len() as i64) || held_members != wanted {
-                    return Err(GhostError::Database(format!(
-                        "np batch {} is already held with a different share list",
-                        hex::encode(anchor_hash)
-                    )));
-                }
-                for s in shares {
-                    if get_share_conn(tx, &s.share.share_id)?.as_ref() != Some(&s.share) {
-                        return Err(GhostError::Database(format!(
-                            "np batch {}: share {} differs from the held copy",
-                            hex::encode(anchor_hash),
-                            hex::encode(s.share.share_id)
-                        )));
-                    }
-                }
-                return Ok(InsertOutcome::AlreadyPresent);
-            }
-            for (i, (s, face)) in shares.iter().zip(&faces).enumerate() {
-                insert_share_conn(tx, &s.share)?;
-                // A fresh batch in this transaction: a conflict here is a duplicate share in the
-                // list, and the plain INSERT surfaces it as an error that rolls the batch back.
-                tx.execute(
-                    "INSERT INTO np_batch_shares (anchor_hash, position, share_id, \
-                     credited_tier, face) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        anchor_hash.to_vec(),
-                        i as i64,
-                        s.share.share_id.to_vec(),
-                        s.credited_tier as i64,
-                        face.to_vec(),
-                    ],
-                )
-                .map_err(db_err)?;
-            }
-            Ok(InsertOutcome::Inserted)
+            insert_share_conn(tx, own_share)?;
+            let a = insert_anchor_conn(tx, anchor)?;
+            let b = insert_batch_conn(tx, &anchor.hash, shares, received_at)?;
+            Ok((a, b))
         })
     }
 
@@ -2097,6 +2130,51 @@ mod tests {
             shares
         );
         assert_eq!(count(&db, "np_shares"), 3);
+    }
+
+    /// The relay's accepted anchor in one transaction: its own share, its header and its batch
+    /// land together, again is `AlreadyPresent` twice, and a refused batch keeps NOTHING (the
+    /// three separate commits it replaces left the header and the share behind).
+    #[test]
+    fn an_anchor_with_its_batch_is_stored_in_one_transaction() {
+        let db = db();
+        db.np_insert_anchor(&anchor(1, None, 0, 100)).unwrap();
+        let a = anchor(2, Some(1), 1, 100);
+        let own = share(30);
+        let members = vec![member(10, 5), member(11, 6)];
+        assert_eq!(
+            db.np_insert_anchor_with_batch(&own, &a, &members, 7)
+                .unwrap(),
+            (InsertOutcome::Inserted, InsertOutcome::Inserted)
+        );
+        assert_eq!(db.np_get_anchor(&a.hash).unwrap(), Some(a.clone()));
+        assert_eq!(db.np_get_share(&own.share_id).unwrap(), Some(own.clone()));
+        let got = db.np_get_batch(&a.hash).unwrap().expect("held");
+        assert_eq!(got.shares, members);
+        assert_eq!(got.received_at, 7);
+        assert_eq!(
+            db.np_insert_anchor_with_batch(&own, &a, &members, 9)
+                .unwrap(),
+            (InsertOutcome::AlreadyPresent, InsertOutcome::AlreadyPresent)
+        );
+
+        // A batch that is refused (a duplicate share in the list) rolls back the header and the
+        // anchor's own share with it.
+        let b = anchor(3, Some(1), 1, 100);
+        let own_b = share(31);
+        let err = db
+            .np_insert_anchor_with_batch(&own_b, &b, &[member(12, 1), member(12, 1)], 0)
+            .unwrap_err();
+        assert!(err.to_string().contains("UNIQUE"), "{err}");
+        assert_eq!(db.np_get_anchor(&b.hash).unwrap(), None, "no header kept");
+        assert_eq!(db.np_get_share(&own_b.share_id).unwrap(), None);
+        assert!(!db.np_has_batch(&b.hash).unwrap());
+        // The same anchor, with a good batch, then goes in.
+        assert_eq!(
+            db.np_insert_anchor_with_batch(&own_b, &b, &[member(12, 1)], 0)
+                .unwrap(),
+            (InsertOutcome::Inserted, InsertOutcome::Inserted)
+        );
     }
 
     #[test]

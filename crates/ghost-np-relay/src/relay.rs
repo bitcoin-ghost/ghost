@@ -1917,8 +1917,7 @@ impl Relay {
         cs: &[Credit],
     ) -> GhostResult<()> {
         let now = self.now as i64;
-        self.db.np_insert_share(&own.to_record(own_height))?;
-        self.db.np_insert_anchor(&NpAnchorRecord {
+        let anchor = NpAnchorRecord {
             hash: a,
             parent: info.parent,
             height: info.height,
@@ -1927,7 +1926,7 @@ impl Relay {
             cum_work: info.work,
             batch_root: own.tag.batch_root,
             received_at: self.anchors[&a].received_at,
-        })?;
+        };
         let members: Vec<NpBatchShare> = ids
             .iter()
             .zip(cs)
@@ -1937,7 +1936,10 @@ impl Relay {
                 face: c.face as u128,
             })
             .collect();
-        self.db.np_insert_batch(&a, &members, now)?;
+        // One transaction, one commit: the share, the header and the batch (see
+        // `np_insert_anchor_with_batch`).
+        self.db
+            .np_insert_anchor_with_batch(&own.to_record(own_height), &anchor, &members, now)?;
         Ok(())
     }
 

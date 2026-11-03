@@ -11,6 +11,11 @@ FAIL or UNMEASURED with its evidence, and a reading that could not be taken is U
   (GHOST_NP_SYNC_FAULT, ghost-np-relay fault.rs) from a loopback address of its own. A fresh node
   syncs from it alone, then from it and honest peers: it must refuse every lie by name, reach the
   honest digests, and ban nobody but the liar.
+- late_table: node0's relay answers every new height's snapshot table past pool_sv2's 2 s budget
+  (the hostile build's GHOST_NP_TABLE_LATE_MS) while the network mines: every new tip is held,
+  served when its table comes, and the templates that arrive during the hold are given back to
+  the channels. pool_sv2 must never exit (the 24 h soak's crash: a SetNewPrevHash for a template
+  the replay had dropped, escalated to a shutdown) and no channel may miss a tip.
 - soak: the 4-node signet mining for --soak-minutes, miners joining, leaving and stalling past
   their no-share timeout, sampled every minute for memory and store size.
 """
@@ -462,6 +467,77 @@ def audit_vs_liar(h, liar, honest, ev):
 
 
 # ---------------------------------------------------------------------------------------------
+def late_table(h):
+    name = ("late snapshot table: every new tip held for its table, served when it comes, the "
+            "templates that arrive meanwhile kept; pool_sv2 never exits, no channel misses a tip")
+    if not h.args.hostile_binary:
+        return result(name, "UNMEASURED", "no --hostile-binary (pool_sv2 built with --features "
+                      "np-fault-injection)")
+    n = h.nodes[0]
+    say(f"\n== late snapshot table: node0's tables {h.args.table_late_ms} ms late")
+    mark = len(n.read_log("pool_sv2"))
+    n.table_late_ms = h.args.table_late_ms
+    n.restart_pool()
+    proc = n.procs["pool_sv2"]
+    for m in h.nodes:
+        m.pause_miners(False)
+    start = n.rpc("getblockcount")
+    target = start + h.args.late_table_blocks
+    ev, ok = [], True
+    deadline, last = time.time() + h.args.mine_timeout, 0
+    try:
+        while time.time() < deadline and n.rpc("getblockcount") < target:
+            if not proc.alive():
+                break
+            if time.time() - last > 30:
+                _progress(h, "late table")
+                last = time.time()
+            time.sleep(1)
+    finally:
+        for m in h.nodes:
+            m.pause_miners(True)
+    height = n.rpc("getblockcount")
+    alive = proc.alive()
+    # Settle what is in flight before reading the log.
+    time.sleep(8)
+    alive = alive and proc.alive()
+    log = n.read_log("pool_sv2")[mark:]
+    counts = {k: log.count(v) for k, v in (
+        ("held", "NODE_POOL_NO_TABLE: the new Bitcoin tip is held"),
+        ("served", "NODE_POOL: the held tip is served"),
+        ("given_back", "arrived during the hold is given back to the channels"),
+        ("tip_mismatch", "NODE_POOL_TIP_MISMATCH"),
+        ("template_mismatch", "NODE_POOL_TEMPLATE_MISMATCH"),
+        ("shutdown", "Pool shutdown complete"),
+        ("shares", "Received SubmitSharesExtended"),
+    )}
+    fault_on = "withholds every snapshot table" in log
+    mined = height - start
+    ok = (alive and fault_on and mined >= h.args.late_table_blocks
+          and counts["held"] >= mined // 2 and counts["served"] >= counts["held"] // 2
+          and counts["shutdown"] == 0 and counts["tip_mismatch"] == 0
+          and counts["template_mismatch"] == 0 and counts["shares"] > 0)
+    ev.append(f"{mined} Bitcoin blocks ({start} -> {height}) with node0's tables "
+              f"{h.args.table_late_ms} ms late (fault line logged: {fault_on}); node0 pool_sv2 "
+              f"{'still running, pid ' + str(proc.p.pid) if alive else 'EXITED'}")
+    ev.append(f"node0 log: tips held {counts['held']}, held tips served {counts['served']}, future "
+              f"templates from during a hold given back {counts['given_back']}, TIP_MISMATCH "
+              f"{counts['tip_mismatch']}, TEMPLATE_MISMATCH {counts['template_mismatch']}, shutdowns "
+              f"{counts['shutdown']}, shares received {counts['shares']}")
+    if counts["given_back"] == 0:
+        ev.append("the replay of a template that arrived during a hold did not come up in this run "
+                  "(timing): the held-tip path ran, the crash's exact interleaving was not hit")
+    # Back to an honest pool_sv2 for whatever runs next.
+    n.table_late_ms = None
+    n.restart_pool()
+    try:
+        STATE["quiet"] = h.quiesce(300)
+    except TimeoutError as e:
+        STATE["quiet"] = None
+        ev.append(str(e))
+    result(name, "PASS" if ok else "FAIL", ev)
+
+
 def file_size(path):
     try:
         return os.path.getsize(path)

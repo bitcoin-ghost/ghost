@@ -316,6 +316,7 @@ class Node:
         self.node_id = None
         self.fault = None  # GHOST_NP_FAULT for a hostile node's pool_sv2
         self.sync_fault = None  # GHOST_NP_SYNC_FAULT for a lying sync peer's relay
+        self.table_late_ms = None  # GHOST_NP_TABLE_LATE_MS: this node's snapshot tables come late
         # The relay listens here: a loopback address of its own for a node whose relay must be
         # told apart by IP (a ban is per IP, and every node else shares 127.0.0.1).
         self.relay_ip = "127.0.0.1"
@@ -513,7 +514,7 @@ public_key = "{self.tdp_key}"
         """Start pool_sv2 on the config written last."""
         a = self.h.args
         d = os.path.join(self.dir, "pool")
-        hostile = self.fault or self.sync_fault
+        hostile = self.fault or self.sync_fault or self.table_late_ms
         if hostile and not a.hostile_binary:
             raise RuntimeError("a hostile node needs --hostile-binary (np-fault-injection build)")
         binary = a.hostile_binary if hostile else self.h.bin(a.pool_binary)
@@ -522,6 +523,8 @@ public_key = "{self.tdp_key}"
             env["GHOST_NP_FAULT"] = self.fault
         if self.sync_fault:
             env["GHOST_NP_SYNC_FAULT"] = self.sync_fault
+        if self.table_late_ms:
+            env["GHOST_NP_TABLE_LATE_MS"] = str(self.table_late_ms)
         self.procs["pool_sv2"] = Proc(
             "pool_sv2", [binary, "-c", os.path.join(d, "pool-config.toml")],
             self.log("pool_sv2"), cwd=d, env=env)
@@ -1116,6 +1119,11 @@ def main():
                     help="signet: lies the lying sync peer tells (ghost-np-relay fault.rs)")
     ap.add_argument("--liar-alone-secs", type=float, default=75,
                     help="signet: how long a fresh node syncs from the lying peer alone")
+    ap.add_argument("--table-late-ms", type=int, default=2500,
+                    help="signet late_table: how long node0's relay withholds each new height's "
+                         "snapshot table (past pool_sv2's 2 s budget, so every new tip is held)")
+    ap.add_argument("--late-table-blocks", type=int, default=16,
+                    help="signet late_table: Bitcoin blocks mined with node0's tables late")
     ap.add_argument("--soak-minutes", type=float, default=0,
                     help="signet: run the soak instead of the scenario list: N minutes of mining "
                          "with miners joining, leaving and stalling, then the checks")
