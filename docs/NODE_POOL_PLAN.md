@@ -112,7 +112,7 @@ Launch blockers: W2.1-W2.9, W2.11-W2.17, migration v65, Phases 3 and 4, ninth no
 About 5,000 new lines, removals of about 140,000 lines, and 16-22 weeks end to end for one engineer. Soak, signet and hardware are elapsed-time bound whoever does the work.
 
 ## 5. User decisions needed
-0. (2026-11-03) After a share-chain partition longer than the 20-block cut, blocks the losing side found stay provisional for good on nodes that never held its anchors. They retire the same amounts either way. Leave it, or drop provisional entries past a depth (say 100 blocks) and log them as final.
+0. (2026-11-03) After a share-chain partition longer than the 20-block cut, blocks the losing side found stay provisional for good on nodes that never held its anchors. They retire the same amounts either way. Leave it, or drop provisional entries past a depth (say 100 blocks) and log them as final. **Decided 2026-11-03: leave them provisional. Also decided: a split longer than the cut costs the losing side its split-era credit (accepted); no per-session cap on re-sensing.**
 1. Treasury address, compiled in by W1.1. A single key is a single point of loss; a multisig address is possible.
 2. Hardware access for the signet stage of Phase 3.
 3. A real outside operator for the ninth-node stage.
