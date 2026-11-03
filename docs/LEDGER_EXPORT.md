@@ -93,8 +93,13 @@ The arithmetic is exact 256-bit; anything that would leave `u128`, or a face val
   sorted by script bytes. This is what the node-pool import loads into `np_ledger` (owed in 2^-32
   sat, keyed by payee script). The export does not set `queue_since`; the import decides it.
 - `totals`: `work`, `face_units`, the remainder fields, `face_units_of_total_work`.
-- `observed` and `warnings` are not covered by the digest: proposer id, active node count, this
-  node's highest round, and the blob length.
+- `observed`, `warnings` and `deleted` are not covered by the digest: proposer id, active node
+  count, this node's highest round, and the blob length.
+- **Deleted rows (decided 2026-11-03).** The node pool pays only P2SH, P2WPKH, P2WSH and P2TR, and
+  its import refuses any other script. A checkpoint row with any other script (P2PKH) is deleted:
+  it is not in `miners`, `genesis_table` or `totals`, and is listed in `deleted` (address and work)
+  and named in `warnings`. Every node deletes the same rows from the same checkpoint, so the digest
+  still agrees across nodes; `miners` plus `deleted` recompute the checkpoint's `ledger_root`.
 
 All `u128` values are JSON strings.
 

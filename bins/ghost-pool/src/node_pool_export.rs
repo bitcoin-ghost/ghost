@@ -446,6 +446,21 @@ pub struct LedgerExport {
     pub observed: Observed,
     /// Not in the digest.
     pub warnings: Vec<String>,
+    /// Not in the digest. Checkpoint rows deleted because the node pool cannot pay their
+    /// script (decided 2026-11-03), with their owed work, so a stranger can still recompute
+    /// the checkpoint's `ledger_root` from `miners` plus these.
+    #[serde(default)]
+    pub deleted: Vec<DeletedRow>,
+}
+
+/// A checkpoint row the export deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletedRow {
+    /// Payout address exactly as the checkpoint keys it.
+    pub address: String,
+    /// Owed work in checkpoint units, exactly as adopted.
+    #[serde(with = "u128_str")]
+    pub work: u128,
 }
 
 fn hex32(s: &str, what: &str) -> Result<[u8; 32]> {
@@ -642,6 +657,7 @@ pub fn build_ledger_export(
     let mut total_work: u128 = 0;
     let mut total_face: u128 = 0;
     let (mut rem_whole, mut rem_frac): (u128, u128) = (0, 0);
+    let mut dropped: Vec<(String, u128)> = Vec::new();
     for (address, work) in &miner_payouts {
         if !seen.insert(address.as_str()) {
             return Err(ExportError::DuplicateAddress(address.clone()));
@@ -651,12 +667,23 @@ pub fn build_ledger_export(
             network: network.to_string(),
             detail,
         };
-        let script = bitcoin::Address::from_str(address)
+        let script_buf = bitcoin::Address::from_str(address)
             .map_err(|e| bad(e.to_string()))?
             .require_network(network)
             .map_err(|e| bad(e.to_string()))?
-            .script_pubkey()
-            .to_bytes();
+            .script_pubkey();
+        // The node pool pays only P2SH, P2WPKH, P2WSH and P2TR, and its import refuses any
+        // other row. Decided 2026-11-03: such a balance is deleted from the export, not
+        // carried. Every node drops the same rows from the same checkpoint, so digests agree.
+        if !(script_buf.is_p2sh()
+            || script_buf.is_p2wpkh()
+            || script_buf.is_p2wsh()
+            || script_buf.is_p2tr())
+        {
+            dropped.push((address.clone(), *work));
+            continue;
+        }
+        let script = script_buf.to_bytes();
         let (face, rem) = mul_shift_div(*work, rate.num, divisor)?;
         if face > i128::MAX as u128 {
             return Err(ExportError::Overflow(format!(
@@ -733,6 +760,12 @@ pub fn build_ledger_export(
         .and_then(|v| u64::try_from(v).ok());
 
     let mut warnings = Vec::new();
+    for (address, work) in &dropped {
+        warnings.push(format!(
+            "deleted {address} (owed work {work}): not a node pool payee class (P2SH, P2WPKH, \
+             P2WSH, P2TR); this balance is not exported"
+        ));
+    }
     if !recomputes {
         warnings.push(format!(
             "ledger_root does not recompute from the adopted lists (stored {}, adopted {}); \
@@ -802,6 +835,13 @@ pub fn build_ledger_export(
             canonical_payout_len: canonical.len(),
         },
         warnings,
+        deleted: dropped
+            .iter()
+            .map(|(address, work)| DeletedRow {
+                address: address.clone(),
+                work: *work,
+            })
+            .collect(),
     };
     export.digest_sha256 = hex::encode(Sha256::digest(canonical_bytes(&export)?));
     Ok(export)
@@ -1125,11 +1165,21 @@ mod tests {
         assert_eq!(canonical_bytes(&parsed).unwrap(), bin);
         assert_eq!(hex::encode(Sha256::digest(&bin)), parsed.digest_sha256);
 
-        let m: Vec<(String, u128)> = parsed
-            .miners
-            .iter()
-            .map(|r| (r.address.clone(), r.work))
+        // The exported rows plus the deleted ones are the checkpoint's whole list.
+        let m: Vec<(String, u128)> = miners()
+            .into_iter()
+            .filter(|(a, w)| {
+                parsed
+                    .miners
+                    .iter()
+                    .any(|r| &r.address == a && r.work == *w)
+                    || parsed
+                        .deleted
+                        .iter()
+                        .any(|r| &r.address == a && r.work == *w)
+            })
             .collect();
+        assert_eq!(m.len(), miners().len());
         let n: Vec<([u8; 32], i32)> = parsed
             .checkpoint
             .node_shares
@@ -1154,15 +1204,25 @@ mod tests {
             parsed.checkpoint.canonical_payout_sha256,
             hex::encode(Sha256::digest(blob))
         );
-        // Every exported address carries its script; P2PKH and P2WPKH both resolve.
-        assert!(parsed
-            .miners
-            .iter()
-            .any(|r| r.script_hex.starts_with("76a914")));
+        // Every exported address carries its script. The P2PKH balance is deleted (2026-11-03):
+        // not exported, not in the table, named in the warnings.
         assert!(parsed
             .miners
             .iter()
             .any(|r| r.script_hex.starts_with("0014")));
+        assert!(!parsed
+            .miners
+            .iter()
+            .any(|r| r.script_hex.starts_with("76a914")));
+        assert!(!parsed
+            .genesis_table
+            .iter()
+            .any(|r| r.script_hex.starts_with("76a914")));
+        assert_eq!(parsed.miners.len(), miners().len() - 1);
+        assert!(parsed
+            .warnings
+            .iter()
+            .any(|w| w.contains("deleted 148WRjKfSSo911CYRLzeyYm1QKhy7kCXTN")));
     }
 
     #[test]
@@ -1181,7 +1241,12 @@ mod tests {
         }
         assert_eq!(l.totals.remainder_face_units, rem_sum / d);
         assert_eq!(l.totals.remainder_frac_num, rem_sum % d);
-        let total_work: u128 = miners().iter().map(|(_, w)| w).sum();
+        // Totals cover the exported rows only; the P2PKH row is deleted.
+        let total_work: u128 = miners()
+            .iter()
+            .filter(|(a, _)| !a.starts_with('1'))
+            .map(|(_, w)| w)
+            .sum();
         assert_eq!(l.totals.work, total_work);
         assert_eq!(
             l.totals.face_units_of_total_work,
@@ -1197,7 +1262,8 @@ mod tests {
         // The genesis table is the per-script sum of the floors.
         let table_total: u128 = l.genesis_table.iter().map(|t| t.face_units).sum();
         assert_eq!(table_total, l.totals.face_units);
-        assert_eq!(l.genesis_table.len(), 4);
+        // Four checkpoint rows, the P2PKH one deleted.
+        assert_eq!(l.genesis_table.len(), 3);
     }
 
     #[test]
