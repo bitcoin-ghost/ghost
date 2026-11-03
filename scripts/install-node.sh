@@ -1095,7 +1095,9 @@ cd "$TMP"
 curl -fsSLO "${RELEASE_BASE}/${POOL_TARBALL}"
 curl -fsSLO "${RELEASE_BASE}/SHA256SUMS.txt"
 curl -fsSLO "${RELEASE_BASE}/SHA256SUMS.txt.asc"
-# Verify the GPG signature over the checksums, then the checksum of our tarball.
+# Verify the GPG signature over the checksums, then the checksum of our tarball. In a keyring of
+# its own, as the updater does, so root's keyring is never given an ultimately trusted key.
+export GNUPGHOME="$TMP/gnupg"; mkdir -m 700 "$GNUPGHOME"
 curl -fsSL "$RELEASE_KEY_URL" 2>/dev/null | gpg --quiet --import 2>/dev/null || true
 # Mark the pinned key trusted so gpg doesn't emit a (cosmetic) web-of-trust warning.
 echo "${GPG_KEY_FP}:6:" | gpg --quiet --import-ownertrust 2>/dev/null || true
@@ -1107,6 +1109,7 @@ else
   err "Release signature verification FAILED (expected signing key ${GPG_KEY_FP})."
 fi
 grep " ${POOL_TARBALL}\$" SHA256SUMS.txt | sha256sum -c - || err "Checksum verification FAILED for ${POOL_TARBALL}."
+unset GNUPGHOME
 tar -xzf "$POOL_TARBALL"
 # The node binary was `ghost-pool` up to and including v1.11.44 (#1018). A release that old is
 # refused rather than installed under the new name: that binary restarts itself and reads its own
