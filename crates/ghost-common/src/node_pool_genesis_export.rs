@@ -30,6 +30,9 @@
 //!    `queue_since = H`, the export's height (the freeze height); rows below the floor get none.
 //!    Derived, not a parameter: every node reading the same digest builds the same table and the
 //!    same `table_root`, with nothing to mistype.
+//! 6. Every row's script is a node pool payee class (P2SH, P2WPKH, P2WSH, P2TR), the scripts a
+//!    coinbase may pay (spec 2.1). An export holding P2PKH rows (the old fleet paid P2PKH) is
+//!    refused, naming the count and the sats owed.
 //!
 //! The result's [`GenesisExport::table_root`](crate::node_pool_genesis_export::GenesisExport::table_root) is the digest a node pins
 //! (`genesis_table_digest`, [`crate::node_pool_network::NetworkStart::check_table`]).
@@ -41,6 +44,7 @@ use sha2::{Digest, Sha256};
 use crate::canonical_payout::{table_root, Balance, Table};
 use crate::node_pool_constants::PAYOUT_FLOOR_FACE;
 use crate::node_pool_network::NodePoolNetwork;
+use crate::share_commit::payee_script_class;
 
 /// The export binary's magic, its first bytes.
 pub const LEDGER_MAGIC: &[u8] = b"GhostLedgerExport/v1";
@@ -145,6 +149,36 @@ pub fn genesis_table(rows: &[(Vec<u8>, u128)], queue_since: u32) -> Result<Table
                 queue_since: (owed >= PAYOUT_FLOOR_FACE).then_some(queue_since),
             },
         );
+    }
+    // Check 6: every row a payee class. The coinbase pays a genesis row like any balance, and
+    // the node pool pays only P2SH, P2WPKH, P2WSH and P2TR (spec 2.1): a P2PKH output costs 4
+    // sigops, the coinbase has 400 left by the template, and regtest lost a block at 120 of them.
+    // The old fleet paid P2PKH, so an export can hold such rows; they need a decision (how those
+    // balances are carried) before the cutover, not a lost block after it.
+    let outside: Vec<&Vec<u8>> = rows
+        .iter()
+        .map(|(s, _)| s)
+        .filter(|s| payee_script_class(s).is_none())
+        .collect();
+    if !outside.is_empty() {
+        let owed: u128 = rows
+            .iter()
+            .filter(|(s, _)| payee_script_class(s).is_none())
+            .fold(0u128, |a, (_, f)| a.saturating_add(*f));
+        let p2pkh = outside
+            .iter()
+            .filter(|s| {
+                s.len() == 25 && s.starts_with(&[0x76, 0xa9, 0x14]) && s.ends_with(&[0x88, 0xac])
+            })
+            .count();
+        return Err(format!(
+            "{} genesis rows ({p2pkh} of them P2PKH) owing {} sats are not a node pool payee \
+             class (P2SH, P2WPKH, P2WSH, P2TR), so the coinbase cannot pay them safely: first {}. \
+             The export must carry them some other way (a decision for the cutover)",
+            outside.len(),
+            owed >> 32,
+            hex::encode(outside[0])
+        ));
     }
     Ok(t)
 }
@@ -302,12 +336,33 @@ mod tests {
 
     fn rows() -> Vec<(Vec<u8>, u128)> {
         let mut r = vec![
-            (vec![0x00, 0x14, 0xAA], 5_000 * FACE_PER_SAT as u128 + 7),
-            (vec![0x51, 0x20, 0xBB], PAYOUT_FLOOR_FACE as u128),
-            (vec![0x51, 0x20, 0xCC], 999 * FACE_PER_SAT as u128),
+            (script(0x00, 0x14, 0xAA), 5_000 * FACE_PER_SAT as u128 + 7),
+            (script(0x51, 0x20, 0xBB), PAYOUT_FLOOR_FACE as u128),
+            (script(0x51, 0x20, 0xCC), 999 * FACE_PER_SAT as u128),
         ];
         r.sort();
         r
+    }
+
+    /// A witness program script: version op, push length, then `len` bytes of `fill`.
+    fn script(op: u8, len: u8, fill: u8) -> Vec<u8> {
+        [&[op, len][..], &vec![fill; len as usize]].concat()
+    }
+
+    /// A P2PKH row (the old fleet paid P2PKH) refuses the export by name, with its count.
+    #[test]
+    fn a_row_outside_the_payee_classes_is_refused() {
+        let p2pkh = [&[0x76, 0xa9, 0x14][..], &[0x11; 20], &[0x88, 0xac]].concat();
+        let mut r = rows();
+        r.push((p2pkh.clone(), 2_000 * FACE_PER_SAT as u128));
+        r.sort();
+        let (bin, json, d) = sample_export("regtest", 7, &r, &r);
+        let e = parse_export(&bin, &json, &d).unwrap_err();
+        assert!(
+            e.contains("1 genesis rows (1 of them P2PKH) owing 2000 sats")
+                && e.contains(&hex::encode(&p2pkh)),
+            "{e}"
+        );
     }
 
     #[test]

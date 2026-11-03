@@ -23,9 +23,18 @@ const GENESIS: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 /// Three payees: one well above the 1,000-sat floor, one exactly at it, one below.
 fn rows() -> Vec<(Vec<u8>, u128)> {
     let mut r = vec![
-        (vec![0x00, 0x14, 0xAA], 5_000 * FACE_PER_SAT as u128 + 7),
-        (vec![0x51, 0x20, 0xBB], PAYOUT_FLOOR_FACE as u128),
-        (vec![0x51, 0x20, 0xCC], 999 * FACE_PER_SAT as u128),
+        (
+            [&[0x00, 0x14][..], &[0xAA; 20]].concat(),
+            5_000 * FACE_PER_SAT as u128 + 7,
+        ),
+        (
+            [&[0x51, 0x20][..], &[0xBB; 32]].concat(),
+            PAYOUT_FLOOR_FACE as u128,
+        ),
+        (
+            [&[0x51, 0x20][..], &[0xCC; 32]].concat(),
+            999 * FACE_PER_SAT as u128,
+        ),
     ];
     r.sort();
     r
@@ -304,7 +313,7 @@ fn verify_round_trips_and_writes_nothing() {
     assert_eq!(f.stored_meta().unwrap().imported_at, 5, "nothing rewritten");
 
     // Another export does not verify against this store.
-    let other_rows = vec![(vec![0x51, 0x20, 0xDD], 7u128)];
+    let other_rows = vec![([&[0x51, 0x20][..], &[0xDD; 32]].concat(), 7u128)];
     let other = export_with("regtest", H, &other_rows, &other_rows);
     let dir = f.write(&other);
     let err = run(&cfg, &dir, &other.digest, true, 0).unwrap_err();

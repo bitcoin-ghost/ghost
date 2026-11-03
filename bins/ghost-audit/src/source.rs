@@ -380,8 +380,14 @@ mod tests {
 
     fn rows(extra: u128) -> Vec<(Vec<u8>, u128)> {
         vec![
-            (vec![0x00, 0x14, 1], 4_000 * FACE_PER_SAT as u128 + extra),
-            (vec![0x51, 0x20, 2], 300 * FACE_PER_SAT as u128),
+            (
+                [&[0x00, 0x14][..], &[1; 20]].concat(),
+                4_000 * FACE_PER_SAT as u128 + extra,
+            ),
+            (
+                [&[0x51, 0x20][..], &[2; 32]].concat(),
+                300 * FACE_PER_SAT as u128,
+            ),
         ]
     }
 

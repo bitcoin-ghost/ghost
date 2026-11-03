@@ -616,7 +616,7 @@ def audit(h):
 def genesis_import(h):
     if not h.export_dir:
         return result("genesis table import (migration v65)", "UNMEASURED", "run with --genesis-rows 0")
-    ev, ok = [f"synthetic export: {len(h.genesis)} rows, sha256 {h.export_digest[:16]}.., "
+    ev, ok = [f"{'real' if h.args.genesis_export else 'synthetic'} export: {len(h.genesis)} rows, sha256 {h.export_digest[:16]}.., "
               f"{sum(1 for v in h.genesis.values() if v < 1000)} below the 1,000-sat floor"], True
     roots = set()
     for n in h.honest():
