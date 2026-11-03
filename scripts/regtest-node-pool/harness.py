@@ -369,6 +369,13 @@ class Node:
     def start_ghost_mining(self):
         d = os.path.join(self.dir, "ghost")
         os.makedirs(os.path.join(d, "data"), exist_ok=True)
+        # --seed-ghost-db / --seed-node-key: start this node on an old node's migrated database
+        # and its node key (the flag-day rehearsal), once; a restart keeps what it has.
+        seeds = [(self.h.args.seed_ghost_db, "ghost.db"), (self.h.args.seed_node_key, "node.key")]
+        for files, name in seeds:
+            if files and self.i < len(files) and not os.path.exists(os.path.join(d, name)):
+                shutil.copy2(files[self.i], os.path.join(d, name))
+                os.chmod(os.path.join(d, name), 0o600)
         self.api_secret = hashlib.sha256(f"secret{self.i}".encode()).hexdigest()
         cfg = f"""[identity]
 key_path = "{d}/node.key"
@@ -696,11 +703,43 @@ class Harness:
         out = subprocess.run([args.bitcoind, "-version"], capture_output=True, text=True).stdout
         self.node_version = (out.splitlines() or ["unknown version"])[0]
         self.is_ghostd = "Ghost Core" in out
-        self.genesis = {}  # script hex -> sats owed at genesis
+        self.genesis = {}  # script hex -> whole sats owed at genesis (payable part)
+        self.genesis_face = {}  # script hex -> face units (2^-32 sat) owed at genesis, exact
         self.genesis_addr = {}  # script hex -> address
         self.grinder = self.build_grinder() if args.network != "regtest" else None
-        if args.genesis_rows:
+        if args.genesis_export:
+            self.use_export(args.genesis_export, args.genesis_export_digest)
+        elif args.genesis_rows:
             self.make_export(args.genesis_rows)
+
+    def use_export(self, src, digest):
+        """A real ledger export (`ghost-mining --np-export` on the old release) instead of the
+        synthetic one: copied into the work dir as published, read for the reference's balances
+        (face units, so fractional sats are kept), and imported by every node with `digest`."""
+        self.export_dir = os.path.join(self.work, "export")
+        os.makedirs(self.export_dir, exist_ok=True)
+        for name in os.listdir(src):
+            shutil.copy2(os.path.join(src, name), self.export_dir)
+        with open(os.path.join(self.export_dir, "ledger-export.json")) as f:
+            j = json.load(f)
+        if j["network"] != NETWORK:
+            raise SystemExit(f"--genesis-export is a {j['network']} export; this run is {NETWORK}")
+        if j["checkpoint"]["height"] != EXPORT_HEIGHT:
+            raise SystemExit(f"--genesis-export is at height {j['checkpoint']['height']}, the run's "
+                             f"export height is {EXPORT_HEIGHT}")
+        for row in j["genesis_table"]:
+            face = int(row["face_units"])
+            self.genesis_face[row["script_hex"]] = face
+            self.genesis[row["script_hex"]] = face >> 32
+        for m in j.get("miners", []):
+            self.genesis_addr.setdefault(m["script_hex"], m["address"])
+        missing = [s for s in self.genesis if s not in self.genesis_addr]
+        if missing:
+            raise SystemExit(f"--genesis-export: {len(missing)} genesis rows have no address in "
+                             "`miners`")
+        self.export_digest = digest
+        say(f"genesis export {src}: {len(self.genesis)} rows, digest {self.export_digest[:16]}.., "
+            f"height {EXPORT_HEIGHT}")
 
     def build_grinder(self):
         """grind.c built into the work dir for the miners (signet's blocks need ~4.8M hashes).
@@ -724,6 +763,7 @@ class Harness:
             table[script] = sats
             self.genesis_addr[script] = addr
         self.genesis = table
+        self.genesis_face = {s: v << 32 for s, v in table.items()}
         ordered = sorted(table.items(), key=lambda kv: bytes.fromhex(kv[0]))
         net = NETWORK.encode()
         body = b"GhostLedgerExport/v1" + len(net).to_bytes(2, "big") + net
@@ -1096,6 +1136,18 @@ def main():
                     help="pool_sv2 built with --features np-fault-injection, for the hostile node")
     ap.add_argument("--genesis-rows", type=int, default=1200,
                     help="rows of the synthetic genesis export every node imports (0: none)")
+    ap.add_argument("--genesis-export", metavar="DIR",
+                    help="import this real ledger export (ghost-mining --np-export) instead of the "
+                         "synthetic one; signet: its height becomes the genesis height")
+    ap.add_argument("--genesis-export-digest", metavar="HEX",
+                    help="the export's published digest (sha256 of ledger-export.bin); required "
+                         "with --genesis-export")
+    ap.add_argument("--seed-ghost-db", nargs="*", metavar="FILE",
+                    help="node i starts ghost-mining on a copy of FILE[i] as its ghost.db (an old "
+                         "node's database, migrated by v65 on first open)")
+    ap.add_argument("--seed-node-key", nargs="*", metavar="FILE",
+                    help="node i uses a copy of FILE[i] as its ghost-mining node.key (the old "
+                         "node's key, so its database's addresses decrypt)")
     ap.add_argument("--faults", nargs="*", default=None,
                     help="hostile builds (node_pool_fault.rs); default wrong-treasury fee-skim "
                          "(regtest), and payee-order no-root overpay as well (signet)")
@@ -1137,6 +1189,14 @@ def main():
     if args.faults is None:
         args.faults = ["wrong-treasury", "fee-skim"] + (
             ["payee-order", "no-root", "overpay"] if signet else [])
+    if args.genesis_export:
+        if not args.genesis_export_digest:
+            raise SystemExit("--genesis-export needs --genesis-export-digest (the published digest)")
+        with open(os.path.join(args.genesis_export, "ledger-export.json")) as f:
+            export_height = json.load(f)["checkpoint"]["height"]
+        if signet:
+            # The freeze: the export's height is the genesis anchor's (plan Phase 4).
+            args.signet_genesis_height = export_height
     configure_network(args)
     args.bitcoind = args.bitcoind or find_ghostd(args.ghostd_cache)
     if not args.bitcoind:

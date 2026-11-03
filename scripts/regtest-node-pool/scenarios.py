@@ -282,7 +282,7 @@ def blocks_settle(h):
         for n in h.honest():
             for sc in sample:
                 led = n.ledger(h.genesis_addr[sc])
-                want = (h.genesis[sc] - paid.get(sc, 0)) << 32
+                want = h.genesis_face[sc] - (paid.get(sc, 0) << 32)
                 got = int(led.get("balance", {}).get("units", -1))
                 if got != want:
                     wrong.append(f"node{n.i} {h.genesis_addr[sc][:14]}.. {got} != {want}")
