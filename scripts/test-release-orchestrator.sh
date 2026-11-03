@@ -139,6 +139,14 @@ case "$*" in
       # Model the release.yml RUN for this tag. Empty output = no run exists at all, which is
       # the genuinely-no-workflow case. Otherwise "status:conclusion", e.g. "in_progress:" or
       # "completed:failure".
+      # GH_RUN_DONE_AFTER=N models #1026: the run stays in_progress for N lookups (uploading),
+      # then completes; until then the release carries only some of its assets.
+      if [ -n "${GH_RUN_DONE_AFTER-}" ]; then
+          r=$(( $(cat "$GH_RUNLOOKUPS" 2>/dev/null || echo 0) + 1 )); echo "$r" > "$GH_RUNLOOKUPS"
+          if [ "$r" -gt "$GH_RUN_DONE_AFTER" ]; then echo done > "$GH_RUNDONE"; echo "completed:success"
+          else echo "in_progress:"; fi
+          exit 0
+      fi
       printf '%s' "${GH_RUN_STATE-}"; [ -n "${GH_RUN_STATE-}" ] && echo
       exit 0 ;;
   *releases\?per_page*)
@@ -153,11 +161,14 @@ case "$*" in
       # A release WE minted carries no artefacts — the count must agree with the name list
       # below, or a mutation can hide behind the two disagreeing.
       [ -f "$GH_CREATED" ] && { echo 0; exit 0; }
+      [ -n "${GH_RUN_DONE_AFTER-}" ] && [ ! -f "$GH_RUNDONE" ] && { echo 2; exit 0; }
       echo "${GH_ASSETS:-5}"; exit 0 ;;
   *".assets[].name"*)
       # A release we minted ourselves has NO assets, whatever GH_ASSETS says.
       [ -f "$GH_CREATED" ] && exit 0
-      i=0; while [ "$i" -lt "${GH_ASSETS:-5}" ]; do
+      want="${GH_ASSETS:-5}"
+      [ -n "${GH_RUN_DONE_AFTER-}" ] && [ ! -f "$GH_RUNDONE" ] && want=2
+      i=0; while [ "$i" -lt "$want" ]; do
           case $i in
             0) echo "bitcoin-ghost-v9.9.9-x86_64-unknown-linux-gnu.tar.gz" ;;
             1) echo "bitcoin-ghost-v9.9.9-x86_64-apple-darwin.tar.gz" ;;
@@ -181,9 +192,12 @@ run_tag_phase() {   # $1 = GH_PUBLISH_WORKS
     printf 'draft=true\ntagname=v9.9.9\n' > "$TMP/gh_state"
     : > "$TMP/gh_calls"
     : > "$TMP/gh_lookups"
-    rm -f "$TMP/gh_created"
+    rm -f "$TMP/gh_created" "$TMP/gh_rundone"
+    : > "$TMP/gh_runlookups"
     ( cd "$REPO" && PATH="$TMP/bin:$PATH" \
         GH_STATE="$TMP/gh_state" GH_CALLS="$TMP/gh_calls" GH_PUBLISH_WORKS="$1" \
+        GH_RUNLOOKUPS="$TMP/gh_runlookups" GH_RUNDONE="$TMP/gh_rundone" \
+        GH_RUN_DONE_AFTER="${GH_RUN_DONE_AFTER-}" \
         GH_LOOKUPS="$TMP/gh_lookups" GH_CREATED="$TMP/gh_created" \
         GH_RELEASE_APPEARS_AFTER="${GH_RELEASE_APPEARS_AFTER:-0}" \
         GH_RUN_STATE="${GH_RUN_STATE-}" GH_ASSETS="${GH_ASSETS:-5}" GH_SIGNED="${GH_SIGNED:-1}" \
@@ -285,6 +299,23 @@ if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q 'assets, want >=' && ! grep -q 
     ok "a release with zero assets is REFUSED by the asset-count check, before any publish (#909)"
 else
     bad "zero-asset release not refused by the count check (rc=$rc) — #909 regression: $(printf '%s' "$out" | tail -1)"
+fi
+
+# 3b. #1026: the release appears while release.yml is still uploading (2 of 5 assets). The phase
+#     must wait for the run to finish, then count, then publish — not refuse and leave a draft.
+out="$(GH_RUN_DONE_AFTER=3 TAG_RELEASE_MAX_SECS=20 run_tag_phase 1)"; rc=$?
+if [ $rc -eq 0 ] && grep -q 'PATCH' "$TMP/gh_calls" 2>/dev/null && [ -f "$TMP/gh_rundone" ]; then
+    ok "a release still uploading is waited for until its run completes, then published (#1026)"
+else
+    bad "counted assets while release.yml was still uploading (rc=$rc) — #1026: $(printf '%s' "$out" | tail -1)"
+fi
+
+# 3c. The run fails AFTER its release appeared: refuse, publish nothing.
+out="$(GH_RUN_STATE=completed:failure GH_ASSETS=5 run_tag_phase 1)"; rc=$?
+if [ $rc -ne 0 ] && ! grep -q 'PATCH' "$TMP/gh_calls" 2>/dev/null; then
+    ok "a run that failed after creating its release is refused, nothing published"
+else
+    bad "published a release whose run failed (rc=$rc)"
 fi
 
 # 4. Assets present but UNSIGNED. The signature is the point of the release; its absence must not

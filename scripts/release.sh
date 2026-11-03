@@ -674,6 +674,27 @@ phase_tag() {
     fi
     [ -n "$rel_id" ] || die "no release found for $TAG to publish"
 
+    # #1026: the release object appears when the workflow's upload step STARTS, so counting
+    # assets the moment it exists races the upload (v1.11.45: 2 of 5 counted, refused, left a
+    # draft). If a run exists for this tag, wait for it to finish and succeed before counting.
+    while :; do
+        run_state=$(gh api "repos/$GH_REPO/actions/runs?per_page=30" \
+            --jq "[.workflow_runs[]|select(.head_branch==\"$TAG\")]|.[0]|\"\(.status):\(.conclusion//\"\")\"" \
+            2>/dev/null)
+        case "$run_state" in
+            completed:success|"null:"|"") break ;;
+            completed:*)
+                die "release.yml for $TAG finished '$run_state' after its release appeared — the
+       build FAILED. Refusing to publish what it uploaded." ;;
+        esac
+        [ "$waited" -ge "$TAG_RELEASE_MAX_SECS" ] \
+            && die "release.yml for $TAG is still '$run_state' after ${waited}s with its release
+       already created. Check the run, then re-run this phase."
+        sleep "$TAG_RELEASE_POLL_SECS"
+        waited=$((waited + TAG_RELEASE_POLL_SECS))
+        [ $((waited % 120)) -eq 0 ] && info "release.yml for $TAG is $run_state, uploading (${waited}s)"
+    done
+
     # The release must actually CONTAIN something before it is published. #909: the old path
     # published `assets=0` and reported success, because it only ever checked flags it had set
     # itself. Assert the artefacts, and assert the signature is among them by name.
