@@ -356,6 +356,18 @@ def slot_classes(h):
     ev, ok = [], True
     seen_classes = set()
     marks = {n.i: len(n.read_log("pool_sv2")) for n in h.honest()}
+    # The miners are paused here. Wait (up to --stall-wait seconds) for a settled miner's class to
+    # be suspended by the no-share timeout while it stays connected, so the climb back below is
+    # seen on this run and not only in earlier pauses.
+    stall_seen = None
+    try:
+        t = time.time()
+        wait_for(lambda: any("cause=Stalled" in l for n in h.honest()
+                             for l in n.read_log("pool_sv2")[marks[n.i]:].splitlines()),
+                 h.args.stall_wait, step=5, what="a class suspended by silence")
+        stall_seen = f"{time.time() - t:.0f}s"
+    except TimeoutError:
+        pass
     before = {(x[0], x[1]): x[3] for x in _class_view(h)}
     for n in h.honest():
         n.pause_miners(False)
@@ -396,7 +408,13 @@ def slot_classes(h):
                   f"class={cls} (expected {want}) settled={settled} ceiling={sens.get('ceiling_class')}; "
                   f"before resuming {before.get((i, addr))}; whole run: {stalled} class(es) suspended by "
                   f"silence, {silent_fail} failed by silence (a trial), failed now {failed}")
-    ev.insert(0, f"miners resumed: every miner back at its class and settled in {back_in}"
+    suspended = sum(1 for n in h.honest() for l in n.read_log("pool_sv2")[marks[n.i]:].splitlines()
+                    if "cause=Stalled" in l)
+    ev.insert(0, (f"paused miners: a class suspended by silence {stall_seen} into the pause ({suspended} "
+                  f"suspensions in this scenario)" if stall_seen else
+                  f"paused miners: no class suspended by silence within {h.args.stall_wait:.0f}s, so this "
+                  f"run's climb back is UNMEASURED here (unit tests cover it)"))
+    ev.insert(1, f"miners resumed: every miner back at its class and settled in {back_in}"
               if back_in else "miners resumed: NOT every miner got back to its class")
     try:
         STATE["quiet"] = h.quiesce(300)

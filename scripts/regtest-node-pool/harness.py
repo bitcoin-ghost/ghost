@@ -1098,6 +1098,9 @@ def main():
     ap.add_argument("--past-halving", action="store_true",
                     help="finally mine past regtest's first halving (150) and report what happens")
     ap.add_argument("--only", nargs="*", help="scenario function names to run")
+    ap.add_argument("--stall-wait", type=float, default=600,
+                    help="slot classes: seconds to wait, miners paused, for a class to be suspended "
+                         "by the no-share timeout before resuming them")
     ap.add_argument("--partition-blocks", type=int, default=30,
                     help="signet: Bitcoin blocks mined while the relay network is split in two "
                          "(more than the 20-block snapshot cut)")
