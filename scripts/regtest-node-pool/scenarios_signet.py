@@ -121,8 +121,7 @@ def ref_state(h):
     """The genesis table as the payout rule's reference reads it: owed in face units,
     queue_since at the export height for balances at or above the floor."""
     st = {}
-    for sc, sats in h.genesis.items():
-        owed = sats << 32
+    for sc, owed in h.genesis_face.items():
         st[bytes.fromhex(sc)] = (owed, HX.EXPORT_HEIGHT if owed >= R.FLOOR else None)
     return st
 
