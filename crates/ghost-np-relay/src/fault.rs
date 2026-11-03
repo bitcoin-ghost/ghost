@@ -35,6 +35,9 @@
 //! - `truncate`: `Headers` replies stop after their first two anchors while `Tip` and `Hello` still
 //!   advertise the whole chain, and `Batch` replies drop their last share id.
 //!
+//! Every lie also answers `GetAddr` with no addresses, so a node that knows only the liar stays
+//! alone with it.
+//!
 //! Anything else, or unset, changes nothing.
 //!
 //! A test build also dials its peers from its relay's listen address ([`connect_from`]), so that
@@ -151,6 +154,11 @@ fn tamper_with(f: SyncFault, m: Message) -> Message {
             ids.pop();
             Message::Batch { anchor, ids }
         }
+        // Every liar also hides its other peers, so a node that knows only the liar stays alone
+        // with it (an eclipse) instead of learning honest peers from it.
+        (SyncFault::Balances | SyncFault::Stamps | SyncFault::Truncate, Message::Addr(_)) => {
+            Message::Addr(vec![])
+        }
         (_, m) => m,
     }
 }
@@ -202,5 +210,11 @@ mod tests {
         assert_eq!(t.recent[0].parent_anchor, [4; 32]);
         assert_eq!(t.recent[0].batch_root[0], 5 ^ 1);
         assert_eq!(t.recent[0].batch_root[1..], [5; 31]);
+        let addr = Message::Addr(vec!["127.0.0.1:1".into()]);
+        assert_eq!(
+            tamper_with(SyncFault::Truncate, addr.clone()),
+            Message::Addr(vec![])
+        );
+        assert_eq!(tamper_with(SyncFault::None, addr.clone()), addr);
     }
 }
