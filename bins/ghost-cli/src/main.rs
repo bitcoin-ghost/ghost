@@ -38,12 +38,18 @@ use std::path::PathBuf;
 #[command(name = "ghost-admin")]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// Pool API URL (required, or set GHOST_POOL_URL env var)
+    /// The node's API URL (or set GHOST_POOL_URL). Default: this machine's ghost-mining API.
     ///
-    /// Made optional at the clap level to sidestep a quirk where a required
-    /// `global = true` String arg ends up being required at both the top level
-    /// and every subcommand level. Presence is validated in main().
-    #[arg(short, long, env = "GHOST_POOL_URL", global = true)]
+    /// An Option at the clap level to sidestep a quirk where a required `global = true` String
+    /// arg ends up being required at both the top level and every subcommand level. An empty
+    /// value is refused in main().
+    #[arg(
+        short,
+        long,
+        env = "GHOST_POOL_URL",
+        global = true,
+        default_value = "http://127.0.0.1:8080"
+    )]
     url: Option<String>,
 
     /// Output format (text, json)
@@ -441,7 +447,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let url = cli.url.as_deref().filter(|s| !s.is_empty()).ok_or_else(|| {
         anyhow::anyhow!(
-            "pool API URL is required — pass --url <URL> or set GHOST_POOL_URL (currently unset or empty)"
+            "the node API URL is empty — pass --url <URL> or unset GHOST_POOL_URL to use http://127.0.0.1:8080"
         )
     })?;
     let client = ApiClient::new(url, cli.retries);
