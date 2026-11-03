@@ -658,6 +658,8 @@ impl Node {
     }
 
     fn send(&mut self, conn: PeerId, m: &Message) {
+        #[cfg(feature = "fault-injection")]
+        let m = &crate::fault::tamper(m.clone());
         self.send_frame(conn, Arc::new(m.encode()));
     }
 
@@ -711,11 +713,23 @@ impl Node {
             .filter(|a| !(a.ip().is_loopback() && Some(a.port()) == own_port))
             .take(self.cfg.max_outbound - outbound)
             .collect();
+        // Test builds: a lying relay dials from its own listen address, so the peers it lies to
+        // can tell it apart by IP on a one-host test network (fault.rs).
+        #[cfg(feature = "fault-injection")]
+        let bind = self
+            .cfg
+            .listen
+            .map(|l| l.ip())
+            .filter(|ip| !ip.is_unspecified());
         for a in cands {
             self.dialing.insert(a);
             let tx = self.ev_tx.clone();
             tokio::spawn(async move {
-                let r = match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(a)).await {
+                #[cfg(feature = "fault-injection")]
+                let connect = crate::fault::connect_from(bind, a);
+                #[cfg(not(feature = "fault-injection"))]
+                let connect = TcpStream::connect(a);
+                let r = match tokio::time::timeout(DIAL_TIMEOUT, connect).await {
                     Ok(r) => r,
                     Err(_) => Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,

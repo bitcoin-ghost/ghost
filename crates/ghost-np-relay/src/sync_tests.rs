@@ -601,3 +601,32 @@ fn checkpoints_restart_verify_and_rebuild() {
     check(&mut s, "both corrupt");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A peer that advertises the heaviest tip but answers `GetHeaders` with a short reply that
+/// stops below it (a truncated history) is passed over for headers: the node syncs the rest from
+/// an honest peer advertising the same tip, whichever of them it would ask first.
+#[test]
+fn a_truncated_headers_reply_does_not_stall_sync() {
+    for liar in [0usize, 1] {
+        let mut s = Sim::mesh(2);
+        grow(&mut s, 0, 3, 10);
+        assert_same(&mut s, &[0, 1]);
+        let i = s.add(open(params(), mem()));
+        s.tamper = Box::new(move |from, to, m| match m {
+            Message::Headers(mut v) if from == liar && to == i => {
+                v.truncate(3);
+                Message::Headers(v)
+            }
+            m => m,
+        });
+        s.link(liar, i);
+        s.link(1 - liar, i);
+        settle_sync(&mut s, 40);
+        assert_same(&mut s, &[0, 1, i]);
+        assert!(
+            s.nodes[i].penalties.is_empty(),
+            "a short reply is not provably a lie: {:?}",
+            s.nodes[i].penalties
+        );
+    }
+}
