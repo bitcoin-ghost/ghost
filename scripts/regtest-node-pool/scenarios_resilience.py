@@ -126,7 +126,6 @@ def partition(h):
     pre_credits = chain_credits(nodes[0], pre_chain)
     hp = nodes[0].rpc("getblockcount")
     marks = {n.i: len(n.read_log("pool_sv2")) for n in nodes}
-    sett0 = {n.i: n.status()["settlement"] for n in nodes}
     reorgs0 = {n.i: n.status()["relay_stats"].get("reorgs", 0) for n in nodes}
     # Split: every pool_sv2 restarted with only its own side's relays. The address book and bans
     # live in memory, so nothing of the other side is remembered.
@@ -263,7 +262,8 @@ def partition(h):
             else:
                 kinds["none"] += 1
         st = n.status()["settlement"]
-        mism = st["mismatched"] - sett0[n.i]["mismatched"]
+        # Every pool_sv2 restarted at the split, so its counters count from then.
+        mism = st["mismatched"]
         prov_now = [x for x in st["provisional"]]
         good = kinds["mismatch"] == 0 and kinds["none"] == 0 and mism == 0
         ok &= good

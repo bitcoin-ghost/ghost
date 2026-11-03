@@ -490,9 +490,9 @@ def bitcoin_reorg(h):
         else:
             ev.append(f"store digests equal on every node after the undo: {mid[0]}")
         # Only the block itself: its stale siblings stay invalid, so no node can tie-break onto one.
+        log_len = {n.i: len(n.read_log("pool_sv2")) for n in h.nodes}
         for n in nodes:
             n.rpc("reconsiderblock", bh)
-        log_len = {n.i: len(n.read_log("pool_sv2")) for n in h.nodes}
         end_q = h.quiesce(180)
         after = {n.i: n.digests() for n in h.nodes}
         ev.append(f"after reconsider: agreed tip {end_q}")

@@ -406,11 +406,12 @@ def signet_reorg(h):
         same = len({json.dumps(d, sort_keys=True) for d in mid.values()}) == 1
         ok &= same
         ev.append(f"store digests {'equal on every node' if same else 'DIFFER'} on the competing branch")
+        # Marked before reconsidering: a fast node settles the first block again at once.
+        log_len = {n.i: len(n.read_log("pool_sv2")) for n in h.nodes}
         for n in nodes:
             n.rpc("reconsiderblock", bh)
         wait_for(lambda: all(n.rpc("getblockcount") == tip for n in nodes), 180,
                  what="every node back on the original branch")
-        log_len = {n.i: len(n.read_log("pool_sv2")) for n in h.nodes}
         end_q = h.quiesce(240)
         after = {n.i: n.digests() for n in h.nodes}
         ev.append(f"reconsiderblock: back on the original branch, agreed {end_q}")
