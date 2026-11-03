@@ -156,6 +156,7 @@ echo "E. the relay-peer health check: a node pool node may have no peers"
 # read_peer_count and health_ghost_pool, run against a stand-in for ghost-mining's /health.
 fns="$(awk '/^read_peer_count\(\) \{$/,/^\}$/{print} /^health_ghost_pool\(\) \{$/,/^\}$/{print}' "$UPDATER")"
 is "both functions are present" 2 "$(printf '%s\n' "$fns" | $G -cE '^(read_peer_count|health_ghost_pool)\(\) \{$' || true)"
+# shellcheck disable=SC2034  # PEERS_BEFORE is read by the eval'd health_ghost_pool
 peers_health() {   # BEFORE AFTER_JSON: health_ghost_pool's verdict
     ( log() { :; }; err() { echo "ERR $*"; }; sleep() { :; }; seq() { echo 1; echo 2; }
       curl() { [ -n "$HEALTH" ] && printf '%s' "$HEALTH"; }
