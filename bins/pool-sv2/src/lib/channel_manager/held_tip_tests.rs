@@ -397,3 +397,34 @@ async fn a_prev_hash_for_a_template_the_channels_lost_is_repaired_not_fatal() {
     assert!(job.is_some());
     assert_eq!(activated, job);
 }
+
+/// The same crash one block later: during the hold the NEXT Bitcoin block arrives, its future
+/// template is served, the tick serves the held tip, then the next block's `SetNewPrevHash`
+/// (a new prev hash) names that template. Ignoring a same-tip re-announcement does not cover
+/// this; the template must be given back to the channels.
+#[tokio::test]
+async fn a_next_block_template_that_arrives_while_the_tip_is_held_survives_its_replay() {
+    let (mut cm, ready, rx) = world().await;
+    let np = cm.node_pool();
+    ready.store(false, Ordering::SeqCst);
+    cm.handle_new_template(None, template(30, H + 2, true), None)
+        .await
+        .unwrap();
+    cm.handle_set_new_prev_hash(None, prev_hash(30, 3), None)
+        .await
+        .unwrap();
+    ready.store(true, Ordering::SeqCst);
+    cm.handle_new_template(None, template(31, H + 3, true), None)
+        .await
+        .unwrap();
+    cm.node_pool_tick().await;
+    assert_eq!(active_template(&cm), Some(30));
+    cm.handle_set_new_prev_hash(None, prev_hash(31, 4), None)
+        .await
+        .expect("the next block's SetNewPrevHash is handled");
+    assert_eq!(active_template(&cm), Some(31));
+    assert!(np.pending_tip().is_none(), "no repair needed");
+    let (job, activated) = last_job_and_activation(&drain(&rx));
+    assert!(job.is_some());
+    assert_eq!(activated, job);
+}
