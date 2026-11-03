@@ -31,6 +31,13 @@ GPG_KEY_FP="777FE81F8CC077FD3D08055E852C2B3190F5B928"
 # comes out of the verified tarball.
 GHOSTD_URL="${GHOSTD_URL:-}"
 RELEASE_KEY_URL="https://get.bitcoinghost.org/ghost-release-key.asc"
+# Release assets live at <this>/<tag>/<asset>.
+RELEASE_DOWNLOAD_URL="https://github.com/bitcoin-ghost/ghost/releases/download"
+# ⛔ TEST ONLY: a local release mirror signed with a throwaway key, for rehearsing an install
+# end to end before any node pool release exists (see test_release_mirror below). Both must be
+# set; refused on mainnet. Never set either for a real node.
+TEST_RELEASE_MIRROR="${GHOST_TEST_RELEASE_MIRROR:-}"
+TEST_RELEASE_KEY_FP="${GHOST_TEST_RELEASE_KEY_FP:-}"
 # ⛔ No old-network peers. The old network's eight nodes keep running `main` beside node pool
 # nodes, and the two must never talk: a seed list here used to name the old fleet, so every install
 # dialled its mesh. A node pool node agrees on its ledger over the share-chain relay
@@ -923,11 +930,36 @@ fi
 # ⛔ Preflight, before anything on this machine is changed. A FAIL stops the install here.
 np_preflight || err "Preflight failed — fix the FAIL lines above and re-run."
 [[ "$PREFLIGHT_ONLY" == "true" ]] && exit 0
+
+# ⛔ TEST ONLY: install from a local release mirror instead of GitHub. The mirror is laid out as
+# release-node-pool.yml publishes, under one URL M:
+#   M/releases                       the release list (GitHub's "list releases" JSON)
+#   M/download/<tag>/<asset>         bitcoin-ghost-<tag>-x86_64-unknown-linux-gnu.tar.gz,
+#                                    SHA256SUMS.txt, SHA256SUMS.txt.asc
+#   M/release-key.asc                the throwaway public key that signed SHA256SUMS.txt
+# and is verified exactly as a real release is, against GHOST_TEST_RELEASE_KEY_FP instead of the
+# release key. The node's updater is pointed at the same mirror (a drop-in, below), so the rehearsal
+# covers automatic updates too. Both variables or neither; never on mainnet.
+if [[ -n "$TEST_RELEASE_MIRROR" || -n "$TEST_RELEASE_KEY_FP" ]]; then
+  [[ -n "$TEST_RELEASE_MIRROR" && -n "$TEST_RELEASE_KEY_FP" ]] \
+    || err "GHOST_TEST_RELEASE_MIRROR and GHOST_TEST_RELEASE_KEY_FP go together (test installs only)."
+  [[ "$NETWORK" != mainnet ]] || err "GHOST_TEST_RELEASE_MIRROR is for test installs on signet or regtest, never mainnet."
+  [[ "$TEST_RELEASE_KEY_FP" =~ ^[0-9A-F]{40}$ ]] || err "GHOST_TEST_RELEASE_KEY_FP must be a 40-hex uppercase fingerprint."
+  [[ "$TEST_RELEASE_KEY_FP" != "$GPG_KEY_FP" ]] || err "GHOST_TEST_RELEASE_KEY_FP is the release key: a test mirror is signed with a throwaway key."
+  TEST_RELEASE_MIRROR="${TEST_RELEASE_MIRROR%/}"
+  NP_RELEASES_API_URL="${TEST_RELEASE_MIRROR}/releases"
+  RELEASE_DOWNLOAD_URL="${TEST_RELEASE_MIRROR}/download"
+  RELEASE_KEY_URL="${TEST_RELEASE_MIRROR}/release-key.asc"
+  GPG_KEY_FP="$TEST_RELEASE_KEY_FP"
+  echo -e "\033[33mWARNING\033[0m: TEST RELEASE MIRROR ${TEST_RELEASE_MIRROR}, verified against ${GPG_KEY_FP}."
+  echo "         This node installs and updates from a test mirror, not from real releases."
+fi
+
 # The node pool release channel: np-latest or an exact np- tag, never an old-network tag.
 GHOST_VERSION_SPEC="$GHOST_VERSION"
 GHOST_VERSION="$(np_resolve_release "$GHOST_VERSION_SPEC")" || err "GHOST_VERSION='${GHOST_VERSION_SPEC}' refused (see above)."
 [[ "$GHOST_VERSION_SPEC" == "$GHOST_VERSION" ]] || log "GHOST_VERSION=${GHOST_VERSION_SPEC} resolved to ${GHOST_VERSION}"
-RELEASE_BASE="https://github.com/bitcoin-ghost/ghost/releases/download/${GHOST_VERSION}"
+RELEASE_BASE="${RELEASE_DOWNLOAD_URL}/${GHOST_VERSION}"
 POOL_TARBALL="bitcoin-ghost-${GHOST_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 # Automatic updates follow the same channel: the updater reads /etc/ghost/release-channel
 # (written below) and picks the newest np- release, never the old network's `releases/latest`.
@@ -1973,8 +2005,13 @@ RELEASES_API_URL="${GHOST_RELEASES_API_URL:-https://api.github.com/repos/bitcoin
 # NOTE: ghostd is no longer fetched from a standalone URL — it ships inside the
 # signed release tarball (below), so the old GHOSTD_URL side-channel is gone.
 # Release tarball base. When GHOST_RELEASE_BASE is set it is used verbatim;
-# otherwise it is constructed per-version from the GitHub releases download URL.
+# otherwise it is constructed per-version as <download URL>/<tag>, GitHub's layout.
 RELEASE_BASE_OVERRIDE="${GHOST_RELEASE_BASE:-}"
+# The download URL that tags hang off. Overridable, like the anchors above, only for a local test
+# mirror laid out the same way (the install rehearsal; install-node.sh writes these into a
+# `test-release-mirror.conf` drop-in of ghost-auto-update.service when installed against one).
+RELEASE_DOWNLOAD_URL="${GHOST_RELEASE_DOWNLOAD_URL:-https://github.com/bitcoin-ghost/ghost/releases/download}"
+PRODUCTION_GPG_KEY_FP="777FE81F8CC077FD3D08055E852C2B3190F5B928"
 
 # ───────────────────────────── managed paths ─────────────────────────────────
 CONF_FILE="${GHOST_AUTOUPDATE_CONF:-/etc/ghost/auto-update.conf}"
@@ -2292,6 +2329,9 @@ main() {
     exit 0
   fi
   log "auto-update enabled${DRY_RUN:+ }$([[ "$DRY_RUN" == "true" ]] && echo '(dry-run)')"
+  if [[ "$GPG_KEY_FP" != "$PRODUCTION_GPG_KEY_FP" ]]; then
+    warn "TEST RELEASE MIRROR: releases are verified against ${GPG_KEY_FP}, not the release key — this node is not following real releases"
+  fi
 
   # 2. Resolve installed + latest versions.
   local installed latest install_sh
@@ -2361,7 +2401,7 @@ main() {
   if [[ -n "$RELEASE_BASE_OVERRIDE" ]]; then
     release_base="$RELEASE_BASE_OVERRIDE"
   else
-    release_base="https://github.com/bitcoin-ghost/ghost/releases/download/${latest}"
+    release_base="${RELEASE_DOWNLOAD_URL}/${latest}"
   fi
   tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
   gnupg="$tmp/gnupg"; mkdir -m700 "$gnupg"
@@ -3682,6 +3722,26 @@ chown root:root /etc/ghost/auto-update.conf
 echo "${GHOST_VERSION}" > /etc/ghost/version
 chmod 644 /etc/ghost/version
 chown root:root /etc/ghost/version
+
+# ⛔ TEST ONLY: a node installed from a test release mirror updates from the same mirror, against the
+# same throwaway key. Any other install removes the drop-in, so re-running the installer normally
+# puts the node back on real releases and the release key.
+TEST_MIRROR_DROPIN=/etc/systemd/system/ghost-auto-update.service.d/test-release-mirror.conf
+if [[ -n "$TEST_RELEASE_MIRROR" ]]; then
+  install -d -m 0755 /etc/systemd/system/ghost-auto-update.service.d
+  cat > "$TEST_MIRROR_DROPIN" <<EOF
+# ⛔ TEST RELEASE MIRROR, written by install-node.sh (GHOST_TEST_RELEASE_MIRROR). This node does not
+# follow real releases. Re-run the installer without GHOST_TEST_RELEASE_MIRROR to remove it.
+[Service]
+Environment=GHOST_NP_RELEASES_API_URL=${NP_RELEASES_API_URL}
+Environment=GHOST_RELEASE_DOWNLOAD_URL=${RELEASE_DOWNLOAD_URL}
+Environment=GHOST_RELEASE_KEY_URL=${RELEASE_KEY_URL}
+Environment=GHOST_GPG_KEY_FP=${GPG_KEY_FP}
+EOF
+  chmod 644 "$TEST_MIRROR_DROPIN"
+else
+  rm -f "$TEST_MIRROR_DROPIN"
+fi
 
 systemctl daemon-reload >/dev/null 2>&1 || true
 # Enable + start the timer ONLY when opted in. Default path: timer stays

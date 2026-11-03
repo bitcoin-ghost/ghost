@@ -258,6 +258,9 @@ validate="$(awk '/^np_hrp "\$NETWORK" >\/dev\/null \|\| err/{on=1} on{print} on&
 is "the validation step is present" yes "$([ -n "$validate" ] && echo yes)"
 old="$TMP/pool-config.toml"
 eval "$($G '^_trim() ' "$INSTALLER")"
+# The release constants the validation step reads (production values; no test mirror in the env).
+unset GHOST_TEST_RELEASE_MIRROR GHOST_TEST_RELEASE_KEY_FP
+eval "$($G -E '^(GPG_KEY_FP|RELEASE_KEY_URL|RELEASE_DOWNLOAD_URL|TEST_RELEASE_MIRROR|TEST_RELEASE_KEY_FP)=' "$INSTALLER")"
 validated() {
     ( log() { :; }; err() { echo "ERR $*"; exit 1; }; usage() { :; }
       np_preflight() { echo "PREFLIGHT"; }
@@ -309,6 +312,50 @@ hasnt "... with no warning that it is unavailable" "not available for node pool 
 is "the installer never tracks the latest release" 0 "$($G -c 'GHOST_VERSION=.*releases/latest' "$INSTALLER" || true)"
 is "the channel marker is written before the updater can be enabled" yes \
    "$(awk '/^cat > \/etc\/ghost\/release-channel /{m=NR} /systemctl enable --now ghost-auto-update.timer/{if(!t)t=NR} END{print (m && t && m<t)?"yes":"no"}' "$INSTALLER")"
+
+echo "7a. the test-only release mirror"
+TFP=0123456789ABCDEF0123456789ABCDEF01234567
+mirrored() {   # NETWORK MIRROR KEY_FP
+    ( log() { :; }; err() { echo "ERR $*"; exit 1; }; usage() { :; }; np_preflight() { :; }
+      FEE_ADDRESS=bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4 NETWORK="$1" RELAY_PEERS="" RELAY_PORT=8566
+      [ "$1" = signet ] && FEE_ADDRESS=tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7
+      GENESIS_ANCHOR="" GENESIS_HEIGHT="" PREFLIGHT_ONLY=false SYNC_MODE=ibd ARCHIVE=false
+      GHOST_VERSION=np-v9.9.9 AUTO_UPDATE=false TEST_RELEASE_MIRROR="$2" TEST_RELEASE_KEY_FP="$3"
+      eval "${validate//\/etc\/ghost\/pool-config.toml/$TMP/none}"
+      echo "$NP_RELEASES_API_URL|$RELEASE_BASE|$RELEASE_KEY_URL|$GPG_KEY_FP" ) 2>/dev/null | tail -1
+}
+prod_fp="$(sed -nE 's/^GPG_KEY_FP="([0-9A-F]{40})"$/\1/p' "$INSTALLER")"
+is "without a mirror: GitHub, the release key" \
+   "https://api.github.com/repos/bitcoin-ghost/ghost/releases?per_page=100|https://github.com/bitcoin-ghost/ghost/releases/download/np-v9.9.9|https://get.bitcoinghost.org/ghost-release-key.asc|$prod_fp" \
+   "$(mirrored signet '' '')"
+is "with a mirror: every URL and the key move to it" \
+   "http://m:8/r/releases|http://m:8/r/download/np-v9.9.9|http://m:8/r/release-key.asc|$TFP" \
+   "$(mirrored signet http://m:8/r/ "$TFP")"
+is "a mirror without its key is refused" "ERR GHOST_TEST_RELEASE_MIRROR and GHOST_TEST_RELEASE_KEY_FP go together (test installs only)." \
+   "$(mirrored signet http://m:8/r '')"
+is "a key without a mirror is refused" "ERR GHOST_TEST_RELEASE_MIRROR and GHOST_TEST_RELEASE_KEY_FP go together (test installs only)." \
+   "$(mirrored signet '' "$TFP")"
+is "a mirror on mainnet is refused" "ERR GHOST_TEST_RELEASE_MIRROR is for test installs on signet or regtest, never mainnet." \
+   "$(mirrored mainnet http://m:8/r "$TFP")"
+is "the release key cannot be the test key" "ERR GHOST_TEST_RELEASE_KEY_FP is the release key: a test mirror is signed with a throwaway key." \
+   "$(mirrored regtest http://m:8/r "$prod_fp")"
+is "a malformed fingerprint is refused" "ERR GHOST_TEST_RELEASE_KEY_FP must be a 40-hex uppercase fingerprint." \
+   "$(mirrored regtest http://m:8/r "${TFP,,}")"
+dropin_block="$(awk '/^TEST_MIRROR_DROPIN=/{on=1} on{print} on&&/^fi$/{exit}' "$INSTALLER")"
+is "the updater drop-in step is present" yes "$([ -n "$dropin_block" ] && echo yes)"
+dropin() {   # MIRROR: runs the step against $TMP/sd, prints the drop-in or "absent"
+    ( TEST_RELEASE_MIRROR="$1" NP_RELEASES_API_URL=http://m/releases RELEASE_DOWNLOAD_URL=http://m/download
+      RELEASE_KEY_URL=http://m/release-key.asc GPG_KEY_FP="$TFP"
+      eval "${dropin_block//\/etc\/systemd\/system/$TMP/sd}" )
+    cat "$TMP/sd/ghost-auto-update.service.d/test-release-mirror.conf" 2>/dev/null || echo absent
+}
+d="$(dropin http://m)"
+for v in GHOST_NP_RELEASES_API_URL=http://m/releases GHOST_RELEASE_DOWNLOAD_URL=http://m/download \
+         GHOST_RELEASE_KEY_URL=http://m/release-key.asc "GHOST_GPG_KEY_FP=$TFP"; do
+    has "a mirror install points the updater at it: ${v%%=*}" "Environment=$v" "$d"
+    has "... a variable the updater reads" "${v%%=*}:-" "$($G -F "${v%%=*}:-" "$REPO_ROOT/scripts/ghost-auto-update.sh")"
+done
+is "a normal re-run removes the drop-in" absent "$(dropin '')"
 
 echo "7b. slot-class sensing reaches pool_sv2"
 # The translator must negotiate the Ghost agent extension, or pool_sv2 never sees an SV1 miner's

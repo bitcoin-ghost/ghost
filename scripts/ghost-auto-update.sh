@@ -52,8 +52,13 @@ RELEASES_API_URL="${GHOST_RELEASES_API_URL:-https://api.github.com/repos/bitcoin
 # NOTE: ghostd is no longer fetched from a standalone URL — it ships inside the
 # signed release tarball (below), so the old GHOSTD_URL side-channel is gone.
 # Release tarball base. When GHOST_RELEASE_BASE is set it is used verbatim;
-# otherwise it is constructed per-version from the GitHub releases download URL.
+# otherwise it is constructed per-version as <download URL>/<tag>, GitHub's layout.
 RELEASE_BASE_OVERRIDE="${GHOST_RELEASE_BASE:-}"
+# The download URL that tags hang off. Overridable, like the anchors above, only for a local test
+# mirror laid out the same way (the install rehearsal; install-node.sh writes these into a
+# `test-release-mirror.conf` drop-in of ghost-auto-update.service when installed against one).
+RELEASE_DOWNLOAD_URL="${GHOST_RELEASE_DOWNLOAD_URL:-https://github.com/bitcoin-ghost/ghost/releases/download}"
+PRODUCTION_GPG_KEY_FP="777FE81F8CC077FD3D08055E852C2B3190F5B928"
 
 # ───────────────────────────── managed paths ─────────────────────────────────
 CONF_FILE="${GHOST_AUTOUPDATE_CONF:-/etc/ghost/auto-update.conf}"
@@ -371,6 +376,9 @@ main() {
     exit 0
   fi
   log "auto-update enabled${DRY_RUN:+ }$([[ "$DRY_RUN" == "true" ]] && echo '(dry-run)')"
+  if [[ "$GPG_KEY_FP" != "$PRODUCTION_GPG_KEY_FP" ]]; then
+    warn "TEST RELEASE MIRROR: releases are verified against ${GPG_KEY_FP}, not the release key — this node is not following real releases"
+  fi
 
   # 2. Resolve installed + latest versions.
   local installed latest install_sh
@@ -440,7 +448,7 @@ main() {
   if [[ -n "$RELEASE_BASE_OVERRIDE" ]]; then
     release_base="$RELEASE_BASE_OVERRIDE"
   else
-    release_base="https://github.com/bitcoin-ghost/ghost/releases/download/${latest}"
+    release_base="${RELEASE_DOWNLOAD_URL}/${latest}"
   fi
   tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
   gnupg="$tmp/gnupg"; mkdir -m700 "$gnupg"

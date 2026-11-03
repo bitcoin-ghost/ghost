@@ -170,7 +170,8 @@ run_node() {
     GHOST_RELEASES_API_URL="file://$latest" \
     GHOST_NP_RELEASES_API_URL="file://$TMP/np-list.json" \
     GHOST_RELEASE_CHANNEL_FILE="$NODE/release-channel" \
-    GHOST_RELEASE_BASE="file://$REL" \
+    GHOST_RELEASE_BASE="${RUN_BASE-file://$REL}" \
+    GHOST_RELEASE_DOWNLOAD_URL="${RUN_DOWNLOAD_URL:-https://invalid.example/download}" \
     GHOST_AUTOUPDATE_CONF="$NODE/auto-update.conf" \
     GHOST_VERSION_FILE="$NODE/version" \
     GHOST_AUTOUPDATE_STATUS="$NODE/status.json" \
@@ -197,6 +198,15 @@ run_node b "$UPDATER" np-v1.0.1 node-pool "$TMP/latest-old.json"
 is "exits 0"   0          "$(cat "$NODE/rc")"
 is "status"    up-to-date "$(field result)"
 is "untouched" "$OLD_BINS" "$(bins)"
+
+echo " b2. without GHOST_RELEASE_BASE, assets are fetched from <download URL>/<tag>/ (GitHub's layout)"
+DL="$TMP/dl"; mkdir -p "$DL/np-v1.0.1"
+cp "$REL"/*.tar.gz "$REL"/SHA256SUMS.txt "$REL"/SHA256SUMS.txt.asc "$DL/np-v1.0.1/"
+RUN_BASE="" RUN_DOWNLOAD_URL="file://$DL" run_node b2 "$UPDATER" np-v1.0.0 node-pool "$TMP/latest-old.json"
+is "exits 0"                  0 "$(cat "$NODE/rc")"
+is "updated from the tag's directory" np-v1.0.1 "$(cat "$NODE/version")"
+is "the whole set is the np- build" "np-v1.0.1-ghostd np-v1.0.1-ghost-mining np-v1.0.1-pool_sv2 np-v1.0.1-translator_sv2" "$(bins)"
+is "a key other than the release key is warned about, once" 1 "$($G -c 'TEST RELEASE MIRROR' "$NODE/out" || true)"
 
 echo " c. an install without the marker is updated exactly as before the channel existed"
 if git -C "$REPO_ROOT" show "$BASELINE_REF:scripts/ghost-auto-update.sh" > "$TMP/updater-before.sh" 2>/dev/null; then
