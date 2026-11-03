@@ -120,7 +120,7 @@ fn tamper_with(f: SyncFault, m: Message) -> Message {
                     s.tag.payee_script = thief_script();
                 } else if let Ok(mut tx) = deserialize::<Transaction>(&s.coinbase) {
                     if let Some(o) = tx.output.first_mut() {
-                        o.value = o.value + Amount::from_sat(1_000);
+                        o.value += Amount::from_sat(1_000);
                         s.coinbase = serialize(&tx);
                     }
                 }
