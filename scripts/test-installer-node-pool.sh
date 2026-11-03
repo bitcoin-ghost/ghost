@@ -471,6 +471,21 @@ has "it runs the pinned Node.js, not apt's" "ExecStart=/opt/ghost/node/bin/node 
 hasnt "it is not ordered after a unit no node has" "ghost-node.service" "$unit"
 has "its password comes from a root-only file, not an Environment= line" "EnvironmentFile=-/etc/ghost/dashboard.env" "$unit"
 hasnt "no password in the unit" "DASHBOARD_PASSWORD=" "$unit"
+# The internal API key: `systemctl show` hands every `Environment=` value to any local user, so the
+# key must reach the dashboard through a root-only EnvironmentFile, never an Environment= line.
+is "the internal API key is never written as an Environment= line" 0 \
+   "$($G -cE 'Environment=INTERNAL_AUTH_KEY' "$INSTALLER" || true)"
+auth_block="$(awk '/^install -d -m 0750 \/etc\/systemd\/system\/ghost-dashboard.service.d$/{on=1} on{print} on&&/^chmod 0644 /{exit}' "$INSTALLER")"
+has "the drop-in names a root-only key file" "EnvironmentFile=/etc/ghost/dashboard-internal-auth.env" "$auth_block"
+has "... written with a 077 umask" "umask 077" "$auth_block"
+has "... and mode 600" "chmod 0600 /etc/ghost/dashboard-internal-auth.env" "$auth_block"
+k="$TMP/authkey"; mkdir -p "$k/etc/ghost" "$k/etc/systemd/system"
+( APISECRET=$(printf 'ab%.0s' $(seq 32))
+  b="${auth_block//\/etc\//$k\/etc\/}"; b="${b//chown root:root/:}"
+  eval "$b" ) >/dev/null 2>&1
+is "a run writes the key file mode 600" 600 "$(stat -c %a "$k/etc/ghost/dashboard-internal-auth.env" 2>/dev/null)"
+hasnt "the drop-in itself holds no key" "abab" "$(cat "$k/etc/systemd/system/ghost-dashboard.service.d/internal-auth.conf" 2>/dev/null)"
+has "the key file holds the node's secret" "INTERNAL_AUTH_KEY=abab" "$(cat "$k/etc/ghost/dashboard-internal-auth.env" 2>/dev/null)"
 pf_dashboard_active() { [ "${DASH_ACTIVE:-no}" = yes ]; }
 NETWORK=mainnet; FEE_ADDRESS=bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4; SIGNET_CHALLENGE=""; BITCOIN_PEERS=""; pf
 has "a free dashboard port passes" "[PASS] port 3000 is free (node dashboard, loopback only)" "$out"

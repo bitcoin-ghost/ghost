@@ -88,7 +88,7 @@ Miners are not paid through it. It only ever receives the transaction fees of bl
 
 ## Internal API secret
 
-A 64-hex-character secret the installer generates. Mainnet refuses to start without it. The installer also writes it to `/etc/systemd/system/ghost-dashboard.service.d/internal-auth.conf`, so a dashboard installed later uses the same value. If you change it by hand, update both.
+A 64-hex-character secret the installer generates. Mainnet refuses to start without it. The installer also writes it to the root-only `/etc/ghost/dashboard-internal-auth.env`, which the dashboard reads through `EnvironmentFile=`, so a dashboard installed later uses the same value. If you change it by hand, update both.
 
 ## Rotation
 

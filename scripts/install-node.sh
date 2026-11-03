@@ -1034,7 +1034,7 @@ np_kept_what() {
     /var/lib/bitcoin)      echo "the chain (ghostd's data directory)";;
     /var/lib/ghost)        echo "node-pool.db (share chain and ledger), miner stats";;
     /home/ghost)           echo ".ghost/node.key (node identity), ghost-mining's database";;
-    /etc/ghost)            echo "pool.toml, pool-config.toml (SV2 key, fee address), dashboard.env";;
+    /etc/ghost)            echo "pool.toml, pool-config.toml (SV2 key, fee address), dashboard.env, dashboard-internal-auth.env";;
     /etc/bitcoin)          echo "bitcoin.conf (RPC password, signet challenge, peers)";;
     /var/backups/ghost)    echo "nightly database backups";;
     /var/lib/ghost-backup) echo "off-node backup key and status";;
@@ -1575,12 +1575,21 @@ EOF
 # out-of-band; systemd applies the drop-in as soon as ghost-dashboard.service
 # exists. Because $APISECRET is pinned to pool.toml's existing value (Change A),
 # a re-run refreshes this file to the SAME value — the two can never drift.
+#
+# ⛔ The key lives in a root-only EnvironmentFile, never in an `Environment=` line: systemd hands
+# `Environment=` values to any local user (`systemctl show ghost-dashboard -p Environment`), and
+# the file mode of the drop-in does not change that. The drop-in names only the file's path.
 install -d -m 0750 /etc/systemd/system/ghost-dashboard.service.d
-cat > /etc/systemd/system/ghost-dashboard.service.d/internal-auth.conf <<EOF
+install -d -m 0755 /etc/ghost
+( umask 077
+  printf 'INTERNAL_AUTH_KEY=%s\n' "${APISECRET}" > /etc/ghost/dashboard-internal-auth.env )
+chown root:root /etc/ghost/dashboard-internal-auth.env
+chmod 0600 /etc/ghost/dashboard-internal-auth.env
+cat > /etc/systemd/system/ghost-dashboard.service.d/internal-auth.conf <<'EOF'
 [Service]
-Environment=INTERNAL_AUTH_KEY=${APISECRET}
+EnvironmentFile=/etc/ghost/dashboard-internal-auth.env
 EOF
-chmod 0600 /etc/systemd/system/ghost-dashboard.service.d/internal-auth.conf
+chmod 0644 /etc/systemd/system/ghost-dashboard.service.d/internal-auth.conf
 systemctl daemon-reload 2>/dev/null || true
 # If the dashboard is already running, restart it to pick up the aligned key
 # (safe: the dashboard is non-consensus). No-op when the unit isn't installed.

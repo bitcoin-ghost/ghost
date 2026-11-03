@@ -354,7 +354,7 @@ The node pool flags (`--fee-address`, `--relay-port`, `--relay-peer`, `--genesis
 
 Older installs may carry keys for removed features (`[network] mining_mode`, `private_mining_password`, `solo_payout_address`, `[pool] treasury_address`, `node_payout_address`, `[coordinator]`, `[ghost_pay]`); they are read and ignored, and the installer no longer writes them.
 
-The dashboard signs its requests to ghost-mining with `internal_api_secret`, which the installer copies into `/etc/systemd/system/ghost-dashboard.service.d/internal-auth.conf` on every run, so the two never drift (see *Node dashboard*, below).
+The dashboard signs its requests to ghost-mining with `internal_api_secret`, which the installer copies into the root-only `/etc/ghost/dashboard-internal-auth.env` on every run (the drop-in `ghost-dashboard.service.d/internal-auth.conf` only names that file, so `systemctl show` never reveals the key), so the two never drift (see *Node dashboard*, below).
 
 ### Re-running the installer
 
