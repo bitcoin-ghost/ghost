@@ -43,6 +43,8 @@
 pub mod archive;
 pub mod checkpoint;
 pub mod client;
+#[cfg(feature = "fault-injection")]
+pub mod fault;
 pub mod headers;
 pub mod net;
 pub mod peers;

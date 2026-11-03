@@ -30,6 +30,15 @@
 //! miner cannot carry, so the ceilings come from published research and are raised only by
 //! hardware tests.
 //!
+//! Silence is the one signal that does not fail a class for good once a miner has settled
+//! (decided 2026-11-03): a settled miner that stays connected but sends no valid share past the
+//! no-share timeout still drops one class per timeout, but the class is only suspended, and once
+//! valid shares resume the miner is sensed again from where it fell and climbs back through the
+//! suspended classes by the ordinary trial rules. A miner that only stalled recovers its class; one
+//! that really lost hashrate fails a trial (low yield, or silence during it) and settles lower,
+//! for good. Silence during a trial still fails that class for good, and disconnects are
+//! unchanged.
+//!
 //! This is a port of the prototype's sense mode (`hardware-test/coinbase_probe.py --sense` in the
 //! design folder): the same ceiling table with its evidence notes, the same stepping rules and
 //! failure signals. The prototype's regular expressions are hand-ported to plain string matching
@@ -678,6 +687,9 @@ pub enum ChangeCause {
     Passed,
     /// The class failed; back to the highest passed class, or the floor.
     Failed(FailureKind),
+    /// A settled miner went silent past the no-share timeout: the class is suspended, not
+    /// failed, and is sensed again once valid shares resume.
+    Stalled,
 }
 
 /// A change in the class served to one miner. The caller rebuilds the miner's job when
@@ -696,8 +708,12 @@ pub struct ClassChange {
 enum Role {
     /// Counting valid shares toward a step up.
     Trial,
-    /// Settled: no further step this session.
+    /// Settled: no further step this session, unless a stall suspended classes above it.
     Hold,
+    /// Valid shares resumed after a stall: counting them at a class that passed before, toward
+    /// re-trying the suspended class above. No dwell applies, since the class already passed,
+    /// and silence here suspends it again rather than failing it.
+    Resense,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -770,6 +786,9 @@ pub struct ClassSensor {
     role: Role,
     passed: [bool; CLASS_COUNT],
     failed: [Option<FailureKind>; CLASS_COUNT],
+    /// Classes a stall dropped this miner from: neither passed nor failed, sensed again once
+    /// valid shares resume.
+    suspended: [bool; CLASS_COUNT],
     att: Attempt,
     valid_times: VecDeque<u64>,
     connected: bool,
@@ -833,6 +852,7 @@ impl ClassSensor {
             role: Role::Trial,
             passed,
             failed: [None; CLASS_COUNT],
+            suspended: [false; CLASS_COUNT],
             att: Attempt {
                 started_ms: now_ms,
                 last_progress_ms: now_ms,
@@ -881,6 +901,7 @@ impl ClassSensor {
         let from = self.idx;
         self.failed[from].get_or_insert(kind);
         self.passed[from] = false;
+        self.suspended[from] = false;
         match self.highest_passed_index() {
             Some(back) => self.begin(back, Role::Hold, now_ms),
             None => self.begin(0, Role::Trial, now_ms),
@@ -892,7 +913,32 @@ impl ClassSensor {
         }
     }
 
+    /// A settled (or re-sensing) miner went silent: suspend the current class and drop to the
+    /// highest passed class below it, or keep the floor, holding there until valid shares
+    /// resume. Nothing is failed, so the climb back is open. `None` when the class served does
+    /// not change (silence at the floor).
+    fn stall(&mut self, now_ms: u64) -> Option<ClassChange> {
+        let from = self.idx;
+        self.passed[from] = false;
+        self.suspended[from] = true;
+        let back = self.highest_passed_index().unwrap_or(0);
+        self.begin(back, Role::Hold, now_ms);
+        (back != from).then_some(ClassChange {
+            from: SLOT_CLASSES[from],
+            to: SLOT_CLASSES[back],
+            cause: ChangeCause::Stalled,
+        })
+    }
+
+    fn is_stalled(&self) -> bool {
+        self.suspended.iter().any(|&s| s)
+    }
+
     fn on_valid(&mut self, now_ms: u64) -> Option<ClassChange> {
+        if self.role == Role::Hold && self.is_stalled() {
+            // Shares resumed after a stall: sense again from here, this share the first.
+            self.begin(self.idx, Role::Resense, now_ms);
+        }
         self.att.valid += 1;
         self.att.last_progress_ms = now_ms;
         self.valid_total += 1;
@@ -900,10 +946,11 @@ impl ClassSensor {
         while self.valid_times.len() > VALID_TIMES_KEPT {
             self.valid_times.pop_front();
         }
-        if self.role != Role::Trial || self.att.valid < self.params.min_shares {
+        if self.role == Role::Hold || self.att.valid < self.params.min_shares {
             return None;
         }
         self.passed[self.idx] = true;
+        self.suspended[self.idx] = false;
         let from = self.idx;
         let next = from + 1;
         if next < CLASS_COUNT && next <= self.top && self.failed[next].is_none() {
@@ -914,6 +961,9 @@ impl ClassSensor {
                 cause: ChangeCause::Passed,
             })
         } else {
+            // Settled. Anything still suspended above is out of reach now (a failed class or
+            // the ceiling stands between), so the stall is over.
+            self.suspended = [false; CLASS_COUNT];
             self.begin(from, Role::Hold, now_ms);
             None
         }
@@ -978,6 +1028,10 @@ impl ClassSensor {
     }
 
     /// Check the clocks: no valid share within the timeout, or a trial past its dwell.
+    ///
+    /// Silence fails a class being tested (a trial) for good. A settled or re-sensing miner's
+    /// class is only suspended (see [`ChangeCause::Stalled`]) and sensed again once valid shares
+    /// resume.
     pub fn tick(&mut self, now_ms: u64) -> Option<ClassChange> {
         if !self.connected {
             return None;
@@ -989,6 +1043,9 @@ impl ClassSensor {
             } else {
                 FailureKind::NoShares
             };
+            if kind == FailureKind::NoShares && self.role != Role::Trial {
+                return self.stall(now_ms);
+            }
             return Some(self.fail(kind, now_ms));
         }
         if self.role == Role::Trial
@@ -1025,7 +1082,7 @@ impl ClassSensor {
             ceiling_bytes: self.rule.ceiling_bytes,
             ceiling_class: SLOT_CLASSES[self.top],
             serving_class: self.serving_class(),
-            settled: self.role == Role::Hold,
+            settled: self.role == Role::Hold && !self.is_stalled(),
             highest_passed: self.highest_passed_index().map(|i| SLOT_CLASSES[i]),
             failed: self.failed_list(),
             valid_shares: self.valid_total,
@@ -1292,6 +1349,183 @@ mod tests {
         let c = s.tick(now + 10_001).unwrap();
         assert_eq!(c.cause, ChangeCause::Failed(FailureKind::NoShares));
         assert_eq!((c.from, c.to), (9, 3));
+    }
+
+    /// A Bitaxe (ceiling 500) climbed to the full class and settled there.
+    fn settled_at_full(now: &mut u64) -> ClassSensor {
+        let mut s = ClassSensor::new(Some("bitaxe/BM1366/v2.4.0"), params(), *now);
+        feed(&mut s, 3 * SLOT_CLASSES.len() as u32, now);
+        let st = s.status();
+        assert_eq!((st.serving_class, st.settled), (500, true));
+        s
+    }
+
+    /// Run the clock for `secs` seconds, a tick every second and a valid share at the class
+    /// served every `every` seconds (none if 0). Returns the class changes, in order.
+    fn run(s: &mut ClassSensor, now: &mut u64, secs: u64, every: u64) -> Vec<ClassChange> {
+        let mut out = vec![];
+        for k in 1..=secs {
+            *now += 1_000;
+            if every != 0 && k % every == 0 {
+                out.extend(s.on_share(s.serving_class(), ShareVerdict::Valid, *now));
+            }
+            out.extend(s.tick(*now));
+        }
+        out
+    }
+
+    fn path(c: &[ClassChange]) -> Vec<(u16, u16, ChangeCause)> {
+        c.iter().map(|c| (c.from, c.to, c.cause)).collect()
+    }
+
+    #[test]
+    fn a_stalled_settled_miner_climbs_back_to_its_class_when_shares_resume() {
+        let mut now = 0;
+        let mut s = settled_at_full(&mut now);
+        // Connected and silent for 35 s, at a 10 s timeout: three classes suspended, none failed.
+        let down = run(&mut s, &mut now, 35, 0);
+        assert_eq!(
+            path(&down),
+            [
+                (500, 364, ChangeCause::Stalled),
+                (364, 143, ChangeCause::Stalled),
+                (143, 44, ChangeCause::Stalled),
+            ]
+        );
+        let st = s.status();
+        assert_eq!(st.serving_class, 44);
+        assert!(!st.settled, "a stalled miner is being sensed again");
+        assert_eq!(st.failed, vec![], "silence after settling fails nothing");
+        // Shares resume at the full rate: sensed again from 44, back up through 143 and 364.
+        let up = run(&mut s, &mut now, 30, 1);
+        assert_eq!(
+            path(&up),
+            [
+                (44, 143, ChangeCause::Passed),
+                (143, 364, ChangeCause::Passed),
+                (364, 500, ChangeCause::Passed),
+            ]
+        );
+        let st = s.status();
+        assert_eq!((st.serving_class, st.settled), (500, true));
+        assert_eq!(st.highest_passed, Some(500));
+        assert_eq!(st.failed, vec![]);
+        assert!(
+            run(&mut s, &mut now, 120, 1).is_empty(),
+            "and it stays there"
+        );
+    }
+
+    #[test]
+    fn a_miner_that_resumes_slower_settles_lower_for_good() {
+        let mut now = 0;
+        let mut s = settled_at_full(&mut now);
+        assert_eq!(
+            path(&run(&mut s, &mut now, 11, 0)).len(),
+            1,
+            "500 suspended"
+        );
+        assert_eq!(s.serving_class(), 364);
+        // Back at a share every 25 s: too slow for the 60 s dwell of a trial (three shares), and
+        // at first slower than the 10 s no-share timeout. It falls while the measured interval
+        // catches up, re-senses, fails the first trial above it, and settles.
+        let changes = run(&mut s, &mut now, 1_500, 25);
+        let st = s.status();
+        assert!(st.settled, "settled: {changes:?}");
+        assert!(
+            st.serving_class < 500,
+            "settled lower: {}",
+            st.serving_class
+        );
+        let failed: Vec<_> = st.failed.iter().map(|f| f.1).collect();
+        assert!(
+            failed
+                .iter()
+                .all(|k| matches!(k, FailureKind::LowYield | FailureKind::NoShares)),
+            "{failed:?}"
+        );
+        assert_eq!(
+            failed.len(),
+            1,
+            "one trial failed, for good: {:?}",
+            st.failed
+        );
+        let (failed_class, _) = st.failed[0];
+        assert!(
+            st.serving_class < failed_class,
+            "never served at or above the failed class"
+        );
+        // The same miner at the same rate for another hour: no class changes at all.
+        assert!(run(&mut s, &mut now, 3_600, 25).is_empty());
+        assert!(s.status().settled);
+    }
+
+    #[test]
+    fn repeated_stalls_never_oscillate_and_each_recovers_the_same_way() {
+        let mut now = 0;
+        let mut s = settled_at_full(&mut now);
+        let mut cycles = vec![];
+        for _ in 0..5 {
+            let down = run(&mut s, &mut now, 15, 0);
+            let up = run(&mut s, &mut now, 30, 1);
+            cycles.push((path(&down), path(&up)));
+            assert_eq!(s.serving_class(), 500);
+            assert!(s.status().settled);
+        }
+        assert!(cycles.windows(2).all(|w| w[0] == w[1]), "{cycles:?}");
+        assert_eq!(cycles[0].0, [(500, 364, ChangeCause::Stalled)]);
+        assert_eq!(cycles[0].1, [(364, 500, ChangeCause::Passed)]);
+        // With no further stall, no further change: at most one change per timeout of silence
+        // or per `min_shares` valid shares, never on its own.
+        assert!(run(&mut s, &mut now, 600, 1).is_empty());
+    }
+
+    #[test]
+    fn a_failure_while_re_sensing_is_for_good() {
+        let mut now = 0;
+        let mut s = settled_at_full(&mut now);
+        run(&mut s, &mut now, 11, 0); // 500 suspended, serving 364
+        feed(&mut s, 3, &mut now); // 364 re-passed, now re-trying 500
+        assert_eq!(s.serving_class(), 500);
+        now += 1_000;
+        let c = s.on_share(500, ShareVerdict::Corrupt, now).unwrap();
+        assert_eq!((c.from, c.to), (500, 364));
+        assert!(s.status().settled);
+        assert!(feed(&mut s, 50, &mut now).is_empty(), "500 is not retried");
+        assert_eq!(s.record().failed, vec![(500, FailureKind::Corrupt)]);
+    }
+
+    #[test]
+    fn silence_at_the_floor_changes_nothing_and_recovers() {
+        let mut now = 0;
+        let mut s = ClassSensor::new(None, params(), now);
+        feed(&mut s, 3, &mut now);
+        assert!(s.status().settled);
+        assert!(
+            run(&mut s, &mut now, 60, 0).is_empty(),
+            "nothing below the floor"
+        );
+        assert_eq!(s.serving_class(), 3);
+        assert!(!s.status().settled);
+        assert!(run(&mut s, &mut now, 5, 1).is_empty());
+        let st = s.status();
+        assert!(st.settled && st.failed.is_empty());
+    }
+
+    #[test]
+    fn a_disconnect_while_stalled_keeps_the_climb_open() {
+        let mut now = 0;
+        let mut s = settled_at_full(&mut now);
+        run(&mut s, &mut now, 11, 0); // serving 364, 500 suspended
+        assert_eq!(s.on_disconnect(now), None, "not a trial: nothing fails");
+        now += 600_000;
+        assert!(s.tick(now).is_none(), "no clock while away");
+        s.on_reconnect(now);
+        assert_eq!(s.serving_class(), 364);
+        // Three shares re-pass 364, three more pass the retried 500.
+        let up = run(&mut s, &mut now, 6, 1);
+        assert_eq!(path(&up), [(364, 500, ChangeCause::Passed)]);
+        assert!(s.status().settled);
     }
 
     #[test]

@@ -51,7 +51,9 @@
 //!
 //! Sessions are keyed by the channel's user identity and live in memory for the process
 //! lifetime: a reconnecting miner keeps its failed classes, and a settled miner its class; a
-//! drop fails a class only while it is being tested. A native SV2 miner with no agent TLV is
+//! drop fails a class only while it is being tested. A settled miner that stays connected but
+//! goes silent past the no-share timeout drops a class per timeout without failing it, and is
+//! sensed again, back up through those classes, once its shares resume. A native SV2 miner with no agent TLV is
 //! looked up by its `SetupConnection` vendor, hardware_version and firmware.
 //!
 //! Relaying shares and anchors is `ghost-np-relay`, started by `[node_pool.relay]`

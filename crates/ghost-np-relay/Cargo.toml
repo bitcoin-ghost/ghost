@@ -28,6 +28,11 @@ authors.workspace = true
 license.workspace = true
 description = "Node pool share-chain relay: network shares, anchors and batches between nodes"
 
+[features]
+# Test only: GHOST_NP_SYNC_FAULT makes this relay serve tampered sync data (fault.rs), for the
+# harness's lying sync peer. Enabled by pool_sv2's np-fault-injection; never in a release build.
+fault-injection = []
+
 [dependencies]
 ghost-common = { workspace = true }
 ghost-storage = { workspace = true }

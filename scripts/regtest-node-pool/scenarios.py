@@ -21,10 +21,13 @@ def genesis_args(h):
 
 
 def settled_in(log, bh):
-    """The block was settled against its anchor: directly, or provisionally and then confirmed."""
-    return logged(log, bh, "NP_SETTLE: pool block settled") or (
-        logged(log, bh, "NP_SETTLE: pool block retired provisionally")
-        and logged(log, bh, "NP_SETTLE: provisional block confirmed by its anchor"))
+    """The block was settled against its anchor: directly, or provisionally and then confirmed.
+    A block built on a partition's losing-side anchors, which a node that never held them
+    cannot confirm, counts once retired provisionally (by what it paid)."""
+    prov = logged(log, bh, "NP_SETTLE: pool block retired provisionally")
+    return logged(log, bh, "NP_SETTLE: pool block settled") or (prov and (
+        logged(log, bh, "NP_SETTLE: provisional block confirmed by its anchor")
+        or bh in STATE.get("minority_blocks", set())))
 
 
 # Shared between scenarios: what earlier ones measured.
@@ -314,17 +317,75 @@ def blocks_settle(h):
                         line += " (a node built jobs at that height without its snapshot table)"
         # Hostile blocks (an earlier scenario on signet) are the only mismatches allowed.
         hostile = len(STATE.get("hostile_hashes", ()))
-        if st["mismatched"] != hostile or st["provisional"]:
+        # The counter is in memory: after a pool_sv2 restart it holds only what came since.
+        mism_bad = st["mismatched"] > hostile if n.restarts else st["mismatched"] != hostile
+        # A block built on anchors this node never held (the losing side of a partition) stays
+        # provisional here: it retired what it paid, the same as where it matched.
+        minority = STATE.get("minority_blocks", set())
+        prov = [p for p in st["provisional"] if str(p["block_hash"]).lower() not in minority]
+        if st["provisional"] and not prov:
+            line += f"; provisional for good {len(st['provisional'])} (the partition's losing-side blocks)"
+        if mism_bad or prov:
             ok = False
-            line += f"; mismatched {st['mismatched']}, of which hostile blocks {hostile}"
+            line += (f"; mismatched {st['mismatched']}, of which hostile blocks {hostile}; provisional "
+                     f"{st['provisional'][:4]}")
         ev.append(line)
     result("pool blocks: every node logs settlement for each block; exact coinbase sums",
            "PASS" if ok else "FAIL", ev)
 
 
+def _class_view(h):
+    """Every connected miner's (node, address, kind, class, expected class, settled)."""
+    out = []
+    for n in h.honest():
+        for m in n.status()["miners"]:
+            want = next((cls for (u, a, s, ag, cls) in n.miners if a == m["address"]), None)
+            if m["kind"] == "standard":
+                want = 500
+            sens = m.get("sensing") or {}
+            out.append((n.i, m["address"], m["kind"], m["slot_class"], want,
+                        m["kind"] == "standard" or sens.get("settled"), sens))
+    return out
+
+
 def slot_classes(h):
+    """Every miner reaches its class and holds it. The harness pauses miners (SIGSTOP) between
+    phases, past the no-share timeout, so a settled miner's class has been suspended a class per
+    timeout by now (decided 2026-11-03: silence suspends, it does not fail): resumed, every
+    miner must climb back to its class, and nothing may have failed for silence alone."""
     ev, ok = [], True
     seen_classes = set()
+    marks = {n.i: len(n.read_log("pool_sv2")) for n in h.honest()}
+    # The miners are paused here. Wait (up to --stall-wait seconds) for a settled miner's class to
+    # be suspended by the no-share timeout while it stays connected, so the climb back below is
+    # seen on this run and not only in earlier pauses.
+    stall_seen = None
+    try:
+        t = time.time()
+        wait_for(lambda: any("cause=Stalled" in l for n in h.honest()
+                             for l in n.read_log("pool_sv2")[marks[n.i]:].splitlines()),
+                 h.args.stall_wait, step=5, what="a class suspended by silence")
+        stall_seen = f"{time.time() - t:.0f}s"
+    except TimeoutError:
+        pass
+    before = {(x[0], x[1]): x[3] for x in _class_view(h)}
+    for n in h.honest():
+        n.pause_miners(False)
+    t = time.time()
+
+    def all_back():
+        v = _class_view(h)
+        return v and all(want is None or (cls == want and settled)
+                         for (_, _, _, cls, want, settled, _) in v) and v
+    try:
+        wait_for(all_back, h.args.mine_timeout, step=3, what="every miner back at its class")
+        back_in = f"{time.time() - t:.0f}s"
+    except TimeoutError as e:
+        back_in = None
+        ok = False
+        ev.append(str(e))
+    for n in h.honest():
+        n.pause_miners(True)
     for n in h.nodes:
         c = n.db()
         try:
@@ -333,27 +394,38 @@ def slot_classes(h):
                 ev.append(f"node{n.i} store: {cnt} network shares committed slot_class {cls}")
         finally:
             c.close()
+    for (i, addr, kind, cls, want, settled, sens) in _class_view(h):
+        n = next(x for x in h.nodes if x.i == i)
         log = n.read_log("pool_sv2")
-        for m in n.status()["miners"]:
-            sens = m.get("sensing") or {}
-            want = next((cls for (u, a, s, ag, cls) in n.miners if a == m["address"]), None)
-            agent_ok = m["kind"] == "standard" or sens.get("agent") not in (None, "SRI/Translator Proxy/")
-            reached = m["kind"] == "standard" and m["slot_class"] == 500 or (want and m["slot_class"] == want)
-            note = ""
-            if not reached and want:
-                # Reached, then dropped by the no-share timeout: the harness pauses miners
-                # (SIGSTOP) between on-demand phases, and a silent settled miner loses its class.
-                changes = [l for l in log.splitlines() if "slot class changed" in l and m["address"] in l]
-                at = max((k for k, l in enumerate(changes) if f"to={want} cause=Passed" in l), default=None)
-                drops = changes[at + 1:] if at is not None else []
-                if drops and all("Failed(NoShares)" in l for l in drops):
-                    reached = True
-                    note = (f"; reached {want}, then dropped {len(drops)} class(es) by the no-share "
-                            f"timeout while paused")
-            ok &= bool(agent_ok and reached)
-            ev.append(f"node{n.i} {m['kind']} {m['address'][:14]}.. agent={sens.get('agent')!r} "
-                      f"model={sens.get('model')!r} class={m['slot_class']} ceiling={sens.get('ceiling_class')} "
-                      f"settled={sens.get('settled')} (expected {want if m['kind'] == 'extended' else 500}){note}")
+        changes = [l for l in log.splitlines() if "slot class changed" in l and addr in l]
+        stalled = sum(1 for l in changes if "cause=Stalled" in l)
+        silent_fail = sum(1 for l in changes if "Failed(NoShares)" in l)
+        failed = sens.get("failed") or []
+        agent_ok = kind == "standard" or sens.get("agent") not in (None, "SRI/Translator Proxy/")
+        good = agent_ok and want is not None and cls == want and bool(settled)
+        ok &= good
+        ev.append(f"node{i} {kind} {addr[:14]}.. agent={sens.get('agent')!r} model={sens.get('model')!r} "
+                  f"class={cls} (expected {want}) settled={settled} ceiling={sens.get('ceiling_class')}; "
+                  f"before resuming {before.get((i, addr))}; whole run: {stalled} class(es) suspended by "
+                  f"silence, {silent_fail} failed by silence (a trial), failed now {failed}")
+    suspended = sum(1 for n in h.honest() for l in n.read_log("pool_sv2")[marks[n.i]:].splitlines()
+                    if "cause=Stalled" in l)
+    ev.insert(0, (f"paused miners: a class suspended by silence {stall_seen} into the pause ({suspended} "
+                  f"suspensions in this scenario)" if stall_seen else
+                  f"paused miners: no class suspended by silence within {h.args.stall_wait:.0f}s, so this "
+                  f"run's climb back is UNMEASURED here (unit tests cover it)"))
+    ev.insert(1, f"miners resumed: every miner back at its class and settled in {back_in}"
+              if back_in else "miners resumed: NOT every miner got back to its class")
+    try:
+        STATE["quiet"] = h.quiesce(300)
+    except TimeoutError as e:
+        STATE["quiet"] = None
+        ok = False
+        ev.append(str(e))
+    # The miners ran again: later scenarios read the chain as it is now.
+    if STATE.get("pool_blocks") is not None:
+        STATE["pool_blocks"] = [b for b in h.pool_blocks(h.nodes[0])
+                                if b[1] not in STATE.get("hostile_hashes", set())]
     missing = [c for c in SLOT_CLASSES if c not in seen_classes]
     if missing:
         ok = False
@@ -376,8 +448,8 @@ def slot_classes(h):
     elif len(multi) < 3:
         ok = False
         ev.append(f"fewer than 3 classes paid more than one balance: {multi}")
-    result("slot classes: each class sensed, served and committed by network shares",
-           "PASS" if ok else "FAIL", ev)
+    result("slot classes: each class sensed, served and committed by network shares; every miner "
+           "back at its class after the pauses", "PASS" if ok else "FAIL", ev)
 
 
 def bitcoin_reorg(h):
@@ -436,9 +508,9 @@ def bitcoin_reorg(h):
         else:
             ev.append(f"store digests equal on every node after the undo: {mid[0]}")
         # Only the block itself: its stale siblings stay invalid, so no node can tie-break onto one.
+        log_len = {n.i: len(n.read_log("pool_sv2")) for n in h.nodes}
         for n in nodes:
             n.rpc("reconsiderblock", bh)
-        log_len = {n.i: len(n.read_log("pool_sv2")) for n in h.nodes}
         end_q = h.quiesce(180)
         after = {n.i: n.digests() for n in h.nodes}
         ev.append(f"after reconsider: agreed tip {end_q}")
@@ -491,10 +563,10 @@ def audit(h):
     target, peer = h.nodes[0], h.nodes[1 % len(h.nodes)]
     addr, _ = payee("auditor", False)
     data = os.path.join(h.work, "audit")
-    argv = [exe, "audit"] + audit_chain_args() + ["--relay-peer", f"127.0.0.1:{peer.relay}",
+    argv = [exe, "audit"] + audit_chain_args() + ["--relay-peer", peer.relay_addr(),
             "--data-dir", data, "--rpc-port", str(target.rpc_port), "--rpc-user", RPC_USER,
             "--rpc-password", RPC_PASS, "--stratum", f"127.0.0.1:{target.sv1}",
-            "--node-relay", f"127.0.0.1:{target.relay}", "--address", addr, "--jobs",
+            "--node-relay", target.relay_addr(), "--address", addr, "--jobs",
             str(h.args.audit_jobs), "--json", "--wait", "180", "--timeout", "120"] + genesis_args(h)
     # New jobs come with new blocks: let the miners go slowly while the auditor listens.
     tr_mark = len(target.read_log("translator"))
@@ -704,10 +776,10 @@ def hostile(h):
         # ghost-audit against the hostile node must FAIL, naming the fault.
         exe = os.path.join(h.args.bin_dir, "ghost-audit")
         addr, _ = payee(f"auditor/{fault}")
-        argv = [exe, "audit"] + audit_chain_args() + ["--relay-peer", f"127.0.0.1:{honest[0].relay}",
+        argv = [exe, "audit"] + audit_chain_args() + ["--relay-peer", honest[0].relay_addr(),
                 "--data-dir", os.path.join(h.work, f"audit-{fault}"), "--rpc-port", str(honest[0].rpc_port),
                 "--rpc-user", RPC_USER, "--rpc-password", RPC_PASS, "--stratum", f"127.0.0.1:{bad.sv1}",
-                "--node-relay", f"127.0.0.1:{bad.relay}", "--address", addr, "--jobs", "1", "--json",
+                "--node-relay", bad.relay_addr(), "--address", addr, "--jobs", "1", "--json",
                 "--wait", "120", "--timeout", "120"] + genesis_args(h)
         out = subprocess.run(argv, capture_output=True, text=True, timeout=400)
         with open(os.path.join(h.work, f"audit-{fault}.log"), "w") as f:
