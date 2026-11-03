@@ -374,6 +374,62 @@ fn sql_string(p: &Path) -> GhostResult<String> {
     Ok(format!("'{}'", s.replace('\'', "''")))
 }
 
+/// Refuse when the filesystem holding `db` has less than twice the database free.
+fn check_space(db: &Path, dest: &Path) -> GhostResult<()> {
+    let dir = db
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut wal = db.as_os_str().to_os_string();
+    wal.push("-wal");
+    let size = file_len(db) + file_len(Path::new(&wal));
+    let need = size.saturating_mul(2);
+    let free = free_bytes(dir)?;
+    if free < need {
+        return Err(GhostError::Migration(format!(
+            "v65 REFUSED, nothing changed: the pre-v65 backup needs twice the database free \
+             ({need} bytes) under {}, and {free} are. Free space, or take a copy yourself with \
+             `sqlite3 {} \"VACUUM INTO '{}'\"` and start again.",
+            dir.display(),
+            db.display(),
+            dest.display()
+        )));
+    }
+    Ok(())
+}
+
+/// The refusals v65 can make without writing, run by the migration runner BEFORE the first
+/// migration of a database below v65 (an old fleet database is at v62, so v63 and v64 run first).
+/// Without it, a database that v65 refuses would already have been moved to v64 by v63 and v64,
+/// with no copy taken, under a message saying nothing changed. Checks: money rows (step 1), and
+/// when a copy will be needed and none exists, the free space for it; a `.pre-v65` file next to
+/// a database still below v64 can only be another database's (an earlier attempt that took one
+/// left its database at v64), so it is refused here as `ensure_backup` would refuse it later.
+pub(crate) fn preflight(conn: &Connection, current_version: u32) -> GhostResult<()> {
+    refuse_money_rows(conn)?;
+    let (_, rows) = rows_to_drop(conn)?;
+    if rows == 0 {
+        return Ok(());
+    }
+    let Some(db) = main_file(conn)? else {
+        return Ok(());
+    };
+    let dest = backup_path(&db);
+    if dest.exists() {
+        if current_version < 64 {
+            let (v, n) = inspect_copy(conn, &dest)?;
+            return Err(GhostError::Migration(format!(
+                "v65 REFUSED, nothing changed: {} exists but is not a copy of this database (its \
+                 user_version is {v} and it has {n} tables; this database is at \
+                 {current_version}). It is never overwritten: move it aside and start again.",
+                dest.display()
+            )));
+        }
+        return Ok(());
+    }
+    check_space(&db, &dest)
+}
+
 /// Step 2: a verified copy of the database before anything is dropped. Returns where it is.
 pub(crate) fn ensure_backup(conn: &Connection, db: &Path) -> GhostResult<PathBuf> {
     let live_version = count_i64(conn, "PRAGMA user_version")?;
@@ -399,25 +455,7 @@ pub(crate) fn ensure_backup(conn: &Connection, db: &Path) -> GhostResult<PathBuf
         )));
     }
 
-    let dir = db
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut wal = db.as_os_str().to_os_string();
-    wal.push("-wal");
-    let size = file_len(db) + file_len(Path::new(&wal));
-    let need = size.saturating_mul(2);
-    let free = free_bytes(dir)?;
-    if free < need {
-        return Err(GhostError::Migration(format!(
-            "v65 REFUSED, nothing changed: the pre-v65 backup needs twice the database free \
-             ({need} bytes) under {}, and {free} are. Free space, or take a copy yourself with \
-             `sqlite3 {} \"VACUUM INTO '{}'\"` and start again.",
-            dir.display(),
-            db.display(),
-            dest.display()
-        )));
-    }
+    check_space(db, &dest)?;
 
     let lit = sql_string(&dest)?;
     if let Err(e) = conn.execute_batch(&format!("VACUUM INTO {lit}")) {
@@ -1021,6 +1059,58 @@ mod tests {
         std::fs::remove_file(backup_path(&p)).unwrap();
         run_migrations(&c).unwrap();
         assert_eq!(raw_version(&c), -65);
+        drop(c);
+        remove(&p);
+    }
+
+    /// An old fleet database is at v62, not v64: a refusal must leave it at v62, with v63 and
+    /// v64 not run (they ran first, and committed, before the preflight existed).
+    #[test]
+    fn a_v62_database_refused_by_v65_stays_at_v62() {
+        let p = temp_path("v62money");
+        let c = Connection::open(&p).unwrap();
+        c.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        run_migrations_to(&c, 62).unwrap();
+        insert_any(&c, "withdrawal_requests");
+        insert_votes(&c, 2);
+        let before = user_tables(&c);
+        let e = run_migrations(&c).unwrap_err().to_string();
+        assert!(
+            e.contains("REFUSED") && e.contains("withdrawal_requests"),
+            "{e}"
+        );
+        assert_eq!(raw_version(&c), 62, "v63 and v64 did not run");
+        assert_eq!(user_tables(&c), before, "no np_ table created");
+        assert!(!backup_path(&p).exists(), "no copy taken for a refusal");
+
+        // Resolved on the old release, the whole chain runs: v63, v64, the copy (at v64), v65.
+        c.execute_batch("DELETE FROM withdrawal_requests").unwrap();
+        run_migrations(&c).unwrap();
+        assert_eq!(raw_version(&c), -65);
+        let b = Connection::open(backup_path(&p)).unwrap();
+        assert_eq!(raw_version(&b), 64);
+        assert_eq!(count(&b, "SELECT COUNT(*) FROM votes"), 2);
+        drop(b);
+        drop(c);
+        remove(&p);
+    }
+
+    /// A `.pre-v65` beside a database below v64 is another database's: refused before v63 runs.
+    #[test]
+    fn a_stale_backup_beside_a_v62_database_is_refused_before_anything_runs() {
+        let p = temp_path("v62stale");
+        let c = Connection::open(&p).unwrap();
+        c.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        run_migrations_to(&c, 62).unwrap();
+        insert_votes(&c, 1);
+        let other = Connection::open(backup_path(&p)).unwrap();
+        other
+            .execute_batch("CREATE TABLE x (y); PRAGMA user_version = 64;")
+            .unwrap();
+        drop(other);
+        let e = run_migrations(&c).unwrap_err().to_string();
+        assert!(e.contains("is not a copy of this database"), "{e}");
+        assert_eq!(raw_version(&c), 62);
         drop(c);
         remove(&p);
     }

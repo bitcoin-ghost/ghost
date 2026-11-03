@@ -387,6 +387,20 @@ Readings chosen where the spec was silent; written into spec 2.2, "Share-chain s
   no verified copy exists: it takes one
   itself (`<db>.pre-v65`, `VACUUM INTO`, twice the database free required), reuses a verifying
   one, and never overwrites one that does not verify.
+- **Refusals come first** (flag-day rehearsal, 2026-11-03): the money, free-space and stale-copy
+  refusals run read-only before the first migration of any database below v65. An old fleet
+  database is at v62; before this, v63 and v64 committed first, so a refused database was left at
+  v64 with no copy taken, under "nothing changed". The copy itself is still taken inside v65, so
+  `<db>.pre-v65` is a v64 database (the old release opens it with a "schema is AHEAD" warning).
+- **Genesis rows outside the payee classes are refused** (export check 6). The old fleet paid
+  P2PKH; the node pool's payee classes (`share_commit::payee_script_class`, spec 2.1) exclude it
+  because each P2PKH output costs 4 sigops of the 400 the template leaves the coinbase. The import
+  used to carry such rows: in the 2026-11-03 rehearsal (600 P2PKH rows of 3,958, 170 at or above
+  the floor) every one was paid in full on signet's near-empty templates, the ledger API refused
+  to show them ("cannot be paid by the node pool"), and a 500-output coinbase on a sigop-heavy
+  mainnet template could have paid more than 100 of them and been lost. The import and
+  `ghost-audit` now refuse such an export, naming the count and the sats; how those balances are
+  carried is a cutover decision.
 - **Space**: with `auto_vacuum = INCREMENTAL` the free list is drained step by step after the
   commit. At `auto_vacuum = 0` nothing is run; a `VACUUM` needs about twice the database free.
 - **Old binaries refuse a v65 database**: the version is stored negated (`-65`), and every

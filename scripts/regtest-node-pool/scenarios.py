@@ -282,7 +282,7 @@ def blocks_settle(h):
         for n in h.honest():
             for sc in sample:
                 led = n.ledger(h.genesis_addr[sc])
-                want = (h.genesis[sc] - paid.get(sc, 0)) << 32
+                want = h.genesis_face[sc] - (paid.get(sc, 0) << 32)
                 got = int(led.get("balance", {}).get("units", -1))
                 if got != want:
                     wrong.append(f"node{n.i} {h.genesis_addr[sc][:14]}.. {got} != {want}")
@@ -616,7 +616,7 @@ def audit(h):
 def genesis_import(h):
     if not h.export_dir:
         return result("genesis table import (migration v65)", "UNMEASURED", "run with --genesis-rows 0")
-    ev, ok = [f"synthetic export: {len(h.genesis)} rows, sha256 {h.export_digest[:16]}.., "
+    ev, ok = [f"{'real' if h.args.genesis_export else 'synthetic'} export: {len(h.genesis)} rows, sha256 {h.export_digest[:16]}.., "
               f"{sum(1 for v in h.genesis.values() if v < 1000)} below the 1,000-sat floor"], True
     roots = set()
     for n in h.honest():

@@ -191,6 +191,12 @@ pub(crate) fn run_migrations_to(conn: &Connection, target: u32) -> GhostResult<(
         (64, migrate_v64),
     ];
 
+    // v65's refusals, before anything runs: a database it will refuse must not first be moved
+    // through the migrations below it (an old fleet database is at v62).
+    if current_version < crate::migration_v65::V65 && crate::migration_v65::V65 <= target {
+        crate::migration_v65::preflight(conn, current_version)?;
+    }
+
     for &(version, migrate_fn) in pre_v10 {
         if current_version < version && version <= target {
             run_migration_tx(conn, version, migrate_fn)?;
