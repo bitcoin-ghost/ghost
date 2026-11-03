@@ -512,16 +512,38 @@ def late_table(h):
         ("shares", "Received SubmitSharesExtended"),
     )}
     fault_on = "withholds every snapshot table" in log
+    # Every hold must end: served by the tick when its table comes, or left behind by the next
+    # SetNewPrevHash that is served at once (the provider's second template on the same tip, or
+    # a newer tip). A hold followed only by another hold, or by nothing, is not resolved.
+    events = []
+    for line in log.splitlines():
+        if "NODE_POOL_NO_TABLE: the new Bitcoin tip is held" in line:
+            events.append("held")
+        elif "NODE_POOL: the held tip is served" in line:
+            events.append("served")
+        elif "Received: SetNewPrevHash" in line:
+            events.append("snph")
+    unresolved = 0
+    for i, e in enumerate(events):
+        if e != "held":
+            continue
+        rest = events[i + 1:]
+        # The held SetNewPrevHash is logged before its "held": what follows decides. A
+        # SetNewPrevHash that is itself held replaces this hold and is judged on its own.
+        if not rest:
+            unresolved += 1
+    counts["unresolved"] = unresolved
     mined = height - start
     ok = (alive and fault_on and mined >= h.args.late_table_blocks
-          and counts["held"] >= mined // 2 and counts["served"] >= counts["held"] // 2
+          and counts["held"] >= mined // 2 and counts["served"] >= 1 and unresolved == 0
           and counts["shutdown"] == 0 and counts["tip_mismatch"] == 0
           and counts["template_mismatch"] == 0 and counts["shares"] > 0)
     ev.append(f"{mined} Bitcoin blocks ({start} -> {height}) with node0's tables "
               f"{h.args.table_late_ms} ms late (fault line logged: {fault_on}); node0 pool_sv2 "
               f"{'still running, pid ' + str(proc.p.pid) if alive else 'EXITED'}")
     ev.append(f"node0 log: tips held {counts['held']}, held tips served {counts['served']}, future "
-              f"templates from during a hold given back {counts['given_back']}, TIP_MISMATCH "
+              f"templates from during a hold given back {counts['given_back']}, holds never "
+              f"resolved {unresolved}, TIP_MISMATCH "
               f"{counts['tip_mismatch']}, TEMPLATE_MISMATCH {counts['template_mismatch']}, shutdowns "
               f"{counts['shutdown']}, shares received {counts['shares']}")
     if counts["given_back"] == 0:
