@@ -2038,8 +2038,7 @@ async fn main() -> Result<()> {
 
         info!(
             "TDP server listening on {}:{} (Template Distribution Protocol for SRI pool)",
-            args.tdp_bind,
-            args.tdp_port
+            args.tdp_bind, args.tdp_port
         );
     }
 

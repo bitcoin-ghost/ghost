@@ -995,12 +995,12 @@ np_uninstall() {
     systemctl disable --now "$u" >/dev/null 2>&1 || true
   done
   for u in "${NP_UNITS[@]}"; do rm -f "$r/etc/systemd/system/$u"; done
-  for d in "${NP_UNIT_DROPINS[@]}"; do rm -rf "${r:?}/etc/systemd/system/$d"; done
+  for d in "${NP_UNIT_DROPINS[@]}"; do rm -rf "$r/etc/systemd/system/$d"; done
   systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl reset-failed >/dev/null 2>&1 || true
 
   log "Removing /opt/ghost (binaries, helper scripts, dashboard, Node.js runtime)"
-  rm -rf "${r:?}/opt/ghost"
+  rm -rf "$r/opt/ghost"
 
   log "Removing the firewall rules the installer opened (22/tcp is left open)"
   for p in $(np_opened_ports | sort -un); do
@@ -1012,7 +1012,7 @@ np_uninstall() {
 
   if [[ "$PURGE" == true ]]; then
     log "Purging the node's data"
-    for d in "${NP_DATA[@]}"; do rm -rf "${r:?}$d"; done
+    for d in "${NP_DATA[@]}"; do rm -rf "$r$d"; done
     if id ghost >/dev/null 2>&1; then userdel ghost >/dev/null 2>&1 || true; fi
     echo
     echo "  Bitcoin Ghost node removed, data included. Nothing of it is left in:"

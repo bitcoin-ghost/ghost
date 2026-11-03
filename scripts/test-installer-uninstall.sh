@@ -146,7 +146,21 @@ else
     echo "  (setsid not available: skipped)"
 fi
 
-echo "4. wiring"
+echo "4. on the machine's own root (no UNINSTALL_ROOT), with rm recorded instead of run"
+for purge in false true; do
+    out="$( ( set -euo pipefail
+      systemctl() { :; }; ufw() { :; }; userdel() { :; }; id() { [ "$1" = ghost ]; }
+      rm() { echo "rm $*"; }; du() { echo "1K"; }
+      log() { :; }; err() { echo "ERROR: $*"; exit 1; }
+      UNINSTALL=true PURGE="$purge" ASSUME_YES=true; unset UNINSTALL_ROOT
+      eval "$block"; np_uninstall ) 2>&1 < /dev/null; echo "rc=$?" )"
+    has "purge=$purge runs to the end" "rc=0" "$out"
+    has "... removing /opt/ghost at its real path" "rm -rf /opt/ghost" "$out"
+    has "... and the release channel marker" "rm -f /etc/ghost/release-channel" "$out"
+done
+has "a purge removes the real data paths" "rm -rf /var/lib/ghost" "$out"
+
+echo "5. wiring"
 is "--uninstall runs before the wizard, the preflight and any download" yes \
    "$(awk '/^  np_uninstall$/{u=NR} /^  run_wizard$/{w=NR} /^np_preflight \|\|/{p=NR} /^curl -fsSLO/{if(!c)c=NR} END{print (u && w && p && c && u<w && u<p && u<c)?"yes":"no"}' "$INSTALLER")"
 is "... after the root check" yes \
