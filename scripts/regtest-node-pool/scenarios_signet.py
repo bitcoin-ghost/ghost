@@ -428,6 +428,12 @@ def signet_reorg(h):
            "undone and redone identically on every node", "PASS" if ok else "FAIL", ev)
 
 
+import scenarios_resilience as RS  # noqa: E402 - partition, lying sync peer, soak
+
 ALL = [bringup, S.genesis_import, signet_chain, genesis_payouts, hostile, mine, S.balances_agree,
-       S.blocks_settle, genesis_exact, genesis_rule, S.slot_classes, signet_reorg, S.fresh_node,
-       S.audit]
+       S.blocks_settle, genesis_exact, genesis_rule, S.slot_classes, signet_reorg, RS.partition,
+       S.balances_agree, S.blocks_settle, RS.lying_peer, S.fresh_node, S.audit]
+
+# --soak-minutes: bring the network up, soak it, then check it as the main run does.
+SOAK = [bringup, S.genesis_import, signet_chain, RS.soak, S.balances_agree, S.blocks_settle,
+        genesis_exact, genesis_rule]

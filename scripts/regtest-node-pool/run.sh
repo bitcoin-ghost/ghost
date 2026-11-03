@@ -22,6 +22,10 @@
 # for a standard channel; --build adds the hostile node's pool_sv2 (feature np-fault-injection)
 # under target/hostile/. CARGO_TARGET_DIR is honoured.
 #
+# Signet also runs scenarios_resilience.py: a share-chain partition (--partition-blocks), a lying
+# sync peer (the hostile build's GHOST_NP_SYNC_FAULT: --sync-faults), and, with --soak-minutes N
+# instead of the scenario list, a soak with miners joining, leaving and stalling.
+#
 # Every scenario prints PASS, FAIL or UNMEASURED with its evidence. Exit status: 1 if any FAIL.
 # Everything started is stopped on exit, Ctrl-C or SIGTERM, and the teardown is itself checked.
 set -euo pipefail

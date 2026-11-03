@@ -225,10 +225,10 @@ def http_json(url, body=None, auth=None, timeout=30):
             raise RuntimeError(f"{url}: HTTP {e.code}")
 
 
-def port_open(port):
+def port_open(port, host="127.0.0.1"):
     with socket.socket() as s:
         s.settimeout(0.3)
-        return s.connect_ex(("127.0.0.1", port)) == 0
+        return s.connect_ex((host, port)) == 0
 
 
 def wait_for(cond, timeout, step=0.5, what="condition"):
@@ -315,6 +315,13 @@ class Node:
         self.tdp_key = None
         self.node_id = None
         self.fault = None  # GHOST_NP_FAULT for a hostile node's pool_sv2
+        self.sync_fault = None  # GHOST_NP_SYNC_FAULT for a lying sync peer's relay
+        # The relay listens here: a loopback address of its own for a node whose relay must be
+        # told apart by IP (a ban is per IP, and every node else shares 127.0.0.1).
+        self.relay_ip = "127.0.0.1"
+        self.relay_peers = []
+        self.restarts = 0  # pool_sv2 restarts: its in-memory counters start again from 0
+        self.miner_argv = {}  # miner process name -> argv, to start it again
 
     def log(self, name):
         return os.path.join(self.dir, name + ".log")
@@ -414,10 +421,15 @@ enabled = {"true" if self.h.is_ghostd and self.h.args.reaper else "false"}
         self.tdp_key = wait_for(ready, 180, what=f"node{self.i} ghost-mining TDP")
 
     # -- pool_sv2 ----------------------------------------------------------------------------
+    def relay_addr(self):
+        return f"{self.relay_ip}:{self.relay}"
+
     def write_pool_config(self, relay_peers, pin=None):
+        """relay_peers: relay addresses, `ip:port` (or bare ports on 127.0.0.1)."""
         d = os.path.join(self.dir, "pool")
         os.makedirs(d, exist_ok=True)
-        peers = ", ".join(f'"127.0.0.1:{p}"' for p in relay_peers)
+        self.relay_peers = [p if isinstance(p, str) else f"127.0.0.1:{p}" for p in relay_peers]
+        peers = ", ".join(f'"{p}"' for p in self.relay_peers)
         a = self.h.args
         pin = f'genesis_table_digest = "{pin}"\n' if pin else ""
         cfg = f"""authority_public_key = "{POOL_PUB}"
@@ -447,7 +459,7 @@ sensing_min_shares = {a.sensing_min_shares}
 
 [node_pool.relay]
 network = "{NETWORK}"
-listen = "127.0.0.1:{self.relay}"
+listen = "{self.relay_ip}:{self.relay}"
 advertise_sv1_port = {self.sv1}
 peers = [{peers}]
 db_path = "{d}/node-pool.db"
@@ -491,21 +503,60 @@ public_key = "{self.tdp_key}"
         return root
 
     def start_pool(self, relay_peers):
-        a = self.h.args
         if self.h.export_dir:
             self.genesis_root = self.import_genesis(relay_peers)
         else:
             self.write_pool_config(relay_peers)
+        self.run_pool()
+
+    def run_pool(self):
+        """Start pool_sv2 on the config written last."""
+        a = self.h.args
         d = os.path.join(self.dir, "pool")
-        binary = a.hostile_binary if self.fault else self.h.bin(a.pool_binary)
+        hostile = self.fault or self.sync_fault
+        if hostile and not a.hostile_binary:
+            raise RuntimeError("a hostile node needs --hostile-binary (np-fault-injection build)")
+        binary = a.hostile_binary if hostile else self.h.bin(a.pool_binary)
         env = {"RUST_LOG": "info", "NO_COLOR": "1"}
         if self.fault:
             env["GHOST_NP_FAULT"] = self.fault
+        if self.sync_fault:
+            env["GHOST_NP_SYNC_FAULT"] = self.sync_fault
         self.procs["pool_sv2"] = Proc(
             "pool_sv2", [binary, "-c", os.path.join(d, "pool-config.toml")],
             self.log("pool_sv2"), cwd=d, env=env)
-        wait_for(lambda: port_open(self.pool) and port_open(self.relay) and port_open(self.pool_mon),
-                 120, what=f"node{self.i} pool_sv2 listening")
+        wait_for(lambda: port_open(self.pool) and port_open(self.relay, self.relay_ip)
+                 and port_open(self.pool_mon), 120, what=f"node{self.i} pool_sv2 listening")
+
+    def restart_pool(self, relay_peers=None, wipe=False):
+        """Stop pool_sv2 and start it again, on new relay peers if given. `wipe` deletes its
+        share-chain store first and imports the genesis table again: a fresh node on the same
+        Bitcoin node."""
+        # The translator drops every SV1 miner when it loses its upstream, and cpu_miner.py does
+        # not reconnect: the translator and the miners are started again too, paused.
+        miners = [k for k in self.miner_procs() if k in self.miner_argv]
+        for k in miners + ["translator", "pool_sv2"]:
+            if k in self.procs:
+                self.procs[k].stop()
+        self.restarts += 1
+        peers = self.relay_peers if relay_peers is None else relay_peers
+        d = os.path.join(self.dir, "pool")
+        if wipe:
+            for f in os.listdir(d):
+                if f.startswith("node-pool.db") or f == "miner-stats.json":
+                    os.remove(os.path.join(d, f))
+            if self.h.export_dir:
+                self.genesis_root = self.import_genesis(peers)
+            else:
+                self.write_pool_config(peers)
+        else:
+            self.write_pool_config(peers, pin=getattr(self, "genesis_root", None))
+        self.run_pool()
+        if "translator" in self.procs:
+            self.start_translator()
+        for k in miners:
+            self.procs[k] = Proc(k, self.miner_argv[k], self.log(k))
+        self.pause_miners(True, only=miners)
 
     def start_translator(self):
         d = os.path.join(self.dir, "translator")
@@ -555,6 +606,7 @@ authority_pubkey = "{POOL_PUB}"
             argv += ["--grinder", self.h.grinder]
         for user, agent in specs:
             argv += ["--miner", f"{user}@{agent}"]
+        self.miner_argv[name] = argv
         self.procs[name] = Proc(name, argv, self.log(name))
 
     def miner_procs(self):
@@ -709,6 +761,25 @@ class Harness:
         self.peak_rss = max(self.peak_rss, total // 1024)
         return total // 1024
 
+    def rss_by_process(self):
+        """Resident set size in KB of every live process of the run, with its children, keyed
+        `node<i>/<name>`."""
+        out = {}
+        for n in self.all_nodes():
+            for name, p in n.procs.items():
+                if not p.alive():
+                    continue
+                kb = 0
+                for pid in [p.p.pid] + self.children(p.p.pid):
+                    try:
+                        with open(f"/proc/{pid}/status") as f:
+                            m = re.search(r"VmRSS:\s+(\d+)", f.read())
+                            kb += int(m.group(1)) if m else 0
+                    except OSError:
+                        pass
+                out[f"node{n.i}/{name}"] = kb
+        return out
+
     @staticmethod
     def children(pid):
         try:
@@ -719,7 +790,8 @@ class Harness:
 
     # -- bring-up --------------------------------------------------------------------------
     def honest(self):
-        return [n for n in self.nodes if not n.fault and "pool_sv2" in n.procs and n.procs["pool_sv2"].alive()]
+        return [n for n in self.nodes if not n.fault and not n.sync_fault and "pool_sv2" in n.procs
+                and n.procs["pool_sv2"].alive()]
 
     def retire(self, n):
         """Stop node n and take it out of the run's node list (its ports and directory are
@@ -732,11 +804,15 @@ class Harness:
     def all_nodes(self):
         return self.nodes + self.retired
 
-    def add_node(self, mine=True, fault=None, agents=None, anchor_odds=None):
+    def add_node(self, mine=True, fault=None, agents=None, anchor_odds=None, sync_fault=None,
+                 relay_ip="127.0.0.1", peers=None):
+        """A node peered with every node so far (or only with `peers`, nodes, for its relay)."""
         i = self.next_index
         self.next_index += 1
         n = Node(self, i)
         n.fault = fault
+        n.sync_fault = sync_fault
+        n.relay_ip = relay_ip
         others = [m for m in self.nodes]
         n.start_bitcoind([m.p2p for m in others])
         self.nodes.append(n)
@@ -750,7 +826,7 @@ class Harness:
         wait_for(lambda: n.rpc("getblockcount") >= h0 and n.rpc("getblockhash", h0) == tip, 120,
                  what=f"node{i} Bitcoin sync")
         n.start_ghost_mining()
-        n.start_pool([m.relay for m in others])
+        n.start_pool([m.relay_addr() for m in (others if peers is None else peers)])
         n.start_translator()
         if mine:
             specs = []
@@ -838,10 +914,10 @@ class Harness:
                 out.append((h, bh, vouts))
         return out
 
-    def quiesce(self, timeout=180):
-        """Wait until every node sees the same Bitcoin tip, the same share-chain tip, and
-        settlement has caught up to it."""
-        nodes = self.honest()
+    def quiesce(self, timeout=180, nodes=None):
+        """Wait until every node (every honest node, or `nodes`) sees the same Bitcoin tip, the
+        same share-chain tip, and settlement has caught up to it."""
+        nodes = self.honest() if nodes is None else nodes
 
         def same():
             tips = {n.rpc("getbestblockhash") for n in nodes}
@@ -923,8 +999,8 @@ def run(args):
         t = time.time()
         h.teardown()
         left = h.leftovers()
-        busy = [p for n in h.all_nodes() for p in (n.p2p, n.rpc_port, n.pool, n.relay, n.sv1, n.tdp, n.http)
-                if port_open(p)]
+        busy = [p for n in h.all_nodes() for p in (n.p2p, n.rpc_port, n.pool, n.sv1, n.tdp, n.http)
+                if port_open(p)] + [n.relay for n in h.all_nodes() if port_open(n.relay, n.relay_ip)]
         if left or busy:
             result("teardown", "FAIL", [f"left running: {l}" for l in left] + [f"port still open: {p}" for p in busy])
         else:
@@ -943,7 +1019,9 @@ def run(args):
 
 def scenarios(h):
     if h.args.network == "signet":
-        from scenarios_signet import ALL  # noqa: E402 - kept in its own file
+        from scenarios_signet import ALL, SOAK  # noqa: E402 - kept in its own file
+        if h.args.soak_minutes:
+            ALL = SOAK
     else:
         from scenarios import ALL  # noqa: E402 - kept in its own file
     for sc in ALL:
@@ -1020,12 +1098,34 @@ def main():
     ap.add_argument("--past-halving", action="store_true",
                     help="finally mine past regtest's first halving (150) and report what happens")
     ap.add_argument("--only", nargs="*", help="scenario function names to run")
+    ap.add_argument("--partition-blocks", type=int, default=30,
+                    help="signet: Bitcoin blocks mined while the relay network is split in two "
+                         "(more than the 20-block snapshot cut)")
+    ap.add_argument("--heal-blocks", type=int, default=16,
+                    help="signet: Bitcoin blocks mined after the split heals, so the losing side's "
+                         "shares can be re-included")
+    ap.add_argument("--sync-faults", nargs="*", default=["balances", "stamps", "truncate"],
+                    help="signet: lies the lying sync peer tells (ghost-np-relay fault.rs)")
+    ap.add_argument("--liar-alone-secs", type=float, default=75,
+                    help="signet: how long a fresh node syncs from the lying peer alone")
+    ap.add_argument("--soak-minutes", type=float, default=0,
+                    help="signet: run the soak instead of the scenario list: N minutes of mining "
+                         "with miners joining, leaving and stalling, then the checks")
+    ap.add_argument("--soak-pace", type=float, default=45.0,
+                    help="signet soak: mean seconds between one miner's shares")
+    ap.add_argument("--soak-stall-secs", type=float, default=1500,
+                    help="signet soak: how long a stalled miner stays silent (past its no-share "
+                         "timeout at the soak pace)")
     args = ap.parse_args()
     signet = args.network == "signet"
     if args.nodes is None:
         args.nodes = 4 if signet else 3
     if args.sensing_min_shares is None:
         args.sensing_min_shares = 1 if signet else 2
+    if args.soak_minutes:
+        if not signet:
+            raise SystemExit("--soak-minutes runs on --network signet")
+        args.pace = args.soak_pace
     if args.faults is None:
         args.faults = ["wrong-treasury", "fee-skim"] + (
             ["payee-order", "no-root", "overpay"] if signet else [])
