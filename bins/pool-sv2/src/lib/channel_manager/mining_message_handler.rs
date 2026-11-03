@@ -456,11 +456,11 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             .map_err(|e| PoolError::disconnect(e, downstream_id))?;
                         let future_standard_job_id = standard_channel
                             .get_future_job_id_from_template_id(template_id)
-                            .expect("future job id must exist");
+                            .ok_or_else(|| PoolError::disconnect(PoolErrorKind::Custom("the channel holds no future job for the template it was just given".into()), downstream_id))?;
                         np.bind_job((downstream_id, channel_id), future_standard_job_id);
                         let future_standard_job = standard_channel
                             .get_future_job(future_standard_job_id)
-                            .expect("future job must exist");
+                            .ok_or_else(|| PoolError::disconnect(PoolErrorKind::Custom("the channel lost the future job it was just given".into()), downstream_id))?;
                         let future_standard_job_message =
                             future_standard_job.get_job_message().clone().into_static();
 
@@ -822,11 +822,11 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
 
                             let future_extended_job_id = extended_channel
                                 .get_future_job_id_from_template_id(last_future_template.template_id)
-                                .expect("future job id must exist");
+                                .ok_or_else(|| PoolError::disconnect(PoolErrorKind::Custom("the channel holds no future job for the template it was just given".into()), downstream_id))?;
                             np.bind_job((downstream_id, channel_id), future_extended_job_id);
                             let future_extended_job = extended_channel
                                 .get_future_job(future_extended_job_id)
-                                .expect("future job must exist");
+                                .ok_or_else(|| PoolError::disconnect(PoolErrorKind::Custom("the channel lost the future job it was just given".into()), downstream_id))?;
 
                             let future_extended_job_message =
                                 future_extended_job.get_job_message().clone().into_static();
