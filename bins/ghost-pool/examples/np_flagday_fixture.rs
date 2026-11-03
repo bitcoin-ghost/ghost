@@ -30,7 +30,8 @@
 //!
 //! ```text
 //! cargo run -p ghost-mining --example np_flagday_fixture -- --db ghost.db --node-key node.key \
-//!     --network signet --height 30 --miners 4000 --seed 1 [--uncapped] [--dirty] [--shares N]
+//!     --network signet --height 30 --miners 4000 --seed 1 [--uncapped] [--dirty] [--no-p2pkh] \
+//!     [--shares N]
 //! ```
 
 use std::collections::BTreeMap;
@@ -70,9 +71,14 @@ fn h32(tag: &str) -> [u8; 32] {
 }
 
 /// Address `i` of the population: P2WPKH 45%, P2PKH 15%, P2SH 10%, P2TR 20%, P2WSH 10%.
-fn address(seed: u64, i: usize, network: Network) -> (String, &'static str) {
+/// With `no_p2pkh` the P2PKH slots are P2WPKH (the node pool's payee classes only).
+fn address(seed: u64, i: usize, network: Network, no_p2pkh: bool) -> (String, &'static str) {
     let h = h32(&format!("np-flagday/{seed}/miner/{i}"));
-    let (script, kind) = match i % 20 {
+    let slot = match i % 20 {
+        9..=11 if no_p2pkh => 0,
+        s => s,
+    };
+    let (script, kind) = match slot {
         0..=8 => {
             let mut s = vec![0x00, 0x14];
             s.extend_from_slice(&h[..20]);
@@ -120,6 +126,7 @@ fn main() -> anyhow::Result<()> {
     let n_shares: usize = arg(&args, "--shares").unwrap_or("20000".into()).parse()?;
     let uncapped = args.iter().any(|a| a == "--uncapped");
     let dirty = args.iter().any(|a| a == "--dirty");
+    let no_p2pkh = args.iter().any(|a| a == "--no-p2pkh");
 
     let identity = if key_path.exists() {
         NodeIdentity::load(&key_path)?
@@ -150,7 +157,7 @@ fn main() -> anyhow::Result<()> {
     let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
     let mut addrs = Vec::with_capacity(n_miners);
     for i in 0..n_miners {
-        let (a, kind) = address(seed, i, network);
+        let (a, kind) = address(seed, i, network, no_p2pkh);
         *kinds.entry(kind).or_default() += 1;
         // Owed micro-work: a long tail of dust, a body, and a few whales.
         let r = rng.range(0, 999);
