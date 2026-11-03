@@ -254,6 +254,35 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
 
+        // A held tip is served (`node_pool_serve_held_tip`) by replaying the active template as
+        // a future one and activating it, which drops every future template the template
+        // provider sent for that same tip meanwhile. The provider's own SetNewPrevHash for one of
+        // those then names a template no channel holds, and the group channel's
+        // TemplateIdNotFound was a shutdown: seen 2026-11-03, a 24 h soak's node0 pool_sv2 shut
+        // itself down at 5 h 59 m this way. The tip is already active and every channel has its
+        // job on it, so there is nothing to do.
+        let replayed = self.channel_manager_data.super_safe_lock(|data| {
+            same_tip_unknown_template(
+                data.last_new_prev_hash.as_ref(),
+                &msg,
+                data.downstream.values().any(|d| {
+                    d.downstream_data.super_safe_lock(|dd| {
+                        dd.group_channel
+                            .get_future_job_id_from_template_id(msg.template_id)
+                            .is_none()
+                    })
+                }),
+            )
+        });
+        if replayed {
+            warn!(
+                template_id = msg.template_id,
+                "NODE_POOL: SetNewPrevHash for a template dropped when the held tip was served; \
+                 the tip is already active, ignored"
+            );
+            return Ok(());
+        }
+
         self.node_pool.on_set_new_prev_hash(msg.template_id);
 
         // The new tip's template was not served (no snapshot table in time): no channel has a
@@ -367,5 +396,56 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         }
 
         Ok(())
+    }
+}
+
+/// Whether `msg` re-announces the tip already active (`last`) for a template the channels do not
+/// hold (`channels_lack_it`): a template dropped when a held tip was served. Such a
+/// SetNewPrevHash changes nothing and is ignored rather than failing the channels.
+fn same_tip_unknown_template(
+    last: Option<&SetNewPrevHash<'static>>,
+    msg: &SetNewPrevHash<'_>,
+    channels_lack_it: bool,
+) -> bool {
+    channels_lack_it && last.is_some_and(|p| p.prev_hash == msg.prev_hash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snph(template_id: u64, tip: u8) -> SetNewPrevHash<'static> {
+        SetNewPrevHash {
+            template_id,
+            prev_hash: [tip; 32].into(),
+            header_timestamp: 1,
+            n_bits: 0x1e0377ae,
+            target: [0xff; 32].into(),
+        }
+    }
+
+    /// The soak's sequence: tip held on 6775, 6776 sent for the same tip, the held tip served
+    /// from 6775 (dropping 6776), then the provider's SetNewPrevHash for 6776.
+    #[test]
+    fn a_dropped_template_on_the_active_tip_is_ignored_and_nothing_else_is() {
+        let active = snph(6775, 0xAA);
+        assert!(same_tip_unknown_template(
+            Some(&active),
+            &snph(6776, 0xAA),
+            true
+        ));
+        // The ordinary second template on a tip: the channels hold it.
+        assert!(!same_tip_unknown_template(
+            Some(&active),
+            &snph(6776, 0xAA),
+            false
+        ));
+        // A new tip is never skipped, known template or not.
+        assert!(!same_tip_unknown_template(
+            Some(&active),
+            &snph(6777, 0xBB),
+            true
+        ));
+        assert!(!same_tip_unknown_template(None, &snph(1, 0xAA), true));
     }
 }
