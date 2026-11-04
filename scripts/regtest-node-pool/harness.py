@@ -1072,6 +1072,11 @@ def scenarios(h):
             ALL = SOAK
     else:
         from scenarios import ALL  # noqa: E402 - kept in its own file
+        if h.args.soak_minutes:
+            import scenarios as S  # noqa: E402
+            import scenarios_resilience as RS  # noqa: E402
+            ALL = [RS.regtest_soak_bringup, S.genesis_import, RS.soak, S.balances_agree,
+                   S.blocks_settle]
     for sc in ALL:
         if h.args.only and sc.__name__ not in h.args.only:
             continue
@@ -1191,8 +1196,13 @@ def main():
     if args.sensing_min_shares is None:
         args.sensing_min_shares = 1 if signet else 2
     if args.soak_minutes:
+        # Regtest too: its difficulty never moves, so a CPU miner's shares stay a mix of loose
+        # shares and anchors for the whole soak. A signet run's retargets harden its blocks past
+        # the anchor tier after about 4,000 blocks (7h at the default pace), and from there on
+        # every share is an anchor and relay goes untested.
         if not signet:
-            raise SystemExit("--soak-minutes runs on --network signet")
+            args.nodes = 4 if args.nodes == 3 else args.nodes
+            args.sensing_min_shares = 1
         args.pace = args.soak_pace
     if args.faults is None:
         args.faults = ["wrong-treasury", "fee-skim"] + (

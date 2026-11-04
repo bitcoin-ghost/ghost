@@ -584,11 +584,36 @@ def sample(h, t0):
     nodes = h.honest()
     st = nodes[0].status()
     return {"t": round(time.time() - t0), "btc": nodes[0].rpc("getblockcount"),
-            "anchors": st["share_chain"]["anchor_height"], "rss_kb": h.rss_by_process(),
+            "anchors": st["share_chain"]["anchor_height"],
+            "relayed": st["relay_stats"]["shares_accepted"],
+            "difficulty": nodes[0].rpc("getdifficulty"), "rss_kb": h.rss_by_process(),
             "store": {f"node{n.i}": store_bytes(n) for n in nodes},
             "bitcoin_dir": {f"node{n.i}": dir_size(os.path.join(n.dir, "bitcoin")) for n in nodes},
             "miners": {f"node{n.i}": sorted(k for k in n.miner_procs() if n.procs[k].alive())
                        for n in nodes}}
+
+
+LOOSE_STALL_SECS = 3600
+
+
+def regtest_soak_bringup(h):
+    """The soak's bring-up on regtest: the signet soak's miners (a full-class miner and the
+    node's other agents, paused until the soak starts), on a chain whose difficulty never moves."""
+    import scenarios_signet as SS  # noqa: E402 - only its miner set-up, no signet chain
+    say("\n== bring-up (regtest soak)")
+    for _ in range(h.args.nodes):
+        n = h.add_node(mine=False)
+        SS.start_node_miners(h, n)
+    ev, ok = [], True
+    try:
+        wait_for(lambda: all(n.status()["peers"] >= len(h.nodes) - 1 for n in h.nodes), 90,
+                 what="relay peers")
+        ev.append("relay peers: " + ", ".join(f"node{n.i}={n.status()['peers']}" for n in h.nodes))
+    except TimeoutError as e:
+        ok = False
+        ev.append(str(e))
+    result("bring-up (regtest soak): nodes up with full-class and mixed miners, relays peered",
+           "PASS" if ok else "FAIL", ev)
 
 
 def soak(h):
@@ -659,6 +684,19 @@ def soak(h):
                     f.write(json.dumps(smp) + "\n")
                 if len(samples) % 10 == 1:
                     _progress(h, f"soak {now / 60:.0f}m")
+                # A soak that stops relaying loose shares has stopped testing them. On a signet
+                # the block target hardens 4x at each retarget past the first; once it is harder
+                # than the anchor tier every CPU share is an anchor and loose shares end. Fail
+                # loudly instead of mining blocks for hours (24h soak of 11-03 lost 8h this way).
+                hour_ago = next((s for s in samples if s["t"] >= smp["t"] - LOOSE_STALL_SECS), None)
+                if (smp["t"] >= LOOSE_STALL_SECS + 600 and hour_ago is not None
+                        and hour_ago["t"] <= smp["t"] - LOOSE_STALL_SECS + 120
+                        and smp["relayed"] == hour_ago["relayed"]):
+                    ok = False
+                    ev.append(f"no loose share relayed for {LOOSE_STALL_SECS // 60} min at {now / 60:.0f}m "
+                              f"(Bitcoin {smp['btc']}, difficulty {smp['difficulty']:.6f}): every share is "
+                              f"an anchor, the soak has stopped testing relay; slow --soak-pace")
+                    break
             except Exception as e:  # noqa: BLE001 - a missed sample is reported, not fatal
                 ev.append(f"sample at {now:.0f}s failed: {e}")
             next_sample += 60
@@ -685,7 +723,8 @@ def soak(h):
     hours = max((final["t"] - warm["t"]) / 3600, 1e-9)
     ev.append(f"ran {final['t'] / 60:.0f} min: Bitcoin {first['btc']} -> {final['btc']} "
               f"({final['btc'] - first['btc']} blocks), share chain {first['anchors']} -> {final['anchors']} "
-              f"anchors; agreed at the end {STATE['quiet']}")
+              f"anchors; loose shares relayed {first['relayed']} -> {final['relayed']}; difficulty "
+              f"{first['difficulty']:.6f} -> {final['difficulty']:.6f}; agreed at the end {STATE['quiet']}")
     ev.append(f"store digests {'identical on every node' if not differ else 'DIFFER on ' + str(differ)}: "
               f"{digests[nodes[0].i]}")
     ev.append("events: " + "; ".join(log))
