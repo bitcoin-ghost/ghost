@@ -63,6 +63,7 @@
       "treasury_base_sats": 1562500,
       "miners_paid_sats": 1000,
       "treasury_change_sats": 310936500,
+      "finder_surplus_sats": 0,
       "treasury_sats": 312499000,
       "payouts": [{ "address": "bcrt1qminerone000000000000000000000000000", "sats": 1000 }],
       "applied_at": 1799999000
@@ -75,6 +76,7 @@
       "treasury_base_sats": 1562500,
       "miners_paid_sats": 1500,
       "treasury_change_sats": 310936000,
+      "finder_surplus_sats": 0,
       "treasury_sats": 312498500,
       "payouts": [{ "address": "bcrt1qminerone000000000000000000000000000", "sats": 1500 }],
       "applied_at": 1799998000

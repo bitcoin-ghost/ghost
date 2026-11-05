@@ -333,8 +333,11 @@ pub struct BlockView {
     pub treasury_base_sats: u64,
     /// Paid to miners' balances.
     pub miners_paid_sats: i64,
-    /// What the miners' half could not pay (`Rm` minus what it paid), sent to the treasury.
+    /// What the miners' half could not pay while a balance waited, sent to the treasury.
     pub treasury_change_sats: i64,
+    /// What was left of the miners' half after the ledger cleared (every balance of 1,000 sats or
+    /// more paid in full): paid to the finder output with the fees.
+    pub finder_surplus_sats: i64,
     /// The treasury output: base plus change.
     pub treasury_sats: i64,
     /// The miner outputs in pay order.
@@ -795,6 +798,15 @@ impl NodePoolApi {
     }
 
     /// The pool-wide status.
+    /// The treasury output (the coinbase's first) of an archived block, if its coinbase is held.
+    fn treasury_output(&self, block_hash: &[u8; 32]) -> Option<i64> {
+        let block = self.parts.db.np_get_btc_block(block_hash).ok()??;
+        let (coinbase, _) = block.coinbase?;
+        let tx: stratum_apps::stratum_core::bitcoin::Transaction =
+            stratum_apps::stratum_core::bitcoin::consensus::deserialize(&coinbase).ok()?;
+        i64::try_from(tx.output.first()?.value.to_sat()).ok()
+    }
+
     pub async fn status(&self) -> Result<StatusResponse, ApiError> {
         let db = &self.parts.db;
         let relay = *self.parts.status.borrow();
@@ -807,7 +819,14 @@ impl NodePoolApi {
             .map(|b| {
                 let (base, rm) = split(b.height, self.halving());
                 let paid: i64 = b.retirements.iter().map(|(_, a)| sats_of(*a)).sum();
-                let change = i64::try_from(rm).unwrap_or(i64::MAX) - paid;
+                let left = i64::try_from(rm).unwrap_or(i64::MAX) - paid;
+                // The leftover went to the treasury as change or to the finder as a cleared
+                // ledger's surplus; the treasury output says which. A block whose coinbase this
+                // node does not hold is shown as change.
+                let base_i = i64::try_from(base).unwrap_or(i64::MAX);
+                let change = self
+                    .treasury_output(&b.block_hash)
+                    .map_or(left, |t| (t - base_i).clamp(0, left.max(0)));
                 BlockView {
                     height: b.height,
                     block_hash: display_hash(&b.block_hash),
@@ -820,7 +839,8 @@ impl NodePoolApi {
                     treasury_base_sats: base,
                     miners_paid_sats: paid,
                     treasury_change_sats: change,
-                    treasury_sats: i64::try_from(base).unwrap_or(i64::MAX) + change,
+                    finder_surplus_sats: left - change,
+                    treasury_sats: base_i + change,
                     payouts: b
                         .retirements
                         .iter()

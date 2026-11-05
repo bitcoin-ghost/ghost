@@ -24,7 +24,7 @@ import time
 
 import harness as HX
 from harness import (CUT_LAG, FIRST_EARNING_HEIGHT, GENESIS_ANCHOR, GENESIS_HEIGHT, REPO,
-                     SIGNET_CHALLENGE, SLOT_CLASSES, TREASURY_SCRIPT, check_coinbase, logged,
+                     SIGNET_CHALLENGE, SLOT_CLASSES, TREASURY_SCRIPT, check_coinbase, logged, miner_count,
                      payee, result, say, subsidy, wait_for)
 import scenarios as S
 from scenarios import STATE, _progress, miner_events, settled_in
@@ -140,10 +140,11 @@ def verify_exact(h, blocks):
         actual = [(v, bytes.fromhex(sc)) for v, sc in vouts]
         witness = actual[-1][1][6:]
         fees = sum(v for v, _ in actual) - subsidy(height)
-        finder = actual[-3] if fees > 0 else (0, b"")
+        n = int.from_bytes(actual[-2][1][-2:], "big")
+        finder = actual[-3] if len(actual) - 3 > n else (0, b"")
         match = None
         for cls in SLOT_CLASSES:
-            want, _ = R.coinbase_outputs(height, state, cls, finder[1], finder[0], witness)
+            want, _ = R.coinbase_outputs(height, state, cls, finder[1], fees, witness)
             if want == actual:
                 match = cls
                 break
@@ -155,7 +156,7 @@ def verify_exact(h, blocks):
         rows.append({"height": height, "hash": bh, "class": match, "outputs": len(actual),
                      "paid": len(outs), "oldest": info["paid_oldest"],
                      "largest": len(outs) - info["paid_oldest"], "sats": sum(p for _, p in outs),
-                     "treasury": tre, "change": info["change"],
+                     "treasury": tre, "change": info["change"], "surplus": info["surplus"],
                      "below_floor": sum(1 for _, p in outs if p < R.MIN_PAY)})
         R.apply_block(state, retired)
     return rows, problems
@@ -209,14 +210,15 @@ def genesis_payouts(h):
     for r in rows:
         ev.append(f"h{r['height']}: class {r['class']}, {r['outputs']} outputs, {r['paid']} paid "
                   f"({r['oldest']} oldest + {r['largest']} largest), {r['sats']} sats to miners, "
-                  f"treasury {r['treasury']} = S/200 + change {r['change']}: exact (refimpl_v3)")
+                  f"treasury {r['treasury']} = S/200 + change {r['change']}, surplus to finder "
+                  f"{r['surplus']}: exact (refimpl_v3)")
     for height, bh, vouts in full_blocks:
-        miners = vouts[1:-2]
+        miners = vouts[1:1 + (miner_count(vouts[-2][1]) or 0)]
         row = next((r for r in rows if r["hash"] == bh), None)
         exact = row is not None and row["class"] == 500 and row["paid"] == 500
         halves = row is not None and row["oldest"] == 250 and row["largest"] == 250
         floor = all(v >= 1000 for v, _ in miners)
-        sums = (vouts[0][0] + sum(v for v, _ in miners) == subsidy(height)
+        sums = (vouts[0][0] + sum(v for v, _ in miners) + (row or {}).get("surplus", 0) == subsidy(height)
                 and vouts[0][0] == subsidy(height) // 200 + (row or {}).get("change", -1))
         payees = [n.i for n in h.honest() if any(
             bh in l and "NP_SETTLE: pool block settled" in l and "payees=500" in l and "slot_class=500" in l
@@ -224,7 +226,7 @@ def genesis_payouts(h):
         good = exact and halves and floor and sums and len(payees) == len(h.honest())
         ok &= good
         ev.append(f"503-output block h{height} {bh[:16]}..: refimpl_v3 exact {exact}; halves 250 oldest + "
-                  f"250 largest {halves}; every output >= 1,000 sats {floor}; treasury + miners = subsidy "
+                  f"250 largest {halves}; every output >= 1,000 sats {floor}; treasury + miners + surplus = subsidy "
                   f"and treasury = S/200 + change {sums}; settled (slot_class=500 payees=500) on nodes "
                   f"{payees} of {[n.i for n in h.honest()]}")
     STATE["full_blocks"] = full_blocks
@@ -302,13 +304,15 @@ def genesis_exact(h):
     bad = [(x, e) for x, e in bad if e]
     ok &= not bad
     ev += [f"h{x}: {'; '.join(e)}" for x, e in bad[:6]]
-    paid, outputs, change = {}, 0, 0
+    paid, outputs, change, surplus = {}, 0, 0, 0
     for height, _, vouts in blocks:
         for v, sc in vouts[1:-2]:
             if sc in payees and sc not in fees:
                 paid[sc] = paid.get(sc, 0) + v
                 outputs += 1
         change += vouts[0][0] - subsidy(height) // 200
+        n = miner_count(vouts[-2][1]) or 0
+        surplus += subsidy(height) - vouts[0][0] - sum(v for v, _ in vouts[1:1 + n])
     g = {sc: v for sc, v in paid.items() if sc in h.genesis}
     full = sum(1 for sc, v in g.items() if v == h.genesis[sc])
     over = [sc for sc, v in g.items() if v > h.genesis[sc]]
@@ -318,14 +322,15 @@ def genesis_exact(h):
     ev.append(f"{len(blocks)} honest pool blocks; {len(rows)} on genesis-only snapshots, every one equal "
               f"to refimpl_v3's coinbase (classes {sorted({r['class'] for r in rows})}, output counts {sizes})")
     ev.append(f"coinbase sums exact on {len(blocks) - len(bad)} of {len(blocks)} (treasury + miners = "
-              f"subsidy, treasury >= S/200, every miner output >= 1,000 sats, finder = fees)")
+              f"subsidy, or a cleared ledger's surplus in the finder output with treasury = S/200; every "
+              f"miner output >= 1,000 sats; finder = fees + surplus)")
     ev.append(f"{outputs} miner outputs paid to {len(paid)} payees; genesis rows: {full} paid in full, "
               f"{len(g) - full} partly, {len(h.genesis) - len(g)} not paid (of them "
               f"{sum(1 for v in h.genesis.values() if v < 1000)} below the floor, never payable); overpaid "
               f"{len(over)}; below-floor rows paid {len(below)}; {sum(g.values())} of "
               f"{sum(h.genesis.values())} genesis sats paid")
     ev.append(f"change to the treasury over the run (treasury less S/200, summed over the blocks): "
-              f"{change} sats")
+              f"{change} sats; surplus of cleared ledgers to finders: {surplus} sats")
     result("payout rule over the run: genesis-only blocks exact against refimpl_v3; sums, floor "
            "and change exact on every block", "PASS" if ok else "FAIL", ev)
 

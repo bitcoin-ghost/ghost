@@ -8,7 +8,7 @@ Status: draft 11, 2026-11-02, against `main` at `f1cc40519`. Replaces the #608 p
 
 **How money moves in a block.**
 - 0.5% of the subsidy goes to the treasury.
-- The other 99.5% pays miners' ledger balances exactly, up to 500 outputs, minimum 1,000 sats: half to the oldest balances, half to the largest. Nobody is paid more than they are owed; any change goes to the treasury.
+- The other 99.5% pays miners' ledger balances exactly, up to 500 outputs, minimum 1,000 sats: half to the oldest balances, half to the largest. Nobody is paid more than they are owed; any change goes to the treasury, except that when a block pays every balance of 1,000 sats or more in full, what is left goes to the finder (decided 11-05).
 - All transaction fees go to the node whose miner found the block.
 - Today that is 312,500,000 sats of subsidy: 1,562,500 to the treasury and 310,937,500 to miners. Miners keep about 98.95% of total block value at current fees.
 
@@ -49,7 +49,7 @@ Anyone can run a node without approval. A miner runs a node and chooses their ow
 | Miner payment | Coinbase, from subsidy only, via a persistent ledger | Decided |
 | Minimum payout | 1,000 sats | Decided; simulation supports it |
 | Outputs | Up to 500 miners + treasury + finder, plus witness commitment and one ledger commitment output | Decided as a maximum; must work on every miner, so each job carries what that miner's firmware can hold (W0.2) |
-| Treasury | User's fixed address, `S/200` of subsidy plus any change a block can't pay to owed balances | Decided 11-02; address needed as a compiled constant |
+| Treasury | User's fixed address, `S/200` of subsidy plus any change a block can't pay to owed balances (a cleared ledger's surplus goes to the finder instead, 11-05) | Decided 11-02; address needed as a compiled constant |
 | Finder | All tx fees to the node whose miner found the block | Decided |
 | Node rewards, elders, capabilities | Removed | Decided |
 | Membership | Open: no roster, no approval, no signed-by-8 gate on listing | Decided |
@@ -71,13 +71,13 @@ A peer checks these as pure functions. Every check runs against the INCLUDING an
 1. PoW meets target.
 2. Rebuilt coinbase folds to the header merkle root.
 3. Tag recomputes from its preimage.
-4. Outputs equal `canonical_outputs(S(H), retired, slot_class)` plus finder and commitments. Treasury + miners = subsidy exactly.
+4. Outputs equal `canonical_outputs(S(H), retired, slot_class)` plus finder and commitments. Treasury + miners + surplus = subsidy exactly; the surplus is nonzero only on a cleared ledger and sits in the finder output with the fees.
 5. BIP34 height, bits, time and scriptSig are valid; `prev_hash` is a real Bitcoin header; job height H >= including anchor's `btc_height` - 12, and H is in the same subsidy era as the including anchor. Without the era guard, old-header shares could reprice across a halving at 2x. A bound of 2 is too tight: it voids 48% of a 37.5% side's work in a 60-minute split, against 5.5% at 12.
 6. The anchor that defines S(H) is an ancestor of the including anchor; not a duplicate. The share's own `parent_anchor` may sit on a dead fork. Requiring it to be an ancestor of the includer voided 52-80% of the losing side's work in a 10-minute split.
 
 A failed share earns nothing, and an anchor including one is invalid. So a block that doesn't pay the ledger earns no credit.
 
-Coinbase layout, fixed: treasury, canonical miner outputs in rule order, finder, commitment OP_RETURN, witness commitment. A zero-value finder output is omitted. The 21-byte payout-tag slot freed at H carries `parent_anchor[..16]`, so a block's anchor is recoverable from the chain alone. The table root goes in the OP_RETURN.
+Coinbase layout, fixed: treasury, canonical miner outputs in rule order, finder, commitment OP_RETURN, witness commitment. The finder output is the fees plus any surplus; a zero-value finder output is omitted. The 21-byte payout-tag slot freed at H carries `parent_anchor[..16]`, so a block's anchor is recoverable from the chain alone. The table root and the miner output count go in the OP_RETURN: `OP_RETURN PUSH38 "GHNP" || root || n_miners (u16 BE)`.
 
 ### 2.2 Anchors
 - An anchor is an NS meeting `T_net + 8`. Its job committed `parent_anchor` and `batch_root` before hashing.
@@ -125,7 +125,7 @@ Mandatory corrections from simulation:
 Bandwidth estimate at 10 EH/s: about 3.7 KB/s per link, 320 MB/day. An SV1 notify with 500 outputs is about 44 KB, so 1,000 miners on 30 s jobs is about 1.5 MB/s of egress. Anchor pushes raise this; measure it.
 
 ### 2.3 Ledger and payout
-The normative reference is `docs/node-pool-reference/refimpl_v3.py`; vectors are `docs/node-pool-reference/test_vectors_v3.json` (37 vectors). A Rust port must match it exactly.
+The normative reference is `docs/node-pool-reference/refimpl_v3.py`; vectors are `docs/node-pool-reference/test_vectors_v3.json` (39 vectors). A Rust port must match it exactly.
 
 Balances are in units of 2^-32 sat, fixed at share time from the share's own header `nBits`, so all nodes agree without a vote.
 
@@ -142,8 +142,12 @@ top = the single largest eligible balance; it is in the largest list but paid la
 pay everyone else in order, oldest first: pay = min(owed, Rm left); stop when Rm left < 1,000 sats
 then top: pay = min(owed_top, Rm left), if >= 1,000 sats
 retired = pay, exactly
-treasury = S/200 + (Rm - sum(pay))
+cleared = every eligible balance is paid, and paid in full
+cleared:  surplus = Rm - sum(pay), change = 0     (surplus to the finder output, with the fees)
+else:     surplus = 0, change = Rm - sum(pay)     (change to the treasury)
+treasury = S/200 + change;  finder = fees + surplus
 ```
+- **A cleared ledger's surplus goes to the finder (user decision 2026-11-05, draft 3.2).** When nobody eligible is left waiting, the leftover is luck, and the finder is chosen in proportion to hashrate, so over many blocks it is shared in proportion to work. Only on a cleared ledger: the finder picks its slot class, and a finder paid whatever `Rm` was left on any block would be paid to pick a small class and leave miners waiting. A block that leaves anyone eligible unpaid still sends the leftover to the treasury, and the unpaid balances stay owed.
 - **The top balance absorbs the remainder (user decision, draft 11).** When a block is worth less than its payees are owed, everyone else is paid in full and the largest balance takes the partial payment; the rest of its balance waits for a later block, where it either is top again or ages into the oldest half.
 - **Nobody is overpaid, and nobody loses balance.** A balance falls only by the exact amount paid. Not being in a block just means waiting.
 - **The ratio, `K_R`, `X` and `x` are gone.** Draft 6 redeemed credit at a floating rate, which overpaid some blocks and underpaid others.

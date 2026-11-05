@@ -89,7 +89,10 @@ export interface NpBlock {
   subsidy_sats: number;
   treasury_base_sats: number;
   miners_paid_sats: number;
+  /** Left over while a balance waited: sent to the treasury. */
   treasury_change_sats: number;
+  /** Left over after every balance of 1,000 sats or more was paid: sent to the finder. */
+  finder_surplus_sats: number;
   treasury_sats: number;
   payouts: NpPaidOutput[];
   applied_at: number;
@@ -261,6 +264,8 @@ export interface NpExpectedWait {
   typical_outputs_per_block: number | null;
   sats_to_floor: number | null;
   credited_sats_24h: number | null;
+  /** How often the pool's credited work should find a block, seconds; null before any credit. */
+  pool_expected_block_interval_secs: number | null;
   assumptions: string[];
 }
 

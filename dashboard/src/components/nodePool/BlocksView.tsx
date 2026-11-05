@@ -53,13 +53,16 @@ export function BlocksView({ status, statusError, statusLoading, now }: BlocksVi
       </Card>
 
       <Card>
-        <CardHeader title="Recent pool blocks" subtitle="Highest first; the treasury gets S/200 plus any change" />
+        <CardHeader
+          title="Recent pool blocks"
+          subtitle="Highest first; the treasury gets S/200 plus any change, and a block that pays every balance gives what is left to its finder"
+        />
         {blocks.length === 0 ? (
           <p className="text-sm" style={{ color: "var(--dim)" }} data-testid="no-blocks">
             The node pool has not found a block on this share chain yet.
           </p>
         ) : (
-          <Table head={["Height", "Block", "Status", "Subsidy", "Paid to miners", "Outputs", "Treasury base", "Treasury change", "Treasury total", "Applied"]}>
+          <Table head={["Height", "Block", "Status", "Subsidy", "Paid to miners", "Outputs", "Treasury base", "Treasury change", "Finder surplus", "Treasury total", "Applied"]}>
             {blocks.map((b) => (
               <tr key={b.block_hash} data-testid="block-row">
                 <Td>{fmtInt(b.height)}</Td>
@@ -70,6 +73,7 @@ export function BlocksView({ status, statusError, statusLoading, now }: BlocksVi
                 <Td>{b.payouts.length}</Td>
                 <Td>{fmtSats(b.treasury_base_sats)}</Td>
                 <Td>{fmtSats(b.treasury_change_sats)}</Td>
+                <Td>{fmtSats(b.finder_surplus_sats)}</Td>
                 <Td>{fmtSats(b.treasury_sats)}</Td>
                 <Td>{fmtAgo(b.applied_at, now)}</Td>
               </tr>
@@ -96,7 +100,10 @@ export function BlocksView({ status, statusError, statusLoading, now }: BlocksVi
       )}
       <Note>
         Payouts are in pay order: the oldest balances first, the largest balance last with whatever
-        is left. All transaction fees go to the finder&apos;s node and are not shown here.
+        is left. All transaction fees go to the finder&apos;s node and are not shown here. When a
+        block pays every balance of 1,000 sats or more in full, what is left of the miners&apos; share
+        goes to the finder too (the finder surplus); otherwise it goes to the treasury as change and
+        the unpaid balances stay owed.
       </Note>
     </div>
   );

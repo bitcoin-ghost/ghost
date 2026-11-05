@@ -35,6 +35,7 @@
     "typical_outputs_per_block": 1,
     "sats_to_floor": null,
     "credited_sats_24h": 9000,
+    "pool_expected_block_interval_secs": 6624000000,
     "assumptions": []
   }
 }

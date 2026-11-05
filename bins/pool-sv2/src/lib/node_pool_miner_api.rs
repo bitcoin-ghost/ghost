@@ -98,6 +98,27 @@ const LATE_APPLY_SECS: i64 = 2 * 3_600;
 /// Bitcoin's target block interval, for the snapshot lag.
 const BITCOIN_BLOCK_SECS: u64 = 600;
 
+/// Bitcoin blocks of credited work the pool's expected block interval is read from: about a day.
+pub const EXPECTED_RATE_BLOCKS: u32 = 144;
+
+/// Mean seconds between the blocks `credited_face` (face units credited over `span_blocks`
+/// Bitcoin blocks) should find, with `rm` the miners' share of a block. A share's face is its
+/// expected value, `difficulty share * Rm / difficulty network`, so the work's expected blocks are
+/// `credited_face / (Rm * 2^32)`. `None` when nothing was credited.
+pub fn expected_interval_secs(credited_face: i128, rm: u64, span_blocks: u32) -> Option<u64> {
+    if credited_face <= 0 || rm == 0 {
+        return None;
+    }
+    let per_block = rm as f64 * ghost_common::node_pool_constants::FACE_PER_SAT as f64;
+    let expected_blocks = credited_face as f64 / per_block;
+    let secs = f64::from(span_blocks) * BITCOIN_BLOCK_SECS as f64 / expected_blocks;
+    Some(if secs >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        secs.round().max(1.0) as u64
+    })
+}
+
 /// Hashrate over three spans, hashes per second.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Rates {
@@ -236,6 +257,10 @@ pub struct ExpectedWait {
     pub sats_to_floor: Option<u64>,
     /// Sats credited in the last 24 hours.
     pub credited_sats_24h: Option<i64>,
+    /// Mean seconds between pool blocks the pool's credited work should find: the work credited
+    /// to everyone over the last [`EXPECTED_RATE_BLOCKS`] Bitcoin blocks, at the share face rate.
+    /// Known from the first credited share, long before the pool has found a block.
+    pub pool_expected_block_interval_secs: Option<u64>,
     /// What the estimate assumes.
     pub assumptions: Vec<String>,
 }
@@ -569,6 +594,8 @@ pub struct WaitInput {
     pub block_outputs: Vec<usize>,
     /// Sats credited in the last 24 hours, if known.
     pub credited_sats_24h: Option<i64>,
+    /// The pool's expected seconds between blocks, from its credited work, if any was credited.
+    pub pool_expected_interval_secs: Option<u64>,
     /// Now.
     pub now: u64,
 }
@@ -595,6 +622,7 @@ pub fn estimate_wait(i: &WaitInput) -> ExpectedWait {
     };
     let mut w = ExpectedWait {
         credited_sats_24h: i.credited_sats_24h,
+        pool_expected_block_interval_secs: i.pool_expected_interval_secs,
         ..Default::default()
     };
     if !i.have_table {
@@ -613,7 +641,12 @@ pub fn estimate_wait(i: &WaitInput) -> ExpectedWait {
         .collect();
     recent.sort_unstable();
     w.pool_blocks_counted = recent.len();
-    if recent.len() < MIN_RATE_BLOCKS {
+    // Too few blocks found to measure the pool's rate: fall back to what its credited work should
+    // find. A new or small pool has this from its first share.
+    let expected = (recent.len() < MIN_RATE_BLOCKS)
+        .then_some(i.pool_expected_interval_secs)
+        .flatten();
+    if recent.len() < MIN_RATE_BLOCKS && expected.is_none() {
         return unknown(
             format!(
                 "the pool has found {} block{} in the last 30 days; at least {MIN_RATE_BLOCKS} \
@@ -626,19 +659,32 @@ pub fn estimate_wait(i: &WaitInput) -> ExpectedWait {
     }
     // Blocks after the first, over the time from the first to now: a long dry spell since the
     // last block lengthens the interval rather than being ignored.
-    let interval = ((now - recent[0]).max(1) as u64) / (recent.len() as u64 - 1);
-    let interval = interval.max(1);
+    let interval = match expected {
+        Some(e) => e,
+        None => (((now - recent[0]).max(1) as u64) / (recent.len() as u64 - 1)).max(1),
+    };
     w.pool_block_interval_secs = Some(interval);
     let typical = typical_outputs(&i.block_outputs).unwrap_or(usize::from(SLOT_CLASSES[0]));
     w.typical_outputs_per_block = Some(typical as u32);
     let (oldest_slots, _) = split_slots(typical);
-    w.assumptions = vec![
+    let rate = if expected.is_some() {
+        format!(
+            "the pool finds a block about every {}: what the work credited to every miner over \
+             the last {EXPECTED_RATE_BLOCKS} Bitcoin blocks should find on average (it has found \
+             {} in the last 30 days, too few to measure)",
+            human_secs(interval),
+            recent.len()
+        )
+    } else {
         format!(
             "the pool keeps finding blocks at its recent rate: {} blocks in the last 30 days, one \
              every {} on average",
             recent.len(),
             human_secs(interval)
-        ),
+        )
+    };
+    w.assumptions = vec![
+        rate,
         format!(
             "each block pays about as many balances as recent blocks did ({typical}, the \
              median), half of them the oldest"
@@ -706,8 +752,10 @@ fn human_secs(s: u64) -> String {
         format!("{} minutes", s.div_ceil(60))
     } else if s < 2 * 86_400 {
         format!("{:.1} hours", s as f64 / 3_600.0)
-    } else {
+    } else if s < 2 * 365 * 86_400 {
         format!("{:.1} days", s as f64 / 86_400.0)
+    } else {
+        format!("{:.0} years", s as f64 / (365.25 * 86_400.0))
     }
 }
 
@@ -997,6 +1045,18 @@ impl NodePoolApi {
             }
         }
         input.block_outputs = block_outputs;
+        let tip = self
+            .settlement_brief()
+            .bitcoin_tip
+            .unwrap_or(self.parts.status.borrow().btc_height);
+        let credited = self
+            .parts
+            .db
+            .np_credited_face_from(tip.saturating_sub(EXPECTED_RATE_BLOCKS - 1))
+            .map_err(internal)?;
+        let (_, rm) = ghost_common::canonical_payout::split(tip.saturating_add(1), self.halving());
+        input.pool_expected_interval_secs =
+            expected_interval_secs(credited, rm, EXPECTED_RATE_BLOCKS);
         Ok(estimate_wait(&input))
     }
 

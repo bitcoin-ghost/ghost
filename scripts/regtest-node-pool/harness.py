@@ -45,6 +45,15 @@ REGTEST_GENESIS = "8d8cd561340ff83e99410e115619d64ad94516264d3e5cd6a991109c69f12
 REGTEST_TIER_BASE = "7fffff" + "00" * 29
 TREASURY_SCRIPT = "51209925167815d1202e985dc607bceab162cb70c98d292da3592c087b44a3fefb2f"
 LEDGER_MAGIC = b"GHNP".hex()
+# OP_RETURN PUSH38 "GHNP" || table root || miner output count (u16 big-endian), draft 3.2
+LEDGER_PREFIX = "6a26" + LEDGER_MAGIC
+
+
+def miner_count(script_hex):
+    """The miner output count a GHNP ledger commitment carries, None if it is not one."""
+    if not script_hex.startswith(LEDGER_PREFIX) or len(script_hex) != 2 * 40:
+        return None
+    return int(script_hex[-4:], 16)
 WITNESS_PREFIX = "6a24aa21a9ed"
 COIN = 100_000_000
 # Regtest's subsidy schedule (Halving::REGTEST): it halves every 150 blocks.
@@ -958,7 +967,7 @@ class Harness:
             blk = node.rpc("getblock", bh, 2)
             cb = blk["tx"][0]
             vouts = [(round(v["value"] * COIN), v["scriptPubKey"]["hex"]) for v in cb["vout"]]
-            if any(s.startswith("6a24" + LEDGER_MAGIC) for _, s in vouts):
+            if any(s.startswith(LEDGER_PREFIX) for _, s in vouts):
                 out.append((h, bh, vouts))
         return out
 
@@ -996,22 +1005,30 @@ def check_coinbase(h, vouts, payee_scripts, fee_scripts):
         return errs
     if vouts[-1][1][:12] != WITNESS_PREFIX:
         errs.append("last output is not the witness commitment")
-    if not vouts[-2][1].startswith("6a24" + LEDGER_MAGIC):
+    n = miner_count(vouts[-2][1])
+    if n is None:
         errs.append("second-to-last output is not the GHNP ledger commitment")
-    body = vouts[1:-2]
-    finder = 0
-    if body and body[-1][1] in fee_scripts and body[-1][1] not in payee_scripts:
-        finder = body[-1][0]
-        body = body[:-1]
+        return errs
+    rest = vouts[1:-2]
+    if len(rest) not in (n, n + 1):
+        errs.append(f"{len(rest)} outputs between the treasury and the commitment; it counts {n} miners")
+        return errs
+    body = rest[:n]
+    finder = rest[n][0] if len(rest) > n else 0
+    if len(rest) > n and rest[n][1] not in fee_scripts:
+        errs.append(f"the output after the miners pays {rest[n][1]}, not a node's fee script")
     treasury = vouts[0][0]
     miners = sum(v for v, _ in body)
     total = sum(v for v, _ in vouts)
-    if treasury + miners != s:
-        errs.append(f"treasury {treasury} + miners {miners} != subsidy {s}")
+    # A cleared ledger's surplus goes to the finder: then treasury is exactly S/200 and treasury
+    # plus miners fall short of the subsidy by the surplus, which the finder holds with the fees.
+    surplus = s - treasury - miners
+    if surplus < 0 or (surplus > 0 and treasury != s // 200):
+        errs.append(f"treasury {treasury} + miners {miners} != subsidy {s} (and no cleared-ledger surplus)")
     if treasury < s // 200:
         errs.append(f"treasury {treasury} below S/200 {s // 200}")
-    if finder != total - s:
-        errs.append(f"finder {finder} != fees {total - s}")
+    if surplus >= 0 and finder != total - s + surplus:
+        errs.append(f"finder {finder} != fees {total - s} + surplus {surplus}")
     for v, sc in body:
         if sc not in payee_scripts:
             errs.append(f"miner output to unknown script {sc}")

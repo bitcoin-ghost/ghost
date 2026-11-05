@@ -282,6 +282,7 @@ fn input() -> WaitInput {
         ],
         block_outputs: vec![10, 10, 10],
         credited_sats_24h: Some(200),
+        pool_expected_interval_secs: None,
         now: 1_800_000_000,
     }
 }
@@ -532,3 +533,48 @@ fn the_typical_block_is_the_median_and_never_below_the_smallest_class() {
     );
     assert_eq!(typical_outputs(&[9, 500, 44, 9, 143]), Some(44));
 }
+
+/// The pool's expected block interval from its credited work: one block's worth of face
+/// (`Rm * 2^32`) credited over a day is one block a day.
+#[test]
+fn the_expected_interval_reads_the_pools_credited_work() {
+    use crate::node_pool_miner_api::expected_interval_secs;
+    let rm: u64 = 310_937_500;
+    let one_block = rm as i128 * FACE_PER_SAT_I;
+    assert_eq!(expected_interval_secs(one_block, rm, 144), Some(86_400));
+    assert_eq!(expected_interval_secs(one_block * 4, rm, 144), Some(21_600));
+    // About 95 TH/s against today's network: ~42 sats a TH/s a day, so ~4,000 sats a day of a
+    // 310.9M-sat block, one block in about 210 years.
+    let secs = expected_interval_secs(4_000 * FACE_PER_SAT_I, rm, 144).unwrap();
+    let years = secs as f64 / (365.25 * 86_400.0);
+    assert!((200.0..220.0).contains(&years), "{years}");
+    assert_eq!(expected_interval_secs(0, rm, 144), None);
+    assert_eq!(expected_interval_secs(-5, rm, 144), None);
+}
+
+/// Too few blocks found to measure the pool's rate: the wait uses the expected interval instead
+/// of giving up, and says so.
+#[test]
+fn a_pool_without_enough_blocks_waits_on_its_expected_interval() {
+    let mut i = input();
+    i.block_times.truncate(2);
+    i.pool_expected_interval_secs = Some(86_400);
+    let w = estimate_wait(&i);
+    assert!(w.known, "{:?}", w.reason);
+    assert_eq!(w.pool_block_interval_secs, Some(86_400));
+    assert_eq!(w.pool_expected_block_interval_secs, Some(86_400));
+    assert_eq!(w.seconds, Some(5 * 86_400));
+    assert!(
+        w.assumptions[0].contains("should find"),
+        "{}",
+        w.assumptions[0]
+    );
+    // Enough blocks: the measured rate wins, and the expected one is still reported.
+    let mut i = input();
+    i.pool_expected_interval_secs = Some(86_400);
+    let w = estimate_wait(&i);
+    assert_eq!(w.pool_block_interval_secs, Some(3 * 86_400 / 2));
+    assert_eq!(w.pool_expected_block_interval_secs, Some(86_400));
+}
+
+const FACE_PER_SAT_I: i128 = ghost_common::node_pool_constants::FACE_PER_SAT;

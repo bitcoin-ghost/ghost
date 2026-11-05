@@ -38,6 +38,7 @@ export function shortHash(h: string | null | undefined, n = 8): string {
 export function fmtDuration(seconds: number | null | undefined): string {
   if (!isNum(seconds) || seconds < 0) return UNKNOWN;
   const d = Math.floor(seconds / 86_400);
+  if (d >= 730) return `${Math.round(seconds / (365.25 * 86_400)).toLocaleString("en-US")} years`;
   const h = Math.floor((seconds % 86_400) / 3_600);
   const m = Math.floor((seconds % 3_600) / 60);
   if (d > 0) return `${d}d ${h}h`;

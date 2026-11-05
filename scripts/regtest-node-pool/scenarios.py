@@ -7,7 +7,7 @@ import subprocess
 import time
 
 from harness import (FIRST_EARNING_HEIGHT, logged, RPC_PASS, RPC_USER, SERIAL_AGENT, SLOT_CLASSES, TREASURY_SCRIPT as TREASURY,
-                     check_coinbase, p2pkh_address, payee, result, say, subsidy, wait_for, Proc, HERE,
+                     check_coinbase, miner_count, p2pkh_address, payee, result, say, subsidy, wait_for, Proc, HERE,
                      TIER_BASE, NETWORK, GENESIS_HEIGHT, audit_chain_args)
 import sys
 
@@ -275,7 +275,7 @@ def blocks_settle(h):
         if errs:
             ok = False
             ev.append(f"h{height} {bh[:16]}: " + "; ".join(errs))
-        if len(vouts) > 4 or (len(vouts) == 4 and vouts[1][1] in payees):
+        if (miner_count(vouts[-2][1]) or 0) > 0:
             paying += 1
     if h.genesis:
         paid = {}
@@ -303,9 +303,10 @@ def blocks_settle(h):
         ev.append(f"genesis rows: {full} paid in full, exactly; {len(paid) - full} partly; "
                   f"{len(h.genesis) - len(paid)} not yet; overpaid {len(over)}; below-floor rows paid "
                   f"{len(below)}; {sum(paid.values())} of {sum(h.genesis.values())} sats owed at genesis paid")
-    ev.append(f"coinbase sums exact (treasury + miners = subsidy, treasury >= S/200, finder = fees) "
+    ev.append(f"coinbase sums exact (treasury + miners = subsidy, or treasury = S/200 and a cleared "
+              f"ledger's surplus in the finder output; finder = fees + surplus) "
               f"on {len(blocks) - sum(1 for e in ev if e.startswith('h'))} of {len(blocks)}; "
-              f"{paying} paid miners, the rest went to the treasury (empty snapshot table)")
+              f"{paying} paid miners, the rest went to the finder (empty snapshot table: cleared)")
     for n in h.honest():
         log = n.read_log("pool_sv2")
         settled = {bh for _, bh, _ in blocks if logged(log, bh, "NP_SETTLE: pool block settled")}
@@ -693,7 +694,7 @@ def past_halving(h):
         errs = check_coinbase(height_, vouts, payees, fees)
         settled = [n.i for n in h.honest() if settled_in(n.read_log("pool_sv2"), bh)]
         ok &= not errs and len(settled) == len(h.honest())
-        ev.append(f"h{height_}: treasury {vouts[0][0]} + miners = {subsidy(height_)} (regtest era "
+        ev.append(f"h{height_}: treasury {vouts[0][0]} + miners + surplus = {subsidy(height_)} (regtest era "
                   f"{height_ // 150}): {'exact' if not errs else '; '.join(errs)}; settled on nodes "
                   f"{settled}")
     result("regtest halving (height 150): pool blocks continue, pay the halved subsidy exactly "

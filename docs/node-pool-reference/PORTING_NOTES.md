@@ -29,9 +29,11 @@ Code: `crates/ghost-common/src/{canonical_payout,share_commit,anchor_chain,node_
 - Tier `t` target is `base >> t`, with `base` the difficulty-1 target `0xFFFF * 2^208`. `base` is a
   parameter, not a constant, because regtest cannot mine tier 10 at difficulty 1; see "Open" below.
 - Rule 4 compares the whole output list: treasury, canonical miners, an optional finder (present
-  only when non-zero, any script), `OP_RETURN "GHNP" || table_root`, and a witness commitment
-  (`OP_RETURN aa21a9ed || 32 bytes`, required). The finder script is not class-limited: it retires
-  nothing and adds one output.
+  only when non-zero, any script), `OP_RETURN PUSH38 "GHNP" || table_root || n_miners` (`u16`
+  big-endian), and a witness commitment (`OP_RETURN aa21a9ed || 32 bytes`, required). The finder
+  script is not class-limited: it retires nothing and adds one output. The finder output is the
+  fees plus, on a cleared ledger (every eligible balance paid in full), the surplus of `Rm`
+  (draft 3.2, 2026-11-05); rule 4 reads the fees as the finder output less the canonical surplus.
 - Rule 5's era guard reads the including anchor's era from `btc_height + 1`, its job height,
   because `btc_height` is the tip its job saw (simulator convention). Window: `H + 12 >= btc_height`.
 - `prev_hash` being a real header, the bits, the median time past and the latest time are
@@ -165,9 +167,10 @@ anchor's ancestry, the share, and the Bitcoin headers, so every viewer reaches t
   slot class (`share_commit::settle_outputs`; the class is inside the tag's hash, so every class
   is tried, and outputs canonical for any class retire exactly what they paid). **Mismatch**:
   anchor held, no match: nothing retired, though the chain paid it.
-- **Provisional**: anchor not held. The miners are the run of outputs after the treasury that
-  sums with it to the subsidy (`canonical_payout::provisional_retirements`); each retires its
-  value. When the anchor arrives the block is checked: kept on a match (the retirements are
+- **Provisional**: anchor not held. The miners are the `n_miners` outputs after the treasury, the
+  count the `GHNP` commitment carries (`canonical_payout::provisional_retirements`); with the
+  treasury they sum to the subsidy, or the treasury is exactly `S/200` and the finder output
+  holds at least the shortfall (a cleared ledger's surplus). Each retires its value. When the anchor arrives the block is checked: kept on a match (the retirements are
   identical, both are the paid outputs), undone on a mismatch. Undo of a block under later
   events rewinds and re-applies them (`np_undo_block_anywhere`).
 - **Reorg**: the last 1,024 best-chain hashes are remembered; a changed hash undoes the settled
@@ -281,7 +284,7 @@ Readings chosen where the spec was silent; written into spec 2.2, "Share-chain s
   miners for the committed class, with the last output read as the finder when its script is not
   owed: an unowed script carrying exactly a missing payee's amount (relabelled payee); any other
   unowed script, or an owed one paid more than canonical (inflated balance); treasury plus miners
-  below the subsidy (fee skim); a dropped payee, a wrong treasury amount, rule order, a zero-value
+  below the subsidy less the canonical surplus (fee skim); a dropped payee, a wrong treasury amount, rule order, a zero-value
   finder (outputs not canonical); everything right but the `GHNP` root (wrong ledger root).
 - **Verdicts**: PASS, FAIL, UNCHECKED. UNCHECKED (prev_hash or parent anchor not held yet, or the
   relay port unreachable) is retried for `--wait` seconds and is never a pass. A tag that does

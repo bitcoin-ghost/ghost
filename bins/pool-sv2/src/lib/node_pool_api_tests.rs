@@ -452,7 +452,9 @@ async fn the_status_has_its_documented_shape() {
     assert_eq!(b.subsidy_sats, 5_000_000_000 >> 6);
     assert_eq!(b.treasury_base_sats, base);
     assert_eq!(b.miners_paid_sats, 1_000);
+    // No coinbase held for it: the leftover is shown as change.
     assert_eq!(b.treasury_change_sats, rm as i64 - 1_000);
+    assert_eq!(b.finder_surplus_sats, 0);
     assert_eq!(b.treasury_sats, base as i64 + rm as i64 - 1_000);
     assert_eq!(b.payouts[0].address, addr(&payee(1)));
     let m = &s.miners[0];
@@ -643,4 +645,53 @@ fn work_before_the_first_earning_height_is_flagged() {
         (idle.first_earning_height, idle.earns, idle.notice),
         (974_521, None, None)
     );
+}
+
+/// A block whose coinbase is held: a treasury of exactly `S/200` means the leftover went to the
+/// finder as a cleared ledger's surplus (draft 3.2), and the status says so.
+#[tokio::test]
+async fn a_cleared_ledgers_surplus_is_shown_as_the_finders() {
+    use ghost_storage::node_pool_store::NpBtcBlock;
+    use stratum_apps::stratum_core::bitcoin::{
+        absolute::LockTime, consensus::serialize, transaction::Version, Amount, ScriptBuf,
+        Transaction, TxIn, TxOut,
+    };
+    let w = world();
+    let (base, rm) = split(960, Halving::REGTEST);
+    let cb = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn::default()],
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(base),
+                script_pubkey: ScriptBuf::new(),
+            },
+            TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::from_bytes(payee(1)),
+            },
+            TxOut {
+                value: Amount::from_sat(rm - 1_000),
+                script_pubkey: ScriptBuf::new(),
+            },
+        ],
+    };
+    w.api
+        .parts
+        .db
+        .np_put_btc_block(&NpBtcBlock {
+            hash: [0xB2; 32],
+            height: 960,
+            header: [0; 80],
+            coinbase: Some((serialize(&cb), vec![])),
+            received_at: 1,
+        })
+        .unwrap();
+    let s = w.api.status().await.unwrap();
+    let b = &s.recent_blocks[0];
+    assert_eq!(b.height, 960);
+    assert_eq!(b.treasury_change_sats, 0);
+    assert_eq!(b.finder_surplus_sats, rm as i64 - 1_000);
+    assert_eq!(b.treasury_sats, base as i64);
 }

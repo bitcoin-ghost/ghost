@@ -359,15 +359,20 @@ pub fn classify_outputs(
             format!("pays {} {a} sats; canonical is {w}", short(s)),
         ));
     }
+    // A cleared ledger's surplus goes to the finder (draft 3.2), so treasury and miners are owed
+    // the subsidy less that surplus, and anything below it went where it should not.
     let s = subsidy(h, halving);
+    let due = s - pay.surplus;
     let core = actual[0].0 + miners.iter().map(|(v, _)| *v).sum::<u64>();
-    if core < s {
+    if core < due {
         let to = finder.map_or("nowhere in the outputs".to_string(), |f| short(&f.1));
         return Err((
             FailReason::FeeSkim,
             format!(
-                "the treasury and miners get {core} of the {s}-sat subsidy; {} sats go to {to}",
-                s - core
+                "the treasury and miners get {core} of the {due} sats they are due \
+                 (subsidy {s}, surplus {}); {} sats go to {to}",
+                pay.surplus,
+                due - core
             ),
         ));
     }

@@ -223,7 +223,9 @@ test("miner detail: ledger, queue by class, workers, payouts and shares", () => 
   assert.match(t, /not yet \(100 needed\)/);
   // A null hashrate is unknown, not zero.
   assert.match(t, /Hashrate 24 h unknown/);
-  assert.match(t, /Credited, last 24 h 9,000 sats/);
+  assert.match(t, /Earned, last 24 h 9,000 sats/);
+  assert.match(t, /Pool finds a block about every 210 years/);
+  assert.match(t, /paid only when the pool finds a block/);
 });
 
 test("miner detail: a failed API shows unavailable for both halves", () => {

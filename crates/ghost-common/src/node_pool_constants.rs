@@ -77,7 +77,8 @@ pub const TREASURY_SCRIPT_PLACEHOLDER: [u8; 34] = [
     0xfb, 0x2f,
 ];
 
-/// Magic of the ledger commitment `OP_RETURN`: `OP_RETURN PUSH36 "GHNP" || table_root`.
+/// Magic of the ledger commitment `OP_RETURN`:
+/// `OP_RETURN PUSH38 "GHNP" || table_root || n_miners (u16 big-endian)`.
 pub const LEDGER_COMMITMENT_MAGIC: &[u8; 4] = b"GHNP";
 
 /// Domain separator of the share tag (spec 2.1).

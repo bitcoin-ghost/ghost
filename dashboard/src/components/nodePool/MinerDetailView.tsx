@@ -3,6 +3,7 @@ import type { NodePoolLedger, NodePoolMiner } from "@/lib/api/nodePool";
 import {
   bestRate,
   fmtAgo,
+  fmtDuration,
   fmtHashrate,
   fmtInt,
   fmtSats,
@@ -61,6 +62,13 @@ function LedgerCard({ ledger, ledgerError }: { ledger?: NodePoolLedger; ledgerEr
         <Kv label="Eligible balances" value={fmtInt(q?.eligible_count)} />
       </Grid>
       {!q && ledger.queue_unavailable ? <Note>Queue unknown: {ledger.queue_unavailable}</Note> : null}
+      <Note>
+        Every share you submit is credited its expected value in sats the moment it is accepted, and
+        your balance is the total of those credits less what has been paid. It is paid only when
+        the pool finds a block, straight from that block&apos;s coinbase; until then it carries
+        forward, never expires and is never shared out. When a block pays every balance of 1,000 sats
+        or more in full, what is left goes to the block&apos;s finder.
+      </Note>
       {q ? (
         <div className="mt-4">
           <div className="text-xs mb-2" style={{ color: "var(--fainter)" }}>
@@ -102,7 +110,16 @@ export function MinerDetailView({ address, ledger, ledgerError, miner, minerErro
               />
               <Kv label="Last share" value={fmtAgo(miner.summary.last_share_at, now)} />
               <Kv label="Expected wait" value={waitLabel(miner.expected_wait)} />
-              <Kv label="Credited, last 24 h" value={fmtSats(miner.expected_wait.credited_sats_24h)} />
+              <Kv label="Earned, last 24 h" value={fmtSats(miner.expected_wait.credited_sats_24h)} />
+              <Kv
+                label="Pool finds a block about every"
+                value={
+                  isNum(miner.expected_wait.pool_expected_block_interval_secs)
+                    ? fmtDuration(miner.expected_wait.pool_expected_block_interval_secs)
+                    : UNKNOWN
+                }
+                hint="what the work credited to every miner over the last day should find on average"
+              />
               <Kv label="Collecting since" value={fmtAgo(miner.collecting_since, now)} />
             </Grid>
             {miner.expected_wait.assumptions.length > 0 ? (

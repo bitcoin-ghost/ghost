@@ -450,6 +450,28 @@ impl Database {
             .collect()
     }
 
+    /// Face units credited to every payee by shares of credit height `min_height` or above, on
+    /// the applied credit events: the pool's whole credited work over that span. At the share
+    /// face rate, this divided by `Rm * 2^32` is how many blocks that work was expected to find.
+    pub fn np_credited_face_from(&self, min_height: u32) -> GhostResult<i128> {
+        self.with_connection(|conn| {
+            let mut st = conn
+                .prepare_cached("SELECT amount FROM np_credits WHERE credit_height >= ?1")
+                .map_err(db_err)?;
+            let rows = st
+                .query_map(params![min_height], |r| r.get::<_, Vec<u8>>(0))
+                .map_err(db_err)?;
+            let mut sum: i128 = 0;
+            for blob in rows {
+                let v = face_from_blob(&blob.map_err(db_err)?)?;
+                sum = sum
+                    .checked_add(v)
+                    .ok_or_else(|| GhostError::Database("credited face overflows i128".into()))?;
+            }
+            Ok(sum)
+        })
+    }
+
     /// Payees with a balance row: in the imported genesis table, the share chain's ledger, or
     /// both (counted once).
     pub fn np_ledger_rows(&self) -> GhostResult<u64> {

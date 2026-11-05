@@ -1213,13 +1213,18 @@ mod tests {
             credits - paid as i128 * FACE_PER_SAT,
             "the stored ledger (credits and retirements; the genesis table is the snapshot's)"
         );
-        // Every genesis balance was paid too, and the treasury took S/200 plus the change.
+        // Every genesis balance was paid too, so the ledger cleared: the treasury took exactly
+        // S/200 and the rest of Rm went to the finder output as the surplus (draft 3.2).
+        let (base, rm) = ghost_common::canonical_payout::split(h, Halving::MAINNET);
         let treasury = cb.output[0].value.to_sat();
         let miners: u64 = retired.iter().map(|x| (x.1 / FACE_PER_SAT) as u64).sum();
+        assert_eq!(treasury, base, "a cleared ledger leaves no change");
+        let n = cb.output.len();
+        let finder = cb.output[n - 3].value.to_sat();
+        assert!(finder >= rm - miners, "the finder output holds the surplus");
         assert_eq!(
-            treasury + miners,
+            treasury + miners + (rm - miners),
             ghost_common::canonical_payout::subsidy(h, Halving::MAINNET),
-            "treasury plus miners is the subsidy exactly"
         );
     }
 }
