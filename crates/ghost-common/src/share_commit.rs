@@ -491,7 +491,8 @@ pub fn verify_share(
 }
 
 /// Rule 4: the coinbase outputs are exactly treasury, canonical miners, an optional non-zero
-/// finder, the ledger commitment and a witness commitment. Returns the retirements.
+/// finder (the fees, plus the surplus of a cleared ledger), the ledger commitment and a witness
+/// commitment. Returns the retirements.
 pub fn check_outputs(
     coinbase: &Transaction,
     table: &Table,
@@ -504,9 +505,8 @@ pub fn check_outputs(
         .iter()
         .map(|o| (o.value.to_sat(), o.script_pubkey.to_bytes()))
         .collect();
-    let canonical = 1 + build_outputs(job_height, halving, table, slots)?
-        .outputs
-        .len();
+    let pay = build_outputs(job_height, halving, table, slots)?;
+    let canonical = 1 + pay.outputs.len();
     let finder = match actual.len().checked_sub(canonical + 2) {
         Some(0) => None,
         Some(1) => Some(&actual[canonical]),
@@ -522,13 +522,17 @@ pub fn check_outputs(
         _ => return Err(ShareError::OutputsMismatch),
     };
     let (finder_script, finder_value) = finder.map_or((&[][..], 0), |f| (&f.1[..], f.0));
+    // The finder output holds the fees and any surplus; the fees are whatever is above the surplus.
+    let fees = finder_value
+        .checked_sub(pay.surplus)
+        .ok_or(ShareError::OutputsMismatch)?;
     let (want, retired) = coinbase_outputs(
         job_height,
         halving,
         table,
         slots,
         finder_script,
-        finder_value,
+        fees,
         &commitment,
     )?;
     if want != actual {
@@ -1078,12 +1082,54 @@ mod tests {
                 crate::canonical_payout::subsidy(H, Halving::MAINNET),
                 TREASURY_SCRIPT_PLACEHOLDER.to_vec(),
             ),
-            good[good.len() - 2].clone(),
+            (0, crate::canonical_payout::commitment_script(&[0; 32], 0)),
             good[good.len() - 1].clone(),
         ];
         assert_eq!(
             provisional_retirements(H, Halving::MAINNET, &treasury_only),
             Some(vec![])
         );
+    }
+
+    /// Draft 3.2: a cleared ledger's surplus belongs in the finder output, and only then.
+    #[test]
+    fn the_finder_takes_the_surplus_only_of_a_cleared_ledger() {
+        use crate::canonical_payout::split;
+        let (t, rm) = split(H, Halving::MAINNET);
+        // Two balances on a class-9 job: both paid in full, the ledger clears.
+        let mut f = Fixture::new(H);
+        f.table = f.table.into_iter().take(2).collect();
+        let pay = build_outputs(H, Halving::MAINNET, &f.table, 9).unwrap();
+        let paid: u64 = pay.outputs.iter().map(|x| x.1).sum();
+        assert_eq!((pay.surplus, pay.change, pay.treasury), (rm - paid, 0, t));
+        assert!(f.verify().is_ok(), "fees + surplus in the finder output");
+        f.finder_value = 0;
+        assert!(f.verify().is_ok(), "the surplus alone in the finder output");
+        // The finder output short of the surplus, or the surplus left in the treasury.
+        let honest = f.outputs();
+        let n = honest.len();
+        let mut short = honest.clone();
+        short[n - 3].0 -= 1;
+        f.outputs = Some(short);
+        assert_eq!(f.verify(), Err(ShareError::OutputsMismatch));
+        let mut kept = honest.clone();
+        kept[0].0 += kept[n - 3].0;
+        kept.remove(n - 3);
+        f.outputs = Some(kept);
+        assert_eq!(f.verify(), Err(ShareError::OutputsMismatch));
+
+        // Thirty balances on a class-9 job: someone waits, so what is left is change to the
+        // treasury, and a finder that takes it is refused.
+        let f = Fixture::new(H);
+        let pay = build_outputs(H, Halving::MAINNET, &f.table, 9).unwrap();
+        assert_eq!(pay.surplus, 0);
+        assert!(pay.change > 0, "the fixture leaves change at class 9");
+        let mut skim = f.outputs();
+        let n = skim.len();
+        skim[n - 3].0 += pay.change;
+        skim[0].0 -= pay.change;
+        let mut f = f;
+        f.outputs = Some(skim);
+        assert_eq!(f.verify(), Err(ShareError::OutputsMismatch));
     }
 }

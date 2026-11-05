@@ -1,4 +1,5 @@
-"""Normative integer reference, draft 3.1 (W1.3): exact pay with the top balance as remainder absorber.
+"""Normative integer reference, draft 3.2: exact pay with the top balance as remainder absorber; a cleared ledger's
+surplus goes to the block finder (draft 3.2, user decision 2026-11-05).
 Python ints only, no floats. Draft 3.0 (the draft 7/8 rule, no absorber) is kept as build_outputs_draft8/select_draft8.
 Run directly to self-test and write test_vectors_v3.json. refimpl_v2.py (draft 6, floating ratio) is kept unchanged.
 
@@ -16,8 +17,18 @@ The rule (user decision):
       stop when Rm left < 1,000 sats
   then top: pay = min(owed_top, Rm left) if that is >= 1,000 sats
   retired = pay, exactly
-  treasury = S/200 + (Rm - sum(pay))
+  cleared = every eligible balance is paid, and paid in full (whole sats)
+  left    = Rm - sum(pay)
+  if cleared: surplus = left, change = 0      the surplus goes to the finder output, with the fees
+  else:       surplus = 0,    change = left   the change goes to the treasury
+  treasury = S/200 + change;  finder = fees + surplus (omitted when 0)
 No K_R, no X, no x, no ratio. Nobody is paid more than owed.
+
+Why only on a cleared ledger: the finder picks its job's slot class. If the finder took whatever Rm was left on any
+block, a small class (3 or 9 outputs) would pay fewer miners and hand the finder the difference. On a cleared ledger
+nobody eligible is left waiting, so the surplus is luck, not a skim: a block that leaves anyone eligible unpaid sends
+what is left to the treasury, and every unpaid balance stays owed. In expectation the finder is chosen in proportion to
+hashrate, so the surplus is shared in proportion to work over many blocks.
 
 Integer details that the prose leaves open, fixed here:
   * pay is in whole sats: pay = min(owed // 2^32, Rm_left). retired = pay * 2^32 face units exactly. The sub-sat
@@ -29,7 +40,9 @@ Integer details that the prose leaves open, fixed here:
   * top is reserved before the oldest are chosen, so it is never also in the oldest list.
   * queue_since = the credit (share) height of the batch that took owed to >= FLOOR; it is reset to None only when
     owed falls below FLOOR. A batch of credits at share height c becomes visible at table height c + 20.
-  * the commitment OP_RETURN carries the table root only; there is no x any more.
+  * the commitment OP_RETURN carries the table root and the number of miner outputs (u16 big-endian):
+    OP_RETURN PUSH38 "GHNP" || root || n_miners. The count is what lets a node that does not hold the block's anchor
+    tell the miners from the finder: once a surplus can go to the finder, treasury + miners no longer always sum to S.
 """
 import hashlib, json, os, random, sys
 
@@ -122,9 +135,14 @@ def build_outputs(h, state, slots):
             outs.append((big[0][0], p))
             paid_top = p
     retired = [(a, p * ONE) for a, p in outs]
-    info = dict(change=left, n_oldest=len(old), n_largest=len(big), paid_oldest=min(len(outs), len(old)), paid_top=paid_top,
+    n_eligible = sum(1 for v in state.values() if v[0] >= FLOOR)
+    cleared = len(outs) == n_eligible and all(p == state[a][0] // ONE for a, p in outs)
+    surplus = left if cleared else 0
+    change = left - surplus
+    info = dict(change=change, surplus=surplus, cleared=cleared, n_oldest=len(old), n_largest=len(big),
+                paid_oldest=min(len(outs), len(old)), paid_top=paid_top,
                 top_partial=bool(big) and 0 < paid_top < big[0][1] // ONE)
-    return tre + left, outs, retired, info
+    return tre + change, outs, retired, info
 
 
 def select_draft8(state, slots):
@@ -239,22 +257,22 @@ def p2wpkh(tag):
 TREASURY_SCRIPT = p2tr(b"placeholder treasury, compiled constant, see plan section 5")
 
 
-def commitment_script(root):
-    return b"\x6a\x24" + b"GHNP" + root
+def commitment_script(root, n_miners):
+    return b"\x6a\x26" + b"GHNP" + root + n_miners.to_bytes(2, "big")
 
 
 def witness_script(wtxid_commitment):
     return b"\x6a\x24\xaa\x21\xa9\xed" + wtxid_commitment
 
 
-def coinbase_outputs(h, state, slots, finder_script, finder_value, witness_commitment=b"\x00" * 32):
+def coinbase_outputs(h, state, slots, finder_script, fees, witness_commitment=b"\x00" * 32):
     """Fixed layout: treasury, miners in pay order, finder, commitment OP_RETURN, witness commitment.
-    A zero-value finder output is omitted. Finder is positional and retires nothing."""
+    The finder output is fees + surplus, omitted when that is zero. Finder is positional and retires nothing."""
     tre, outs, retired, info = build_outputs(h, state, slots)
     o = [(tre, TREASURY_SCRIPT)] + [(p, a) for a, p in outs]
-    if finder_value > 0:
-        o.append((finder_value, finder_script))
-    o.append((0, commitment_script(table_root(state))))
+    if fees + info["surplus"] > 0:
+        o.append((fees + info["surplus"], finder_script))
+    o.append((0, commitment_script(table_root(state), len(outs))))
     o.append((0, witness_script(witness_commitment)))
     return o, retired
 
@@ -279,8 +297,14 @@ def check_invariants(h, state, res, slots):
     t, rm = split(h)
     S = t + rm
     paid = sum(p for _, p in outs)
-    assert tre + paid == S, "treasury + miners != subsidy"
-    assert tre == t + (rm - paid) and tre >= t
+    assert tre + paid + info["surplus"] == S, "treasury + miners + surplus != subsidy"
+    assert tre == t + info["change"] and info["change"] + info["surplus"] == rm - paid and tre >= t
+    assert info["surplus"] == 0 or info["change"] == 0, "both a surplus and change"
+    el_n = sum(1 for v in state.values() if v[0] >= FLOOR)
+    if info["surplus"] > 0:
+        assert len(outs) == el_n and all(p == state[a][0] // ONE for a, p in outs), "a surplus with someone eligible unpaid"
+    if len(outs) == el_n and all(p == state[a][0] // ONE for a, p in outs):
+        assert info["change"] == 0, "change on a cleared ledger"
     assert len(outs) <= slots and len({a for a, _ in outs}) == len(outs)
     assert all(p >= MIN_PAY for _, p in outs), "an output below 1,000 sats"
     assert all(p * ONE <= state[a][0] for a, p in outs), "paid more than owed"
@@ -344,7 +368,7 @@ def vector(name, h, state, slots=500, extra=None, gen_desc=None):
     check_invariants(h, state, res, slots)
     tre, outs, ret, info = res
     d = hashlib.sha256(json.dumps([tre, [(a.hex(), p) for a, p in outs], [(a.hex(), str(r)) for a, r in ret]]).encode()).hexdigest()
-    v = dict(name=name, height=h, slots=slots, n_input=len(state), treasury=tre, change=info["change"],
+    v = dict(name=name, height=h, slots=slots, n_input=len(state), treasury=tre, change=info["change"], surplus=info["surplus"],
              n_miner_outputs=len(outs), n_oldest_selected=info["n_oldest"], n_largest_selected=info["n_largest"],
              miner_total=sum(p for _, p in outs), table_root=table_root(state).hex(), digest=d)
     if len(outs) <= 12:
@@ -417,24 +441,28 @@ def main():
               after_halving=str(share_face(10, NB, 1_050_000)), before_halving=str(share_face(10, NB, 1_049_999)))
 
     # --- degenerate tables -------------------------------------------------------------------------------
-    V.append(vector("empty table: whole subsidy to treasury", H, {}))
-    V.append(vector("all below floor or non-positive: whole subsidy to treasury", H,
+    V.append(vector("empty table: cleared, all of Rm is surplus to the finder", H, {}))
+    V.append(vector("all below floor or non-positive: cleared, all of Rm is surplus to the finder", H,
                     st(("a", -5, None), ("b", 0, None), ("c", FLOOR - 1, None))))
     res = build_outputs(H, st(("c", FLOOR - 1, None)), 500)
-    assert res[0] == subsidy(H) and res[1] == []
+    assert res[0] == t0 and res[1] == [] and res[3]["surplus"] == RM
 
     # --- launch: little owed, change to treasury ------------------------------------------------------------
     launch = st(("big1", 40_000_000 * ONE + 77, H - 30), ("big2", 25_000_000 * ONE, H - 25), ("mid", 3_000_000 * ONE + 5, H - 22),
                 ("bitaxe1", 1_000 * ONE, H - 21), ("bitaxe2", 600 * ONE, None), ("bitaxe3", 999 * ONE + ONE - 1, None))
     res = build_outputs(H, launch, 500)
     check_invariants(H, launch, res, 500)
-    assert res[3]["change"] == RM - (40_000_000 + 25_000_000 + 3_000_000 + 1_000) and len(res[1]) == 4
-    assert res[0] == t0 + res[3]["change"]
-    V.append(vector("launch: four eligible balances, 68.0M owed of 310.9M, change to treasury", H, launch, 500))
-    V.append(vector("launch: same table on a class-3 block, the 3 selected are paid in full", H, launch, 3))
+    assert res[3]["surplus"] == RM - (40_000_000 + 25_000_000 + 3_000_000 + 1_000) and len(res[1]) == 4
+    assert res[0] == t0 and res[3]["change"] == 0 and res[3]["cleared"]
+    V.append(vector("launch: four eligible balances, 68.0M owed of 310.9M, cleared, surplus to finder", H, launch, 500))
+    res3 = build_outputs(H, launch, 3)
+    assert len(res3[1]) == 3 and res3[3]["surplus"] == 0 and not res3[3]["cleared"]
+    assert res3[0] == t0 + RM - sum(p for _, p in res3[1]), "a class too small to clear sends what is left to the treasury"
+    V.append(vector("launch: same table on a class-3 block, one eligible left waiting: no surplus, change to treasury",
+                    H, launch, 3))
     one = st(("first", 1_234 * ONE + 999, H - 21))
     res = build_outputs(H, one, 500)
-    assert res[1] == [(p2tr("first"), 1_234)] and res[0] == subsidy(H) - 1_234
+    assert res[1] == [(p2tr("first"), 1_234)] and res[0] == t0 and res[3]["surplus"] == RM - 1_234
     V.append(vector("launch: one balance of 1,234.0000002 sats", H, one, 500))
 
     # --- exact floor boundary ------------------------------------------------------------------------------
@@ -454,7 +482,7 @@ def main():
     fl = flat(23_000, 18_000)
     for sl in (9, 500):
         res = build_outputs(H, fl, sl)
-        assert res[3]["change"] == RM - 18_000 * sl
+        assert res[3]["change"] == RM - 18_000 * sl and res[3]["surplus"] == 0
         V.append(vector(f"class {sl}: 23,000 flat 18,000-sat balances, change to treasury", H, fl, sl, gen_desc="flat(23000, 18000)"))
 
     # --- a 9-output block ---------------------------------------------------------------------------------------
@@ -493,9 +521,22 @@ def main():
     full = st(*[(f"q{i}", 1_000_000 * ONE, 10 + i) for i in range(5)], *[(f"l{i}", 10_000_000 * ONE, 50) for i in range(1, 4)],
               ("l0", 50_000_000 * ONE + 3, 60))
     res = build_outputs(H, full, 9)
-    assert res[1][-1] == (p2tr("l0"), 50_000_000) and not res[3]["top_partial"] and res[3]["change"] == RM - 85_000_000
-    assert res[0] == t0 + RM - 85_000_000
-    V.append(vector("all 9 slots paid in full including top, change to treasury", H, full, 9))
+    assert res[1][-1] == (p2tr("l0"), 50_000_000) and not res[3]["top_partial"] and res[3]["surplus"] == RM - 85_000_000
+    assert res[0] == t0 and res[3]["change"] == 0
+    V.append(vector("all 9 slots paid in full including top, ledger cleared, surplus to finder", H, full, 9))
+    # one more eligible balance than the class holds: everyone selected is paid in full, but one waits
+    full10 = dict(full)
+    full10[p2tr("waits")] = (1_000 * ONE, 99)
+    res = build_outputs(H, full10, 9)
+    assert len(res[1]) == 9 and p2tr("waits") not in dict(res[1]) and res[3]["surplus"] == 0
+    assert res[3]["change"] == RM - sum(p for _, p in res[1]) and res[0] == t0 + res[3]["change"]
+    V.append(vector("all 9 selected paid in full but a 10th eligible waits: no surplus, change to treasury", H, full10, 9))
+    # a sub-sat remainder and balances below the floor do not stop a ledger clearing
+    sub = dict(full)
+    sub[p2tr("dust")] = (FLOOR - 1, None)
+    res = build_outputs(H, sub, 9)
+    assert res[3]["cleared"] and res[3]["surplus"] == RM - 85_000_000
+    V.append(vector("cleared with a balance below the floor left owed: surplus to finder", H, sub, 9))
 
     # stop rule: left exactly 1,000 pays the next (at most 1,000); left 999 stops and 999 goes to the treasury
     s1000 = st(("a", (RM - 1_000) * ONE, 1), ("b", 5_000 * ONE, 2), ("c", 900_000_000 * ONE, 3))     # c is top
@@ -504,7 +545,7 @@ def main():
     V.append(vector("stop rule: 1,000 sats left still pays the next payee 1,000", H, s1000, 9))
     s999 = st(("a", (RM - 999) * ONE, 1), ("b", 5_000 * ONE, 2), ("c", 900_000_000 * ONE, 3))
     res = build_outputs(H, s999, 9)
-    assert res[1] == [(p2tr("a"), RM - 999)] and res[3]["change"] == 999 and res[0] == t0 + 999
+    assert res[1] == [(p2tr("a"), RM - 999)] and res[3]["change"] == 999 and res[0] == t0 + 999 and res[3]["surplus"] == 0
     V.append(vector("stop rule: 999 sats left stops, 999 to treasury, payee b and top c wait", H, s999, 9))
 
     # --- ties --------------------------------------------------------------------------------------------------------
@@ -535,6 +576,7 @@ def main():
             o, ret = coinbase_outputs(H, s, 500, script_fn("finder"), finder_value)
             assert len(o) == want, (len(o), want)
             assert sum(v for v, _ in o) == subsidy(H) + finder_value
+            assert o[-2][1][-2:] == (500).to_bytes(2, "big"), "the commitment counts the miner outputs"
             assert all(script_ok(sc) for _, sc in o[:want - 2])
             V.append(vector(f"{want} outputs, {fv_name}, finder {finder_value}", H, s, 500,
                             dict(coinbase_outputs=want, output_section_bytes=outputs_bytes(o), output_digest=outputs_digest(o)),
@@ -549,6 +591,14 @@ def main():
     sf = {p2tr("nodeA"): (5000 * ONE, 900_000), p2tr("other"): (6000 * ONE, 900_000)}
     o, ret = coinbase_outputs(H, sf, 500, p2tr("nodeA"), 9_999)
     assert sum(1 for _, sc in o if sc == p2tr("nodeA")) == 2 and len([1 for sc, _ in ret if sc == p2tr("nodeA")]) == 1
+    # that ledger clears: the finder output is fees + surplus, and the coinbase still sums to S + fees
+    assert o[-3] == (9_999 + RM - 11_000, p2tr("nodeA")) and o[0] == (t0, TREASURY_SCRIPT)
+    assert sum(v for v, _ in o) == subsidy(H) + 9_999
+    # a cleared ledger with no fees still has a finder output: the surplus
+    o, _ = coinbase_outputs(H, sf, 500, p2tr("nodeA"), 0)
+    assert o[-3] == (RM - 11_000, p2tr("nodeA")) and len(o) == 1 + 2 + 1 + 2
+    o, _ = coinbase_outputs(H, {}, 9, p2tr("nodeA"), 0)
+    assert o[:2] == [(t0, TREASURY_SCRIPT), (RM, p2tr("nodeA"))] and o[2][1][-2:] == b"\x00\x00"
 
     # --- cut(H) = H - 20 and retired through H - 1 ----------------------------------------------------------------
     cr = {H - 25: {p2tr("m"): 3_000 * ONE}, H - 20: {p2tr("n"): 2_000 * ONE}, H - 19: {p2tr("late"): 9_000 * ONE}}

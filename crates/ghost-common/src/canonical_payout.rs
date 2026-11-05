@@ -38,8 +38,16 @@
 //! largest  = [top] + rest of eligible by (owed desc, script asc), first L in all
 //! pay everyone selected except top, oldest first: pay = min(owed, Rm left); stop when Rm left < 1,000
 //! then top: pay = min(owed_top, Rm left) if that is >= 1,000 sats
-//! retired = pay, exactly;  treasury = S/200 + (Rm - sum(pay))
+//! retired = pay, exactly
+//! cleared  = every eligible balance is paid, and paid in full (whole sats)
+//! cleared:  surplus = Rm - sum(pay), change = 0      (the surplus goes to the finder, with the fees)
+//! else:     surplus = 0, change = Rm - sum(pay)      (the change goes to the treasury)
+//! treasury = S/200 + change;  finder = fees + surplus, omitted when 0
 //! ```
+//!
+//! The surplus goes to the finder only on a cleared ledger. The finder picks its job's slot class,
+//! so a finder that took whatever `Rm` was left on any block would be paid to pick a small class
+//! and leave miners waiting. On a cleared ledger nobody eligible waits, so the surplus is luck.
 //!
 //! Pure: no I/O, no clock, no floats. Nothing here is wired into the running node.
 //!
@@ -102,11 +110,13 @@ pub enum PayoutError {
 pub struct Payout {
     /// Treasury output value: `S/200` plus any change.
     pub treasury: u64,
+    /// `Rm` left over on a cleared ledger: paid to the finder output, with the fees.
+    pub surplus: u64,
     /// Miner outputs in pay order: oldest, largest without top, then top last.
     pub outputs: Vec<(Script, u64)>,
     /// Face units each paid script is retired by: `pay * 2^32`, exactly.
     pub retired: Vec<(Script, i128)>,
-    /// `Rm` left unpaid, sent to the treasury.
+    /// `Rm` left over while an eligible balance waits, sent to the treasury.
     pub change: u64,
     /// Size of the oldest list selected.
     pub n_oldest: usize,
@@ -368,12 +378,14 @@ pub fn build_outputs(
     let (old, big) = select(table, slots)?;
     let mut left = rm;
     let mut outputs: Vec<(Script, u64)> = Vec::new();
+    let mut all_full = true;
     let others = big.get(1..).unwrap_or(&[]);
     for (a, owed) in old.iter().chain(others) {
         if left < MIN_PAYOUT_SATS {
             break;
         }
         let p = sats_of(*owed).min(left);
+        all_full &= p == sats_of(*owed);
         left -= p;
         outputs.push(((*a).clone(), p));
     }
@@ -381,11 +393,15 @@ pub fn build_outputs(
     if let Some((a, owed)) = big.first() {
         let p = sats_of(*owed).min(left);
         if p >= MIN_PAYOUT_SATS {
+            all_full &= p == sats_of(*owed);
             left -= p;
             outputs.push(((*a).clone(), p));
             paid_top = p;
         }
     }
+    let cleared = all_full && outputs.len() == eligible_count(table)?;
+    let surplus = if cleared { left } else { 0 };
+    let change = left - surplus;
     let retired = outputs
         .iter()
         .map(|(a, p)| (a.clone(), *p as i128 * FACE_PER_SAT))
@@ -394,11 +410,12 @@ pub fn build_outputs(
         .first()
         .is_some_and(|(_, owed)| 0 < paid_top && paid_top < sats_of(*owed));
     Ok(Payout {
-        treasury: tre + left,
+        treasury: tre + change,
+        surplus,
         paid_oldest: outputs.len().min(old.len()),
         outputs,
         retired,
-        change: left,
+        change,
         n_oldest: old.len(),
         n_largest: big.len(),
         paid_top,
@@ -538,11 +555,15 @@ pub fn table_root(table: &Table) -> [u8; 32] {
     m.finalize().into()
 }
 
-/// The ledger commitment output script: `OP_RETURN PUSH36 "GHNP" || root`.
-pub fn commitment_script(root: &[u8; 32]) -> Script {
-    let mut s = vec![0x6a, 0x24];
+/// The ledger commitment output script: `OP_RETURN PUSH38 "GHNP" || root || n_miners`, the count
+/// of miner outputs as a big-endian `u16`. The count tells the miners from the finder without the
+/// table: once a cleared ledger's surplus goes to the finder, treasury plus miners need not sum to
+/// the subsidy.
+pub fn commitment_script(root: &[u8; 32], n_miners: u16) -> Script {
+    let mut s = vec![0x6a, 0x26];
     s.extend_from_slice(LEDGER_COMMITMENT_MAGIC);
     s.extend_from_slice(root);
+    s.extend_from_slice(&n_miners.to_be_bytes());
     s
 }
 
@@ -554,70 +575,84 @@ pub fn witness_script(wtxid_commitment: &[u8; 32]) -> Script {
 }
 
 /// The full fixed coinbase output layout: treasury, miners in pay order, finder, ledger commitment,
-/// witness commitment. A zero-value finder output is omitted; the finder is positional and retires
-/// nothing. Returns `(value, script)` pairs and the retirements.
+/// witness commitment. The finder output is `fees + surplus`, omitted when that is zero; the
+/// finder is positional and retires nothing. Returns `(value, script)` pairs and the retirements.
 pub fn coinbase_outputs(
     h: u32,
     halving: Halving,
     table: &Table,
     slots: usize,
     finder_script: &[u8],
-    finder_value: u64,
+    fees: u64,
     witness_commitment: &[u8; 32],
 ) -> Result<(Vec<CoinbaseOutput>, Vec<Retirement>), PayoutError> {
     let pay = build_outputs(h, halving, table, slots)?;
+    let n_miners = u16::try_from(pay.outputs.len()).map_err(|_| PayoutError::Overflow)?;
+    let finder_value = fees.checked_add(pay.surplus).ok_or(PayoutError::Overflow)?;
     let mut o = Vec::with_capacity(pay.outputs.len() + 4);
     o.push((pay.treasury, TREASURY_SCRIPT_PLACEHOLDER.to_vec()));
     o.extend(pay.outputs.into_iter().map(|(a, p)| (p, a)));
     if finder_value > 0 {
         o.push((finder_value, finder_script.to_vec()));
     }
-    o.push((0, commitment_script(&table_root(table))));
+    o.push((0, commitment_script(&table_root(table), n_miners)));
     o.push((0, witness_script(witness_commitment)));
     Ok((o, pay.retired))
 }
 
-/// The ledger commitment root a coinbase carries: the second-to-last output, `OP_RETURN PUSH36
-/// "GHNP" || root`. `None` if the coinbase is not laid out as a node pool block.
+/// The ledger commitment root a coinbase carries: the second-to-last output, `OP_RETURN PUSH38
+/// "GHNP" || root || n_miners`. `None` if the coinbase is not laid out as a node pool block.
 pub fn ledger_root_of(outputs: &[CoinbaseOutput]) -> Option<[u8; 32]> {
+    ledger_commitment_of(outputs).map(|(root, _)| root)
+}
+
+/// The ledger commitment's table root and miner output count. `None` if the coinbase is not laid
+/// out as a node pool block.
+pub fn ledger_commitment_of(outputs: &[CoinbaseOutput]) -> Option<([u8; 32], u16)> {
     let n = outputs.len();
     let s = &outputs.get(n.checked_sub(2)?)?.1;
-    let rest = s.strip_prefix(&[0x6a, 0x24][..])?;
-    let root = rest.strip_prefix(&LEDGER_COMMITMENT_MAGIC[..])?;
-    root.try_into().ok()
+    let rest = s.strip_prefix(&[0x6a, 0x26][..])?;
+    let rest = rest.strip_prefix(&LEDGER_COMMITMENT_MAGIC[..])?;
+    if rest.len() != 34 {
+        return None;
+    }
+    let root = rest[..32].try_into().ok()?;
+    Some((root, u16::from_be_bytes([rest[32], rest[33]])))
 }
 
 /// What a mined node pool coinbase retires, read from its outputs alone: settlement's
 /// provisional retirement for a block whose anchor this node does not hold yet (spec 2.3).
 ///
 /// The layout is fixed: treasury, miners, an optional finder, the ledger commitment, the witness
-/// commitment. Treasury plus miners is exactly the subsidy, and every miner output is at least
-/// 1,000 sats, so the miners are the unique run after the treasury that brings the sum to the
-/// subsidy; at most one output (the finder) may follow before the commitment. Each miner output
-/// retires its value exactly. `None` if the outputs do not have that shape.
+/// commitment. The commitment counts the miner outputs, so the miners are the run of that length
+/// after the treasury and at most one output (the finder) follows them. Every miner output is at
+/// least 1,000 sats. Treasury plus miners is the subsidy, or, when a cleared ledger's surplus went
+/// to the finder, the treasury is exactly `S/200` and the finder holds at least the rest. Each
+/// miner output retires its value exactly. `None` if the outputs do not have that shape.
 pub fn provisional_retirements(
     h: u32,
     halving: Halving,
     outputs: &[CoinbaseOutput],
 ) -> Option<Vec<Retirement>> {
-    ledger_root_of(outputs)?;
+    let (_, n) = ledger_commitment_of(outputs)?;
+    let miners = n as usize;
     let body = &outputs[..outputs.len() - 2];
     let (treasury, rest) = body.split_first()?;
-    if treasury.1 != TREASURY_SCRIPT_PLACEHOLDER {
+    if treasury.1 != TREASURY_SCRIPT_PLACEHOLDER || rest.len() < miners || rest.len() - miners > 1 {
         return None;
     }
+    let (t, _) = split(h, halving);
     let s = subsidy(h, halving);
     let mut sum = treasury.0;
-    let mut miners = 0;
-    while sum < s {
-        let (v, _) = rest.get(miners)?;
+    for (v, _) in &rest[..miners] {
         if *v < MIN_PAYOUT_SATS {
             return None;
         }
         sum = sum.checked_add(*v)?;
-        miners += 1;
     }
-    if sum != s || rest.len() - miners > 1 {
+    let finder = rest.get(miners).map_or(0, |f| f.0);
+    let surplus_to_finder = treasury.0 == t && sum < s && finder >= s - sum;
+    if sum != s && !surplus_to_finder {
         return None;
     }
     Some(
@@ -841,8 +876,25 @@ mod tests {
         let (t, rm) = split(h, Halving::MAINNET);
         let outs = &res.outputs;
         let paid: u64 = outs.iter().map(|(_, p)| p).sum();
-        assert_eq!(res.treasury + paid, t + rm, "treasury + miners != subsidy");
-        assert!(res.treasury == t + (rm - paid) && res.treasury >= t);
+        assert_eq!(
+            res.treasury + paid + res.surplus,
+            t + rm,
+            "treasury + miners + surplus != subsidy"
+        );
+        assert!(res.treasury == t + res.change && res.change + res.surplus == rm - paid);
+        assert!(
+            res.surplus == 0 || res.change == 0,
+            "both a surplus and change"
+        );
+        let n_eligible = table.values().filter(|b| b.owed >= FLOOR).count();
+        let cleared =
+            outs.len() == n_eligible && outs.iter().all(|(a, p)| *p as i128 == table[a].owed / ONE);
+        if res.surplus > 0 {
+            assert!(cleared, "a surplus with someone eligible unpaid");
+        }
+        if cleared {
+            assert_eq!(res.change, 0, "change on a cleared ledger");
+        }
         let uniq: BTreeSet<_> = outs.iter().map(|(a, _)| a).collect();
         assert!(outs.len() <= slots && uniq.len() == outs.len());
         assert!(
@@ -1020,7 +1072,7 @@ mod tests {
         }
 
         let vectors = doc["vectors"].as_array().unwrap();
-        assert_eq!(vectors.len(), 37);
+        assert_eq!(vectors.len(), 39);
         let mut matched = 0;
         for v in vectors {
             let name = v["name"].as_str().unwrap();
@@ -1033,6 +1085,7 @@ mod tests {
             let miner_total: u64 = p.outputs.iter().map(|(_, x)| x).sum();
             assert_eq!(p.treasury, v["treasury"].as_u64().unwrap(), "{name}");
             assert_eq!(p.change, v["change"].as_u64().unwrap(), "{name}");
+            assert_eq!(p.surplus, v["surplus"].as_u64().unwrap(), "{name}");
             assert_eq!(
                 p.outputs.len() as u64,
                 v["n_miner_outputs"].as_u64().unwrap()
@@ -1075,6 +1128,8 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(o.len() as u64, n.as_u64().unwrap(), "{name}");
+                let count = p.outputs.len() as u16;
+                assert_eq!(ledger_commitment_of(&o), Some((table_root(&table), count)));
                 assert_eq!(ret, p.retired);
                 assert_eq!(
                     o.iter().map(|x| x.0).sum::<u64>(),
@@ -1102,7 +1157,7 @@ mod tests {
             }
             matched += 1;
         }
-        assert_eq!(matched, 37);
+        assert_eq!(matched, 39);
     }
 
     #[test]
@@ -1349,6 +1404,101 @@ mod tests {
         .unwrap();
         assert_eq!(o.iter().filter(|x| x.1 == p2tr("nodeA")).count(), 2);
         assert_eq!(ret.iter().filter(|x| x.0 == p2tr("nodeA")).count(), 1);
+        // That ledger clears: the finder output is fees + surplus, the treasury S/200, and the
+        // coinbase still sums to the subsidy plus the fees.
+        let (t, rm) = split(H, Halving::MAINNET);
+        assert_eq!(o[0].0, t);
+        assert_eq!(o[o.len() - 3], (9_999 + rm - 11_000, p2tr("nodeA")));
+        let total: u64 = o.iter().map(|x| x.0).sum();
+        assert_eq!(total, subsidy(H, Halving::MAINNET) + 9_999);
+        // With no fees the surplus alone is the finder output; an empty ledger hands it all of Rm.
+        let (o, _) =
+            coinbase_outputs(H, Halving::MAINNET, &sf, 500, &p2tr("nodeA"), 0, &[0; 32]).unwrap();
+        assert_eq!(o[o.len() - 3], (rm - 11_000, p2tr("nodeA")));
+        let (o, _) = coinbase_outputs(
+            H,
+            Halving::MAINNET,
+            &Table::new(),
+            9,
+            &p2tr("nodeA"),
+            0,
+            &[0; 32],
+        )
+        .unwrap();
+        assert_eq!(
+            o[..2],
+            [
+                (t, TREASURY_SCRIPT_PLACEHOLDER.to_vec()),
+                (rm, p2tr("nodeA"))
+            ]
+        );
+        assert_eq!(
+            ledger_commitment_of(&o),
+            Some((table_root(&Table::new()), 0))
+        );
+    }
+
+    /// A node that does not hold a block's anchor reads its retirements from the outputs alone. A
+    /// cleared ledger's surplus in the finder output must not read as one more miner: the
+    /// commitment's count says where the miners end.
+    #[test]
+    fn provisional_retirements_tell_a_surplus_finder_from_a_miner() {
+        let (t, rm) = split(H, Halving::MAINNET);
+        let two = BTreeMap::from([
+            (
+                p2tr("a"),
+                Balance {
+                    owed: 5000 * ONE,
+                    queue_since: Some(900_000),
+                },
+            ),
+            (
+                p2tr("b"),
+                Balance {
+                    owed: 6000 * ONE,
+                    queue_since: Some(900_000),
+                },
+            ),
+        ]);
+        // No fees: treasury + a + b + finder (= surplus) is exactly the subsidy, the shape that a
+        // sum-only reading would take for three miners.
+        let (o, ret) =
+            coinbase_outputs(H, Halving::MAINNET, &two, 9, &p2tr("finder"), 0, &[0; 32]).unwrap();
+        assert_eq!(o.iter().map(|x| x.0).sum::<u64>(), t + rm);
+        assert_eq!(provisional_retirements(H, Halving::MAINNET, &o), Some(ret));
+        // With fees too.
+        let (o, ret) =
+            coinbase_outputs(H, Halving::MAINNET, &two, 9, &p2tr("finder"), 777, &[0; 32]).unwrap();
+        assert_eq!(provisional_retirements(H, Halving::MAINNET, &o), Some(ret));
+        // A finder holding less than the surplus, or a treasury above S/200 beside a short miner
+        // sum, is not a node pool coinbase.
+        let mut short = o.clone();
+        let n = short.len();
+        short[n - 3].0 = 1;
+        assert_eq!(provisional_retirements(H, Halving::MAINNET, &short), None);
+        let mut fat = o.clone();
+        fat[0].0 += 1;
+        assert_eq!(provisional_retirements(H, Halving::MAINNET, &fat), None);
+        // A count that leaves more than one output after the miners.
+        let mut lie = o.clone();
+        lie[n - 2].1 = commitment_script(&table_root(&two), 1);
+        assert_eq!(provisional_retirements(H, Halving::MAINNET, &lie), None);
+        // An empty ledger: no miners, the whole Rm in the finder output.
+        let (o, ret) = coinbase_outputs(
+            H,
+            Halving::MAINNET,
+            &Table::new(),
+            9,
+            &p2tr("f"),
+            0,
+            &[0; 32],
+        )
+        .unwrap();
+        assert!(ret.is_empty());
+        assert_eq!(
+            provisional_retirements(H, Halving::MAINNET, &o),
+            Some(vec![])
+        );
     }
 
     /// splitmix64: a tiny deterministic generator for the property tests.
