@@ -105,6 +105,13 @@ def mine(h):
                      f"share chain: {anchors} anchors; anchors refused as invalid: {invalid}"])
 
 
+def earns(ledger):
+    """Whether a miner's shares can have earned: one of its recent shares is on a job whose block
+    pays a subsidy. Regtest halves every 150 blocks, so from block 4,950 the subsidy is 0 and a
+    share there is credited 0 units; a long regtest soak runs far past that."""
+    return any(subsidy(int(s.get("job_height", 0))) > 0 for s in ledger.get("recent_shares", []))
+
+
 def balances_agree(h):
     if not STATE.get("quiet"):
         return result("balances: miners on every node earn, all nodes agree", "UNMEASURED",
@@ -123,17 +130,21 @@ def balances_agree(h):
         ev.append("the ledger is empty")
     miners = [(n.i, m) for n in h.nodes for m in n.miners]
     for i, (user, addr, script, agent, cls) in miners:
-        seen = []
+        seen, earning = [], False
         for n in h.nodes:
             led = n.ledger(addr)
+            earning |= earns(led)
             seen.append((n.i, led.get("balance", {}).get("units"), len(led.get("recent_shares", []))))
         units = {s[1] for s in seen}
-        credited = all(s[1] and int(s[1]) > 0 and s[2] > 0 for s in seen)
+        credited = all(s[2] > 0 for s in seen)
+        if earning:
+            credited = credited and all(s[1] and int(s[1]) > 0 for s in seen)
         if len(units) != 1 or not credited:
             ok = False
         ev.append(f"node{i} miner {addr[:16]}.. ({agent}): balance units "
                   f"{'equal' if len(units) == 1 else 'DIFFER'} on {len(seen)} nodes = "
-                  f"{seen[0][1]}; credited shares per node {[s[2] for s in seen]}")
+                  f"{seen[0][1]}; credited shares per node {[s[2] for s in seen]}"
+                  + ("" if earning else "; every share past the last subsidy, so 0 is expected"))
     result("balances: miners on every node earn, all nodes agree (same store digests)",
            "PASS" if ok else "FAIL", ev)
 

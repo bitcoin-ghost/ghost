@@ -307,6 +307,8 @@ pub struct Miner {
     pub node_id: [u8; 32],
     /// Header time of its shares.
     pub time: u32,
+    /// The subsidy schedule its coinbases pay: the relay's (`RelayParams::halving`).
+    pub halving: Halving,
     extranonce: u64,
 }
 
@@ -317,6 +319,7 @@ impl Miner {
             payee: p2tr(label),
             node_id: [node; 32],
             time: T0 as u32,
+            halving: Halving::MAINNET,
             extranonce: 0,
         }
     }
@@ -348,7 +351,7 @@ impl Miner {
         };
         let (outs, _) = coinbase_outputs(
             h,
-            Halving::MAINNET,
+            self.halving,
             table,
             SLOTS as usize,
             &p2tr("finder"),

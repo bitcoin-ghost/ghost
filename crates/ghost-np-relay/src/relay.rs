@@ -2164,12 +2164,21 @@ impl Relay {
             .btc_height
             .max(self.btc_tip);
         let halving = self.p.halving;
+        // Jobs carry this batch until the next re-batch, so its anchor may sit at any Bitcoin
+        // height from `b` to `b + BATCH_MARGIN`: a share must be in the era of every one of them
+        // (share rule 5), or a job past a halving commits it and the anchor is invalid. Within
+        // the margin of a halving that leaves the old era's shares out; they could not be
+        // included after it anyway.
         let era = halving.era(b + 1);
+        let era_ahead = halving.era(b + 1 + BATCH_MARGIN);
         let mut cands: Vec<(u32, ShareId)> = self
             .loose
             .iter()
             .filter(|(_, l)| l.job_height + SHARE_HEIGHT_WINDOW >= b + BATCH_MARGIN)
-            .filter(|(_, l)| halving.era(l.job_height) == era)
+            .filter(|(_, l)| {
+                let e = halving.era(l.job_height);
+                e == era && e == era_ahead
+            })
             .map(|(i, l)| (l.job_height, *i))
             .collect();
         cands.sort_unstable();

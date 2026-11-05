@@ -362,6 +362,69 @@ fn a_new_bitcoin_tip_re_batches_at_the_next_tick() {
         .any(|o| matches!(o, crate::relay::Out::Publish(_))));
 }
 
+/// Regtest halves every 150 blocks, so 1,050 starts era 7. A batch is carried by jobs until the
+/// next re-batch, which can be a block or two after the tip moved; a batch built two blocks
+/// before the halving must not hold era-6 shares, or a job past the halving commits them and
+/// its anchor breaks share rule 5 on every peer (seen once in the 24 h regtest soak).
+#[test]
+fn a_batch_built_just_before_a_halving_holds_no_shares_a_job_past_it_cannot_include() {
+    let mut s = Sim::with_relays(2, |_| {
+        let mut p = params();
+        p.halving = Halving::REGTEST;
+        Relay::open(
+            p,
+            Arc::new(Database::in_memory().expect("db")),
+            fed_archive(START_TIP),
+        )
+        .expect("open")
+    });
+    for n in &mut s.nodes {
+        n.miner.halving = Halving::REGTEST;
+    }
+    s.link(0, 1);
+    s.run();
+    assert_eq!(Halving::REGTEST.era(1_050), 7);
+    assert_eq!(Halving::REGTEST.era(1_049), 6);
+
+    // Three blocks out, an anchor up to two blocks ahead is still in era 6: the share is batched.
+    s.btc.extend_to(1_045);
+    s.tick(1);
+    let early = s.mine(0, false).id();
+    s.tick(31);
+    assert_eq!(
+        s.nodes[0].published.last().unwrap().batch_root,
+        batch_root(&[early]),
+        "far from the halving the share is batched"
+    );
+    s.mine(0, true);
+    s.tick(1);
+
+    // At 1,047 an anchor up to two blocks ahead may sit at 1,049, whose jobs are era 7.
+    s.btc.extend_to(1_046);
+    s.tick(1);
+    let late = s.mine(0, false).id();
+    s.btc.extend_to(1_047);
+    s.tick(1);
+    assert_eq!(
+        s.nodes[0].published.last().unwrap().batch_root,
+        batch_root(&[]),
+        "within the margin of a halving the era-6 share {late:?} is left out"
+    );
+
+    // The tip crosses before the next re-batch: a job on block 1,049 carries that batch.
+    s.btc.extend_to(1_049);
+    for n in &mut s.nodes {
+        feed(n.relay.archive(), &n.node);
+    }
+    s.mine(0, true);
+    s.tick(1);
+    assert_no_penalties(&s);
+    assert_converged(&s);
+    for n in &s.nodes {
+        assert_eq!(n.relay.status().stats.anchors_invalid, 0);
+    }
+}
+
 #[test]
 fn a_restarted_node_reloads_its_chain_and_ledger() {
     let dir = std::env::temp_dir().join(format!("np-relay-restart-{}", std::process::id()));

@@ -745,11 +745,14 @@ def soak(h):
                   f"MB/h); ghostd datadir {ba / 1e6:.0f} -> {bb / 1e6:.0f} MB")
     # Joined miners are credited the same on every node.
     for n, p, addr, agent in joined:
-        units = {int(m.ledger(addr).get("balance", {}).get("units", 0) or 0) for m in nodes}
-        credited = len(units) == 1 and units.pop() > 0
+        leds = [m.ledger(addr) for m in nodes]
+        units = {int(l.get("balance", {}).get("units", 0) or 0) for l in leds}
+        earning = any(S.earns(l) for l in leds)
+        shared = all(l.get("recent_shares") for l in leds)
+        credited = len(units) == 1 and shared and (units.pop() > 0 or not earning)
         ok &= credited
         ev.append(f"joined node{n.i}/{p} {addr[:14]}.. ({agent}): credited, one balance on every node: "
-                  f"{credited}")
+                  f"{credited}" + ("" if earning else " (joined past the last subsidy: 0 units expected)"))
     # Stalled miners: suspended by silence, then back at their class.
     for n, proc, start, _ in stalls:
         addr = next(m[1] for m in n.miners if m[3] == "bitaxe/v2.10.0")
