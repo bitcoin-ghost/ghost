@@ -269,14 +269,19 @@ def blocks_settle(h):
     fees = {n.fee_script for n in h.nodes}
     ev, ok = [f"{len(blocks)} pool blocks on the best chain, heights {blocks[0][0]}..{blocks[-1][0]}"
               if blocks else "no pool blocks"], bool(blocks)
-    paying = 0
+    paying, surplus_blocks, surplus_sats = 0, 0, 0
     for height, bh, vouts in blocks:
         errs = check_coinbase(height, vouts, payees, fees)
         if errs:
             ok = False
             ev.append(f"h{height} {bh[:16]}: " + "; ".join(errs))
-        if (miner_count(vouts[-2][1]) or 0) > 0:
+        n = miner_count(vouts[-2][1]) or 0
+        if n > 0:
             paying += 1
+        left = subsidy(height) - vouts[0][0] - sum(v for v, _ in vouts[1:1 + n])
+        if left > 0:
+            surplus_blocks += 1
+            surplus_sats += left
     if h.genesis:
         paid = {}
         for _, _, vouts in blocks:
@@ -306,7 +311,8 @@ def blocks_settle(h):
     ev.append(f"coinbase sums exact (treasury + miners = subsidy, or treasury = S/200 and a cleared "
               f"ledger's surplus in the finder output; finder = fees + surplus) "
               f"on {len(blocks) - sum(1 for e in ev if e.startswith('h'))} of {len(blocks)}; "
-              f"{paying} paid miners, the rest went to the finder (empty snapshot table: cleared)")
+              f"{paying} paid miners; {surplus_blocks} cleared the ledger and paid the finder a surplus "
+              f"({surplus_sats} sats in all)")
     for n in h.honest():
         log = n.read_log("pool_sv2")
         settled = {bh for _, bh, _ in blocks if logged(log, bh, "NP_SETTLE: pool block settled")}
