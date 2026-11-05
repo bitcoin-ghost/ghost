@@ -153,13 +153,22 @@ async fn a_connected_worker_with_no_share_yet_is_idle() {
 }
 
 #[tokio::test]
-async fn the_wait_is_unknown_on_two_pool_blocks() {
+async fn on_two_pool_blocks_the_wait_uses_the_expected_interval() {
     let r = api().miner(&addr(&payee(1))).await.unwrap();
     let w = &r.expected_wait;
-    assert!(!w.known);
     assert_eq!(w.pool_blocks_counted, 2);
-    assert!(w.reason.as_ref().unwrap().contains("2 blocks"));
-    assert!(w.seconds.is_none() && w.blocks_needed.is_none());
+    // Too few blocks to measure, but work was credited: the pool's expected interval stands in.
+    let e = w
+        .pool_expected_block_interval_secs
+        .expect("credits in the window");
+    assert!(w.known, "{:?}", w.reason);
+    assert_eq!(w.pool_block_interval_secs, Some(e));
+    assert!(
+        w.assumptions[0].contains("should find"),
+        "{}",
+        w.assumptions[0]
+    );
+    assert!(w.seconds.is_some() && w.blocks_needed.is_some());
 }
 
 #[tokio::test]
@@ -488,7 +497,8 @@ async fn the_miner_routes_answer_over_http() {
         assert!(v.get(k).is_some(), "miner lacks {k}");
     }
     assert!(v["summary"]["hashrate_hs"].get("15m").is_some());
-    assert_eq!(v["expected_wait"]["known"], false);
+    assert_eq!(v["expected_wait"]["known"], true);
+    assert!(v["expected_wait"]["pool_expected_block_interval_secs"].is_u64());
 
     let r = reqwest::get(format!(
         "{base}/api/v1/node-pool/miner/{a}/history?window=24h"

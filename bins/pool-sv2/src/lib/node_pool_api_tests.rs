@@ -657,7 +657,7 @@ async fn a_cleared_ledgers_surplus_is_shown_as_the_finders() {
         Transaction, TxIn, TxOut,
     };
     let w = world();
-    let (base, rm) = split(960, Halving::REGTEST);
+    let (base, rm) = split(970, Halving::REGTEST);
     let cb = Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
@@ -677,20 +677,23 @@ async fn a_cleared_ledgers_surplus_is_shown_as_the_finders() {
             },
         ],
     };
-    w.api
-        .parts
-        .db
-        .np_put_btc_block(&NpBtcBlock {
-            hash: [0xB2; 32],
-            height: 960,
-            header: [0; 80],
-            coinbase: Some((serialize(&cb), vec![])),
-            received_at: 1,
-        })
+    use stratum_apps::stratum_core::bitcoin::hashes::{sha256d, Hash};
+    let header = [7u8; 80];
+    let hash = sha256d::Hash::hash(&header).to_byte_array();
+    let db = &w.api.parts.db;
+    db.np_put_btc_block(&NpBtcBlock {
+        hash,
+        height: 970,
+        header,
+        coinbase: Some((serialize(&cb), vec![])),
+        received_at: 1,
+    })
+    .unwrap();
+    db.np_apply_block(&hash, 970, &[(payee(1), 1_000 * ONE)], 2_400)
         .unwrap();
     let s = w.api.status().await.unwrap();
     let b = &s.recent_blocks[0];
-    assert_eq!(b.height, 960);
+    assert_eq!(b.height, 970);
     assert_eq!(b.treasury_change_sats, 0);
     assert_eq!(b.finder_surplus_sats, rm as i64 - 1_000);
     assert_eq!(b.treasury_sats, base as i64);

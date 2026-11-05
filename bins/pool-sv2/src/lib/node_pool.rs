@@ -1462,19 +1462,41 @@ mod tests {
     }
 
     #[test]
-    fn the_finder_output_is_omitted_without_fees() {
+    fn the_finder_output_is_omitted_without_fees_or_surplus() {
+        // 20 balances on a class-9 job: someone waits, so what is left is treasury change and a
+        // block without fees has no finder output.
         let np = pool(1);
-        np.insert_table([1; 32], H, Arc::new(owed_table(5)));
+        np.insert_table([1; 32], H, Arc::new(owed_table(20)));
         let (reward, _) = np
             .canonical_outputs(&[1; 32], 9, &np_template(subsidy(H, Halving::MAINNET)))
             .unwrap();
         let got = full(&reward);
-        assert_eq!(got.len(), 1 + 5 + 2, "treasury, 5 miners, GHNP, witness");
+        assert_eq!(got.len(), 1 + 9 + 2, "treasury, 9 miners, GHNP, witness");
         assert!(got.iter().all(|o| o.1 != np.finder_script()));
         let (reward, _) = np
             .canonical_outputs(&[1; 32], 9, &np_template(subsidy(H, Halving::MAINNET) + 1))
             .unwrap();
-        assert_eq!(full(&reward)[6], (1, np.finder_script().to_vec()));
+        assert_eq!(full(&reward)[10], (1, np.finder_script().to_vec()));
+
+        // 5 balances on a class-9 job: all paid in full, the ledger clears, and the surplus is
+        // the finder output even without fees; the template's value is still spent exactly.
+        np.insert_table([2; 32], H, Arc::new(owed_table(5)));
+        let t = np_template(subsidy(H, Halving::MAINNET));
+        let (reward, _) = np.canonical_outputs(&[2; 32], 9, &t).unwrap();
+        let got = full(&reward);
+        let (base, rm) = ghost_common::canonical_payout::split(H, Halving::MAINNET);
+        let paid: u64 = got[1..6].iter().map(|o| o.0).sum();
+        assert_eq!(
+            got.len(),
+            1 + 5 + 1 + 2,
+            "treasury, 5 miners, finder, GHNP, witness"
+        );
+        assert_eq!(got[0].0, base);
+        assert_eq!(got[6], (rm - paid, np.finder_script().to_vec()));
+        assert_eq!(
+            reward.iter().map(|o| o.value.to_sat()).sum::<u64>(),
+            t.coinbase_tx_value_remaining
+        );
     }
 
     #[test]
