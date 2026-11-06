@@ -168,6 +168,9 @@ const THEMES = ["light", "dark"];
 // service the site's host proxies to.
 const ENV_MISSING = ["/mempool-app/api/", "/api/backup-offsite", "/hazync/api/"];
 // The website's live regions: status tiles, the node list, the miner page's sections.
+// The miner page's "next payment" tile shows a bare "unknown" when the API says the wait is not
+// known; the reason is its sub-line and the queue section's sentence.
+const MINER_PAGE_WORDS = [/^unknown$/, /unavailable/i];
 const SITE_VALUES = ["[data-np-field]", "#np-list-status", "#np-list-body", "#np-list-meta", "[id^=mp-]", "#error-msg"];
 // Every other page in the dashboard's sidebar (dashboard/src/components/layout/Sidebar.tsx).
 const OTHER_DASHBOARD_PAGES = ["/home", "/sync", "/block-template", "/mempool", "/network", "/shroud",
@@ -203,7 +206,9 @@ async function visit(page, url, label, { expectErrors = [], settle, allowWords =
   // A prefetch Next.js cancels when the page moves on (`?_rsc=`) is not a failure.
   const onFailed = (r) => {
     if (allowed(r.url()) || /fonts\.(googleapis|gstatic)/.test(r.url())) return;
-    if (/[?&]_rsc=/.test(r.url()) && r.failure()?.errorText === "net::ERR_ABORTED") return;
+    // Any request the browser cancels because the page moved on (a poll, a prefetch) is
+    // ERR_ABORTED: not a failure of the page. A refused, reset or timed-out request still is.
+    if (r.failure()?.errorText === "net::ERR_ABORTED") return;
     problems.push(`request failed: ${r.url()} ${r.failure()?.errorText}`);
   };
   // The JSON the page itself fetched, by URL path (last answer wins): time-windowed figures
@@ -280,6 +285,9 @@ async function login(ctx) {
   await page.fill('input[type="password"]', A.password);
   await Promise.all([page.waitForURL((u) => !u.pathname.startsWith("/login"), { timeout: 30_000 }), page.click('button[type="submit"]')]);
   await page.waitForLoadState("networkidle");
+  // The login fetch's body can still be open when the app navigates; leave the page here, before
+  // any check listens, so its abort is not charged to the first page checked.
+  await page.goto("about:blank");
   return page;
 }
 
@@ -506,6 +514,7 @@ async function main() {
       for (const [i, a] of addresses.entries()) {
         const label = `site miner ${i} ${tag}`;
         const r = await visit(page, `${A.site}/miner.html?address=${a}`, `site-miner-${i}-${tag}`, {
+          allowWords: MINER_PAGE_WORDS,
           values: SITE_VALUES,
           settle: (pg) => pg.waitForFunction(() => /Checked|Updated/.test(document.getElementById("mp-updated")?.innerText || "") || document.getElementById("error-mode")?.hidden === false, null, { timeout: 60_000 }),
         });
@@ -552,6 +561,7 @@ async function main() {
         if (rows.length === l.payouts.length) pass(label, `${rows.length} payout row(s) match the ledger`);
         label = `site paid address ${i}`;
         r = await visit(spage, `${A.site}/miner.html?address=${a}`, `site-paid-${i}`, {
+          allowWords: MINER_PAGE_WORDS,
           values: SITE_VALUES,
           settle: (pg) => pg.waitForFunction(() => /Checked|Updated/.test(document.getElementById("mp-updated")?.innerText || ""), null, { timeout: 60_000 }),
         });
@@ -575,6 +585,7 @@ async function main() {
       // address is not fresh: its probes open channels.)
       const fresh = "bcrt1q8987qe7sm0v04xe8kgacpny64zmd37u6tq498j";
       let r = await visit(page, `${A.site}/miner.html?address=${fresh}`, "fail-site-fresh-address", {
+          allowWords: MINER_PAGE_WORDS,
         values: SITE_VALUES,
         settle: (pg) => pg.waitForFunction(() => /Checked|Updated/.test(document.getElementById("mp-updated")?.innerText || "") || document.getElementById("error-mode")?.hidden === false, null, { timeout: 60_000 }),
       });
@@ -604,10 +615,10 @@ async function main() {
       try {
         const a = n1.miners[0].address;
         r = await visit(page, `${A.site}/miner.html?address=${a}`, "fail-site-node1-down", {
+          allowWords: MINER_PAGE_WORDS,
         values: SITE_VALUES,
           expectErrors: [`/api/pool/${n1.ip}/`],
           settle: (pg) => pg.waitForFunction(() => /Checked|Updated/.test(document.getElementById("mp-updated")?.innerText || "") || document.getElementById("error-mode")?.hidden === false, null, { timeout: 90_000 }),
-          allowWords: [/unavailable/i],
         });
         report("site miner, its node down", r);
         if (!squash(r.text).includes(W.sats(ledgers[a].balance.sats))) fail("site miner, its node down", "balance not shown from another node");
