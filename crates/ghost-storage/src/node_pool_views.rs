@@ -472,6 +472,20 @@ impl Database {
         })
     }
 
+    /// Pool blocks applied to the ledger: every pool block on this node's best Bitcoin chain
+    /// since the genesis anchor (an undone block is not counted).
+    pub fn np_pool_blocks(&self) -> GhostResult<u64> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM np_ledger_events WHERE kind = 1",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n.max(0) as u64)
+            .map_err(db_err)
+        })
+    }
+
     /// Payees with a balance row: in the imported genesis table, the share chain's ledger, or
     /// both (counted once).
     pub fn np_ledger_rows(&self) -> GhostResult<u64> {
@@ -592,6 +606,7 @@ mod tests {
         assert_eq!((paid[0].height, paid[0].block_hash), (701, [0xB2; 32]));
         assert_eq!(paid[1].amount, 2_000 * FACE_PER_SAT);
         assert_eq!(paid[1].applied_at, 400);
+        assert_eq!(db.np_pool_blocks().unwrap(), 2);
         let blocks = db.np_recent_blocks(1).unwrap();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].height, 701);
@@ -602,6 +617,11 @@ mod tests {
 
         db.np_undo_block(&[0xB2; 32]).unwrap();
         assert_eq!(db.np_payee_retirements(&payee(7), 10).unwrap().len(), 1);
+        assert_eq!(
+            db.np_pool_blocks().unwrap(),
+            1,
+            "an undone block is not counted"
+        );
         assert_eq!(db.np_recent_blocks(5).unwrap().len(), 1);
     }
 

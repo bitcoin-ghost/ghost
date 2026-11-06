@@ -444,6 +444,10 @@ async fn the_status_has_its_documented_shape() {
     assert_eq!(s.fee_address, "bcrt1qfee");
     assert_eq!(s.start.genesis_table_digest, "42".repeat(32));
     assert_eq!(s.recent_blocks.len(), 2);
+    assert_eq!(
+        s.pool_blocks_found, 2,
+        "every applied pool block, not only the listed ones"
+    );
     let b = &s.recent_blocks[0];
     assert_eq!((b.height, b.status), (960, "provisional"));
     // A regtest relay: block 960 is in regtest era 6 (150-block halvings), not mainnet era 0.
@@ -476,6 +480,8 @@ async fn the_status_has_its_documented_shape() {
         "settlement",
         "fee_address",
         "ledger_rows",
+        "pool_blocks_found",
+        "pool_expected_block_interval_secs",
         "recent_blocks",
         "miners",
     ] {

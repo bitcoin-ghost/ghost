@@ -43,6 +43,7 @@ use stratum_apps::stratum_core::bitcoin::{address::NetworkUnchecked, Address, Sc
 use crate::{
     miner_stats::{now_secs, MinerStats},
     node_pool::{ChannelKind, ChannelStatus, NodePool},
+    node_pool_miner_api::{expected_interval_secs, EXPECTED_RATE_BLOCKS},
     node_pool_relay::RelayParts,
 };
 
@@ -518,6 +519,13 @@ pub struct StatusResponse {
     /// Payees with a balance row: carried over at the cutover, credited on the share chain, or
     /// both.
     pub ledger_rows: u64,
+    /// Pool blocks found since the genesis anchor, on this node's best Bitcoin chain. The same
+    /// on every node that follows that chain; `recent_blocks` lists only the latest.
+    pub pool_blocks_found: u64,
+    /// Mean seconds between pool blocks the pool's credited work should find: the work every
+    /// miner was credited over the last day of Bitcoin blocks, as the miner page's expected
+    /// wait reads it. `null` before any work is credited.
+    pub pool_expected_block_interval_secs: Option<u64>,
     /// Recent pool blocks, highest first.
     pub recent_blocks: Vec<BlockView>,
     /// Connected miners.
@@ -894,6 +902,13 @@ impl NodePoolApi {
                 created_at: c.created_at,
             })
             .collect();
+        let tip = st.bitcoin_tip.unwrap_or(relay.btc_height);
+        let credited = db
+            .np_credited_face_from(tip.saturating_sub(EXPECTED_RATE_BLOCKS - 1))
+            .map_err(internal)?;
+        let (_, rm) = split(tip.saturating_add(1), self.halving());
+        let pool_expected_block_interval_secs =
+            expected_interval_secs(credited, rm, EXPECTED_RATE_BLOCKS);
         let start = &self.parts.start;
         Ok(StatusResponse {
             network: start.network.as_str(),
@@ -948,6 +963,8 @@ impl NodePoolApi {
             },
             fee_address: self.fee_address.clone(),
             ledger_rows: db.np_ledger_rows().map_err(internal)?,
+            pool_blocks_found: db.np_pool_blocks().map_err(internal)?,
+            pool_expected_block_interval_secs,
             recent_blocks,
             miners,
             earning: EarningView::new(start.genesis_btc_height, self.live.job_height()),
