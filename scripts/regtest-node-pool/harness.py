@@ -329,6 +329,12 @@ class Node:
         # The relay listens here: a loopback address of its own for a node whose relay must be
         # told apart by IP (a ban is per IP, and every node else shares 127.0.0.1).
         self.relay_ip = "127.0.0.1"
+        # The address the translator serves SV1 on (and the miners dial): 127.0.0.1, or with
+        # --node-ips one loopback address per node, the relay's too, so each node has a host of
+        # its own as on a real network (the lister lists nodes by host; the website asks by host).
+        self.stratum_ip = "127.0.0.1"
+        if h.args.node_ips:
+            self.relay_ip = self.stratum_ip = f"127.0.0.{10 + idx}"
         self.relay_peers = []
         self.restarts = 0  # pool_sv2 restarts: its in-memory counters start again from 0
         self.miner_argv = {}  # miner process name -> argv, to start it again
@@ -403,10 +409,11 @@ zmq_hashtx = "tcp://127.0.0.1:{self.zmq_tx}"
 [network]
 internal_api_secret = "{self.api_secret}"
 signing_key = "{hashlib.sha256(f"sign{self.i}".encode()).hexdigest()}"
-public_address = "127.0.0.1"
+public_address = "{self.stratum_ip}"
 sv2_port = {self.pool}
 sv1_port = {self.sv1}
 http_port = {self.http}
+verification_https_port = {self.http + 2}
 max_miners = 100
 farm_port = {self.sv1 + 5}
 
@@ -420,6 +427,10 @@ archive_mode = false
 prune_height = 0
 
 [pool]
+# pool_sv2's monitoring listener, which this node's API forwards the node pool routes to, and
+# where a lister run against this node writes its list (served at /api/v1/node-pool/node-list).
+node_pool_api = "http://127.0.0.1:{self.pool_mon}"
+node_list_path = "{d}/node-list.json"
 
 [reaper]
 enabled = {"true" if self.h.is_ghostd and self.h.args.reaper else "false"}
@@ -583,7 +594,7 @@ public_key = "{self.tdp_key}"
         # As the installer writes it, except the difficulty floor: quantise_to_tiers floors SV1
         # difficulty at 2^10 (difficulty-1 units, about 2^42 hashes a share), out of a CPU's
         # reach, so regtest runs a fixed, tiny difficulty and the miner aims at the network tier.
-        cfg = f"""downstream_address = "127.0.0.1"
+        cfg = f"""downstream_address = "{self.stratum_ip}"
 downstream_port = {self.sv1}
 max_supported_version = 2
 min_supported_version = 2
@@ -612,12 +623,12 @@ authority_pubkey = "{POOL_PUB}"
         self.procs["translator"] = Proc(
             "translator", [self.h.bin("translator_sv2"), "-c", os.path.join(d, "translator.toml")],
             self.log("translator"), cwd=d, env={"RUST_LOG": "info", "NO_COLOR": "1"})
-        wait_for(lambda: port_open(self.sv1), 60, what=f"node{self.i} translator SV1 port")
+        wait_for(lambda: port_open(self.sv1, self.stratum_ip), 60, what=f"node{self.i} translator SV1 port")
 
     def start_miners(self, specs, pace, anchor_odds, name="miner"):
         """One cpu_miner.py process (`name`) mining for `specs`, (user, agent) pairs. A node
         may run several, paused and resumed apart (pause_miners)."""
-        argv = [sys.executable, os.path.join(HERE, "cpu_miner.py"), "127.0.0.1", str(self.sv1),
+        argv = [sys.executable, os.path.join(HERE, "cpu_miner.py"), self.stratum_ip, str(self.sv1),
                 "--events", os.path.join(self.dir, "miner-events.jsonl"), "--pace", str(pace),
                 "--anchor-odds", str(anchor_odds), "--tier-base", TIER_BASE,
                 "--seed", str(1000 + 10 * self.i + len(self.miner_procs()))]
@@ -862,14 +873,15 @@ class Harness:
         return self.nodes + self.retired
 
     def add_node(self, mine=True, fault=None, agents=None, anchor_odds=None, sync_fault=None,
-                 relay_ip="127.0.0.1", peers=None):
+                 relay_ip=None, peers=None):
         """A node peered with every node so far (or only with `peers`, nodes, for its relay)."""
         i = self.next_index
         self.next_index += 1
         n = Node(self, i)
         n.fault = fault
         n.sync_fault = sync_fault
-        n.relay_ip = relay_ip
+        if relay_ip is not None:
+            n.relay_ip = relay_ip
         others = [m for m in self.nodes]
         n.start_bitcoind([m.p2p for m in others])
         self.nodes.append(n)
@@ -905,7 +917,7 @@ class Harness:
             n.start_miners(specs, self.args.pace,
                            self.args.anchor_odds if anchor_odds is None else anchor_odds)
         say(f"  node{i}: bitcoind :{n.rpc_port}  ghost-mining tdp :{n.tdp}  pool_sv2 :{n.pool} "
-            f"relay :{n.relay} api :{n.pool_mon}  sv1 :{n.sv1}  miners {len(n.miners)}")
+            f"relay {n.relay_addr()} api :{n.pool_mon} http :{n.http}  sv1 {n.stratum_ip}:{n.sv1}  miners {len(n.miners)}")
         return n
 
     def generate(self, n, count, tag="bootstrap"):
@@ -1053,6 +1065,8 @@ def run(args):
     signal.signal(signal.SIGTERM, on_signal)
     try:
         scenarios(h)
+        if args.serve_minutes:
+            serve(h)
     except KeyboardInterrupt as e:
         interrupted = True
         result("harness", "FAIL", f"interrupted: {e}")
@@ -1064,8 +1078,9 @@ def run(args):
         t = time.time()
         h.teardown()
         left = h.leftovers()
-        busy = [p for n in h.all_nodes() for p in (n.p2p, n.rpc_port, n.pool, n.sv1, n.tdp, n.http)
-                if port_open(p)] + [n.relay for n in h.all_nodes() if port_open(n.relay, n.relay_ip)]
+        busy = [p for n in h.all_nodes() for p in (n.p2p, n.rpc_port, n.pool, n.tdp, n.http)
+                if port_open(p)] + [n.relay for n in h.all_nodes() if port_open(n.relay, n.relay_ip)] \
+            + [n.sv1 for n in h.all_nodes() if port_open(n.sv1, n.stratum_ip)]
         if left or busy:
             result("teardown", "FAIL", [f"left running: {l}" for l in left] + [f"port still open: {p}" for p in busy])
         else:
@@ -1080,6 +1095,85 @@ def run(args):
     else:
         say(f"logs kept in {h.work}")
     return 1 if any(v == "FAIL" for _, v, _ in RESULTS) else 0
+
+
+def serve(h):
+    """--serve-minutes: keep the nodes up after the scenarios, for front ends and people to use,
+    and describe them in <work dir>/serve.json. Miners resume with --serve-mining, else stay
+    paused. Ends after N minutes, on SIGTERM or Ctrl-C (a clean end, not a FAIL), or when a node
+    process dies (a FAIL); teardown follows as after any run."""
+    minutes = h.args.serve_minutes
+    nodes = h.honest()
+    desc = {
+        "network": NETWORK, "work": h.work, "harness_pid": os.getpid(),
+        "rpc_user": RPC_USER, "rpc_password": RPC_PASS, "treasury_script": TREASURY_SCRIPT,
+        "genesis_export": h.export_dir, "export_digest": h.export_digest,
+        "genesis_table_digest": getattr(nodes[0], "genesis_root", None) if nodes else None,
+        "audit_chain_args": audit_chain_args(), "bin_dir": h.args.bin_dir,
+        "mining": bool(h.args.serve_mining), "until_unix": int(time.time() + 60 * minutes),
+        "nodes": [{
+            "index": n.i, "ip": n.stratum_ip, "relay": n.relay_addr(), "relay_peers": n.relay_peers,
+            "sv1": n.sv1, "sv2": n.pool, "http": n.http, "pool_api": n.pool_mon,
+            "rpc_port": n.rpc_port, "fee_address": n.fee_addr, "dir": n.dir,
+            "node_list_path": os.path.join(n.dir, "ghost", "node-list.json"),
+            "miners": [{"user": u, "address": a, "script": sc, "agent": ag, "class": c}
+                       for u, a, sc, ag, c in n.miners],
+            "pids": {k: p.p.pid for k, p in n.procs.items() if p.alive()},
+        } for n in nodes],
+    }
+    path = os.path.join(h.work, "serve.json")
+    with open(path + ".tmp", "w") as f:
+        json.dump(desc, f, indent=1)
+    os.replace(path + ".tmp", path)
+    if h.args.serve_mining:
+        # Again at the serving pace: regtest finds a block on most shares, and at the scenarios'
+        # pace the chain would pass its halvings (every 150 blocks) within minutes.
+        for n in nodes:
+            n.pause_miners(False)  # a stopped process would not see its SIGTERM
+            for k in [k for k in n.miner_procs() if k in n.miner_argv and n.procs[k].alive()]:
+                argv = list(n.miner_argv[k])
+                argv[argv.index("--pace") + 1] = str(h.args.serve_pace)
+                n.procs[k].stop()
+                n.miner_argv[k] = argv
+                n.procs[k] = Proc(k, argv, n.log(k))
+        for nd, n in zip(desc["nodes"], nodes):
+            nd["pids"] = {k: p.p.pid for k, p in n.procs.items() if p.alive()}
+        with open(path + ".tmp", "w") as f:
+            json.dump(desc, f, indent=1)
+        os.replace(path + ".tmp", path)
+    for n in nodes:
+        n.pause_miners(not h.args.serve_mining)
+    say(f"\n== serving for {minutes:g} minutes, miners {'mining' if h.args.serve_mining else 'paused'}; "
+        f"nodes described in {path}")
+    end, last, ok, ev = time.time() + 60 * minutes, 0, True, []
+    try:
+        while time.time() < end:
+            dead = [f"node{n.i}/{k}" for n in nodes for k, p in n.procs.items()
+                    if not p.alive() and not k.startswith("miner")]
+            if dead:
+                ok = False
+                ev.append(f"processes died while serving: {dead}")
+                break
+            if time.time() - last > 300:
+                _progress_line(h)
+                last = time.time()
+            time.sleep(2)
+    except KeyboardInterrupt as e:
+        ev.append(f"stopped by {e}")
+    for n in nodes:
+        n.pause_miners(True)
+    result(f"serve: nodes kept up for use ({minutes:g} minutes asked)", "PASS" if ok else "FAIL",
+           ev or [f"served {minutes:g} minutes"])
+
+
+def _progress_line(h):
+    try:
+        n = h.nodes[0]
+        st = n.status()
+        say(f"  [serve {time.time() - h.t0:5.0f}s] btc {n.rpc('getblockcount')}  anchors "
+            f"{st['share_chain']['anchor_height']}  peers {st['peers']}  rss {h.rss_mb()} MB")
+    except Exception as e:  # noqa: BLE001 - a missed progress line is not a failure
+        say(f"  [serve] progress unavailable: {e}")
 
 
 def scenarios(h):
@@ -1137,6 +1231,16 @@ def main():
     ap.add_argument("--sv2-handicap", type=int, default=20000)
     ap.add_argument("--workdir")
     ap.add_argument("--keep", action="store_true", help="keep the work dir even on success")
+    ap.add_argument("--node-ips", action="store_true",
+                    help="give node i its own loopback address, 127.0.0.<10+i>, for its relay and "
+                         "SV1 port (a host per node, as the lister and the website see nodes)")
+    ap.add_argument("--serve-minutes", type=float, default=0,
+                    help="after the scenarios, keep the nodes up this many minutes for front ends "
+                         "to be pointed at, described in <work dir>/serve.json; SIGTERM ends it")
+    ap.add_argument("--serve-mining", action="store_true",
+                    help="with --serve-minutes: resume the miners while serving")
+    ap.add_argument("--serve-pace", type=float, default=180.0,
+                    help="with --serve-mining: mean seconds between a miner's shares while serving")
     ap.add_argument("--base-port", type=int, default=21000)
     ap.add_argument("--pace", type=float, default=8.0, help="mean seconds between a miner's shares")
     ap.add_argument("--signet-blocks", type=int, default=90,

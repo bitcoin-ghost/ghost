@@ -452,7 +452,7 @@ def audit_vs_liar(h, liar, honest, ev):
     argv = [exe, "audit"] + HX.audit_chain_args() + [
         "--relay-peer", honest[0].relay_addr(), "--data-dir", os.path.join(h.work, "audit-liar"),
         "--rpc-port", str(honest[0].rpc_port), "--rpc-user", HX.RPC_USER, "--rpc-password",
-        HX.RPC_PASS, "--stratum", f"127.0.0.1:{liar.sv1}", "--node-relay", liar.relay_addr(),
+        HX.RPC_PASS, "--stratum", f"{liar.stratum_ip}:{liar.sv1}", "--node-relay", liar.relay_addr(),
         "--address", addr, "--jobs", "1", "--json", "--wait", "120", "--timeout", "120"] + S.genesis_args(h)
     import subprocess
     out = subprocess.run(argv, capture_output=True, text=True, timeout=400)

@@ -222,7 +222,7 @@ def one_refused_miner(h):
     for n in h.nodes:
         n.pause_miners(False)
     t = time.time()
-    proc = Proc("refused-miner", [sys.executable, os.path.join(HERE, "cpu_miner.py"), "127.0.0.1",
+    proc = Proc("refused-miner", [sys.executable, os.path.join(HERE, "cpu_miner.py"), n0.stratum_ip,
                                   str(n0.sv1), "--events", events, "--miner", f"{bad}@bitaxe/v2.10.0",
                                   "--tier-base", TIER_BASE], os.path.join(n0.dir, "refused-miner.log"))
     try:
@@ -583,7 +583,7 @@ def audit(h):
     data = os.path.join(h.work, "audit")
     argv = [exe, "audit"] + audit_chain_args() + ["--relay-peer", peer.relay_addr(),
             "--data-dir", data, "--rpc-port", str(target.rpc_port), "--rpc-user", RPC_USER,
-            "--rpc-password", RPC_PASS, "--stratum", f"127.0.0.1:{target.sv1}",
+            "--rpc-password", RPC_PASS, "--stratum", f"{target.stratum_ip}:{target.sv1}",
             "--node-relay", target.relay_addr(), "--address", addr, "--jobs",
             str(h.args.audit_jobs), "--json", "--wait", "180", "--timeout", "120"] + genesis_args(h)
     # New jobs come with new blocks: let the miners go slowly while the auditor listens.
@@ -796,7 +796,7 @@ def hostile(h):
         addr, _ = payee(f"auditor/{fault}")
         argv = [exe, "audit"] + audit_chain_args() + ["--relay-peer", honest[0].relay_addr(),
                 "--data-dir", os.path.join(h.work, f"audit-{fault}"), "--rpc-port", str(honest[0].rpc_port),
-                "--rpc-user", RPC_USER, "--rpc-password", RPC_PASS, "--stratum", f"127.0.0.1:{bad.sv1}",
+                "--rpc-user", RPC_USER, "--rpc-password", RPC_PASS, "--stratum", f"{bad.stratum_ip}:{bad.sv1}",
                 "--node-relay", bad.relay_addr(), "--address", addr, "--jobs", "1", "--json",
                 "--wait", "120", "--timeout", "120"] + genesis_args(h)
         out = subprocess.run(argv, capture_output=True, text=True, timeout=400)
