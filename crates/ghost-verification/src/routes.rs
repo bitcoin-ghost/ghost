@@ -1302,6 +1302,19 @@ async fn api_mining_status_handler(
         .map(|c| c.read().pool.pool_name.clone())
         .unwrap_or_else(|| config.pool_name.clone());
 
+    // The stratum ports this node serves, from its own `[network]` (the dashboard's "Connect
+    // miners" page shows them). The compiled defaults are the installer's, and only a fallback
+    // when the full config is not loaded: a node configured on other ports must not tell its
+    // operator 3333 / 34255.
+    let (sv1_port, sv2_port) = state
+        .full_node_config
+        .as_ref()
+        .map(|c| {
+            let c = c.read();
+            (c.network.sv1_port, c.network.sv2_port)
+        })
+        .unwrap_or((SV1_STRATUM_PORT, SV2_STRATUM_PORT));
+
     Json(serde_json::json!({
         // Backend fields
         "active": true,
@@ -1325,11 +1338,11 @@ async fn api_mining_status_handler(
         "shares_submitted": shares_submitted,
         "shares_accepted": shares_accepted,
         "shares_rejected": shares_submitted - shares_accepted,
-        "stratum_v1_port": SV1_STRATUM_PORT,
-        "stratum_v2_port": SV2_STRATUM_PORT,
+        "stratum_v1_port": sv1_port,
+        "stratum_v2_port": sv2_port,
         "authority_public_key": authority_public_key,
-        "stratum_v1_endpoint": format!("stratum+tcp://0.0.0.0:{}", SV1_STRATUM_PORT),
-        "stratum_v2_endpoint": format!("stratum+tcp://0.0.0.0:{}", SV2_STRATUM_PORT),
+        "stratum_v1_endpoint": format!("stratum+tcp://0.0.0.0:{sv1_port}"),
+        "stratum_v2_endpoint": format!("stratum+tcp://0.0.0.0:{sv2_port}"),
         "pool_name": real_pool_name,
         "blocks_found": state.database.as_ref()
             .and_then(|db| db.get_blocks_found_count().ok())
@@ -11447,6 +11460,54 @@ mod tests {
             serde_json::Value::String("customAuthorityKey123".to_string()),
             "the node's own configured key must be advertised verbatim"
         );
+    }
+
+    /// `/api/v1/mining/status` reports the stratum ports this node is configured on, not the
+    /// compiled defaults: the dashboard's "Connect miners" page tells the operator these.
+    #[tokio::test]
+    async fn test_mining_status_reports_the_configured_ports() {
+        use ghost_common::config::NodeConfig as FullNodeConfig;
+
+        async fn ports(state: Arc<crate::server::VerificationState>) -> serde_json::Value {
+            let response = super::create_router(state)
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/api/v1/mining/status")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
+                .await
+                .unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = FullNodeConfig::default();
+        cfg.network.sv1_port = 43030;
+        cfg.network.sv2_port = 43020;
+        let state = Arc::new(
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_full_node_config(cfg, dir.path().join("pool.toml")),
+        );
+        let d = ports(state).await;
+        assert_eq!(d["stratum_v1_port"], 43030);
+        assert_eq!(d["stratum_v2_port"], 43020);
+        assert_eq!(d["stratum_v1_endpoint"], "stratum+tcp://0.0.0.0:43030");
+        assert_eq!(d["stratum_v2_endpoint"], "stratum+tcp://0.0.0.0:43020");
+
+        // No full config loaded: the installer's defaults.
+        let bare = Arc::new(crate::server::VerificationState::new(
+            "test_node".to_string(),
+            "1.0.0".to_string(),
+        ));
+        let d = ports(bare).await;
+        assert_eq!(d["stratum_v1_port"], SV1_STRATUM_PORT);
+        assert_eq!(d["stratum_v2_port"], SV2_STRATUM_PORT);
     }
 
     /// The watchdog's `unit` reaches an operator's inbox verbatim, so it is the one
