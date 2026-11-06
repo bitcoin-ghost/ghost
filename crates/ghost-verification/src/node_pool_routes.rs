@@ -8,6 +8,13 @@
 //!   store (pool_sv2 runs as root and writes it 0600) and holds none of the live state, so it
 //!   forwards rather than re-deriving: the answer, its status code and its body pass through
 //!   unchanged. pool_sv2 not answering is a 503 that says so.
+//! - `GET /api/v1/node-pool/node-list` serves this node's open-listing lister's `node-list.json`
+//!   (`ghost-audit list`, enabled with `install-node.sh --lister`) read-only, so `ghost-audit
+//!   merge` can collect each lister's list over the API port every node already exposes, with no
+//!   new port or process. It reads one fixed file
+//!   ([`crate::server::VerificationState::node_list_path`]), takes no input, and serves it only
+//!   if it parses as a `ghost-audit/node-list/v1` list: a node with no lister answers 404, an
+//!   unreadable or half-written file 503.
 //! - Routes of features the node pool removed (the old payout ledger, node rewards, elders and
 //!   capabilities, checkpoints, solo and private modes, Ghost Pay, Wraith, L2, zk and MPC) answer
 //!   `410 Gone` with the feature's name and where its replacement is, rather than a bare 404, so
@@ -144,9 +151,56 @@ async fn status_handler(State(state): State<Arc<VerificationState>>) -> Response
     forward(&state, "/api/v1/node-pool/status").await
 }
 
+/// Schema of a lister's `node-list.json`.
+const NODE_LIST_SCHEMA: &str = "ghost-audit/node-list/v1";
+/// Largest node list served (the merge reads at most this much from one lister).
+const NODE_LIST_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// `GET /api/v1/node-pool/node-list`: this node's lister's `node-list.json`, as written.
+async fn node_list_handler(State(state): State<Arc<VerificationState>>) -> Response {
+    let path = &state.node_list_path;
+    let unreadable = || {
+        json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this node's lister has not written a readable node list",
+        )
+    };
+    match tokio::fs::metadata(path).await {
+        Ok(m) if m.is_file() && m.len() <= NODE_LIST_MAX_BYTES => {}
+        Ok(_) => return unreadable(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "this node runs no lister (install-node.sh --lister), so it has no node list",
+            )
+        }
+        Err(_) => return unreadable(),
+    }
+    let Ok(body) = tokio::fs::read(path).await else {
+        return unreadable();
+    };
+    let schema_ok = body.len() as u64 <= NODE_LIST_MAX_BYTES
+        && serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .is_some_and(|v| v.get("schema").and_then(|s| s.as_str()) == Some(NODE_LIST_SCHEMA));
+    if !schema_ok {
+        return unreadable();
+    }
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 /// The public node pool routes.
 pub(crate) fn node_pool_router() -> Router<Arc<VerificationState>> {
     Router::new()
+        .route("/api/v1/node-pool/node-list", get(node_list_handler))
         .route("/api/v1/ledger/:address", get(ledger_handler))
         .route("/api/v1/miner/:address", get(miner_handler))
         .route("/api/v1/miner/:address/history", get(miner_history_handler))
@@ -423,6 +477,62 @@ mod tests {
             assert!(v["error"].is_string(), "{uri}");
         }
         assert_eq!(seen.lock().len(), n, "nothing malformed reaches pool_sv2");
+    }
+
+    #[tokio::test]
+    async fn the_listers_node_list_is_served_read_only_and_only_when_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node-list.json");
+        let app = || {
+            crate::routes::create_router(Arc::new(
+                VerificationState::new("test_node".into(), "1.0.0".into())
+                    .with_node_list_path(&path),
+            ))
+        };
+        // No lister: 404, saying so.
+        let (code, v) = call(app(), "GET", "/api/v1/node-pool/node-list").await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        assert!(
+            v["error"].as_str().unwrap().contains("runs no lister"),
+            "{v}"
+        );
+        // A valid list: served as written.
+        let list = r#"{"schema":"ghost-audit/node-list/v1","listed":0,"nodes":[]}"#;
+        std::fs::write(&path, list).unwrap();
+        let r = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/node-pool/node-list")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(r.headers()[header::CONTENT_TYPE], "application/json");
+        let body = r.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], list.as_bytes());
+        // Half a file, another schema, or too large: 503, and nothing of it served.
+        for bad in [
+            &br#"{"schema":"ghost-audit/node-list/v1","nod"#[..],
+            &br#"{"schema":"something/else","nodes":[]}"#[..],
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            let (code, v) = call(app(), "GET", "/api/v1/node-pool/node-list").await;
+            assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(v["error"]
+                .as_str()
+                .unwrap()
+                .contains("not written a readable"));
+        }
+        std::fs::write(&path, vec![b' '; NODE_LIST_MAX_BYTES as usize + 1]).unwrap();
+        let (code, _) = call(app(), "GET", "/api/v1/node-pool/node-list").await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        // Read-only: nothing but GET.
+        std::fs::write(&path, list).unwrap();
+        let (code, _) = call(app(), "POST", "/api/v1/node-pool/node-list").await;
+        assert_eq!(code, StatusCode::METHOD_NOT_ALLOWED);
     }
 
     #[tokio::test]

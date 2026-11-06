@@ -1106,6 +1106,11 @@ pub type RecordsCache = Arc<
 /// (`monitoring_address = "127.0.0.1:9090"`): where the node pool API is served.
 pub const DEFAULT_NODE_POOL_API: &str = "http://127.0.0.1:9090";
 
+/// Where this node's open-listing lister (`ghost-audit list`, installed with
+/// `install-node.sh --lister`) writes its `node-list.json`, served read-only at
+/// `GET /api/v1/node-pool/node-list`.
+pub const DEFAULT_NODE_LIST_PATH: &str = "/var/lib/ghost-audit/node-list.json";
+
 pub struct VerificationState {
     /// Node ID (hex)
     pub node_id: String,
@@ -1255,6 +1260,9 @@ pub struct VerificationState {
     /// Defaults to [`DEFAULT_NODE_POOL_API`], the loopback monitoring listener the installer
     /// configures.
     pub node_pool_api: String,
+    /// This node's lister's `node-list.json`, served read-only at
+    /// `GET /api/v1/node-pool/node-list`. Defaults to [`DEFAULT_NODE_LIST_PATH`].
+    pub node_list_path: std::path::PathBuf,
     /// Provider returning a JSON snapshot of the coinbase for the block currently being built:
     /// the subsidy, the treasury's base share, the miners' share and the transaction fees to the
     /// finder. A closure so this crate needn't depend on ghost-mining's template types. `None`
@@ -1480,6 +1488,7 @@ impl VerificationState {
             template_snapshot: None,
             coinbase_snapshot: None,
             node_pool_api: DEFAULT_NODE_POOL_API.to_string(),
+            node_list_path: std::path::PathBuf::from(DEFAULT_NODE_LIST_PATH),
             get_round_elapsed_secs: None,
             // VF-C2: Default to requiring internal auth for security
             require_internal_auth: true,
@@ -1971,6 +1980,12 @@ impl VerificationState {
     /// Where pool_sv2's node pool API listens (`http://host:port`).
     pub fn with_node_pool_api(mut self, base_url: impl Into<String>) -> Self {
         self.node_pool_api = base_url.into();
+        self
+    }
+
+    /// Where this node's lister writes `node-list.json`.
+    pub fn with_node_list_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.node_list_path = path.into();
         self
     }
 
