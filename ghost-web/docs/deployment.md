@@ -151,6 +151,10 @@ On a fresh install there is no Bitcoin node yet; ghostd is installed, and the in
 | `--no-auto-update` | | Never auto-update (the default). |
 | `--backups` | on | Back up the node database every night at 03:00 UTC, kept 7 days. See *Database backups*, below. |
 | `--no-backups` | | No nightly backups. The job is still installed; switch it on later with `sudo systemctl enable --now ghost-backup.timer`. |
+| `--lister` | off | Also run an open-listing lister on this node. See *Running a lister*, below. |
+| `--lister-table-digest <hex>` | | The network's pinned genesis table digest, for the lister. Needed off regtest. |
+| `--lister-genesis-export <dir>` | | The ledger export directory (`ledger-export.bin`, `ledger-export.json`), for the lister's first run. Needed off regtest, with `--lister-export-digest <sha256>`. |
+| `--no-lister` | | Stop and disable the lister. A re-run with neither flag keeps it as it was. |
 | `--non-interactive` | | Never start the wizard. |
 | `-h`, `--help` | | Print the help. |
 
@@ -268,6 +272,7 @@ Before step 1 the preflight runs (see *Preflight*, above); a FAIL stops the inst
 | `ghost-auto-update.timer` | root | only with `--auto-update` | systemd |
 | `ghost-backup.timer` | ghost | unless `--no-backups` | systemd |
 | `ghost-dashboard` | `ghost` | yes | systemd (does not wait for the gate; shows the node as unavailable until it answers) |
+| `ghost-lister` | `ghost-audit` | only with `--lister` | systemd |
 
 ### The boot gate
 
@@ -284,7 +289,7 @@ The installer enables `ufw` and allows:
 | 22/tcp | SSH | The only SSH rule — see the warning above |
 | 8333/tcp | ghostd P2P | 38333 on signet, 18444 on regtest. Removed with `--tor-only` |
 | 8566/tcp | Node pool share-chain relay | `--relay-port` |
-| 8080/tcp | ghost-mining HTTP API | |
+| 8080/tcp | ghost-mining HTTP API | Also serves the lister's `node-list.json` at `/api/v1/node-pool/node-list` |
 
 8555–8562 (the old mesh), 8563 (Noise mesh), 8443 (verification HTTPS) and 8442 (TDP) are **not** opened, and a rule an older install left is deleted on a re-run: ghost-mining no longer runs the old mesh, and a node pool node must never be reachable by the old network's mesh. ghost-mining's template server (TDP, 8442) serves only the node's own pool_sv2, so it listens on `127.0.0.1` (`--tdp-bind 127.0.0.1` in the unit); its verification HTTPS listener (8443), a leftover of the old mesh, also listens on `127.0.0.1` only.
 
@@ -395,10 +400,11 @@ It **keeps the node's data**, and lists what it kept and where when it finishes:
 | `/etc/ghost` | `pool.toml`, `pool-config.toml` (the SV2 authority key, the fee address, relay peers, genesis), `translator-config.toml`, `dashboard.env` |
 | `/etc/bitcoin` | `bitcoin.conf` (the RPC password, a custom signet's challenge, Bitcoin peers) |
 | `/var/backups/ghost`, `/var/lib/ghost-backup` | Nightly backups, the off-node backup key and status |
+| `/var/lib/ghost-audit` | The lister's share chain, probe history and `node-list.json` |
 
 The `ghost` user, `ufw` (still enabled, with 22/tcp open, so ssh keeps working) and the apt packages are left as they are. Installing again over what was kept is a re-run: the same node ID, keys, fee address, relay peers and ledger.
 
-`--purge` also deletes everything in that table and the `ghost` user. Back up `node.key` and `node-pool.db` first if you might want this node back: nothing else can recreate them.
+`--purge` also deletes everything in that table and the `ghost` and `ghost-audit` users. Back up `node.key` and `node-pool.db` first if you might want this node back: nothing else can recreate them.
 
 Without `--yes` it asks you to type `uninstall` (or `purge`) on the terminal; with no terminal and no `--yes` it refuses and changes nothing.
 
@@ -461,6 +467,25 @@ User names, host names and paths may contain only letters, digits and `. _ - /`.
 After the local backup succeeds, the nightly job copies that night's files to the destination, then deletes older copies there until only the newest `keep` (default 7) are left. It only ever deletes files whose names the job itself writes (`ghost-YYYYmmddHHMM.db.gz`, `ghost-pay-YYYYmmddHHMM.db.gz`). A local destination also has to have room for the copies plus 256 MiB, or the copy is refused.
 
 **A failed off-node copy never fails or undoes the local backup.** The unit's exit status depends only on the local backup. The off-node outcome is written to `/var/lib/ghost-backup/offsite.status` (`last_offsite_result`, `last_offsite_time`, `last_offsite_error`), and the dashboard shows it. Copies are not encrypted before they leave the node, so store them somewhere only you can read.
+
+## Running a lister
+
+A lister runs `ghost-audit list` (open listing): every 10 minutes it crawls the relays' address gossip, probes every node it finds like a miner would (it submits no shares), and writes `node-list.json`, the nodes that passed. Anyone can run one. `bitcoinghost.org` publishes the *merged* list of several listers (see [the node pool page](#node-pool), *Publishing the merged list*), so running a lister and asking for it to be added is how an operator takes part in deciding the list.
+
+It is off unless you pass `--lister`:
+
+```
+curl -sSL https://get.bitcoinghost.org | sudo GHOST_VERSION=np-latest bash -s -- --fee-address <address> \
+  --network signet --lister --lister-table-digest <table_root> \
+  --lister-genesis-export /root/ledger-export --lister-export-digest <sha256 of ledger-export.bin>
+```
+
+Off regtest the lister judges every job against the network's genesis table, so it needs the pinned `table_root` (the value pool_sv2's `--np-import-genesis` printed) and, for its first run, the published ledger export. The installer checks the export against its digest and copies it to `/var/lib/ghost-audit/genesis-export`, where the sandboxed unit can read it. Without them `--lister` installs everything, leaves the lister off and says what is missing; re-run with it. A re-run reads the pins back from `/etc/ghost/lister.env`, so they are given once.
+
+- `ghost-lister.service` runs as its own user, `ghost-audit`, with `/var/lib/ghost-audit` its only writable path. It syncs its share chain from this node's relay and the `--relay-peer`s, settled from this node's ghostd, and its probes log in with the fee address.
+- `/etc/ghost/lister.env` (root-only, `0600`) holds the RPC credentials, the pins and `GHOST_LISTER_ARGS`, the flags passed to `ghost-audit list`. Edit it and `sudo systemctl restart ghost-lister` to change them.
+- Its list is served read-only by ghost-mining at `http://<node>:8080/api/v1/node-pool/node-list` (a port already open; no new port or process): 404 on a node with no lister, 503 until it has written a valid list.
+- `sudo journalctl -u ghost-lister -f` shows a line per round: relays answered, candidates, probes passed, failed and unmeasured, listed and delisted.
 
 ## Alerts and the restart watchdog
 

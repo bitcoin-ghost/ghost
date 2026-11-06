@@ -96,6 +96,8 @@ The first run syncs the share chain from your relay peers, which takes a while; 
 
 `ghost-audit probe` runs the same checks from outside, plus the node's advert (its relay port answers on this share chain and discloses its job stamps), and prints a JSON verdict: `pass`, `fail` or `unmeasured`, with reason codes. It probes every protocol the node advertises (SV1, SV2 or both), and each must pass, so a node that serves SV2 miners worse than SV1 miners fails. Open listing uses it to decide whether a node is listed: only `pass` is listed. A node that serves only SV2 can be listed; it appears in the node list but not the DNS name, which carries the SV1 port. Being listed means a node passed this probe when it ran; it does not mean the node is honest with every miner, which is why you audit your own.
 
+`ghost-audit list` runs that probe on every node it finds, on a schedule, and writes a lister's `node-list.json`; `ghost-audit merge` combines several listers' lists, listing a node only when most of them do. Both are described under [Being listed](#node-pool).
+
 ## What it does not check
 
 - **Whether your shares were included.** Each anchor commits to its batch of shares in a merkle tree, so a miner can get a short proof that an anchor included a share. `ghost-audit` submits no shares, so it has none to look for.

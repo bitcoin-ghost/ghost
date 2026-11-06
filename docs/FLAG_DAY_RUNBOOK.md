@@ -170,10 +170,20 @@ first opens it.
 
 ## 7. Repoint miners
 
-- **Command**: publish the node list and DNS (`ghost-audit list`), announce.
+- **Command**: publish the node list and DNS, announce. The listers run on nodes installed with
+  `--lister` (step 5; off mainnet's compiled pins they need `--lister-table-digest <ROOT>`,
+  `--lister-genesis-export` and `--lister-export-digest`). On the website host,
+  `ghost-node-list-merge.timer` runs `ghost-audit merge` over those listers
+  (`/etc/ghost/node-list-merge.env`), writes `node-list.json` and pushes `pool` through the
+  Namecheap hook. Before enabling the timer: `curl -s http://<node>:8080/api/v1/node-pool/node-list`
+  answers 200 on each lister; one `ghost-audit merge` by hand (without `--dns-hook`) lists the
+  nodes expected; `namecheap-hook.py --dry-run` on its fragment prints only `pool` changing.
 - **Check**: `curl -s http://127.0.0.1:9090/api/v1/node-pool/status` on each node: peers > 0, the
   same share-chain tip, `genesis_table_digest` = `<ROOT>`; `ghost-audit probe` passes against each
-  node; a sample of genesis payees' `/api/v1/ledger/<address>` shows the imported balance.
+  node; a sample of genesis payees' `/api/v1/ledger/<address>` shows the imported balance;
+  `journalctl -u ghost-node-list-merge` ends `merged: N of N listers voted` and `dns: records
+  changed; the hook pushed them`, and `dig +short pool.bitcoinghost.org` returns the listed IPs.
+  A merge exiting 2 (no quorum) has changed nothing; 4 means the push failed and is retried.
 - **Rollback**: after the import there is none but forward fixes (plan). Miners can point back at
   the old fleet while it runs, but work done there after F is not in the genesis table.
 

@@ -429,10 +429,12 @@ Readings chosen where the spec was silent; written into spec 2.2, "Share-chain s
   blocks at genesis) that only a Bitcoin node supplies today. A peer-only bootstrap (walk back
   from the job's `prev_hash` with the archive's peer checks applied top-down) is possible but not
   built.
-- **Who runs the lister, and where its outputs are published.** Anyone can run `ghost-audit list`;
-  which run feeds `bitcoinghost.org/node-list.json` and the pool DNS name, and how the files get
-  there, is the operators' call. A node list from a lister the reader does not run is that
-  lister's claim; the probe is reproducible by anyone.
+- **Who runs the lister, and where its outputs are published.** Anyone can run `ghost-audit list`
+  (`install-node.sh --lister`, served at `/api/v1/node-pool/node-list`). What feeds
+  `bitcoinghost.org/node-list.json` and the pool DNS name is `ghost-audit merge` over a configured
+  set of listers, majority of the configured ones, pushed to Namecheap by a hook (built 11-06 on
+  `feat/node-pool-lister`). Which listers are configured is still the operators' call: the merge
+  makes one lister's claim insufficient, not the configured set trustless.
 - **The website's `/api/pool/<host>/` proxy.** `miner.js` now asks the hosts in `node-list.json`
   through it (it used to name vm1-vm4 of the old fleet). The proxy lives on the website server,
   outside this repo, and must forward only to hosts listed in the current `node-list.json` (and
