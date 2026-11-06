@@ -28,6 +28,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use ghost_common::anchor_chain::ShareId;
+use ghost_common::share_commit::batch_root;
 use ghost_storage::Database;
 
 use crate::headers::HeaderOracle;
@@ -94,12 +96,19 @@ async fn node_with(
 }
 
 impl TestNode {
-    /// A share on this node's latest job, through its local queue.
-    async fn mine(&mut self, btc: &Btc, anchor: bool) {
+    /// A share on this node's latest job, through its local queue. Returns its id.
+    async fn mine(&mut self, btc: &Btc, anchor: bool) -> ShareId {
         let job = self.job.lock().unwrap().expect("published");
         let tier = if anchor { 18 } else { 10 };
         let s = self.miner.build(job, &genesis_table(), btc.tip, tier);
+        let id = s.id();
         self.handle.local.send(s).await.unwrap();
+        id
+    }
+
+    /// The batch root of this node's latest published job.
+    fn job_batch_root(&self) -> Option<[u8; 32]> {
+        self.job.lock().unwrap().map(|j| j.batch_root)
     }
 
     fn status(&self) -> crate::relay::RelayStatus {
@@ -127,16 +136,27 @@ async fn three_nodes_over_tcp_discover_each_other_and_converge() {
     })
     .await;
 
+    let mut ids = Vec::new();
     for n in [&mut a, &mut b, &mut c] {
-        n.mine(&btc, false).await;
-        n.mine(&btc, false).await;
+        ids.push(n.mine(&btc, false).await);
+        ids.push(n.mine(&btc, false).await);
     }
     wait_for("shares relayed", || {
         [&a, &b, &c].iter().all(|n| n.status().loose == 6)
     })
     .await;
-    // The 1 s backstop re-batches them into every node's job.
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    // The 1 s backstop re-batches them into every node's job. Wait for that job rather than for
+    // a fixed time: the re-batch runs on the relay's tick, and on a slow runner a fixed sleep let
+    // B mine its anchor on a job that still committed fewer than six shares, so a miner was
+    // missing from the ledger. All six share one job height, so the batch orders them by id.
+    ids.sort_unstable();
+    let all_six = batch_root(&ids);
+    wait_for("every job commits all six shares", || {
+        [&a, &b, &c]
+            .iter()
+            .all(|n| n.job_batch_root() == Some(all_six))
+    })
+    .await;
     b.mine(&btc, true).await;
     wait_for("one anchor everywhere", || {
         [&a, &b, &c].iter().all(|n| n.status().height == 1)
