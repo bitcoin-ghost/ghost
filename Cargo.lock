@@ -2871,6 +2871,7 @@ dependencies = [
  "clap",
  "corepc-node",
  "criterion",
+ "ghost-common",
  "half",
  "hex",
  "num-format",

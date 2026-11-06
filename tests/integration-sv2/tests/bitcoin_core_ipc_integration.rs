@@ -17,6 +17,7 @@ async fn pool_propagates_block_with_bitcoin_core_ipc() {
             bitcoin_core.is_signet(),
             None,
         ),
+        &bitcoin_core,
         vec![],
         vec![],
         false,

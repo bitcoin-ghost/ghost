@@ -17,6 +17,7 @@ exclude = ["resources/high_diff_chain.tar.gz"]
 stratum-apps = { path = "../../crates/stratum-apps", features = ["network", "config"] }
 pool_sv2 = { path = "../../bins/pool-sv2" }
 translator_sv2 = { path = "../../bins/translator-sv2" }
+ghost-common = { workspace = true }
 async-channel = { version = "1.5.1", default-features = false }
 corepc-node = { version = "0.7.0", default-features = false, features = ["28_0"] }
 ureq = "2.12"

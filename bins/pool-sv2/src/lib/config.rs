@@ -147,6 +147,12 @@ impl PoolConfig {
     pub fn node_pool(&self) -> Option<&NodePoolConfig> {
         self.node_pool.as_ref()
     }
+
+    /// Sets the `[node_pool]` section, for a config built with [`PoolConfig::new`] rather than
+    /// read from TOML. Startup checks it exactly as it checks one read from a file.
+    pub fn set_node_pool(&mut self, node_pool: NodePoolConfig) {
+        self.node_pool = Some(node_pool);
+    }
 }
 
 impl PoolConfig {
