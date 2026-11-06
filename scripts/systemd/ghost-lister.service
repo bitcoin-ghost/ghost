@@ -1,0 +1,37 @@
+[Unit]
+Description=Bitcoin Ghost open-listing lister (ghost-audit list)
+Documentation=https://bitcoinghost.org/docs.html#node-pool
+# Probes every node found in relay gossip each round and writes /var/lib/ghost-audit/node-list.json,
+# which ghost-mining serves read-only at GET /api/v1/node-pool/node-list for `ghost-audit merge`.
+# Opt-in: install-node.sh --lister. It submits no shares.
+After=network-online.target ghostd.service sri-pool.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ghost-audit
+Group=ghost-audit
+# GHOST_AUDIT_RPC_USER / GHOST_AUDIT_RPC_PASSWORD, the genesis pins and GHOST_LISTER_ARGS, written by
+# the installer. Root-only (0600): systemd reads it before dropping to ghost-audit, and never shows
+# a file's contents to other users the way it shows Environment= lines.
+EnvironmentFile=/etc/ghost/lister.env
+ExecStart=/opt/ghost/bin/ghost-audit list --data-dir /var/lib/ghost-audit --state /var/lib/ghost-audit/list-state.json --out-json /var/lib/ghost-audit/node-list.json --out-dns /var/lib/ghost-audit/pool.zone $GHOST_LISTER_ARGS
+# 0755 and umask 022: ghost-mining (user ghost) reads node-list.json to serve it.
+StateDirectory=ghost-audit
+StateDirectoryMode=0755
+UMask=0022
+Restart=on-failure
+RestartSec=60
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

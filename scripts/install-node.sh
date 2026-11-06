@@ -89,6 +89,13 @@ TOR_MODE="hybrid"
 # updater verifies the GPG release signature before applying anything.
 AUTO_UPDATE="false"
 BACKUPS="true"
+# Open listing (W2.10): run `ghost-audit list` on this node as ghost-lister.service. OFF unless
+# --lister is passed; empty means "as the last install left it" (a re-run keeps an enabled lister),
+# --no-lister turns it off. The genesis table pins it needs off regtest:
+LISTER=""
+LISTER_TABLE_DIGEST=""
+LISTER_GENESIS_EXPORT=""
+LISTER_EXPORT_DIGEST=""
 # The node pool block reserve is always written: blockreservedweight=90000 in bitcoin.conf, so
 # getblocktemplate leaves room for the node pool's coinbase (up to 22 KB). ghostd's default
 # 8,000 WU lost a block at a 2.25 KB coinbase on a full template. `--node-pool` used to switch it
@@ -151,6 +158,15 @@ Options:
                                 kept 7 days in /var/backups/ghost/db   (default)
   --no-backups                No nightly backups. They can be switched on later:
                                 sudo systemctl enable --now ghost-backup.timer
+  --lister                    Also run an open-listing lister on this node (off by default):
+                                ghost-audit list probes every node it finds in relay gossip
+                                every 10 minutes (it submits no shares) and its node-list.json is
+                                served read-only at http://<node>:8080/api/v1/node-pool/node-list
+                                for the website's merge. Off regtest it needs the three below.
+  --lister-table-digest <hex> The network's pinned genesis table digest (table_root, 64 hex).
+  --lister-genesis-export <dir>  The ledger export directory (ledger-export.bin and .json)
+  --lister-export-digest <hex>     and its published sha256; copied for the lister's first run.
+  --no-lister                 Stop and disable the lister (a re-run otherwise keeps it as it was).
   --payout-address <address>  Old name of --fee-address, still accepted.
   --node-pool                 Accepted and ignored: the node pool is the only mode.
   --non-interactive           Never prompt; use flags/defaults only (for scripts)
@@ -219,6 +235,11 @@ while [[ $# -gt 0 ]]; do
     --no-auto-update) AUTO_UPDATE="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --backups)        BACKUPS="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --no-backups)     BACKUPS="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --lister)         LISTER="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --no-lister)      LISTER="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --lister-table-digest) LISTER_TABLE_DIGEST="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --lister-genesis-export) LISTER_GENESIS_EXPORT="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --lister-export-digest) LISTER_EXPORT_DIGEST="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --node-pool)      shift;;   # the only mode now; kept so old command lines still run
     --non-interactive) NON_INTERACTIVE="true"; shift;;
     --uninstall)      UNINSTALL="true"; shift;;
@@ -732,6 +753,68 @@ np_resolve_release() {
       return 1 ;;
   esac
 }
+
+# >>> NP_LISTER
+# Open listing (W2.10), opt-in with --lister: `ghost-audit list` as ghost-lister.service, user
+# ghost-audit, state in /var/lib/ghost-audit. Its node-list.json there is what ghost-mining serves
+# read-only at GET /api/v1/node-pool/node-list (port 8080, already open), so `ghost-audit merge`
+# can collect it with no new port or process.
+NP_LISTER_ENV=/etc/ghost/lister.env
+NP_LISTER_DIR=/var/lib/ghost-audit
+NP_LISTER_EXPORT_DIR=/var/lib/ghost-audit/genesis-export
+NP_AUDIT_BIN=/opt/ghost/bin/ghost-audit
+
+# A value from an env file: np_lister_old KEY FILE.
+np_lister_old() { [[ -r "$2" ]] && sed -nE "s/^${1}=(.*)$/\1/p" "$2" | tail -1 || true; }
+
+# Why the lister cannot run with this configuration, or nothing when it can. Reads NETWORK
+# GENESIS_ANCHOR LISTER_TABLE_DIGEST LISTER_EXPORT_DIGEST and LISTER_EXPORT_PRESENT (true when the
+# ledger export is in NP_LISTER_EXPORT_DIR). Off regtest the lister judges jobs against the
+# network's genesis table, so it needs the pinned digest and, for its first run, the export.
+np_lister_blocker() {
+  if [[ ! "$GENESIS_ANCHOR" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "no share-chain genesis is set"; return
+  fi
+  [[ "$NETWORK" == regtest ]] && return
+  if [[ ! "$LISTER_TABLE_DIGEST" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "no genesis table digest: pass --lister-table-digest <the table_root pool_sv2's genesis import printed>"; return
+  fi
+  if [[ "${LISTER_EXPORT_PRESENT:-false}" != true || ! "$LISTER_EXPORT_DIGEST" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "no ledger export: pass --lister-genesis-export <dir> --lister-export-digest <sha256>"; return
+  fi
+}
+
+# The lister's env file. Reads RPC_USER RPCPW NETWORK GENESIS_ANCHOR GENESIS_HEIGHT RELAY_PORT
+# RELAY_PEERS FEE_ADDRESS LISTER_TABLE_DIGEST LISTER_EXPORT_DIGEST LISTER_EXPORT_PRESENT. It syncs
+# its share chain from this node's relay and the configured peers, starts discovery there, and
+# logs its probes in with the fee address (a probe submits nothing).
+np_lister_env_render() {
+  local args p
+  args="--network ${NETWORK} --genesis-anchor ${GENESIS_ANCHOR} --genesis-height ${GENESIS_HEIGHT}"
+  args+=" --relay-peer 127.0.0.1:${RELAY_PORT}"
+  for p in $RELAY_PEERS; do args+=" --relay-peer ${p}"; done
+  args+=" --address ${FEE_ADDRESS}"
+  cat <<EOF
+# ghost-audit list (open listing), written by install-node.sh. Root-only: it holds the RPC password.
+# Edit, then: sudo systemctl restart ghost-lister
+GHOST_AUDIT_RPC_USER=${RPC_USER}
+GHOST_AUDIT_RPC_PASSWORD=${RPCPW}
+GHOST_LISTER_ARGS=${args}
+EOF
+  if [[ "$LISTER_TABLE_DIGEST" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "GHOST_AUDIT_GENESIS_TABLE_DIGEST=${LISTER_TABLE_DIGEST}"
+  else
+    echo "# GHOST_AUDIT_GENESIS_TABLE_DIGEST=<64 hex: the network's pinned genesis table digest>"
+  fi
+  if [[ "${LISTER_EXPORT_PRESENT:-false}" == true && "$LISTER_EXPORT_DIGEST" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "GHOST_AUDIT_GENESIS_EXPORT=${NP_LISTER_EXPORT_DIR}"
+    echo "GHOST_AUDIT_EXPORT_DIGEST=${LISTER_EXPORT_DIGEST}"
+  else
+    echo "# GHOST_AUDIT_GENESIS_EXPORT=${NP_LISTER_EXPORT_DIR}"
+    echo "# GHOST_AUDIT_EXPORT_DIGEST=<64 hex: the published sha256 of ledger-export.bin>"
+  fi
+}
+# <<< NP_LISTER
 # <<< NODE_POOL_FUNCTIONS
 
 # is_core_rpc_client PATH — true only if PATH is the Ghost Core RPC client (#1028).
@@ -952,10 +1035,10 @@ UNINSTALL_ROOT="${UNINSTALL_ROOT:-}"
 NP_UNITS=(ghost-dashboard.service sri-translator.service sri-pool.service ghost-mining.service
   ghost-mining-gate.service ghostd.service ghost-auto-update.timer ghost-auto-update.service
   ghost-restart-watch.timer ghost-restart-watch.service ghost-backup.timer ghost-backup.service
-  ghost-mining-firewall.path ghost-mining-firewall.service)
+  ghost-mining-firewall.path ghost-mining-firewall.service ghost-lister.service)
 NP_UNIT_DROPINS=(ghost-dashboard.service.d ghost-mining.service.d ghost-auto-update.service.d)
 NP_DATA=(/var/lib/bitcoin /var/lib/ghost /home/ghost /etc/ghost /etc/bitcoin /var/backups/ghost
-  /var/lib/ghost-backup)
+  /var/lib/ghost-backup /var/lib/ghost-audit)
 NP_REMOVED_FILES=(/etc/sudoers.d/ghost-autoupdate /etc/sudoers.d/ghost-backup-offsite
   /etc/ghost/release-channel /etc/ghost/version /etc/ghost/auto-update.conf
   /etc/systemd/journald.conf.d/10-ghost.conf)
@@ -1014,6 +1097,7 @@ np_uninstall() {
     log "Purging the node's data"
     for d in "${NP_DATA[@]}"; do rm -rf "$r$d"; done
     if id ghost >/dev/null 2>&1; then userdel ghost >/dev/null 2>&1 || true; fi
+    if id ghost-audit >/dev/null 2>&1; then userdel ghost-audit >/dev/null 2>&1 || true; fi
     echo
     echo "  Bitcoin Ghost node removed, data included. Nothing of it is left in:"
     for d in "${NP_DATA[@]}"; do echo "    $d"; done
@@ -1034,10 +1118,11 @@ np_kept_what() {
     /var/lib/bitcoin)      echo "the chain (ghostd's data directory)";;
     /var/lib/ghost)        echo "node-pool.db (share chain and ledger), miner stats";;
     /home/ghost)           echo ".ghost/node.key (node identity), ghost-mining's database";;
-    /etc/ghost)            echo "pool.toml, pool-config.toml (SV2 key, fee address), dashboard.env, dashboard-internal-auth.env";;
+    /etc/ghost)            echo "pool.toml, pool-config.toml (SV2 key, fee address), dashboard.env, dashboard-internal-auth.env, lister.env";;
     /etc/bitcoin)          echo "bitcoin.conf (RPC password, signet challenge, peers)";;
     /var/backups/ghost)    echo "nightly database backups";;
     /var/lib/ghost-backup) echo "off-node backup key and status";;
+    /var/lib/ghost-audit)  echo "the lister's share chain, probe history and node-list.json";;
   esac
 }
 # <<< NP_UNINSTALL
@@ -1105,6 +1190,16 @@ fi
 [[ "$GENESIS_HEIGHT" =~ ^[0-9]{1,10}$ ]] || err "--genesis-height must be a block height."
 if ! [[ "$RELAY_PORT" =~ ^[0-9]{1,5}$ ]] || (( RELAY_PORT == 0 || RELAY_PORT > 65535 )); then
   err "--relay-port must be a TCP port."
+fi
+for v in LISTER_TABLE_DIGEST LISTER_EXPORT_DIGEST; do
+  [[ -z "${!v:-}" || "${!v:-}" =~ ^[0-9a-fA-F]{64}$ ]] || err "--$(echo "$v" | tr 'A-Z_' 'a-z-') must be 64 hex characters."
+done
+if [[ -n "${LISTER_GENESIS_EXPORT:-}" ]]; then
+  [[ -n "$LISTER_EXPORT_DIGEST" ]] || err "--lister-genesis-export needs --lister-export-digest."
+  [[ -f "$LISTER_GENESIS_EXPORT/ledger-export.bin" && -f "$LISTER_GENESIS_EXPORT/ledger-export.json" ]] \
+    || err "--lister-genesis-export ${LISTER_GENESIS_EXPORT} does not hold ledger-export.bin and ledger-export.json."
+  [[ "$(sha256sum "$LISTER_GENESIS_EXPORT/ledger-export.bin" | cut -d' ' -f1)" == "${LISTER_EXPORT_DIGEST,,}" ]] \
+    || err "ledger-export.bin in ${LISTER_GENESIS_EXPORT} does not hash to --lister-export-digest."
 fi
 
 # ⛔ Preflight, before anything on this machine is changed. A FAIL stops the install here.
@@ -1337,6 +1432,13 @@ else
 fi
 if [[ -n "$admin_bin" ]]; then
   install -m755 -o root -g root "$admin_bin" /opt/ghost/bin/ghost-admin
+fi
+# ghost-audit (the miner's job check, the public prober and the open-listing lister) ships in the
+# node pool release. Installed on every node, so `--lister` can be switched on later; nothing runs
+# it unless the lister is enabled.
+audit_bin="$(find . -name ghost-audit -type f | head -1)"
+if [[ -n "$audit_bin" ]]; then
+  install -m755 -o root -g root "$audit_bin" /opt/ghost/bin/ghost-audit
 fi
 # The miner-facing SV2 stratum stack ships in the SAME signed tarball. Without
 # these two binaries a node has ghost-mining's Template Distribution Protocol
@@ -4520,6 +4622,95 @@ else
   log "nightly backups disabled (--no-backups) — enable later: systemctl enable --now ghost-backup.timer"
 fi
 
+# ───────────────────────────── 10b2. open-listing lister ─────────────────────
+# Opt-in (--lister). Its user, directory, env file and unit are written on every install, so it
+# can be switched on later; it is ENABLED only with --lister (or kept enabled by a re-run) and a
+# configuration it can run on (np_lister_blocker). It needs no firewall rule: it only dials out,
+# and its node-list.json is served by ghost-mining on 8080.
+id ghost-audit >/dev/null 2>&1 || useradd -r -M -d "$NP_LISTER_DIR" -s /usr/sbin/nologin ghost-audit
+mkdir -p "$NP_LISTER_DIR"
+chown ghost-audit:ghost-audit "$NP_LISTER_DIR"
+chmod 755 "$NP_LISTER_DIR"
+# A re-run keeps the pins the last install wrote.
+[[ -n "$LISTER_TABLE_DIGEST" ]] || LISTER_TABLE_DIGEST="$(np_lister_old GHOST_AUDIT_GENESIS_TABLE_DIGEST "$NP_LISTER_ENV")"
+[[ -n "$LISTER_EXPORT_DIGEST" ]] || LISTER_EXPORT_DIGEST="$(np_lister_old GHOST_AUDIT_EXPORT_DIGEST "$NP_LISTER_ENV")"
+if [[ -n "$LISTER_GENESIS_EXPORT" ]]; then
+  # Copied where the sandboxed unit (ProtectHome) can read it; checked against its digest above.
+  mkdir -p "$NP_LISTER_EXPORT_DIR"
+  install -m644 -o ghost-audit -g ghost-audit "$LISTER_GENESIS_EXPORT/ledger-export.bin" \
+    "$LISTER_GENESIS_EXPORT/ledger-export.json" "$NP_LISTER_EXPORT_DIR/"
+fi
+LISTER_EXPORT_PRESENT=false
+[[ -f "$NP_LISTER_EXPORT_DIR/ledger-export.bin" && -f "$NP_LISTER_EXPORT_DIR/ledger-export.json" ]] && LISTER_EXPORT_PRESENT=true
+# Root-only: it holds the RPC password. systemd reads it as root before dropping to ghost-audit.
+( umask 077; np_lister_env_render > "${NP_LISTER_ENV}.tmp" )
+chown root:root "${NP_LISTER_ENV}.tmp"
+chmod 600 "${NP_LISTER_ENV}.tmp"
+mv -f "${NP_LISTER_ENV}.tmp" "$NP_LISTER_ENV"
+# Canonical copy: scripts/systemd/ghost-lister.service (scripts/check-inlined-copies.sh).
+cat > /etc/systemd/system/ghost-lister.service <<'GHOST_LISTER_SERVICE_EOF'
+[Unit]
+Description=Bitcoin Ghost open-listing lister (ghost-audit list)
+Documentation=https://bitcoinghost.org/docs.html#node-pool
+# Probes every node found in relay gossip each round and writes /var/lib/ghost-audit/node-list.json,
+# which ghost-mining serves read-only at GET /api/v1/node-pool/node-list for `ghost-audit merge`.
+# Opt-in: install-node.sh --lister. It submits no shares.
+After=network-online.target ghostd.service sri-pool.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ghost-audit
+Group=ghost-audit
+# GHOST_AUDIT_RPC_USER / GHOST_AUDIT_RPC_PASSWORD, the genesis pins and GHOST_LISTER_ARGS, written by
+# the installer. Root-only (0600): systemd reads it before dropping to ghost-audit, and never shows
+# a file's contents to other users the way it shows Environment= lines.
+EnvironmentFile=/etc/ghost/lister.env
+ExecStart=/opt/ghost/bin/ghost-audit list --data-dir /var/lib/ghost-audit --state /var/lib/ghost-audit/list-state.json --out-json /var/lib/ghost-audit/node-list.json --out-dns /var/lib/ghost-audit/pool.zone $GHOST_LISTER_ARGS
+# 0755 and umask 022: ghost-mining (user ghost) reads node-list.json to serve it.
+StateDirectory=ghost-audit
+StateDirectoryMode=0755
+UMask=0022
+Restart=on-failure
+RestartSec=60
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
+GHOST_LISTER_SERVICE_EOF
+systemctl daemon-reload >/dev/null 2>&1 || true
+# >>> NP_LISTER_ENABLE
+if [[ -z "$LISTER" ]]; then
+  if systemctl is-enabled --quiet ghost-lister.service 2>/dev/null; then LISTER=true; else LISTER=false; fi
+fi
+LISTER_STATUS="off (--lister turns it on)"
+if [[ "$LISTER" == "true" ]]; then
+  lister_why="$(np_lister_blocker)"
+  [[ -x "$NP_AUDIT_BIN" ]] || lister_why="this release ships no ghost-audit"
+  if [[ -z "$lister_why" ]]; then
+    systemctl enable ghost-lister.service >/dev/null 2>&1 || true
+    systemctl restart ghost-lister.service >/dev/null 2>&1 || log "WARNING: ghost-lister did not start: sudo journalctl -u ghost-lister -n 50"
+    LISTER_STATUS="on: node-list.json served at http://${PUBIP:-<this node>}:8080/api/v1/node-pool/node-list"
+    log "open-listing lister ENABLED (ghost-lister.service)"
+  else
+    systemctl disable --now ghost-lister.service >/dev/null 2>&1 || true
+    LISTER_STATUS="NOT started: ${lister_why}"
+    log "WARNING: --lister was given but the lister cannot run: ${lister_why}. It is installed and left off; re-run with what is missing."
+  fi
+else
+  systemctl disable --now ghost-lister.service >/dev/null 2>&1 || true
+fi
+# <<< NP_LISTER_ENABLE
+
 # ───────────────────────────── 10c. node dashboard ───────────────────────────
 # The operator dashboard (dashboard/, a Next.js standalone build) from this release, run by a
 # Node.js runtime of its own under /opt/ghost/node. Ubuntu's apt nodejs is 18 on 24.04 and the
@@ -4684,6 +4875,7 @@ cat <<EOF
      Relay:           port ${RELAY_PORT}, peers: ${RELAY_PEERS:-none yet}
      Genesis:         ${GENESIS_STATUS}
      Alerts:          ${ALERT_WEBHOOK:-DISABLED (no --alert-webhook)}
+     Lister:          ${LISTER_STATUS}
      ghostd:          $(systemctl is-active ghostd)   (initial sync — full IBD takes hours; watch: sudo journalctl -u ghostd -f)
      ghost-mining-gate: $(systemctl is-active ghost-mining-gate)  (waiting for sync, then auto-starts ghost-mining)
      ghost-mining:    $(systemctl is-active ghost-mining)  (started by the gate)
