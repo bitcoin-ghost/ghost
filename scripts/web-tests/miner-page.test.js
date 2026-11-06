@@ -186,6 +186,22 @@ test('a selected worker gets its own chart and row highlight', () => {
   assert(MP.tipHtml(st, 'balance', 287).includes('6,500'));
 });
 
+test('no worker seen while a node is down names that node instead of saying none exist', () => {
+  // The miner's own node is the one not answering: the others have never seen it.
+  const st = goodState();
+  st.miners = MP.mergeMiners([
+    { node: '203.0.113.10', ok: true, status: 200, body: minerBody('203.0.113.10', []) },
+    { node: '203.0.113.30', ok: false, status: 0, body: null }
+  ]);
+  const out = MP.renderAll(st, 640);
+  noJunk(out.workers, 'workers');
+  assert(out.workers.includes('Not answering: 203.0.113.30'), out.workers);
+  assert(!out.workers.includes('No node has seen a worker'), 'not the all-answered wording');
+  // Every node answered and none saw it: the plain wording.
+  st.miners = MP.mergeMiners([{ node: '203.0.113.10', ok: true, status: 200, body: minerBody('203.0.113.10', []) }]);
+  assert(MP.renderAll(st, 640).workers.includes('No node has seen a worker'));
+});
+
 test('a failed API shows unavailable everywhere and invents nothing', () => {
   const st = {
     query: MP.parseQuery('?address=' + ADDR),

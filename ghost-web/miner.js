@@ -411,6 +411,12 @@
       return '<div class="mpc-empty">Worker details are unavailable: no node answered.</div>';
     }
     if (!M.workers.length) {
+      // A node that did not answer may be the very one the miner is connected to: then "no
+      // node has seen a worker" would be false.
+      if (M.failed.length) {
+        return '<div class="mpc-empty">No answering node has seen a worker for this address in the last 30 days. ' +
+          'Not answering: ' + esc(M.failed.join(', ')) + '. If your miner is connected there, its workers are missing from this page until it answers.</div>';
+      }
       return '<div class="mpc-empty">No node has seen a worker for this address in the last 30 days. Workers appear here within a minute of their first share.</div>';
     }
     var rows = M.workers.map(function (w) {
