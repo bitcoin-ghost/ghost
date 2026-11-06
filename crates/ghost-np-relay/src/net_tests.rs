@@ -29,7 +29,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use ghost_common::anchor_chain::ShareId;
-use ghost_common::share_commit::batch_root;
+use ghost_common::node_pool_constants::ANCHOR_TIER_OFFSET;
+use ghost_common::share_commit::{batch_root, hash_meets_tier};
 use ghost_storage::Database;
 
 use crate::headers::HeaderOracle;
@@ -99,8 +100,14 @@ impl TestNode {
     /// A share on this node's latest job, through its local queue. Returns its id.
     async fn mine(&mut self, btc: &Btc, anchor: bool) -> ShareId {
         let job = self.job.lock().unwrap().expect("published");
-        let tier = if anchor { 18 } else { 10 };
-        let s = self.miner.build(job, &genesis_table(), btc.tip, tier);
+        let tier = if anchor { 10 + ANCHOR_TIER_OFFSET } else { 10 };
+        let mut s = self.miner.build(job, &genesis_table(), btc.tip, tier);
+        // A network share that happens to meet the anchor tier IS an anchor (about 1 in 256), on
+        // whatever batch its job carried: mine again, as `Miner::mine` does, or the test's single
+        // anchor is not the one it mines on purpose.
+        while !anchor && hash_meets_tier(&s.id(), base(), 10 + ANCHOR_TIER_OFFSET) {
+            s = self.miner.build(job, &genesis_table(), btc.tip, tier);
+        }
         let id = s.id();
         self.handle.local.send(s).await.unwrap();
         id
