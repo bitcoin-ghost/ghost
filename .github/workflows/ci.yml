@@ -218,6 +218,10 @@ jobs:
       # when getHosts fails or returns nothing. No real API call.
       - name: Namecheap DNS hook self-test
         run: python3 -I scripts/dns-hooks/test_namecheap_hook.py
+      # The website's API proxy, against fake nodes on loopback: listed hosts and read routes
+      # only, GET only, path tricks refused, oversized, slow and redirecting nodes cut off.
+      - name: Website API proxy self-test
+        run: python3 -I scripts/website-proxy/test_ghost_site_proxy.py
       # Fuzz targets depend on internal APIs and rot silently when a signature changes.
       # One had been importing a module that no longer existed, unnoticed, because no job
       # built them (#468). Build only — running the fuzzers belongs in a scheduled job.

@@ -1,19 +1,15 @@
 #!/usr/bin/env node
-// The website as the browser proof serves it: ghost-web/ as static files, plus the two API paths
-// the pages read, both forwarded to live node pool nodes.
+// The website as the browser proof serves it: ghost-web/ as static files, as nginx serves the real
+// site, plus the paths nginx hands to the website's API proxy, handed to a running one.
 //
 //   /node-list.json            the merged list (`ghost-audit merge` output), from --node-list
-//   /api/pool/<host>/<path>    the per-node proxy miner.js asks: forwarded to that host's API port
-//                              ONLY if <host> is listed in the current node list and <path> is
-//                              one of the node pool's read routes (the rule PORTING_NOTES sets
-//                              for the real website's proxy); anything else is 404
-//   /api/v1/<path>             the same-origin API index.html and pool.html read: one node's
-//
-// A node's API port comes from --api-port-map (host=port,...): on a real network it is 8080 on
-// every host; on a regtest run every node is on loopback with a port of its own.
+//   /api/pool/<host>/<path>    the per-node proxy miner.js asks, and
+//   /api/v1/node-pool/status   the status tiles' same-origin status: both passed, method, path and
+//                              query as received and nothing else, to --api-proxy, which is
+//                              scripts/website-proxy/ghost-site-proxy.py (the rules live there)
 //
 //   node site-server.mjs --root ghost-web --port 43900 --node-list merged.json \
-//        --api-port-map 127.0.0.10=43010,127.0.0.11=43110 --same-origin-api http://127.0.0.1:43010
+//        --api-proxy http://127.0.0.1:43902
 //
 // No packages. Logs one line per request to stdout.
 import http from "node:http";
@@ -24,50 +20,41 @@ function args() {
   const a = {};
   const v = process.argv.slice(2);
   for (let i = 0; i < v.length; i += 2) a[v[i].replace(/^--/, "")] = v[i + 1];
-  for (const k of ["root", "port", "node-list", "api-port-map", "same-origin-api"])
+  for (const k of ["root", "port", "node-list", "api-proxy"])
     if (!a[k]) throw new Error(`missing --${k}`);
   return a;
 }
 
 const A = args();
 const ROOT = path.resolve(A.root);
-const PORTS = Object.fromEntries(
-  A["api-port-map"].split(",").filter(Boolean).map((kv) => kv.split("=")),
-);
+const PROXY = new URL(A["api-proxy"]);
 const TYPES = {
   ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8", ".json": "application/json", ".png": "image/png",
   ".svg": "image/svg+xml", ".md": "text/markdown; charset=utf-8", ".txt": "text/plain",
   ".xml": "application/xml", ".ico": "image/x-icon", ".sh": "text/plain",
 };
-// The read routes a miner page may ask a listed node for.
-const ALLOWED = [
-  /^\/api\/v1\/ledger\/[A-Za-z0-9]{1,100}$/,
-  /^\/api\/v1\/miner\/[A-Za-z0-9]{1,100}$/,
-  /^\/api\/v1\/miner\/[A-Za-z0-9]{1,100}\/history$/,
-  /^\/api\/v1\/node-pool\/status$/,
-];
 
-function listedHosts() {
-  try {
-    const l = JSON.parse(fs.readFileSync(A["node-list"], "utf8"));
-    return new Set((l.nodes || []).map((n) => n.host));
-  } catch {
-    return new Set();
-  }
-}
-
-function forward(res, target) {
-  const req = http.get(target, { timeout: 10_000 }, (up) => {
-    res.writeHead(up.statusCode, { "content-type": up.headers["content-type"] || "application/json" });
-    up.pipe(res);
-  });
-  req.on("timeout", () => req.destroy(new Error("timeout")));
-  req.on("error", (e) => {
+// As the nginx locations do: the raw path and query, the method, no viewer header, no body.
+function toProxy(req, res) {
+  const up = http.request(
+    { host: PROXY.hostname, port: PROXY.port, method: req.method, path: req.url, timeout: 20_000,
+      headers: { host: "bitcoinghost.test" } },
+    (r) => {
+      const h = { "content-type": r.headers["content-type"] || "application/json" };
+      if (r.headers["x-ghost-node"]) h["x-ghost-node"] = r.headers["x-ghost-node"];
+      if (r.headers.allow) h.allow = r.headers.allow;
+      res.writeHead(r.statusCode, h);
+      r.pipe(res);
+    },
+  );
+  up.on("timeout", () => up.destroy(new Error("timeout")));
+  up.on("error", (e) => {
     if (res.headersSent) return res.end();
     res.writeHead(502, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: `node did not answer: ${e.message}` }));
+    res.end(JSON.stringify({ error: `the API proxy did not answer: ${e.message}` }));
   });
+  up.end();
 }
 
 function notFound(res) {
@@ -80,6 +67,8 @@ http
     const u = new URL(req.url, "http://x");
     const log = () => console.log(`${new Date().toISOString()} ${req.method} ${req.url} ${res.statusCode}`);
     res.on("finish", log);
+    if (u.pathname.startsWith("/api/pool/") || u.pathname === "/api/v1/node-pool/status")
+      return toProxy(req, res);
     if (req.method !== "GET" && req.method !== "HEAD") return notFound(res);
     if (u.pathname === "/node-list.json") {
       fs.readFile(A["node-list"], (e, b) => {
@@ -89,18 +78,7 @@ http
       });
       return;
     }
-    const m = u.pathname.match(/^\/api\/pool\/([0-9A-Fa-f:.]{2,45})(\/.*)$/);
-    if (m) {
-      const [, host, rest] = m;
-      if (!listedHosts().has(host) || !PORTS[host] || !ALLOWED.some((r) => r.test(rest)))
-        return notFound(res);
-      const h = host.includes(":") ? `[${host}]` : host;
-      return forward(res, `http://${h}:${PORTS[host]}${rest}${u.search}`);
-    }
-    if (u.pathname.startsWith("/api/")) {
-      if (!ALLOWED.some((r) => r.test(u.pathname))) return notFound(res);
-      return forward(res, `${A["same-origin-api"]}${u.pathname}${u.search}`);
-    }
+    if (u.pathname.startsWith("/api/")) return notFound(res);
     let p = path.normalize(path.join(ROOT, decodeURIComponent(u.pathname)));
     if (!p.startsWith(ROOT)) return notFound(res);
     if (fs.existsSync(p) && fs.statSync(p).isDirectory()) p = path.join(p, "index.html");

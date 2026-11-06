@@ -435,10 +435,16 @@ Readings chosen where the spec was silent; written into spec 2.2, "Share-chain s
   set of listers, majority of the configured ones, pushed to Namecheap by a hook (built 11-06 on
   `feat/node-pool-lister`). Which listers are configured is still the operators' call: the merge
   makes one lister's claim insufficient, not the configured set trustless.
-- **The website's `/api/pool/<host>/` proxy.** `miner.js` now asks the hosts in `node-list.json`
-  through it (it used to name vm1-vm4 of the old fleet). The proxy lives on the website server,
-  outside this repo, and must forward only to hosts listed in the current `node-list.json` (and
-  only to the node's public API port), or it is an open proxy. Not built here.
+- **The website's `/api/pool/<host>/` proxy.** `miner.js` asks the hosts in `node-list.json`
+  through it (it used to name vm1-vm4 of the old fleet). BUILT 11-06 (`feat/node-pool-site-cleanup`):
+  `scripts/website-proxy/ghost-site-proxy.py` (standard-library Python, run by
+  `scripts/systemd/ghost-site-proxy.service` behind the nginx locations in
+  `scripts/website-proxy/nginx-site-proxy.conf`) forwards only GETs of the pages' read routes,
+  only to IP-literal hosts in the current `node-list.json` (re-read on change, fail closed), only
+  to the fixed API port, with a deadline, a size cap, no redirects and no viewer headers or
+  cookies; it also serves the same-origin `/api/v1/node-pool/status` the status tiles read (the
+  first listed node that answers, cached 10 s). Deploying it on the website host is the
+  operators' call.
 - **Listing over SV2 only.** A node serving only SV2 is never listed, since the probe speaks SV1.
 - **`ghost-audit` over SV2.** Only SV1 is audited. pool_sv2 builds one coinbase per extended
   channel either way, but a hostile node could serve SV2 miners differently; an SV2 client (Noise

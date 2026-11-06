@@ -119,6 +119,8 @@ Setting it up on the website host:
 3. Try it: `sudo -u ghost-merge /opt/ghost/bin/namecheap-hook.py --dry-run /var/lib/ghost-merge/pool.zone` after one `ghost-audit merge` run without `--dns-hook`.
 4. Install `scripts/systemd/ghost-node-list-merge.service` and `.timer` and `sudo systemctl enable --now ghost-node-list-merge.timer`. Serve `/var/lib/ghost-merge/node-list.json` as `/node-list.json` (nginx: `location = /node-list.json { alias /var/lib/ghost-merge/node-list.json; add_header Cache-Control no-store; }`).
 
+5. Install the website's API proxy, which lets the miner page ask the listed nodes and the status tiles read one: copy `scripts/website-proxy/ghost-site-proxy.py` to `/opt/ghost/bin/ghost-site-proxy`, install `scripts/systemd/ghost-site-proxy.service` and `sudo systemctl enable --now ghost-site-proxy`, and add the two locations in `scripts/website-proxy/nginx-site-proxy.conf` to the site's nginx server block. It forwards only `GET`s of the pages' read routes (`/api/v1/ledger/…`, `/api/v1/miner/…`, its `/history`, `/api/v1/node-pool/status`), only to hosts in the current `node-list.json` (re-read whenever it changes; a list it cannot read lists nobody), only to their API port 8080, with an 8-second deadline, a 4 MiB answer cap, no redirect followed and nothing of the viewer's request (headers, cookies) passed on.
+
 Another provider needs only another hook: a program that takes the fragment's path, reads its own credentials, and exits 0 once the records are published.
 
 ## Pointing a miner

@@ -5,7 +5,7 @@
 //
 //   node proof.mjs --serve <work>/serve.json --dashboard http://127.0.0.1:43901 \
 //        --password <dashboard password> --site http://127.0.0.1:43900 --shots <dir> \
-//        [--playwright <dir holding node_modules/playwright>]
+//        --node-list <the site's node-list.json> [--playwright <dir holding node_modules/playwright>]
 //
 // Every page, at 1280 px and at 390 px, in the light and the dark theme:
 //   - no console error, no uncaught exception, no failed request, no HTTP error answer (except
@@ -17,16 +17,20 @@
 //   - a full-page screenshot.
 // Then the numbers: balances, payouts, blocks (subsidy, miners, treasury base and change,
 // finder surplus, against the coinbase on the Bitcoin node), expected wait, the pool's block
-// interval and worker hashrate, each as the page shows it against the API.
+// interval and worker hashrate, each as the page shows it against the API; the status tiles'
+// pool hashrate and total owed, the same on every node. And the website's API proxy
+// (scripts/website-proxy/ghost-site-proxy.py, behind the site): listed hosts and read routes only,
+// GET only, path tricks refused, a node dropped from the list refused at once.
 // The miners are paused (SIGSTOP) while the numbers are read, so the chain holds still, and
 // resumed at the end. Exit 1 on any failure; a JSON report is written beside the screenshots.
 import fs from "node:fs";
+import http from "node:http";
 import path from "node:path";
 import { createRequire } from "node:module";
 
 const A = {};
 for (let i = 2; i < process.argv.length; i += 2) A[process.argv[i].replace(/^--/, "")] = process.argv[i + 1];
-for (const k of ["serve", "dashboard", "password", "site", "shots"]) if (!A[k]) throw new Error(`missing --${k}`);
+for (const k of ["serve", "dashboard", "password", "site", "shots", "node-list"]) if (!A[k]) throw new Error(`missing --${k}`);
 const require = createRequire(path.join(path.resolve(A.playwright || "."), "noop.js"));
 const { chromium } = require("playwright");
 
@@ -126,7 +130,31 @@ const W = {
     return (v === 0 ? "0" : v.toFixed(v < 10 ? 2 : v < 100 ? 1 : 0)) + units[i];
   },
 };
+// ghost-web/node-pool.js (the status tiles)
+const T = {
+  hashrate(hs) {
+    if (!Number.isFinite(hs) || hs <= 0) return "0H/s";
+    for (const [f, u] of [[1e18, "EH/s"], [1e15, "PH/s"], [1e12, "TH/s"], [1e9, "GH/s"], [1e6, "MH/s"], [1e3, "kH/s"]])
+      if (hs >= f) return `${(hs / f).toFixed(2)}${u}`;
+    return `${hs.toFixed(0)}H/s`;
+  },
+};
 const squash = (s) => s.replace(/\s+/g, "");
+
+// A request to the site exactly as written (fetch would normalise `..` away), no body.
+function rawRequest(method, p) {
+  const u = new URL(A.site);
+  return new Promise((resolve) => {
+    const r = http.request({ host: u.hostname, port: u.port, method, path: p, timeout: 30_000 }, (res) => {
+      let b = "";
+      res.on("data", (c) => (b += c));
+      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body: b }));
+    });
+    r.on("timeout", () => r.destroy(new Error("timeout")));
+    r.on("error", (e) => resolve({ status: 0, headers: {}, body: String(e) }));
+    r.end();
+  });
+}
 const bestRate = (r) => { for (const k of ["1h", "15m", "24h"]) if (Number.isFinite(r?.[k])) return r[k]; return null; };
 
 // ---------------------------------------------------------------- the browser
@@ -319,6 +347,21 @@ async function main() {
       }
     }
     pass("api", `ledger for ${addresses.length} addresses identical on ${nodes.length} nodes`);
+    // The pool-wide figures of the status: every node gives the same.
+    for (const n of nodes.slice(1)) {
+      const s = (await api(n, "/api/v1/node-pool/status")).body;
+      if (JSON.stringify(s?.total_owed) !== JSON.stringify(status.total_owed))
+        fail("api", `node${n.index} total_owed ${JSON.stringify(s?.total_owed)} != node0 ${JSON.stringify(status.total_owed)}`);
+      if (JSON.stringify(s?.pool_hashrate) !== JSON.stringify(status.pool_hashrate))
+        fail("api", `node${n.index} pool_hashrate ${JSON.stringify(s?.pool_hashrate)} != node0 ${JSON.stringify(status.pool_hashrate)}`);
+    }
+    if (!status.total_owed || !status.pool_hashrate) fail("api", "the status lacks total_owed or pool_hashrate");
+    else if (!Number.isFinite(status.pool_hashrate.hashes_per_sec) || status.pool_hashrate.credited_shares <= 0)
+      fail("api", `pool hashrate not measured on a pool with credited work: ${JSON.stringify(status.pool_hashrate)}`);
+    else pass("api", `total owed ${status.total_owed.sats} sats and pool hashrate ${D.hashrate(status.pool_hashrate.hashes_per_sec)} (${status.pool_hashrate.credited_shares} credited shares) identical on ${nodes.length} nodes`);
+    // Total owed is every balance summed: the ledgers of the addresses mining are part of it.
+    const ownSum = addresses.reduce((x, a) => x + BigInt(ledgers[a].balance.units), 0n);
+    if (BigInt(status.total_owed?.units ?? -1) < ownSum) fail("api", `total owed ${status.total_owed?.units} units is less than the mining addresses' ${ownSum}`);
 
     // Blocks: the API against the coinbase on the Bitcoin node, and the run's preconditions.
     const blocks = status.recent_blocks;
@@ -472,19 +515,28 @@ async function main() {
         if ((p === "/pool.html" || p === "/index.html") && vp.name === "desktop" && theme === "dark") {
           // The status tiles, read after the miners were paused: the chain holds still.
           const v = await page.$$eval("[data-np-field]", (els) => Object.fromEntries(els.map((e) => [e.getAttribute("data-np-field"), e.innerText.replace(/\s+/g, " ").trim()])));
+          // Pool-wide figures against node0's; this node's own (peers, miners) against the status
+          // the page was given, which is whichever listed node the proxy asked first.
+          const own = r.json["/api/v1/node-pool/status"];
+          if (!own) fail(label, "the page did not get /api/v1/node-pool/status through the proxy");
           const want = {
             tip_height: en(status.share_chain.anchor_height),
             btc_height: en(status.settlement.bitcoin_tip),
             network_tier: en(status.share_chain.t_net),
-            peers: en(status.peers),
-            miners: en(status.miners.length),
+            peers: own ? en(own.peers) : undefined,
+            miners: own ? en(own.miners.length) : undefined,
             blocks_found: status.pool_blocks_found === undefined ? undefined : en(status.pool_blocks_found),
+            hashrate: T.hashrate(status.pool_hashrate.hashes_per_sec),
+            owed_sats: `${en(status.total_owed.sats)}sats`,
           };
           for (const [k, t] of Object.entries(v)) {
             if (t === "unavailable") fail(label, `tile ${k} shows unavailable`);
-            else if (t === "—") GAPS.push(`${label}: tile ${k} reads "—": the status API does not report it`);
+            else if (t === "—") fail(label, `tile ${k} reads "—": the status API does not report it`);
+            else if (k === "hashrate" || k === "owed_sats") expectKv(label, `tile ${k}`, squash(t), want[k]);
             else if (want[k] !== undefined) expectKv(label, `tile ${k}`, t, want[k]);
           }
+          for (const k of p === "/index.html" || p === "/" ? ["hashrate", "owed_sats"] : ["hashrate", "owed_sats", "peers", "miners"])
+            if (!(k in v)) fail(label, `no ${k} tile`);
         }
         if (p === "/endpoints.html" && vp.name === "desktop" && theme === "dark") {
           const rows = await page.$$eval("#np-list-body tr", (trs) => trs.length);
@@ -571,6 +623,53 @@ async function main() {
         if (!squash(await spage.$eval("#mp-tiles", (e) => e.innerText)).includes(W.sats(l.balance.sats))) fail(label, `balance ${W.sats(l.balance.sats)} not shown`);
       }
       await ctx.close();
+    }
+
+    // ---------------- the website's API proxy, end to end through the site
+    console.log("== website API proxy");
+    {
+      const listedHosts = listed.nodes.map((n) => n.host);
+      const h0 = listedHosts[0];
+      const ok = await rawRequest("GET", `/api/pool/${h0}/api/v1/node-pool/status`);
+      if (ok.status !== 200 || ok.headers["x-ghost-node"] !== h0 || JSON.parse(ok.body).network !== "regtest")
+        fail("site proxy", `a listed host's status: HTTP ${ok.status}, node ${ok.headers["x-ghost-node"]}`);
+      else pass("site proxy", `a listed host (${h0}) is forwarded`);
+      const same = await rawRequest("GET", "/api/v1/node-pool/status");
+      if (same.status !== 200 || !listedHosts.includes(same.headers["x-ghost-node"]))
+        fail("site proxy", `same-origin status: HTTP ${same.status}, node ${same.headers["x-ghost-node"]}`);
+      else pass("site proxy", `same-origin status answered by listed node ${same.headers["x-ghost-node"]}`);
+      const refused = [
+        ["GET", "/api/pool/127.0.0.99/api/v1/node-pool/status", 404, "an unlisted host"],
+        ["GET", `/api/pool/${h0}:22/api/v1/node-pool/status`, 404, "a port in the host"],
+        ["GET", `/api/pool/${h0}/api/v1/node-pool/node-list`, 404, "a route the pages do not read"],
+        ["GET", `/api/pool/${h0}/api/internal/config/update`, 404, "an internal route"],
+        ["GET", `/api/pool/${h0}/api/v1/ledger/../../api/internal/config`, 404, "path traversal"],
+        ["GET", `/api/pool/${h0}/api/v1/ledger/%2e%2e%2f%2e%2e%2fapi%2finternal`, 404, "encoded path traversal"],
+        ["GET", `/api/pool/${h0}/api/v1/miner/${addresses[0]}/history?window=1y`, 404, "a query the pages do not send"],
+        ["POST", `/api/pool/${h0}/api/v1/node-pool/status`, 405, "a POST"],
+        ["DELETE", "/api/v1/node-pool/status", 405, "a DELETE"],
+      ];
+      for (const [m, p, want, what] of refused) {
+        const r = await rawRequest(m, p);
+        if (r.status !== want) fail("site proxy", `${what} (${m} ${p}) answered ${r.status}, not ${want}`);
+        else pass("site proxy", `${what} refused with ${want}`);
+      }
+      // A node dropped from the list is refused on the next request, and is back when relisted.
+      const original = fs.readFileSync(A["node-list"]);
+      const dropped = JSON.parse(original);
+      const gone = dropped.nodes.pop().host;
+      fs.writeFileSync(`${A["node-list"]}.tmp`, JSON.stringify(dropped));
+      fs.renameSync(`${A["node-list"]}.tmp`, A["node-list"]);
+      try {
+        const r = await rawRequest("GET", `/api/pool/${gone}/api/v1/node-pool/status`);
+        if (r.status !== 404) fail("site proxy", `a host dropped from the list answered ${r.status}, not 404`);
+        else pass("site proxy", `a host dropped from the list (${gone}) is refused at once`);
+      } finally {
+        fs.writeFileSync(`${A["node-list"]}.tmp`, original);
+        fs.renameSync(`${A["node-list"]}.tmp`, A["node-list"]);
+      }
+      const back = await rawRequest("GET", `/api/pool/${gone}/api/v1/node-pool/status`);
+      if (back.status !== 200) fail("site proxy", `a relisted host answered ${back.status}`);
     }
 
     // ---------------- failure behaviour

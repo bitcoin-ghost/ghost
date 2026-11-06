@@ -13,9 +13,10 @@
 # 2. Open listing as on the real network: a `ghost-audit list` lister per node, writing the list
 #    that node's ghost-mining serves at /api/v1/node-pool/node-list, then `ghost-audit merge`
 #    over the three over HTTP: the merged list is the website's /node-list.json.
-# 3. The website (site-server.mjs: ghost-web/ plus the per-node proxy, forwarding only to listed
-#    hosts) and the dashboard's standalone build (laid out as the release bundle), pointed at
-#    node0.
+# 3. The website: site-server.mjs serves ghost-web/ and hands /api/pool/<host>/... and
+#    /api/v1/node-pool/status to the website's API proxy (scripts/website-proxy/ghost-site-proxy.py,
+#    forwarding only to listed hosts), as nginx does on the real site. And the dashboard's
+#    standalone build (laid out as the release bundle), pointed at node0.
 # 4. proof.mjs drives every page in headless Chromium (Playwright, pinned) and checks it against
 #    the API. Screenshots and report.json go to DIR/shots.
 #
@@ -130,9 +131,13 @@ sleep 5
 # -- the website and the dashboard
 port_map="$(q '",".join(n["ip"] + "=" + str(n["http"]) for n in d["nodes"])')"
 node0_api="http://127.0.0.1:$(q 'd["nodes"][0]["http"]')"
-site_port=$((base + 900)) dash_port=$((base + 901))
+site_port=$((base + 900)) dash_port=$((base + 901)) proxy_port=$((base + 902))
+# The proxy as deployed, but on loopback nodes: --allow-private, and each node's own API port.
+python3 -I "$repo/scripts/website-proxy/ghost-site-proxy.py" --listen "127.0.0.1:$proxy_port" \
+  --node-list "$work/node-list.json" --api-port-map "$port_map" --allow-private > "$work/site-proxy.log" 2>&1 &
+pids+=($!)
 node "$here/site-server.mjs" --root "$repo/ghost-web" --port "$site_port" --node-list "$work/node-list.json" \
-  --api-port-map "$port_map" --same-origin-api "$node0_api" > "$work/site.log" 2>&1 &
+  --api-proxy "http://127.0.0.1:$proxy_port" > "$work/site.log" 2>&1 &
 pids+=($!)
 # Built every run, so the pages proven are the tree's (an old .next would prove an old dashboard).
 [[ -d "$repo/dashboard/node_modules" ]] || ( cd "$repo/dashboard" && npm ci --no-audit --no-fund )
@@ -152,5 +157,6 @@ done
 # -- the browser
 status=0
 node "$here/proof.mjs" --serve "$serve_json" --dashboard "http://127.0.0.1:$dash_port" --password "$password" \
-  --site "http://127.0.0.1:$site_port" --shots "$work/shots" --playwright "$work/pw" || status=$?
+  --site "http://127.0.0.1:$site_port" --shots "$work/shots" --playwright "$work/pw" \
+  --node-list "$work/node-list.json" || status=$?
 exit "$status"
