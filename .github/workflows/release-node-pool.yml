@@ -260,7 +260,7 @@ jobs:
           # Copy binaries (check actual names from target directory)
           # ghost-audit is the miner's tool (W2.9): it ships in the archive for miners to run and
           # is never rolled onto a node (scripts/release.sh FLEET_BINARIES).
-          for bin in ghost-mining ghost-admin translator_sv2 pool_sv2 ghost-audit ghost-light-wallet ghost-light-wallet-tui; do
+          for bin in ghost-mining ghost-admin translator_sv2 pool_sv2 ghost-audit; do
             if [ -f "target/${{ matrix.target }}/release/${bin}${{ matrix.suffix }}" ]; then
               cp "target/${{ matrix.target }}/release/${bin}${{ matrix.suffix }}" dist/
             fi

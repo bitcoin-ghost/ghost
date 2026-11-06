@@ -2334,54 +2334,7 @@ impl Database {
     // =========================================================================
 }
 
-// =============================================================================
-// TREASURY STATE QUERIES
-// =============================================================================
-
-impl Database {}
-
-// =============================================================================
-// CAPABILITY VERIFICATION CHALLENGES
-// =============================================================================
-
-impl Database {}
-
 impl Database {
-    // =========================================================================
-    // UNIQUE CHALLENGER COUNT QUERIES (C-2 Sybil Prevention)
-    // =========================================================================
-
-    // =========================================================================
-    // PER-CHALLENGER MAJORITY QUERIES (anti-griefing for liveness probes)
-    //
-    // CONSENSUS SECURITY: Stratum and GhostPay are liveness checks with NO
-    // chain ground truth, so a stored verdict cannot be re-derived the way
-    // Archive/Policy now are. A colluding minority that is merely >5% of a
-    // target's challengers could otherwise sign `passed=0` and drag an honest
-    // node under the per-challenge percentage gate to deny its rewards.
-    //
-    // These queries collapse the verdict to ONE VOTE PER DISTINCT CHALLENGER:
-    // each challenger's vote is the majority of THAT challenger's own results,
-    // then we count how many distinct challengers voted pass vs total. The
-    // caller (`get_qualified_capabilities_with_rates`) then requires a STRICT
-    // majority of distinct challengers. This makes a <50% colluding minority
-    // unable to grief OR inflate, and is flood-resistant: a single challenger
-    // spamming thousands of rows still contributes exactly one vote.
-    // =========================================================================
-
-    // =========================================================================
-    // DETERMINISTIC QUALIFICATION over the converged verification_ledger (v42)
-    //
-    // These read ONLY the reconciled ledger over a bounded, cutoff-anchored
-    // window `[since, until]`, so every node that has converged its ledger
-    // computes identical tallies for the same (target, window) — the
-    // foundation for an independently-verifiable node-reward split. They mirror
-    // the live `*_challenges` gate semantics: archive/policy use a per-row pass
-    // rate (their verdicts are re-derived at ingest), stratum/ghostpay use a
-    // per-distinct-challenger majority. `capability` is one of
-    // "archive"/"policy"/"stratum"/"ghostpay" (see `CapabilityType::as_str`).
-    // =========================================================================
-
     /// Record an uptime sample for a node
     pub fn record_uptime_sample(
         &self,
@@ -3465,10 +3418,6 @@ mod tests {
         let fetched = db.get_round(1).expect("Failed to get round");
         assert!(fetched.is_some());
     }
-
-    // =========================================================================
-    // PER-CHALLENGER MAJORITY (anti-griefing for stratum / ghostpay)
-    // =========================================================================
 
     // ---- v56: the archive/live split, through the public API --------------------------------
 

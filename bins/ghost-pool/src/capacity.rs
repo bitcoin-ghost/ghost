@@ -14,7 +14,7 @@
 //!
 //! The operator's `network.max_miners` becomes a *ceiling* — they can throttle
 //! their own node DOWN below the calculated cap (e.g. they're co-locating
-//! ghost-pay on the same box and need headroom) but they can't exceed it.
+//! other services on the same box and need headroom) but they can't exceed it.
 //! The advertised capacity is `min(calculated, operator_declared)`.
 
 use serde::Serialize;

@@ -817,7 +817,7 @@ impl BitcoinNetwork {
 
 /// TLS configuration for HTTP servers
 ///
-/// Controls HTTPS for the verification (8080), Ghost Pay (8800), and GSP (8900) servers.
+/// Controls HTTPS for the verification server (8080).
 ///
 /// If neither `cert_path` nor `key_path` is set, a self-signed certificate is
 /// automatically generated at startup. For mainnet, operator-provided certificates
@@ -909,7 +909,7 @@ pub struct NetworkConfig {
     /// Retired key, see `retired_p2p`: the old mesh's Noise encryption switch.
     #[serde(default, skip_serializing, rename = "noise_enabled")]
     pub retired_noise_enabled: Option<IgnoredAny>,
-    /// TLS configuration for HTTP servers (verification, Ghost Pay, GSP)
+    /// TLS configuration for the verification HTTP server
     ///
     /// When configured with cert/key paths, HTTPS is enabled for all HTTP servers.
     /// When not configured, a self-signed certificate is auto-generated.
@@ -1838,10 +1838,9 @@ impl BackupSchedule {
 ///   `Vec::is_empty` serializes away when written as `[]` and would be reported. Writing an empty list is equivalent to omitting
 ///   it, so this is harmless, but it is the one shape that can produce a spurious name.
 ///
-/// ⛔ I nearly documented a false-positive class that does not exist, from a grep that matched a
-/// DIFFERENT struct's `http_port` and a neighbouring attribute. `ghost_pay.http_port` is genuinely
-/// ignored — `GhostPayConfig` has no such field. **Confirm against the struct, not against a grep,
-/// before believing either this function or a claim that it is wrong.**
+/// ⛔ Confirm a reported key against the struct, not against a grep, before believing either this
+/// function or a claim that it is wrong: a grep that matches a DIFFERENT struct's field of the same
+/// name nearly produced a false-positive class that does not exist.
 pub fn ignored_config_keys(raw: &str) -> Result<Vec<String>, String> {
     fn walk(v: &toml::Value, prefix: &str, out: &mut std::collections::BTreeSet<String>) {
         if let Some(t) = v.as_table() {

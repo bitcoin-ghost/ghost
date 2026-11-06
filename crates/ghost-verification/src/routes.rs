@@ -3082,23 +3082,6 @@ async fn api_watchdog_status_handler(
         })
     };
 
-    // Check GSP (Ghost Service Protocol) status for light wallet support
-    let gsp_status = if let Some(gsp_info) = state.get_gsp_info() {
-        serde_json::json!({
-            "status": "running",
-            "protocol_version": gsp_info.protocol_version,
-            "network": gsp_info.network,
-            "connections": gsp_info.connections,
-            "sync_status": gsp_info.sync_status,
-            "registered_wallets": gsp_info.registered_wallets
-        })
-    } else {
-        serde_json::json!({
-            "status": "not_enabled",
-            "message": "GSP light wallet server not configured"
-        })
-    };
-
     // Build services list for dashboard compatibility
     let services_list = vec![
         serde_json::json!({
@@ -3110,11 +3093,6 @@ async fn api_watchdog_status_handler(
             "name": "ghost-core",
             "status": ghost_core_status.get("status").and_then(|s| s.as_str()).unwrap_or("unknown"),
             "details": ghost_core_status
-        }),
-        serde_json::json!({
-            "name": "gsp",
-            "status": gsp_status.get("status").and_then(|s| s.as_str()).unwrap_or("not_enabled"),
-            "details": gsp_status
         }),
     ];
 
@@ -7715,7 +7693,7 @@ struct LogsQuery {
 /// event into the buffer so each entry carries the real structured message,
 /// target and level, with no host log daemon or elevated privileges required.
 ///
-/// Any other allowlisted binary (ghostd / ghost-pay / dashboard / SV2 stack) is
+/// Any other allowlisted binary (ghostd / dashboard / SV2 stack) is
 /// read from the systemd journal via `crate::journal`. The client sends only a
 /// LOGICAL key, which is resolved through a strict compile-time allowlist to a
 /// hard-coded unit string; `journalctl` is then exec'd with an explicit argv, so
@@ -8294,7 +8272,7 @@ async fn api_swarm_update_all_post_handler(
 /// pre-#1018 name is served rather than refused, and systemd is only ever asked for the
 /// current one.
 const WATCHDOG_ALLOWED_SERVICES: &[&str] =
-    &[crate::journal::NODE_SERVICE, "ghost-core", "ghost-pay"];
+    &[crate::journal::NODE_SERVICE, "ghost-core"];
 
 /// Watchdog service control: start
 async fn api_watchdog_start_handler(

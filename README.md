@@ -25,7 +25,6 @@ No separate token, no altcoin — it settles in Bitcoin.
 |-----------|------|-------------|
 | `ghostd` (Ghost Core) | `ghost-core/` | A fork of Bitcoin Core v30 running on Bitcoin mainnet, with Reaper mempool filtering and Ghost Haze block stripping. Separate C++/CMake build. |
 | `ghost-mining` | `bins/ghost-pool/` | Pool node: block templates for pool_sv2, round statistics and the operator API. |
-| Light wallet | `bins/ghost-cli/`, `crates/ghost-light-wallet/` | CLI/TUI wallet with BIP-352 Silent Payments. |
 | SV2 mining apps | `bins/translator-sv2/`, `bins/pool-sv2/` | Stratum V2 translator and pool, amalgamated in-tree. pool_sv2 builds every job's canonical coinbase and runs the node pool share-chain relay. |
 
 The workspace contains over 40 crates and binaries under `crates/` and `bins/`.
@@ -45,8 +44,8 @@ website for the full crate map, or browse the source directly.
                   └─────┬─────┘  └─────┬─────┘  └─────┬─────┘
                      ghostd         ghostd         ghostd
                         │              │              │
-                   Your miners    Their miners    Light wallets
-                  (Stratum V1)   (Stratum V1)    (CLI / TUI)
+                   Your miners    Their miners    Their miners
+                  (Stratum V1)   (Stratum V1)    (Stratum V1)
 ```
 
 Every node is a peer. Miners connect to whichever node they choose. Nodes agree
@@ -63,7 +62,6 @@ mempool policy.
 | 34255 | Stratum V2 — via SRI pool |
 | 8566 | Node pool share-chain relay |
 | 8080 | REST API |
-| 8900 | GSP WebSocket (light-wallet backend) |
 
 ## Running a node
 
@@ -110,7 +108,7 @@ Requirements:
 ```sh
 git clone https://github.com/bitcoin-ghost/ghost.git
 cd ghost
-cargo build --release            # builds the Rust workspace (ghost-mining, wallets, ...)
+cargo build --release            # builds the Rust workspace (ghost-mining, pool_sv2, ...)
 ```
 
 `ghost-core` has its own build; see [`ghost-core/INSTALL.md`](ghost-core/INSTALL.md).

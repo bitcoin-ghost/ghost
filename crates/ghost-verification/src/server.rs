@@ -1181,8 +1181,6 @@ pub struct VerificationState {
     /// silently claiming health. Defaulting an unwired probe to `true` is precisely the bug this
     /// replaces.
     get_core_health: Option<Box<dyn Fn() -> (bool, u64) + Send + Sync>>,
-    /// GSP (Ghost Service Protocol) handler for light wallets
-    gsp_handler: Option<Box<dyn GspHandler + Send + Sync>>,
     /// Database for queries (optional)
     pub database: Option<Database>,
     /// Memo for `GET /api/v1/pool/records`, keyed by window name.
@@ -1333,34 +1331,6 @@ pub struct VerificationState {
     pub alert_dispatcher: std::sync::OnceLock<Arc<crate::alerts::AlertDispatcher>>,
 }
 
-/// GSP (Ghost Service Protocol) handler trait for light wallet support
-pub trait GspHandler: Send + Sync {
-    /// Check if GSP is enabled
-    fn is_enabled(&self) -> bool;
-    /// Get GSP protocol version
-    fn get_protocol_version(&self) -> String;
-    /// Get network name (mainnet, signet, regtest, etc.)
-    fn get_network(&self) -> String;
-    /// Get current connection count
-    fn get_connection_count(&self) -> u32;
-    /// Get number of registered wallets
-    fn get_registered_wallets(&self) -> u32;
-    /// Get sync status
-    fn get_sync_status(&self) -> String;
-    /// Perform health check
-    fn health_check(&self) -> GhostResult<bool>;
-}
-
-/// GSP status info for watchdog
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct GspInfo {
-    pub protocol_version: String,
-    pub network: String,
-    pub connections: u32,
-    pub sync_status: String,
-    pub registered_wallets: u32,
-}
-
 /// How many recently-admitted share hashes ingest remembers, for replay rejection (H-13).
 ///
 /// See `VerificationState::recent_share_hashes` for the sizing argument.
@@ -1469,7 +1439,6 @@ impl VerificationState {
             get_round_id: Box::new(|| 0),
             get_miner_count: Box::new(|| 0),
             get_core_health: None,
-            gsp_handler: None,
             database: None,
             rpc: None,
             dashboard_config: parking_lot::RwLock::new(dashboard_config),
@@ -2301,32 +2270,6 @@ impl VerificationState {
     /// callback has been wired up (older deploys without the provider).
     pub fn round_elapsed_secs(&self) -> Option<u64> {
         self.get_round_elapsed_secs.as_ref().map(|f| f())
-    }
-
-    /// Set GSP handler for light wallet support
-    pub fn with_gsp_handler(mut self, handler: impl GspHandler + 'static) -> Self {
-        self.gsp_handler = Some(Box::new(handler));
-        self
-    }
-
-    /// Check if GSP is enabled
-    pub fn gsp_enabled(&self) -> bool {
-        self.gsp_handler
-            .as_ref()
-            .map(|h| h.is_enabled())
-            .unwrap_or(false)
-    }
-
-    /// Get GSP info for watchdog
-    pub fn get_gsp_info(&self) -> Option<GspInfo> {
-        let handler = self.gsp_handler.as_ref()?;
-        Some(GspInfo {
-            protocol_version: handler.get_protocol_version(),
-            network: handler.get_network(),
-            connections: handler.get_connection_count(),
-            sync_status: handler.get_sync_status(),
-            registered_wallets: handler.get_registered_wallets(),
-        })
     }
 
     /// Set the publicly-advertised stratum host (IP or DNS name) the API reports to miners.

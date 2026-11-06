@@ -51,7 +51,7 @@ use ghost_common::zmq::{ZmqConfig, ZmqSubscriber};
 use ghost_policy::PolicyProfile;
 use ghost_reaper::ReaperConfig;
 use ghost_storage::Database;
-use ghost_verification::{start_server, start_server_on, GspHandler, VerificationState};
+use ghost_verification::{start_server, start_server_on, VerificationState};
 
 use ghost_pool::capacity;
 use ghost_pool::reorg::{ReorgConfig, ReorgHandler};
@@ -72,106 +72,6 @@ const LOCAL_HASHRATE_WINDOW_SECS: i64 = 600;
 /// Using OnceLock ensures the subscriber lives for the program lifetime
 /// without leaking, and can be properly dropped on program exit.
 static ZMQ_SUBSCRIBER: OnceLock<ZmqSubscriber> = OnceLock::new();
-
-/// GSP handler that caches status from periodic HTTP polls to the GSP service
-struct CachedGspHandler {
-    cache: Arc<parking_lot::RwLock<GspCachedState>>,
-}
-
-#[derive(Default)]
-struct GspCachedState {
-    enabled: bool,
-    protocol_version: String,
-    network: String,
-    connections: u32,
-    registered_wallets: u32,
-    sync_status: String,
-}
-
-impl CachedGspHandler {
-    fn new(gsp_url: String) -> Self {
-        let cache = Arc::new(parking_lot::RwLock::new(GspCachedState::default()));
-        let poll_cache = Arc::clone(&cache);
-
-        // C-04: Validate GSP URL is a loopback address to prevent MITM on health checks
-        let is_loopback = is_loopback_url(&gsp_url);
-
-        if !is_loopback {
-            tracing::warn!(
-                url = %gsp_url,
-                "C-04: GSP URL is not a loopback address — TLS verification enforced. \
-                 Use 127.0.0.1 or localhost for local GSP connections."
-            );
-        }
-
-        // Background task polls GSP info every 30s
-        tokio::spawn(async move {
-            let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5));
-            // H-4: No TLS cert bypass — loopback should use plain HTTP, not HTTPS with invalid certs
-            let client = client;
-            let client = client.build().unwrap_or_default();
-            loop {
-                match client.get(format!("{}/api/v1/info", gsp_url)).send().await {
-                    Ok(resp) if resp.status().is_success() => {
-                        if let Ok(info) = resp.json::<serde_json::Value>().await {
-                            let mut state = poll_cache.write();
-                            state.enabled = true;
-                            state.protocol_version = info
-                                .get("protocol_version")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown")
-                                .to_string();
-                            state.network = info
-                                .get("network")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown")
-                                .to_string();
-                            state.connections =
-                                info.get("connections")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0) as u32;
-                            state.sync_status = info
-                                .get("sync_status")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown")
-                                .to_string();
-                        }
-                    }
-                    _ => {
-                        poll_cache.write().enabled = false;
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            }
-        });
-
-        Self { cache }
-    }
-}
-
-impl GspHandler for CachedGspHandler {
-    fn is_enabled(&self) -> bool {
-        self.cache.read().enabled
-    }
-    fn get_protocol_version(&self) -> String {
-        self.cache.read().protocol_version.clone()
-    }
-    fn get_network(&self) -> String {
-        self.cache.read().network.clone()
-    }
-    fn get_connection_count(&self) -> u32 {
-        self.cache.read().connections
-    }
-    fn get_registered_wallets(&self) -> u32 {
-        self.cache.read().registered_wallets
-    }
-    fn get_sync_status(&self) -> String {
-        self.cache.read().sync_status.clone()
-    }
-    fn health_check(&self) -> ghost_common::GhostResult<bool> {
-        Ok(self.cache.read().enabled)
-    }
-}
 
 /// What a node should report as its own hashrate, given a query outcome.
 ///
@@ -1025,10 +925,6 @@ async fn main() -> Result<()> {
     verification_state = verification_state.with_reaper_stats(move || {
         serde_json::to_value(reaper_stats_for_api.snapshot()).unwrap_or(serde_json::Value::Null)
     });
-
-    // Wire GSP handler if GSP service URL is configured or default (port 8900)
-    let gsp_handler = CachedGspHandler::new("https://127.0.0.1:8900".to_string());
-    verification_state = verification_state.with_gsp_handler(gsp_handler);
 
     // Pass database and RPC to verification state for API endpoints
     verification_state = verification_state.with_database((*db).clone());
@@ -2484,11 +2380,6 @@ fn parse_log_level(s: &str) -> Level {
     }
 }
 
-/// Check if a URL points to a loopback address
-fn is_loopback_url(url: &str) -> bool {
-    url.contains("127.0.0.1") || url.contains("localhost") || url.contains("[::1]")
-}
-
 /// Resolve the effective signer configuration from config and defaults
 fn resolve_signer_path(
     config_signer: &Option<SignerConfig>,
@@ -2749,33 +2640,6 @@ mod tests {
         let f =
             build_log_filter("info", Some("ghost_pool::round=debug,!!!nonsense!!!")).to_string();
         assert!(f.contains("ghost_pool::round=debug"), "got {f:?}");
-    }
-
-    // ── is_loopback_url ──────────────────────────────────────────────
-
-    #[test]
-    fn is_loopback_url_127() {
-        assert!(is_loopback_url("http://127.0.0.1:8800/api"));
-    }
-
-    #[test]
-    fn is_loopback_url_localhost() {
-        assert!(is_loopback_url("http://localhost:8800"));
-    }
-
-    #[test]
-    fn is_loopback_url_ipv6() {
-        assert!(is_loopback_url("http://[::1]:8800"));
-    }
-
-    #[test]
-    fn is_loopback_url_external_ip() {
-        assert!(!is_loopback_url("http://10.0.0.1:8800"));
-    }
-
-    #[test]
-    fn is_loopback_url_external_domain() {
-        assert!(!is_loopback_url("http://example.com:8800"));
     }
 
     // ── resolve_signer_path ──────────────────────────────────────────

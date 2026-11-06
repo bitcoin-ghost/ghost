@@ -33,7 +33,6 @@ members = [
     "crates/ghost-accounting",
     "crates/ghost-verification",
     "crates/ghost-np-relay",
-    # GSP
     # Node Binaries
     "bins/ghost-pool",
     "bins/ghost-stats",
@@ -79,7 +78,6 @@ ghost-accounting = { path = "crates/ghost-accounting" }
 ghost-mining = { path = "bins/ghost-pool" }
 ghost-verification = { path = "crates/ghost-verification" }
 ghost-np-relay = { path = "crates/ghost-np-relay" }
-# GSP crates
 # Async runtime
 tokio = { version = "1.36", features = ["full"] }
 

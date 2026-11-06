@@ -4,11 +4,7 @@
 //! Run with: cargo test --test integration e2e
 //!
 //! Test Categories:
-//! - GSP protocol messages
 //! - BUDS classification
-//!
-//! Note: Light wallet tests require the ghost-light-wallet binary crate.
-//! For real network tests, use the signet test scripts.
 
 // ============================================================================
 // BUDS Classification E2E Tests
