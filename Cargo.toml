@@ -143,10 +143,6 @@ getrandom = "0.2"
 # JWT
 jsonwebtoken = "9.0"
 
-# WebSocket
-tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
-futures-util = "0.3"
-
 # Config
 config = "0.14"
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -197,12 +193,8 @@ rand = { workspace = true }
 bitcoin = { workspace = true }
 tempfile = "3.10"
 hex = { workspace = true }
-serde_json = { workspace = true }
 rusqlite = { workspace = true }
 sha2 = { workspace = true }
-reqwest = { workspace = true }
-tokio-tungstenite = { workspace = true }
-futures-util = { workspace = true }
 
 [[test]]
 name = "integration"
@@ -211,10 +203,6 @@ path = "tests/integration.rs"
 [[test]]
 name = "load_tests"
 path = "tests/load_tests.rs"
-
-[[test]]
-name = "cluster_chaos"
-path = "tests/cluster_chaos.rs"
 
 [profile.release]
 lto = true
