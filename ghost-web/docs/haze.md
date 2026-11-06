@@ -139,12 +139,7 @@ Three separate things would each be enough to prevent it:
 
 Measured, not assumed: two hazed regtest nodes, one with 120 blocks, the other connected to it.
 Headers transfer fine — the second node learns the whole chain. **Zero blocks transfer, and the
-second node stays at height 0.** (`test/hazync/hazed-to-hazed.sh`.)
-
-**Fast sync is a different mechanism entirely.** A node adopts a proven UTXO set at some height and
-validates forward from there, downloading nothing below it — see [Hazync sync](#hazync). Stripped
-blocks moving between hazed nodes are *history*, filling in economic data for a chain the receiver
-already holds, and a proof is what licenses trusting it.
+second node stays at height 0.**
 
 ## Reorgs, restarts, and the limits of stripped storage
 

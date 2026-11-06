@@ -164,9 +164,7 @@ const THEMES = ["light", "dark"];
 // What a regtest harness node does not run, unlike an installed node: the mempool explorer's
 // backend behind /mempool-app/api, and the installer's off-site backup helper behind
 // /api/backup-offsite (/opt/ghost/bin/ghost-backup-offsite). Their failures are not the page's.
-// The website's Hazync page reads the Hazync coordinator's board (/hazync/api/), a separate
-// service the site's host proxies to.
-const ENV_MISSING = ["/mempool-app/api/", "/api/backup-offsite", "/hazync/api/"];
+const ENV_MISSING = ["/mempool-app/api/", "/api/backup-offsite"];
 // The website's live regions: status tiles, the node list, the miner page's sections.
 // The miner page's "next payment" tile shows a bare "unknown" when the API says the wait is not
 // known; the reason is its sub-line and the queue section's sentence.
@@ -455,7 +453,7 @@ async function main() {
 
     // ---------------- website
     const sitePages = ["/", "/index.html", "/pool.html", "/endpoints.html", "/nodes.html", "/miners.html", "/downloads.html",
-      "/security.html", "/hazync.html", "/docs/", "/miner.html", "/no-such-page"];
+      "/security.html", "/docs/", "/miner.html", "/no-such-page"];
     const docs = fs.readdirSync(path.join(path.dirname(new URL(import.meta.url).pathname), "../../ghost-web/docs")).filter((f) => f.endsWith(".md"));
     const listed = JSON.parse(await (await fetch(`${A.site}/node-list.json`)).text());
     const linkChecked = new Set();
