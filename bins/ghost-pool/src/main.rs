@@ -955,6 +955,14 @@ async fn main() -> Result<()> {
     // Report the node's real configured chain on the status/info endpoints
     // (dashboard + wallets) instead of the historical hardcoded "signet".
     verification_state = verification_state.with_network(config.bitcoin.network);
+    // Where pool_sv2 serves the node pool API and where the lister writes its node list, when
+    // the config moves them off the installer's defaults (validated loopback above).
+    if let Some(api) = config.pool.node_pool_api.clone() {
+        verification_state = verification_state.with_node_pool_api(api);
+    }
+    if let Some(path) = config.pool.node_list_path.clone() {
+        verification_state = verification_state.with_node_list_path(path);
+    }
     // H-13: the webhook ingest judges every share by its committed tier and requires its 80-byte
     // header; pool_sv2 sends both on every share.
     verification_state = verification_state

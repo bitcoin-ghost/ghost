@@ -521,6 +521,18 @@ impl NodeConfig {
             }
         }
 
+        if let Some(url) = &self.pool.node_pool_api {
+            if !is_loopback_http_base(url) {
+                result.add_error(
+                    "pool.node_pool_api",
+                    &format!(
+                        "node_pool_api must be http://<loopback address>:<port> (pool_sv2's \
+                         monitoring_address), got {url:?}"
+                    ),
+                );
+            }
+        }
+
         // Max miners validation
         if self.network.max_miners == 0 {
             result.add_warning("network.max_miners", "Set to 0 - no miners can connect");
@@ -1994,6 +2006,48 @@ pub struct PoolConfig {
     /// existing pool.toml files parse unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_refresh_secs: Option<u64>,
+
+    /// Where the colocated pool_sv2 serves the node pool API (its `monitoring_address`), as
+    /// `http://<loopback address>:<port>`. ghost-mining forwards `/api/v1/ledger/{address}`,
+    /// `/api/v1/node-pool/status` and `/api/v1/miner/{address}` there. `None` is the
+    /// installer's `http://127.0.0.1:9090`. Only loopback is accepted: the monitoring listener
+    /// is local by design, and the forwarder must never be pointed at another host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_pool_api: Option<String>,
+
+    /// Where this node's open-listing lister writes `node-list.json`, served read-only at
+    /// `GET /api/v1/node-pool/node-list`. `None` is the installer's
+    /// `/var/lib/ghost-audit/node-list.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_list_path: Option<PathBuf>,
+}
+
+/// Whether `url` is `http://<loopback IP or localhost>:<port>` with nothing after the port but an
+/// optional `/`: the only shape [`PoolConfig::node_pool_api`] accepts.
+pub fn is_loopback_http_base(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.strip_suffix('/').unwrap_or(rest);
+    if authority.contains('/') || authority.contains('@') {
+        return false;
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, p),
+        None => return false,
+    };
+    if port.is_empty() || port.parse::<u16>().map_or(true, |p| p == 0) {
+        return false;
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
 }
 
 impl PoolConfig {
@@ -2021,6 +2075,8 @@ impl Default for PoolConfig {
             retired_genesis_password: None,
             block_priority: BlockPriority::default(),
             template_refresh_secs: None,
+            node_pool_api: None,
+            node_list_path: None,
         }
     }
 }
@@ -2652,6 +2708,72 @@ mod tests {
             .errors
             .iter()
             .any(|e| e.field == "identity.signer" && e.message.contains("KMS")));
+    }
+
+    #[test]
+    fn node_pool_api_accepts_only_a_loopback_http_base() {
+        for ok in [
+            "http://127.0.0.1:9090",
+            "http://127.0.0.1:9090/",
+            "http://127.0.0.12:43021",
+            "http://localhost:9090",
+            "http://[::1]:9090",
+        ] {
+            assert!(is_loopback_http_base(ok), "{ok} should be accepted");
+        }
+        for bad in [
+            "https://127.0.0.1:9090",
+            "http://10.0.0.1:9090",
+            "http://example.org:9090",
+            "http://127.0.0.1",
+            "http://127.0.0.1:0",
+            "http://127.0.0.1:9090/api",
+            "http://user@127.0.0.1:9090",
+            "http://127.0.0.1.example.org:9090",
+            "127.0.0.1:9090",
+        ] {
+            assert!(!is_loopback_http_base(bad), "{bad} should be refused");
+        }
+    }
+
+    #[test]
+    fn node_pool_api_off_loopback_fails_validation() {
+        let mut config = NodeConfig::default();
+        assert!(!config
+            .validate()
+            .errors
+            .iter()
+            .any(|e| e.field == "pool.node_pool_api"));
+        config.pool.node_pool_api = Some("http://127.0.0.1:43021".into());
+        assert!(!config
+            .validate()
+            .errors
+            .iter()
+            .any(|e| e.field == "pool.node_pool_api"));
+        config.pool.node_pool_api = Some("http://192.0.2.7:9090".into());
+        assert!(config
+            .validate()
+            .errors
+            .iter()
+            .any(|e| e.field == "pool.node_pool_api"));
+    }
+
+    #[test]
+    fn node_pool_keys_parse_from_pool_toml() {
+        let pool: PoolConfig = toml::from_str(
+            "node_pool_api = \"http://127.0.0.1:43021\"\nnode_list_path = \"/srv/l/node-list.json\"\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            pool.node_pool_api.as_deref(),
+            Some("http://127.0.0.1:43021")
+        );
+        assert_eq!(
+            pool.node_list_path.as_deref(),
+            Some(std::path::Path::new("/srv/l/node-list.json"))
+        );
+        let none: PoolConfig = toml::from_str("").expect("parses");
+        assert!(none.node_pool_api.is_none() && none.node_list_path.is_none());
     }
 
     #[test]
