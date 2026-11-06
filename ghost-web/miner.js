@@ -1,7 +1,8 @@
 /* Bitcoin Ghost: the miner page (miner.html).
  *
- * Which nodes: the listed ones in /node-list.json, written by `ghost-audit list` (open listing,
- * W2.10). A node is addressed by its listed host, through the website's per-node proxy
+ * Which nodes: the listed ones in /node-list.json, the merged list `ghost-audit merge` writes from
+ * several listers' `ghost-audit list` output (open listing, W2.10): a node is in it only when a
+ * majority of the listers list it. A node is addressed by its listed host, through the website's per-node proxy
  * (/api/pool/<host>/...), which must forward only to hosts in that file. With no listed node
  * the page says so; it never falls back to a fixed list.
  *

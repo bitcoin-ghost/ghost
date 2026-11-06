@@ -234,6 +234,22 @@ test('the nodes asked come from node-list.json, never a fixed list', () => {
   assert(!/\bvm[1-8]\b/.test(src), 'miner.js names no old-fleet node');
 });
 
+test('a merged node list (ghost-audit merge) is read like a lister\'s', () => {
+  // The shape `ghost-audit merge` writes: the lister's fields plus `votes` and a `merge` object.
+  const merged = {
+    schema: 'ghost-audit/node-list/v1', network: 'mainnet', listed: 2, candidates: 3,
+    nodes: [
+      { relay: '203.0.113.20:8566', host: '203.0.113.20', sv1: 'stratum+tcp://203.0.113.20:3333', votes: 2 },
+      { relay: '[2a01:4f8::1]:8566', host: '2a01:4f8::1', sv1: 'stratum+tcp://[2a01:4f8::1]:3333', votes: 3 }
+    ],
+    merge: { configured: 3, voting: 3, threshold: 2, sources: [] }
+  };
+  assert.deepStrictEqual(MP.nodesFromList(merged), ['203.0.113.20', '2a01:4f8::1']);
+  // A merge with no quorum writes nothing, so the page never sees an empty merged list from an
+  // outage; a merged list that lists nobody means nobody.
+  assert.deepStrictEqual(MP.nodesFromList(Object.assign({}, merged, { nodes: [], listed: 0 })), []);
+});
+
 test('with no node listed the page says so and asks nobody', () => {
   const out = MP.renderAll({ query: MP.parseQuery('?address=' + ADDR), noNodes: true, ledger: null, miners: null, history: null, now: NOW }, 640);
   for (const k of ['header', 'workers', 'hashrate', 'shares', 'balance', 'queue', 'payouts']) {
