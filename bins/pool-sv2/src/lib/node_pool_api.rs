@@ -24,7 +24,8 @@
 //!   (W2.14) it also carries this node's id, the relay's counters since start (`relay_stats`),
 //!   and its retention (`retention`: the checkpoint depth, whether it prunes, and the stored
 //!   checkpoints without their folded state). For the website's tiles it carries the pool's
-//!   hashrate estimated from credited share work (`pool_hashrate`, see [`PoolHashrateView`]) and
+//!   hashrate estimated from credited share work (`pool_hashrate`, see
+//!   [`PoolHashrateView`](crate::node_pool_api::PoolHashrateView)) and
 //!   the sum of every balance (`total_owed`).
 
 use std::{collections::HashSet, future::Future, pin::Pin, str::FromStr, sync::Arc};
