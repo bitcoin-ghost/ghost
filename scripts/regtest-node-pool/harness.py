@@ -1313,6 +1313,17 @@ def main():
                     help="signet soak: how long a stalled miner stays silent (past its no-share "
                          "timeout at the soak pace)")
     args = ap.parse_args()
+    try:
+        lo, hi = map(int, open("/proc/sys/net/ipv4/ip_local_port_range").read().split())
+        # Nodes take base+i*100 .. base+i*100+99; hostile and late nodes come after the rest.
+        top = args.base_port + 1000
+        if args.base_port <= hi and top >= lo:
+            print(f"WARNING: ports {args.base_port}-{top} overlap the kernel's ephemeral range "
+                  f"{lo}-{hi}: any other process's outgoing connection can take one first and a "
+                  f"bind then fails with 'Address already in use'. Use a base port below {lo - 1000}.",
+                  flush=True)
+    except (OSError, ValueError):
+        pass
     signet = args.network == "signet"
     if args.nodes is None:
         args.nodes = 4 if signet else 3

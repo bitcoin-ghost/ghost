@@ -690,11 +690,17 @@ def past_halving(h):
         alive = n.procs["pool_sv2"].alive()
         ok &= alive and not m
         ev.append(f"node{n.i}: pool_sv2 alive={alive}; " + (m.group(0)[-200:] if m else "no subsidy error"))
-    blocks = [b for b in h.pool_blocks(n0) if b[0] >= 150]
+    # The hostile scenarios run first and can reach past 150: their blocks are wrong on purpose
+    # and judged there, so this check covers only the honest nodes' blocks.
+    hostile_hashes = STATE.get("hostile_hashes", set())
+    every = [b for b in h.pool_blocks(n0) if b[0] >= 150]
+    blocks = [b for b in every if b[1] not in hostile_hashes]
+    skipped = sorted(b[0] for b in every if b[1] in hostile_hashes)
     payees = ({m[2] for n in h.nodes for m in n.miners} | {payee("node0/sv2-device", True)[1]}
               | set(h.genesis))
     fees = {n.fee_script for n in h.nodes}
-    ev.append(f"pool blocks at 150 or above: {len(blocks)} (heights {[b[0] for b in blocks]})")
+    ev.append(f"honest pool blocks at 150 or above: {len(blocks)} (heights {[b[0] for b in blocks]})"
+              + (f"; hostile blocks left to the hostile scenarios: heights {skipped}" if skipped else ""))
     ok &= bool(blocks)
     for height_, bh, vouts in blocks:
         errs = check_coinbase(height_, vouts, payees, fees)
