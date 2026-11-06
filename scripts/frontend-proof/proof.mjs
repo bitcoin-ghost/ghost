@@ -173,7 +173,7 @@ const SITE_VALUES = ["[data-np-field]", "#np-list-status", "#np-list-body", "#np
 // Every other page in the dashboard's sidebar (dashboard/src/components/layout/Sidebar.tsx).
 const OTHER_DASHBOARD_PAGES = ["/home", "/sync", "/block-template", "/mempool", "/network", "/shroud",
   "/ghost-mode", "/filtering", "/filtering/basic", "/filtering/advanced", "/storage", "/haze", "/address",
-  "/zero-sync", "/system", "/swarm", "/connect", "/watchdog", "/logs", "/settings"];
+  "/zero-sync", "/system", "/swarm", "/watchdog", "/logs", "/settings"];
 
 async function newContext(browser, vp, theme) {
   const ctx = await browser.newContext({

@@ -122,7 +122,8 @@ Settings, Alerts.
 
 The Bitcoin node, privacy, transaction filtering, storage and system pages are unchanged. Pages
 for elders, capabilities, checkpoints, votes, node rewards, Wraith, Ghost Pay, Tap and L2 are
-gone, as are the old mesh's pool, geo, capacity and peers pages.
+gone, as are the old mesh's pool, geo, capacity and peers pages, and the Connect Wallet page
+(GhostTap and light-wallet pairing): Ghost Pay and Ghost Tap are obsolete.
 
 :::info Honest readings
 Where the node does not report a value, the dashboard says **unknown**; where a call fails, it says

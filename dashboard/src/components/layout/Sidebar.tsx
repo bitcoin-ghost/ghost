@@ -21,7 +21,6 @@ import {
   Globe,
   HeartPulse,
   ScrollText,
-  Smartphone,
   HardDrive,
   Search,
   Cpu,
@@ -112,7 +111,6 @@ const GROUPS: NavGroup[] = [
     items: [
       { href: "/system", label: "System", icon: <Cpu {...ICON} /> },
       { href: "/swarm", label: "Swarm", icon: <NetworkIcon {...ICON} /> },
-      { href: "/connect", label: "Connect Wallet", icon: <Smartphone {...ICON} /> },
       { href: "/watchdog", label: "Watchdog", icon: <HeartPulse {...ICON} /> },
       { href: "/logs", label: "Logs", icon: <ScrollText {...ICON} /> },
       { href: "/settings", label: "Settings", icon: <Settings {...ICON} /> },
