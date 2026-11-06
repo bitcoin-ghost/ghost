@@ -4,6 +4,7 @@ import type { NodePoolLedger, NodePoolMiner, NodePoolStatus } from "@/lib/api/no
 import {
   bestRate,
   errorText,
+  fmtAmountSats,
   fmtHashrate,
   fmtInt,
   fmtSats,
@@ -129,7 +130,7 @@ export function MinersView({ status, statusError, statusLoading, ledgers, miners
                       (d) => `${fmtInt(d.summary.shares_24h.accepted)} / ${fmtInt(d.summary.shares_24h.stale)} / ${fmtInt(d.summary.shares_24h.rejected)}`,
                     )}
                   </Td>
-                  <Td>{cell(l, (d) => (d.known ? fmtSats(d.balance.sats) : "no balance yet"))}</Td>
+                  <Td>{cell(l, (d) => (d.known ? fmtAmountSats(d.balance) : "no balance yet"))}</Td>
                   <Td>{cell(l, queueText)}</Td>
                   <Td>{cell(m, (d) => waitLabel(d.expected_wait))}</Td>
                 </tr>

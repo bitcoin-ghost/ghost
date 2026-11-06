@@ -3,6 +3,7 @@ import type { NodePoolLedger, NodePoolMiner } from "@/lib/api/nodePool";
 import {
   bestRate,
   fmtAgo,
+  fmtAmountSats,
   fmtDuration,
   fmtHashrate,
   fmtInt,
@@ -48,18 +49,18 @@ function LedgerCard({ ledger, ledgerError }: { ledger?: NodePoolLedger; ledgerEr
         </p>
       ) : null}
       <Grid>
-        <Kv label="Balance owed" value={fmtSats(ledger.balance.sats)} hint={`${ledger.balance.units} units of 2^-32 sat`} />
+        <Kv label="Balance owed" value={fmtAmountSats(ledger.balance)} hint={`${ledger.balance.units} units of 2^-32 sat`} />
         <Kv label="Queued since height" value={ledger.queue_since != null ? fmtInt(ledger.queue_since) : "not queued (below the floor)"} />
         {ledger.genesis ? (
           <Kv
             label="Carried over at the cutover"
-            value={fmtSats(ledger.genesis.owed.sats)}
+            value={fmtAmountSats(ledger.genesis.owed)}
             hint={`at height ${fmtInt(ledger.genesis.export_height)}; included in the balance owed`}
           />
         ) : null}
         <Kv label="Minimum payout" value={fmtSats(ledger.min_payout_sats)} />
         <Kv label="Next block height" value={fmtInt(q?.next_block_height)} />
-        <Kv label="Owed on the next block's table" value={q ? fmtSats(q.owed.sats) : UNKNOWN} />
+        <Kv label="Owed on the next block's table" value={q ? fmtAmountSats(q.owed) : UNKNOWN} />
         <Kv label="Eligible" value={q ? (q.eligible ? "yes" : "no") : UNKNOWN} />
         <Kv label="Oldest-queue rank" value={q ? (q.age_rank != null ? `#${q.age_rank}` : q.is_top ? "top balance (paid last)" : "not ranked") : UNKNOWN} />
         <Kv label="Size rank" value={q ? (q.size_rank != null ? `#${q.size_rank}` : "not ranked") : UNKNOWN} />
@@ -211,7 +212,7 @@ export function MinerDetailView({ address, ledger, ledgerError, miner, minerErro
                 <Td mono>{shortHash(s.anchor, 6)}</Td>
                 <Td>{fmtInt(s.job_height)}</Td>
                 <Td>{s.credited_tier}</Td>
-                <Td>{fmtSats(s.credit.sats)}</Td>
+                <Td>{fmtAmountSats(s.credit)}</Td>
                 <Td>{fmtAgo(s.received_at, now)}</Td>
               </tr>
             ))}

@@ -4,7 +4,7 @@
   "script_hex": "0014aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "known": true,
   "message": null,
-  "balance": { "units": "27494408335681", "sats": 6501 },
+  "balance": { "units": "27923905065281", "sats": 6501 },
   "genesis": {
     "owed": { "units": "2147483648000", "sats": 500 },
     "export_height": 850,
@@ -17,7 +17,7 @@
     "next_block_height": 1000,
     "snapshot_height": 980,
     "parent_anchor": "abababababababababababababababababababababababababababababababab",
-    "owed": { "units": "27494408335681", "sats": 6501 },
+    "owed": { "units": "27923905065281", "sats": 6501 },
     "eligible": true,
     "eligible_count": 3,
     "is_top": false,
@@ -36,7 +36,7 @@
       "anchor_btc_height": 900,
       "job_height": 901,
       "credited_tier": 10,
-      "credit": { "units": "38654828349", "sats": 9000 },
+      "credit": { "units": "38654828349", "sats": 9 },
       "received_at": 1799990000
     }
   ],
