@@ -3,10 +3,10 @@ import { Card, CardHeader } from "@/components/ui/Card";
 import type { NodePoolStatus } from "@/lib/api/nodePool";
 import type { NodeStatus } from "@/types/api";
 import {
+  fmtAmountSats,
   fmtDuration,
   fmtHashrate,
   fmtInt,
-  fmtSats,
   groupByAddress,
   isNum,
   nodePoolHealth,
@@ -139,7 +139,7 @@ export function OverviewView({ status, statusError, statusLoading, node, nodeErr
           />
           <Kv
             label="Total owed to miners"
-            value={fmtSats(status?.total_owed?.sats)}
+            value={fmtAmountSats(status?.total_owed)}
             hint="every balance on the ledger summed: carried over at the cutover, plus credits, minus payouts"
           />
           <Kv label="Pool blocks listed" value={fmtInt(status?.recent_blocks.length)} />

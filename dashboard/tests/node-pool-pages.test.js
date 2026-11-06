@@ -118,6 +118,28 @@ test("overview: a hashrate the node cannot measure says why; an older pool_sv2's
   assert.match(t, /Total owed to miners unknown/);
 });
 
+test("overview: total owed comes from the exact units, not the i64 sats that saturate", () => {
+  need();
+  const status = fixture("node-pool-status.json");
+  // 2^96 units = 2^64 sats, past i64::MAX: pool_sv2's `sats` saturates at i64::MAX there (which
+  // a JS number cannot even hold exactly: it reads as 2^63).
+  status.total_owed = { units: "79228162514264337593543950336", sats: 9223372036854775807 };
+  let t = text(html(views.OverviewView, { status }));
+  assert.match(t, /Total owed to miners 18,446,744,073,709,551,616 sats/);
+  // Whole sats rounded down, as the API's own `sats`: 30,500.81 sats shows as 30,500.
+  status.total_owed = { units: "131000000000000", sats: 0 };
+  t = text(html(views.OverviewView, { status }));
+  assert.match(t, /Total owed to miners 30,500 sats/);
+  // Rounded down below zero too (a ledger that has paid out more than it credited).
+  status.total_owed = { units: "-1", sats: -1 };
+  t = text(html(views.OverviewView, { status }));
+  assert.match(t, /Total owed to miners -1 sats/);
+  // No usable units: the API's sats, as before.
+  status.total_owed = { units: "not a number", sats: 12 };
+  t = text(html(views.OverviewView, { status }));
+  assert.match(t, /Total owed to miners 12 sats/);
+});
+
 test("overview: pool-wide figures an older pool_sv2 does not send read unknown; none credited says so", () => {
   need();
   const status = fixture("node-pool-status.json");

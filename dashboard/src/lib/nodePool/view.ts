@@ -25,6 +25,24 @@ export function fmtSats(v: number | null | undefined): string {
   return isNum(v) ? `${v.toLocaleString("en-US")} sats` : UNKNOWN;
 }
 
+/** Units of 2^-32 sat per whole sat. */
+const UNITS_PER_SAT = 4294967296;
+
+/** An amount pool_sv2 reports as `{ units, sats }`, in whole sats rounded down, from `units`.
+ *  `units` is the exact ledger value (a decimal string); `sats` is an i64 that saturates on a
+ *  ledger that large, so it is used only when `units` is missing or not an integer. */
+export function fmtAmountSats(a: { units?: string | null; sats?: number | null } | null | undefined): string {
+  const units = a?.units;
+  if (typeof units === "string" && /^-?\d+$/.test(units)) {
+    const u = BigInt(units);
+    const per = BigInt(UNITS_PER_SAT);
+    let q = u / per; // truncates toward zero
+    if (u < BigInt(0) && q * per !== u) q -= BigInt(1);
+    return `${q.toLocaleString("en-US")} sats`;
+  }
+  return fmtSats(a?.sats);
+}
+
 export function fmtBtc(v: number | null | undefined): string {
   return isNum(v) ? `${(v / 1e8).toFixed(8)} BTC` : UNKNOWN;
 }
