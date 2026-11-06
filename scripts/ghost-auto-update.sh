@@ -571,7 +571,7 @@ main() {
   # 5. Unpack the verified tarball and locate the binaries it carries (ghostd is
   #    now bundled in the tarball, so it is covered by the checks above).
   tar -xzf "$tmp/$tarball" -C "$tmp"
-  local new_pool new_pay new_cli new_admin new_ghostd new_pool_sv2 new_translator
+  local new_pool new_pay new_cli new_admin new_ghostd new_pool_sv2 new_translator new_audit
   new_pool="$(find "$tmp" -name ghost-mining -type f | head -1 || true)"
   new_pay="$(find "$tmp" -name ghost-pay -type f | head -1 || true)"
   new_cli="$(find "$tmp" -name ghost-cli -type f | head -1 || true)"
@@ -579,6 +579,7 @@ main() {
   new_ghostd="$(find "$tmp" -name ghostd -type f | head -1 || true)"
   new_pool_sv2="$(find "$tmp" -name pool_sv2 -type f | head -1 || true)"
   new_translator="$(find "$tmp" -name translator_sv2 -type f | head -1 || true)"
+  new_audit="$(find "$tmp" -name ghost-audit -type f | head -1 || true)"
   [[ -n "$new_pool" ]] || { err "verified tarball did not contain ghost-mining"; write_status "error" "tarball missing ghost-mining" "$latest"; exit 1; }
   [[ -n "$new_ghostd" ]] || { err "verified tarball did not contain ghostd (release predates the unified build?)"; write_status "error" "tarball missing ghostd" "$latest"; exit 1; }
 
@@ -626,6 +627,12 @@ main() {
   fi
   if [[ -x "$BIN_DIR/ghost-admin" && -n "$new_admin" ]]; then
     SWAP_DEST+=("$BIN_DIR/ghost-admin"); SWAP_SRC+=("$new_admin")
+  fi
+  # ghost-audit runs the opt-in lister (ghost-lister.service). It is swapped with the rest and the
+  # lister, if it runs, is restarted onto it once the node is healthy (step 10); a stopped lister
+  # is left stopped.
+  if [[ -x "$BIN_DIR/ghost-audit" && -n "$new_audit" ]]; then
+    SWAP_DEST+=("$BIN_DIR/ghost-audit"); SWAP_SRC+=("$new_audit")
   fi
   # The SV2 stack moves with ghost-mining or the update does not happen (#1044). An installed
   # binary the release does not carry would be left at the old version under a new ghost-mining
@@ -708,6 +715,10 @@ main() {
     echo "$latest" > "$VERSION_FILE"; chmod 644 "$VERSION_FILE" 2>/dev/null || true
     local dash_note=""
     [[ -z "$new_dash" ]] || dash_note="; $(swap_dashboard "$new_dash" "$ts")"
+    # Node pool nodes only: the old network has no lister, and its update path stays as it was.
+    if [[ "$CHANNEL" == node-pool ]]; then
+      $SYSTEMCTL try-restart ghost-lister.service >/dev/null 2>&1 || warn "ghost-lister did not restart on the new ghost-audit"
+    fi
     log "UPDATE COMPLETE: now running $latest (backups: *.bak.${ts})${dash_note}"
     write_status "updated" "updated $installed -> $latest${dash_note}" "$latest"
     exit 0
