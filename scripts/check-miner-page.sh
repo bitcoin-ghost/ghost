@@ -29,4 +29,5 @@ while IFS= read -r -d '' f; do
 done < <(find ghost-web -name '*.js' -not -path 'ghost-web/vendor/*' -print0)
 
 node scripts/web-tests/miner-page.test.js || status=1
+node scripts/web-tests/status-tiles.test.js || status=1
 exit "$status"

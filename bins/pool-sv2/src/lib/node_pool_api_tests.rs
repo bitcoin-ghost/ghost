@@ -248,6 +248,7 @@ pub(crate) fn world_on(genesis: Option<Table>) -> World {
         settlement: settlement_rx,
         checkpoint_depth: 288,
         prune: true,
+        tier0_hashes: 4_295_032_833.0,
     };
     let miners = vec![ChannelStatus {
         key: (4, 1),
@@ -631,6 +632,72 @@ async fn balances_include_the_genesis_table() {
     // Without a genesis table nothing is carried.
     let r = world().api.ledger(&addr(&payee(4))).await.unwrap();
     assert!(!r.known && r.genesis.is_none());
+}
+
+/// The status sums every balance, and estimates the pool's hashrate from the shares credited on
+/// the best chain over the last day of Bitcoin blocks: anchor 1's two shares at job height 901
+/// (its credit event is applied), not anchor 2's share at 902 (a losing fork, not applied).
+#[tokio::test]
+async fn the_status_carries_total_owed_and_the_pool_hashrate() {
+    let w = world();
+    let s = w.api.status().await.unwrap();
+    let owed = P1_CREDIT + 24_000 * ONE - 2_500 * ONE;
+    assert_eq!(s.total_owed.units, owed.to_string());
+    assert_eq!(s.total_owed.sats, 30_500);
+    let folded: i128 = [1u8, 2, 3]
+        .iter()
+        .map(|p| w.api.parts.db.np_payee_balance(&payee(*p)).unwrap().unwrap().owed)
+        .sum();
+    assert_eq!(s.total_owed.units, folded.to_string(), "every balance summed");
+
+    let h = &s.pool_hashrate;
+    assert_eq!((h.from_job_height, h.to_job_height), (Some(856), Some(999)));
+    assert_eq!((h.window_blocks, h.credited_shares), (144, 2));
+    let want = 2.0 * 1024.0 * 4_295_032_833.0 / (144.0 * 600.0);
+    assert!((h.hashes_per_sec.unwrap() - want).abs() < 1e-6, "{h:?}");
+    assert!(h.unavailable.is_none());
+    let v = serde_json::to_value(&s).unwrap();
+    assert!(v["pool_hashrate"]["hashes_per_sec"].is_f64());
+    assert!(v["total_owed"]["sats"].is_i64() && v["total_owed"]["units"].is_string());
+
+    // The share at 902 counts once its credit event is applied, and nothing above the tip does.
+    w.api
+        .parts
+        .db
+        .np_apply_credits(
+            &credit_event_key(&[2; 32], 902),
+            902,
+            &[(payee(1), 77)].into(),
+            3_100,
+        )
+        .unwrap();
+    assert_eq!(w.api.pool_hashrate(Some(999)).unwrap().credited_shares, 3);
+    assert_eq!(w.api.pool_hashrate(Some(901)).unwrap().credited_shares, 2);
+
+    // A young share chain: the window starts at the first earning height.
+    let young = w.api.pool_hashrate(Some(30)).unwrap();
+    assert_eq!((young.from_job_height, young.window_blocks), (Some(21), 10));
+    assert_eq!(young.hashes_per_sec, Some(0.0));
+    // Before it, and with no tip, there is no figure, and the reason is given.
+    for tip in [Some(20), None] {
+        let h = w.api.pool_hashrate(tip).unwrap();
+        assert!(h.hashes_per_sec.is_none() && h.unavailable.is_some(), "{tip:?}");
+    }
+}
+
+/// A node that prunes inside the window would count only part of its work: no figure.
+#[tokio::test]
+async fn a_pruned_window_gives_no_hashrate() {
+    // The world keeps one checkpoint at Bitcoin height 700; pruning deletes batches below it.
+    let mut w = world();
+    let h = w.api.pool_hashrate(Some(800)).unwrap();
+    assert_eq!(h.from_job_height, None);
+    assert!(h.hashes_per_sec.is_none(), "{h:?}");
+    assert!(h.unavailable.unwrap().contains("pruned"));
+    assert!(w.api.pool_hashrate(Some(999)).unwrap().hashes_per_sec.is_some());
+    // An archive node keeps every batch: the same window is measured.
+    w.api.parts.prune = false;
+    assert!(w.api.pool_hashrate(Some(800)).unwrap().hashes_per_sec.is_some());
 }
 
 /// Finding E: work below the first earning height (genesis + 21) earns nothing; the status and

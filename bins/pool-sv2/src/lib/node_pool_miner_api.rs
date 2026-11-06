@@ -96,7 +96,7 @@ pub const RATE_WINDOW_SECS: u64 = 30 * 86_400;
 /// placed at its Bitcoin time instead.
 const LATE_APPLY_SECS: i64 = 2 * 3_600;
 /// Bitcoin's target block interval, for the snapshot lag.
-const BITCOIN_BLOCK_SECS: u64 = 600;
+pub(crate) const BITCOIN_BLOCK_SECS: u64 = 600;
 
 /// Bitcoin blocks of credited work the pool's expected block interval is read from: about a day.
 pub const EXPECTED_RATE_BLOCKS: u32 = 144;

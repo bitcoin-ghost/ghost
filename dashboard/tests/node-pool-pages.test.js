@@ -95,6 +95,27 @@ test("overview: renders the status, health checks and start values", () => {
   // Pool-wide: every block since genesis, not the listed few, and the credited work's rate.
   assert.match(t, /Pool blocks found 41/);
   assert.match(t, /Pool finds a block about every 14h 26m/);
+  // The credited work's hashrate and the ledger's total, as pool_sv2 reports them.
+  assert.match(t, /Pool hashrate 101\.81 MH\/s/);
+  assert.match(m, /job heights 856 to 999 \(2 shares\), over 144 Bitcoin blocks/);
+  assert.match(t, /Total owed to miners 30,500 sats/);
+});
+
+test("overview: a hashrate the node cannot measure says why; an older pool_sv2's missing figures read unknown", () => {
+  need();
+  const status = fixture("node-pool-status.json");
+  status.pool_hashrate = {
+    hashes_per_sec: null, from_job_height: null, to_job_height: null, window_blocks: 0,
+    credited_shares: 0, unavailable: "settlement has not seen a Bitcoin tip yet",
+  };
+  let t = text(html(views.OverviewView, { status }));
+  assert.match(t, /Pool hashrate not measured: settlement has not seen a Bitcoin tip yet/);
+  assert.doesNotMatch(t, /Pool hashrate 0/);
+  delete status.pool_hashrate;
+  delete status.total_owed;
+  t = text(html(views.OverviewView, { status }));
+  assert.match(t, /Pool hashrate unknown/);
+  assert.match(t, /Total owed to miners unknown/);
 });
 
 test("overview: pool-wide figures an older pool_sv2 does not send read unknown; none credited says so", () => {

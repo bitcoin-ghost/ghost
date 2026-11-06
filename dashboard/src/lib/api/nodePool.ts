@@ -137,9 +137,26 @@ export interface NodePoolStatus {
   /** What the pool's credited work over the last day should find: mean seconds between
    *  pool blocks. `null` before any work is credited. */
   pool_expected_block_interval_secs?: number | null;
+  /** Every balance summed: what the pool owes its miners now. */
+  total_owed?: NpAmount;
+  /** The pool's hashrate from credited share work over the last day of Bitcoin blocks. */
+  pool_hashrate?: NpPoolHashrate;
   recent_blocks: NpBlock[];
   miners: NpMinerChannel[];
   earning?: NpEarning;
+}
+
+/** The pool's hashrate, estimated from the work credited on the share chain: every share
+ *  credited on the best chain at a job height in the window, `2^tier` tier-0 shares each, over
+ *  the window's Bitcoin blocks at 600 s a block. The same on every node on the same chains. */
+export interface NpPoolHashrate {
+  /** `null` when it cannot be measured; `unavailable` says why. */
+  hashes_per_sec: number | null;
+  from_job_height: number | null;
+  to_job_height: number | null;
+  window_blocks: number;
+  credited_shares: number;
+  unavailable: string | null;
 }
 
 /** Whether work served now earns: nothing before the genesis anchor's height + 21. */

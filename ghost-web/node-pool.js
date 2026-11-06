@@ -27,13 +27,16 @@
     // The Bitcoin tip settlement last saw, not share_chain.btc_height (the height the tip
     // anchor's job was for, which trails the tip).
     btc_height:   ['settlement.bitcoin_tip', 'btc_height', 'bitcoin_height', 'tip.btc_height', 'share_chain.btc_height', 'block_height'],
-    hashrate:     ['pool_hashrate_ths', 'hashrate_ths', 'pool_hashrate_hs', 'hashrate_hs', 'pool_hashrate', 'hashrate'],
+    // The pool's hashrate from credited share work over the last day of Bitcoin blocks (the
+    // same on every node); null with a reason when the node cannot measure it.
+    hashrate:     ['pool_hashrate.hashes_per_sec', 'pool_hashrate_ths', 'hashrate_ths', 'pool_hashrate_hs', 'hashrate_hs'],
     peers:        ['relay.peer_count', 'relay.peers', 'peer_count', 'peers'],
     miners:       ['miners.connected', 'connected_miners', 'active_miners', 'miner_count', 'miners'],
     // Every pool block since the genesis anchor; recent_blocks is only the latest few.
     blocks_found: ['pool_blocks_found', 'blocks_found', 'pool_blocks', 'blocks.found', 'blocks'],
     network_tier: ['share_chain.t_net', 't_net', 'network_tier', 'tier'],
-    owed_sats:    ['ledger.total_owed_sats', 'total_owed_sats', 'owed_sats'],
+    // Every balance on the ledger summed.
+    owed_sats:    ['total_owed.sats', 'ledger.total_owed_sats', 'total_owed_sats', 'owed_sats'],
     balances:     ['ledger_rows', 'ledger.balances', 'ledger.eligible', 'balances', 'eligible_balances']
   };
 
@@ -48,6 +51,13 @@
   }
 
   function lookup(obj, field) {
+    if (field === 'hashrate') {
+      // A node that cannot measure it says why; show that rather than a dash.
+      var hr = get(obj, 'pool_hashrate');
+      if (hr && typeof hr === 'object' && hr.hashes_per_sec == null && hr.unavailable) {
+        return { path: 'pool_hashrate.unavailable', value: 'not measured', title: String(hr.unavailable) };
+      }
+    }
     var paths = FIELDS[field] || [field];
     for (var i = 0; i < paths.length; i++) {
       var v = get(obj, paths[i]);
@@ -56,12 +66,14 @@
     return null;
   }
 
-  function formatHashrate(ths) {
-    if (!isFinite(ths) || ths <= 0) return '0<span class="unit">TH/s</span>';
-    if (ths < 1)    return (ths * 1000).toFixed(1) + '<span class="unit">GH/s</span>';
-    if (ths < 1000) return ths.toFixed(2) + '<span class="unit">TH/s</span>';
-    if (ths < 1e6)  return (ths / 1000).toFixed(2) + '<span class="unit">PH/s</span>';
-    return (ths / 1e6).toFixed(2) + '<span class="unit">EH/s</span>';
+  // Hashes per second, in the largest unit it reaches (two decimals), down to H/s.
+  var HR_UNITS = [[1e18, 'EH/s'], [1e15, 'PH/s'], [1e12, 'TH/s'], [1e9, 'GH/s'], [1e6, 'MH/s'], [1e3, 'kH/s']];
+  function formatHashrate(hs) {
+    if (!isFinite(hs) || hs <= 0) return '0<span class="unit">H/s</span>';
+    for (var i = 0; i < HR_UNITS.length; i++) {
+      if (hs >= HR_UNITS[i][0]) return (hs / HR_UNITS[i][0]).toFixed(2) + '<span class="unit">' + HR_UNITS[i][1] + '</span>';
+    }
+    return hs.toFixed(0) + '<span class="unit">H/s</span>';
   }
 
   function escapeHtml(s) {
@@ -75,8 +87,8 @@
     if (Array.isArray(v)) v = v.length;
     if (typeof v === 'object') return null;
     if (field === 'hashrate' && typeof v === 'number') {
-      if (/_hs$/.test(hit.path)) return formatHashrate(v / 1e12);
-      if (/_ths$/.test(hit.path)) return formatHashrate(v);
+      if (/(_hs|\.hashes_per_sec)$/.test(hit.path)) return formatHashrate(v);
+      if (/_ths$/.test(hit.path)) return formatHashrate(v * 1e12);
       return escapeHtml(v.toLocaleString());   // unit unknown: show the number as given
     }
     if (field === 'owed_sats' && typeof v === 'number') {
@@ -92,7 +104,8 @@
     for (var i = 0; i < els.length; i++) {
       var el = els[i];
       var field = el.getAttribute('data-np-field');
-      var html = ok ? render(field, lookup(data, field)) : null;
+      var hit = ok ? lookup(data, field) : null;
+      var html = ok ? render(field, hit) : null;
       if (!ok) {
         el.textContent = 'unavailable';
         el.classList.add('np-na');
@@ -102,7 +115,7 @@
         el.classList.add('np-na');
       } else {
         el.innerHTML = html;
-        el.title = '';
+        el.title = (hit && hit.title) || '';
         el.classList.remove('np-na');
       }
     }
@@ -143,6 +156,12 @@
     }
     tick();
     setInterval(tick, POLL_MS);
+  }
+
+  // Under node (scripts/web-tests), the field lookup and rendering only.
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = { lookup: lookup, render: render, formatHashrate: formatHashrate, FIELDS: FIELDS };
+    return;
   }
 
   function init() {

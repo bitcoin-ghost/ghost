@@ -93,6 +93,7 @@ fn api() -> NodePoolApi {
         settlement,
         checkpoint_depth: 288,
         prune: true,
+        tier0_hashes: 4_295_032_833.0,
     };
     NodePoolApi::new(parts, FEE.into(), Arc::new(pool()))
 }

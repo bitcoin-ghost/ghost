@@ -56,6 +56,15 @@
   "ledger_rows": 3,
   "pool_blocks_found": 41,
   "pool_expected_block_interval_secs": 52000,
+  "total_owed": { "units": "130996625984789", "sats": 30500 },
+  "pool_hashrate": {
+    "hashes_per_sec": 101808185.67,
+    "from_job_height": 856,
+    "to_job_height": 999,
+    "window_blocks": 144,
+    "credited_shares": 2,
+    "unavailable": null
+  },
   "recent_blocks": [
     {
       "height": 960,

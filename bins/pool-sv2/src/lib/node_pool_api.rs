@@ -23,7 +23,9 @@
 //!   connected miners with their slot class and any firmware warning. For the operator dashboard
 //!   (W2.14) it also carries this node's id, the relay's counters since start (`relay_stats`),
 //!   and its retention (`retention`: the checkpoint depth, whether it prunes, and the stored
-//!   checkpoints without their folded state).
+//!   checkpoints without their folded state). For the website's tiles it carries the pool's
+//!   hashrate estimated from credited share work (`pool_hashrate`, see [`PoolHashrateView`]) and
+//!   the sum of every balance (`total_owed`).
 
 use std::{collections::HashSet, future::Future, pin::Pin, str::FromStr, sync::Arc};
 
@@ -43,7 +45,7 @@ use stratum_apps::stratum_core::bitcoin::{address::NetworkUnchecked, Address, Sc
 use crate::{
     miner_stats::{now_secs, MinerStats},
     node_pool::{ChannelKind, ChannelStatus, NodePool},
-    node_pool_miner_api::{expected_interval_secs, EXPECTED_RATE_BLOCKS},
+    node_pool_miner_api::{expected_interval_secs, BITCOIN_BLOCK_SECS, EXPECTED_RATE_BLOCKS},
     node_pool_relay::RelayParts,
 };
 
@@ -495,8 +497,34 @@ pub struct RetentionView {
     pub checkpoints: Vec<CheckpointView>,
 }
 
+/// The pool's hashrate, estimated from the work credited on the share chain.
+///
+/// Every share credited on this node's best chain at a job height in the window counts as
+/// `2^credited_tier` shares at tier 0, each `RelayParts::tier0_hashes` expected hashes (about
+/// `2^32` on mainnet): exact work, not sampled from blocks. The window is the last
+/// [`EXPECTED_RATE_BLOCKS`] Bitcoin blocks (the same day the expected block interval reads),
+/// cut to the first earning height on a younger share chain, and its length is taken as
+/// 600 seconds a block. The share chain and its credits are shared, so every node on the same
+/// Bitcoin tip and share chain gives the same figure. Shares at the job height of the block
+/// being mined now are not counted (that interval is not over).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PoolHashrateView {
+    /// Hashes per second, or `null` (see `unavailable`).
+    pub hashes_per_sec: Option<f64>,
+    /// The first job height counted.
+    pub from_job_height: Option<u32>,
+    /// The last job height counted (the Bitcoin tip settlement last saw).
+    pub to_job_height: Option<u32>,
+    /// Bitcoin blocks the window spans; seconds are this times 600.
+    pub window_blocks: u32,
+    /// Credited shares counted.
+    pub credited_shares: u64,
+    /// Why `hashes_per_sec` is `null`.
+    pub unavailable: Option<String>,
+}
+
 /// `GET /api/v1/node-pool/status`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StatusResponse {
     /// This node's network.
     pub network: &'static str,
@@ -519,6 +547,12 @@ pub struct StatusResponse {
     /// Payees with a balance row: carried over at the cutover, credited on the share chain, or
     /// both.
     pub ledger_rows: u64,
+    /// Every balance summed: what the pool owes its miners now, carried over at the cutover plus
+    /// every credit through the tip, minus every payout. The same on every node that follows
+    /// the same share chain and Bitcoin chain.
+    pub total_owed: Amount,
+    /// The pool's hashrate, from credited share work over the last day of Bitcoin blocks.
+    pub pool_hashrate: PoolHashrateView,
     /// Pool blocks found since the genesis anchor, on this node's best Bitcoin chain. The same
     /// on every node that follows that chain; `recent_blocks` lists only the latest.
     pub pool_blocks_found: u64,
@@ -815,6 +849,83 @@ impl NodePoolApi {
         i64::try_from(tx.output.first()?.value.to_sat()).ok()
     }
 
+    /// [`PoolHashrateView`] at Bitcoin tip `tip`.
+    pub(crate) fn pool_hashrate(&self, tip: Option<u32>) -> Result<PoolHashrateView, ApiError> {
+        let none = |why: &str| PoolHashrateView {
+            hashes_per_sec: None,
+            from_job_height: None,
+            to_job_height: None,
+            window_blocks: 0,
+            credited_shares: 0,
+            unavailable: Some(why.to_string()),
+        };
+        let Some(tip) = tip else {
+            return Ok(none("settlement has not seen a Bitcoin tip yet"));
+        };
+        let first =
+            ghost_common::canonical_payout::first_earning_height(self.parts.start.genesis_btc_height);
+        let from = tip
+            .saturating_sub(EXPECTED_RATE_BLOCKS - 1)
+            .max(first);
+        if from > tip {
+            return Ok(none(&format!(
+                "no share earns before Bitcoin height {first}, and the tip is {tip}"
+            )));
+        }
+        let db = &self.parts.db;
+        if self.parts.prune {
+            // Batches below the older kept checkpoint are deleted: a window reaching below it
+            // would count only part of its work.
+            let oldest = db
+                .np_checkpoint_heads()
+                .map_err(internal)?
+                .iter()
+                .map(|c| c.btc_height)
+                .min();
+            if oldest.is_some_and(|o| o > from.saturating_sub(1)) {
+                return Ok(none(
+                    "this node has pruned batches inside the window (checkpoint depth below a day)",
+                ));
+            }
+        }
+        let mut shares = 0u64;
+        let mut tier0_shares = 0f64;
+        let mut applied = std::collections::HashMap::new();
+        for g in db
+            .np_batched_share_tiers(from, from.saturating_sub(1))
+            .map_err(internal)?
+        {
+            if g.job_height > tip {
+                continue;
+            }
+            let key = credit_event_key(&g.anchor_hash, g.job_height);
+            let credited = match applied.get(&key) {
+                Some(c) => *c,
+                None => {
+                    let c = db
+                        .np_ledger_event_applied(NpLedgerEventKind::Credit, &key)
+                        .map_err(internal)?;
+                    applied.insert(key, c);
+                    c
+                }
+            };
+            if credited {
+                shares += g.shares;
+                tier0_shares += g.shares as f64 * 2f64.powi(i32::from(g.credited_tier));
+            }
+        }
+        let window_blocks = tip - from + 1;
+        let secs = f64::from(window_blocks) * BITCOIN_BLOCK_SECS as f64;
+        Ok(PoolHashrateView {
+            hashes_per_sec: Some(tier0_shares * self.parts.tier0_hashes / secs),
+            from_job_height: Some(from),
+            to_job_height: Some(tip),
+            window_blocks,
+            credited_shares: shares,
+            unavailable: None,
+        })
+    }
+
     pub async fn status(&self) -> Result<StatusResponse, ApiError> {
         let db = &self.parts.db;
         let relay = *self.parts.status.borrow();
@@ -963,6 +1074,8 @@ impl NodePoolApi {
             },
             fee_address: self.fee_address.clone(),
             ledger_rows: db.np_ledger_rows().map_err(internal)?,
+            total_owed: Amount::of(db.np_total_owed().map_err(internal)?),
+            pool_hashrate: self.pool_hashrate(st.bitcoin_tip)?,
             pool_blocks_found: db.np_pool_blocks().map_err(internal)?,
             pool_expected_block_interval_secs,
             recent_blocks,

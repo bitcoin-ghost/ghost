@@ -500,6 +500,88 @@ impl Database {
             .map_err(db_err)
         })
     }
+
+    /// Every balance summed, face units: the imported genesis table plus the share chain's own
+    /// table. Owed is additive (module docs), so the sum of every payee's folded balance is the
+    /// sum of the two tables, read without folding any one payee.
+    pub fn np_total_owed(&self) -> GhostResult<i128> {
+        self.with_connection(|conn| {
+            let mut sum: i128 = 0;
+            for sql in ["SELECT owed FROM np_ledger", "SELECT owed FROM np_genesis"] {
+                let mut st = conn.prepare_cached(sql).map_err(db_err)?;
+                let rows = st
+                    .query_map([], |r| r.get::<_, Vec<u8>>(0))
+                    .map_err(db_err)?;
+                for blob in rows {
+                    sum = sum
+                        .checked_add(face_from_blob(&blob.map_err(db_err)?)?)
+                        .ok_or_else(|| GhostError::Database("total owed overflows i128".into()))?;
+                }
+            }
+            Ok(sum)
+        })
+    }
+
+    /// Shares batches carry at job height `min_job_height` or above, counted per anchor, job
+    /// height and credited tier. Whether an anchor's credits at a job height were applied on this
+    /// node's best chain is the caller's question (the module docs say why); each group is one
+    /// credit event's shares at one tier. Only batches at Bitcoin height `min_batch_btc_height`
+    /// or above are read: a batch never carries a share whose job is above its own anchor's.
+    pub fn np_batched_share_tiers(
+        &self,
+        min_job_height: u32,
+        min_batch_btc_height: u32,
+    ) -> GhostResult<Vec<NpShareTierCount>> {
+        self.with_connection(|conn| {
+            let mut st = conn
+                .prepare_cached(
+                    "SELECT bs.anchor_hash, s.job_height, bs.credited_tier, COUNT(*) \
+                     FROM np_batches b \
+                     JOIN np_batch_shares bs ON bs.anchor_hash = b.anchor_hash \
+                     JOIN np_shares s ON s.share_id = bs.share_id \
+                     WHERE b.btc_height >= ?2 AND s.job_height >= ?1 \
+                     GROUP BY bs.anchor_hash, s.job_height, bs.credited_tier",
+                )
+                .map_err(db_err)?;
+            let rows = st
+                .query_map(params![min_job_height, min_batch_btc_height], |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })
+                .map_err(db_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_err)?;
+            rows.into_iter()
+                .map(|(a, jh, tier, n)| {
+                    Ok(NpShareTierCount {
+                        anchor_hash: blob32(a, "np batch anchor")?,
+                        job_height: u32_col(jh, "np share job height")?,
+                        credited_tier: u8::try_from(tier).map_err(|_| {
+                            GhostError::Database(format!("np credited tier {tier} is not a u8"))
+                        })?,
+                        shares: u64::try_from(n).unwrap_or(0),
+                    })
+                })
+                .collect()
+        })
+    }
+}
+
+/// Shares one anchor's batch carries at one job height and credited tier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NpShareTierCount {
+    /// The anchor whose batch carries them.
+    pub anchor_hash: AnchorHash,
+    /// Their job height.
+    pub job_height: u32,
+    /// The tier they were credited at under that anchor.
+    pub credited_tier: u8,
+    /// How many.
+    pub shares: u64,
 }
 
 #[cfg(test)]
@@ -815,5 +897,61 @@ mod tests {
             db.np_payee_balance(&payee(7)).unwrap().unwrap().owed,
             "the last event ends at the balance"
         );
+    }
+
+    #[test]
+    fn total_owed_is_every_payees_folded_balance_summed() {
+        let (db, _) = with_genesis();
+        assert_eq!(
+            db.np_total_owed().unwrap(),
+            5_900 * FACE_PER_SAT + 3,
+            "the genesis table alone"
+        );
+        let mut d = BTreeMap::new();
+        d.insert(payee(7), 200 * FACE_PER_SAT);
+        d.insert(payee(8), 50 * FACE_PER_SAT);
+        db.np_apply_credits(&[0x31; 32], 510, &d, 300).unwrap();
+        db.np_apply_block(&[0xB1; 32], 700, &[(payee(9), 5_000 * FACE_PER_SAT)], 400)
+            .unwrap();
+        let folded: i128 = [7, 8, 9]
+            .iter()
+            .map(|p| db.np_payee_balance(&payee(*p)).unwrap().map_or(0, |b| b.owed))
+            .sum();
+        assert_eq!(db.np_total_owed().unwrap(), folded);
+        assert_eq!(folded, 1_150 * FACE_PER_SAT + 3);
+        assert_eq!(Database::in_memory().unwrap().np_total_owed().unwrap(), 0);
+    }
+
+    #[test]
+    fn batched_share_tiers_group_by_anchor_job_height_and_tier() {
+        let db = Database::in_memory().unwrap();
+        anchor(&db, 1, 509, 100);
+        anchor(&db, 2, 512, 200);
+        // Job heights 510, 511 (anchor 1) and 512, 512 again and 511 (anchor 2).
+        let mut deep = member(2, 7, 5);
+        deep.credited_tier = 12;
+        db.np_insert_batch(&[1; 32], &[member(10, 7, 5), member(11, 8, 6)], 100)
+            .unwrap();
+        db.np_insert_batch(&[2; 32], &[member(12, 7, 9), deep, member(11, 8, 6)], 200)
+            .unwrap();
+        // `deep` is seed 2: job height 502, below the floor asked for.
+        let mut g = db.np_batched_share_tiers(510, 0).unwrap();
+        g.sort_by_key(|x| (x.anchor_hash, x.job_height));
+        let flat: Vec<_> = g
+            .iter()
+            .map(|x| (x.anchor_hash[0], x.job_height, x.credited_tier, x.shares))
+            .collect();
+        assert_eq!(
+            flat,
+            vec![(1, 510, 10, 1), (1, 511, 10, 1), (2, 511, 10, 1), (2, 512, 10, 1)]
+        );
+        let all = db.np_batched_share_tiers(0, 0).unwrap();
+        assert!(all.iter().any(|x| x.credited_tier == 12 && x.job_height == 502));
+        // The batch floor skips anchor 1's batch.
+        assert!(db
+            .np_batched_share_tiers(510, 510)
+            .unwrap()
+            .iter()
+            .all(|x| x.anchor_hash == [2; 32]));
     }
 }

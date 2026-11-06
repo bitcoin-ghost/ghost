@@ -4,7 +4,9 @@ import type { NodePoolStatus } from "@/lib/api/nodePool";
 import type { NodeStatus } from "@/types/api";
 import {
   fmtDuration,
+  fmtHashrate,
   fmtInt,
+  fmtSats,
   groupByAddress,
   isNum,
   nodePoolHealth,
@@ -58,6 +60,7 @@ export function OverviewView({ status, statusError, statusLoading, node, nodeErr
   const warnings = status ? status.miners.filter((m) => m.firmware_warning).length : null;
   const st = status?.settlement;
   const interval = status?.pool_expected_block_interval_secs;
+  const hr = status?.pool_hashrate;
   return (
     <div className="space-y-6">
       <Card>
@@ -118,6 +121,26 @@ export function OverviewView({ status, statusError, statusLoading, node, nodeErr
                   : UNKNOWN
             }
             hint="what the work credited to every miner over the last day should find on average"
+          />
+          <Kv
+            label="Pool hashrate"
+            value={
+              hr
+                ? isNum(hr.hashes_per_sec)
+                  ? fmtHashrate(hr.hashes_per_sec)
+                  : `not measured: ${hr.unavailable ?? UNKNOWN}`
+                : UNKNOWN
+            }
+            hint={
+              hr && isNum(hr.from_job_height) && isNum(hr.to_job_height)
+                ? `work credited on the share chain at job heights ${fmtInt(hr.from_job_height)} to ${fmtInt(hr.to_job_height)} (${fmtInt(hr.credited_shares)} shares), over ${fmtInt(hr.window_blocks)} Bitcoin blocks at 10 minutes each`
+                : "work credited on the share chain over the last day of Bitcoin blocks"
+            }
+          />
+          <Kv
+            label="Total owed to miners"
+            value={fmtSats(status?.total_owed?.sats)}
+            hint="every balance on the ledger summed: carried over at the cutover, plus credits, minus payouts"
           />
           <Kv label="Pool blocks listed" value={fmtInt(status?.recent_blocks.length)} />
           <Kv label="Ledger rows" value={fmtInt(status?.ledger_rows)} />

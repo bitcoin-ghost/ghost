@@ -125,8 +125,15 @@
     <div class="np-prose">
       <p>These come from <code>GET /api/v1/node-pool/status</code> on a node pool node, polled every 30 seconds.
       If it does not answer, every tile reads <strong>unavailable</strong>; a tile the node does not report reads —.
-      Nothing is estimated or filled in.</p>
-      <p>Every node computes the same ledger from the same share chain, so any honest node should give the same balances.
+      Nothing is filled in.</p>
+      <p>One tile is an estimate, and says what from: the <strong>pool hashrate</strong> is the work of every share credited
+      on the share chain over the last 144 Bitcoin blocks (a share credited at tier <em>t</em> stands for 2<sup><em>t</em></sup>
+      difficulty-1 shares, about 2<sup>32</sup> hashes each), divided by 144 blocks of ten minutes. It is exact work, not a guess
+      from blocks found, but Bitcoin's blocks are not exactly ten minutes apart, so it can be a few percent off. A node that has
+      pruned part of that day says <strong>not measured</strong>. <strong>Relay peers</strong> and <strong>connected miners</strong>
+      are this node's own; the rest are the pool's.</p>
+      <p>Every node computes the same ledger from the same share chain, so any honest node should give the same balances,
+      the same <strong>total owed</strong> (every balance summed) and the same hashrate.
       A node that is still syncing, or cut off from its peers, can lag.</p>
       <p>The <strong>blocks found</strong> count is the node pool's. It has never found a block.</p>
     </div>

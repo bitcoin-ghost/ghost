@@ -337,6 +337,19 @@ pub struct RelayParts {
     pub checkpoint_depth: u32,
     /// Batches below the older kept checkpoint are deleted (`false`: an archive node).
     pub prune: bool,
+    /// Expected hashes behind one share at tier 0: `2^256 / (tier_base + 1)`. A share credited
+    /// at tier `t` stands for `2^t` times this. On mainnet `tier_base` is the difficulty-1
+    /// target, so this is about `2^32`.
+    pub tier0_hashes: f64,
+}
+
+/// `2^256 / (target + 1)`, the expected hashes to meet `target`, as a float.
+pub fn hashes_for_target(target: &U256) -> f64 {
+    let t = target
+        .to_be_bytes()
+        .iter()
+        .fold(0f64, |acc, b| acc * 256.0 + f64::from(*b));
+    2f64.powi(256) / (t + 1.0)
 }
 
 /// Open the store and start the relay, publishing to `np`'s anchor driver and taking its
@@ -479,6 +492,7 @@ pub async fn start_with_parts(
         settlement: handle.settlement.clone(),
         checkpoint_depth,
         prune,
+        tier0_hashes: hashes_for_target(&tier_base),
     };
     Ok((handle, parts))
 }
