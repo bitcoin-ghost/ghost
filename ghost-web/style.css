@@ -198,6 +198,7 @@ nav.primary a.current::after {
 }
 .metric {
   padding: 28px 0;
+  min-width: 0;
 }
 .metric .label {
   font-family: var(--font-mono);
@@ -214,6 +215,7 @@ nav.primary a.current::after {
   margin-top: 6px;
   color: var(--fg);
   letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
 }
 .metric .unit, .metric .value .unit { color: var(--dim); font-size: 0.55em; margin-left: 6px; font-weight: 400; letter-spacing: 0.02em; }
 

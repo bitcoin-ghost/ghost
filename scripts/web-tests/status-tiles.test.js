@@ -60,8 +60,17 @@ test('an older node without the fields reads as not reported, never as zero', ()
   assert.strictEqual(show(s, 'owed_sats'), null);
 });
 
-test('total owed is read from total_owed.sats', () => {
+test('total owed is whole sats of total_owed.units, exact past what an i64 of sats holds', () => {
   assert.strictEqual(strip(show(status(), 'owed_sats')), '30,500 sats');
+  const s = status();
+  // 2^64 sats and a fraction: `sats` would have saturated at 9,223,372,036,854,775,807.
+  s.total_owed = { units: (2n ** 96n + 5n).toString(), sats: 9223372036854775807 };
+  assert.strictEqual(strip(show(s, 'owed_sats')), '18,446,744,073,709,551,616 sats');
+  s.total_owed = { units: '-1', sats: -1 };
+  assert.strictEqual(strip(show(s, 'owed_sats')), '-1 sats', 'floored, as the API floors');
+  delete s.total_owed.units;
+  s.total_owed.sats = 1200;
+  assert.strictEqual(strip(show(s, 'owed_sats')), '1,200 sats');
 });
 
 test('the other tiles read the fields pool_sv2 sends', () => {

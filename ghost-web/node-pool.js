@@ -36,7 +36,8 @@
     blocks_found: ['pool_blocks_found', 'blocks_found', 'pool_blocks', 'blocks.found', 'blocks'],
     network_tier: ['share_chain.t_net', 't_net', 'network_tier', 'tier'],
     // Every balance on the ledger summed.
-    owed_sats:    ['total_owed.sats', 'ledger.total_owed_sats', 'total_owed_sats', 'owed_sats'],
+    // `units` (2^-32 sat, exact) first: `sats` is an i64 and saturates on a regtest ledger.
+    owed_sats:    ['total_owed.units', 'total_owed.sats', 'ledger.total_owed_sats', 'total_owed_sats', 'owed_sats'],
     balances:     ['ledger_rows', 'ledger.balances', 'ledger.eligible', 'balances', 'eligible_balances']
   };
 
@@ -90,6 +91,12 @@
       if (/(_hs|\.hashes_per_sec)$/.test(hit.path)) return formatHashrate(v);
       if (/_ths$/.test(hit.path)) return formatHashrate(v * 1e12);
       return escapeHtml(v.toLocaleString());   // unit unknown: show the number as given
+    }
+    if (field === 'owed_sats' && /\.units$/.test(hit.path) && typeof v === 'string' && /^-?\d+$/.test(v) && typeof BigInt === 'function') {
+      // Whole sats, rounded down (as the API's `sats`), exact at any size.
+      var u = BigInt(v), q = u / BigInt(4294967296);
+      if (u < 0 && q * BigInt(4294967296) !== u) q -= BigInt(1);
+      return escapeHtml(q.toLocaleString('en-US')) + '<span class="unit">sats</span>';
     }
     if (field === 'owed_sats' && typeof v === 'number') {
       return escapeHtml(v.toLocaleString()) + '<span class="unit">sats</span>';

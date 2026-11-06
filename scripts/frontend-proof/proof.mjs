@@ -527,7 +527,8 @@ async function main() {
             miners: own ? en(own.miners.length) : undefined,
             blocks_found: status.pool_blocks_found === undefined ? undefined : en(status.pool_blocks_found),
             hashrate: T.hashrate(status.pool_hashrate.hashes_per_sec),
-            owed_sats: `${en(status.total_owed.sats)}sats`,
+            // node-pool.js shows the exact units as whole sats (`sats` saturates on regtest).
+            owed_sats: `${(BigInt(status.total_owed.units) >> 32n).toLocaleString("en-US")}sats`,
           };
           for (const [k, t] of Object.entries(v)) {
             if (t === "unavailable") fail(label, `tile ${k} shows unavailable`);
