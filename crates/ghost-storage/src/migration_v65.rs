@@ -972,7 +972,13 @@ mod tests {
         let report = run(&c, set_schema_version).unwrap();
 
         let backup = report.backup.clone().expect("a backup was required");
-        assert_eq!(backup, backup_path(&p));
+        // SQLite reports the main file by its resolved path, so on macOS, where the temp dir
+        // `/var/folders/..` is a symlink into `/private/var/..`, the two spellings differ while
+        // naming the same file. Compare the files, not the spellings.
+        assert_eq!(
+            backup.canonicalize().unwrap(),
+            backup_path(&p).canonicalize().unwrap()
+        );
         assert_eq!(report.rows_dropped, 2_001);
         assert_eq!(report.dropped.len(), DROPPED_TABLES.len());
         assert_eq!(report.auto_vacuum, 2);
