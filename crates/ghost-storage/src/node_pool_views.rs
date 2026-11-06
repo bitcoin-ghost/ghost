@@ -915,7 +915,11 @@ mod tests {
             .unwrap();
         let folded: i128 = [7, 8, 9]
             .iter()
-            .map(|p| db.np_payee_balance(&payee(*p)).unwrap().map_or(0, |b| b.owed))
+            .map(|p| {
+                db.np_payee_balance(&payee(*p))
+                    .unwrap()
+                    .map_or(0, |b| b.owed)
+            })
             .sum();
         assert_eq!(db.np_total_owed().unwrap(), folded);
         assert_eq!(folded, 1_150 * FACE_PER_SAT + 3);
@@ -943,10 +947,17 @@ mod tests {
             .collect();
         assert_eq!(
             flat,
-            vec![(1, 510, 10, 1), (1, 511, 10, 1), (2, 511, 10, 1), (2, 512, 10, 1)]
+            vec![
+                (1, 510, 10, 1),
+                (1, 511, 10, 1),
+                (2, 511, 10, 1),
+                (2, 512, 10, 1)
+            ]
         );
         let all = db.np_batched_share_tiers(0, 0).unwrap();
-        assert!(all.iter().any(|x| x.credited_tier == 12 && x.job_height == 502));
+        assert!(all
+            .iter()
+            .any(|x| x.credited_tier == 12 && x.job_height == 502));
         // The batch floor skips anchor 1's batch.
         assert!(db
             .np_batched_share_tiers(510, 510)

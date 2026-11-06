@@ -646,9 +646,21 @@ async fn the_status_carries_total_owed_and_the_pool_hashrate() {
     assert_eq!(s.total_owed.sats, 30_500);
     let folded: i128 = [1u8, 2, 3]
         .iter()
-        .map(|p| w.api.parts.db.np_payee_balance(&payee(*p)).unwrap().unwrap().owed)
+        .map(|p| {
+            w.api
+                .parts
+                .db
+                .np_payee_balance(&payee(*p))
+                .unwrap()
+                .unwrap()
+                .owed
+        })
         .sum();
-    assert_eq!(s.total_owed.units, folded.to_string(), "every balance summed");
+    assert_eq!(
+        s.total_owed.units,
+        folded.to_string(),
+        "every balance summed"
+    );
 
     let h = &s.pool_hashrate;
     assert_eq!((h.from_job_height, h.to_job_height), (Some(856), Some(999)));
@@ -681,7 +693,10 @@ async fn the_status_carries_total_owed_and_the_pool_hashrate() {
     // Before it, and with no tip, there is no figure, and the reason is given.
     for tip in [Some(20), None] {
         let h = w.api.pool_hashrate(tip).unwrap();
-        assert!(h.hashes_per_sec.is_none() && h.unavailable.is_some(), "{tip:?}");
+        assert!(
+            h.hashes_per_sec.is_none() && h.unavailable.is_some(),
+            "{tip:?}"
+        );
     }
 }
 
@@ -694,10 +709,20 @@ async fn a_pruned_window_gives_no_hashrate() {
     assert_eq!(h.from_job_height, None);
     assert!(h.hashes_per_sec.is_none(), "{h:?}");
     assert!(h.unavailable.unwrap().contains("pruned"));
-    assert!(w.api.pool_hashrate(Some(999)).unwrap().hashes_per_sec.is_some());
+    assert!(w
+        .api
+        .pool_hashrate(Some(999))
+        .unwrap()
+        .hashes_per_sec
+        .is_some());
     // An archive node keeps every batch: the same window is measured.
     w.api.parts.prune = false;
-    assert!(w.api.pool_hashrate(Some(800)).unwrap().hashes_per_sec.is_some());
+    assert!(w
+        .api
+        .pool_hashrate(Some(800))
+        .unwrap()
+        .hashes_per_sec
+        .is_some());
 }
 
 /// Finding E: work below the first earning height (genesis + 21) earns nothing; the status and

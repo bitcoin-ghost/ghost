@@ -862,11 +862,10 @@ impl NodePoolApi {
         let Some(tip) = tip else {
             return Ok(none("settlement has not seen a Bitcoin tip yet"));
         };
-        let first =
-            ghost_common::canonical_payout::first_earning_height(self.parts.start.genesis_btc_height);
-        let from = tip
-            .saturating_sub(EXPECTED_RATE_BLOCKS - 1)
-            .max(first);
+        let first = ghost_common::canonical_payout::first_earning_height(
+            self.parts.start.genesis_btc_height,
+        );
+        let from = tip.saturating_sub(EXPECTED_RATE_BLOCKS - 1).max(first);
         if from > tip {
             return Ok(none(&format!(
                 "no share earns before Bitcoin height {first}, and the tip is {tip}"

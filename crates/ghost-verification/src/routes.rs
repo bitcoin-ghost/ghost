@@ -8271,8 +8271,7 @@ async fn api_swarm_update_all_post_handler(
 /// Compared AFTER [`crate::journal::canonical_service`], so a dashboard still sending the
 /// pre-#1018 name is served rather than refused, and systemd is only ever asked for the
 /// current one.
-const WATCHDOG_ALLOWED_SERVICES: &[&str] =
-    &[crate::journal::NODE_SERVICE, "ghost-core"];
+const WATCHDOG_ALLOWED_SERVICES: &[&str] = &[crate::journal::NODE_SERVICE, "ghost-core"];
 
 /// Watchdog service control: start
 async fn api_watchdog_start_handler(
