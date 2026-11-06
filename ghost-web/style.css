@@ -1732,3 +1732,7 @@ pre.diagram .dim { color: var(--dim); }
 @media (max-width: 420px) {
   .mp2-tiles .v { font-size: 22px; }
 }
+
+/* Long inline code (a key fingerprint, a command line) wraps rather than widening the page on
+   a phone. Code blocks (pre) scroll inside themselves instead. */
+:not(pre) > code { overflow-wrap: anywhere; }

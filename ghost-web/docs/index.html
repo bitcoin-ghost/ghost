@@ -215,6 +215,8 @@
     .docs-viewer { border-left: none; padding-left: 0; border-top: 1px solid var(--rule); padding-top: 24px; }
     /* A wide table scrolls inside itself instead of widening the page on a phone. */
     .docs-viewer .md-body table { display: block; overflow-x: auto; width: auto; max-width: 100%; }
+    /* Long inline code (a command line, a URL, a key) wraps rather than widening the page. */
+    .docs-viewer .md-body :not(pre) > code { overflow-wrap: anywhere; }
   }
   </style>
 </head>
