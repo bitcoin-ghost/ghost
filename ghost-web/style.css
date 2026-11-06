@@ -1378,7 +1378,7 @@ h2.section-title {
 .lb-table-wrap {
   border: 1px solid var(--rule);
   border-radius: 6px;
-  overflow: hidden;
+  overflow-x: auto;
 }
 .lb-table {
   width: 100%; border-collapse: collapse;
@@ -1658,7 +1658,8 @@ pre.diagram .dim { color: var(--dim); }
 .mp2-section { padding: 56px 0; }
 .mp2-nodeinfo { font-family: var(--font-mono); font-size: 12px; color: var(--dim); }
 .mp2-worker { color: var(--dim); font-weight: 500; }
-.mp2-tiles { grid-template-columns: repeat(3, 1fr); margin-top: 16px; }
+.mp2-tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 16px; }
+.mp-tile .v { overflow-wrap: anywhere; }
 .mp-tile .v.mp-na { color: var(--dim); font-size: 18px; }
 .mp2-updated { font-family: var(--font-mono); font-size: 11px; color: var(--fainter); margin-top: 10px; min-height: 1em; }
 .mp2-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; flex-wrap: wrap; margin-bottom: 8px; }
@@ -1724,7 +1725,7 @@ pre.diagram .dim { color: var(--dim); }
 .mpq-words { margin-top: 8px; margin-bottom: 20px; }
 .mpq-assume { margin: 8px 0 0 20px; }
 @media (max-width: 900px) {
-  .mp2-tiles { grid-template-columns: repeat(2, 1fr); }
+  .mp2-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .mp2-section { padding: 40px 0; }
   .mpw-table td, .mpw-table th { padding: 10px 8px; font-size: 12px; }
 }
