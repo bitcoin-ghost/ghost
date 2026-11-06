@@ -415,6 +415,7 @@ sv2_port = {self.pool}
 sv1_port = {self.sv1}
 http_port = {self.http}
 verification_https_port = {self.http + 2}
+sv2_authority_public_key = "{POOL_PUB}"
 max_miners = 100
 farm_port = {self.sv1 + 5}
 
