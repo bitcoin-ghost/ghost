@@ -367,7 +367,8 @@ for n in "${REACHED[@]}"; do
     # ⛔ #759: this used to FAIL on a missing `[tdp]` block. That invariant was UNSATISFIABLE.
     #
     # `[tdp]` is not a section of `NodeConfig` — the accepted set is identity, bitcoin, network,
-    # policy, storage, pool, ghost_pay, reaper, coordinator, node_launch, alerts, backup. It is not
+    # policy, storage, pool, reaper, node_launch, alerts, backup, plus the retired `ghost_pay` and
+    # `coordinator` sections, which are still read and ignored. It is not
     # in `pool-config.toml` either (that carries `[share_tier_binding]` and `[share_webhook]`), and
     # no shipped template contains it. TDP is pool_sv2's concern, configured by `--tdp-port` /
     # `--tdp-pubkey-from-keyfile`, not by a block in pool.toml.

@@ -10,8 +10,9 @@
 # Runs the REAL scripts/ghost-auto-update.sh end to end: a release tarball signed with a
 # throwaway GPG key, served over file://, stub binaries that print their version, and a fake
 # systemctl that records every call. Asserted:
-#   A. a full node swaps all four binaries, stops translator -> pool -> pay -> mining -> ghostd,
-#      and starts ghostd -> mining -> pool -> translator; a masked ghost-pay is not started;
+#   A. a full node swaps all four binaries, stops translator -> pool -> mining -> ghostd,
+#      and starts ghostd -> mining -> pool -> translator; a retired ghost-pay unit (enabled, its
+#      binary installed and in the release) is never stopped, swapped or started;
 #   B. a failed health check restores all four, the SV2 pair included;
 #   C. a release missing an SV2 binary the node runs is refused before anything is stopped;
 #   D. a node without the SV2 stack is updated without having it installed.
@@ -54,7 +55,7 @@ make_release() {
     ( cd "$dir" && sha256sum "$tarball" > SHA256SUMS.txt )
     gpg --batch --quiet --yes --armor --local-user "$FP" --detach-sign -o "$dir/SHA256SUMS.txt.asc" "$dir/SHA256SUMS.txt"
 }
-FULL="$TMP/rel-full";  mkdir -p "$FULL";  make_release "$FULL"  ghostd ghost-mining pool_sv2 translator_sv2
+FULL="$TMP/rel-full";  mkdir -p "$FULL";  make_release "$FULL"  ghostd ghost-mining ghost-pay pool_sv2 translator_sv2
 NOSV2="$TMP/rel-nosv2"; mkdir -p "$NOSV2"; make_release "$NOSV2" ghostd ghost-mining translator_sv2
 printf '{"tag_name": "v1.0.1"}\n' > "$TMP/latest.json"
 unset GNUPGHOME
@@ -84,8 +85,9 @@ run_case() {
     local name="$1" rel="$2" health="$3"; shift 3
     NODE="$TMP/node-$name"; mkdir -p "$NODE/bin"
     printf '%s\n' "$@" > "$NODE/units"
-    echo ghost-pay.service > "$NODE/masked"
+    : > "$NODE/masked"
     stub "$NODE/bin/ghostd" old-ghostd
+    case " $* " in *" ghost-pay.service "*)      stub "$NODE/bin/ghost-pay" old-ghost-pay ;; esac
     stub "$NODE/bin/ghost-mining" old-ghost-mining
     case " $* " in *" sri-pool.service "*)       stub "$NODE/bin/pool_sv2" old-pool_sv2 ;; esac
     case " $* " in *" sri-translator.service "*) stub "$NODE/bin/translator_sv2" old-translator_sv2 ;; esac
@@ -120,8 +122,10 @@ is "ghostd swapped"                new-ghostd        "$(ver ghostd)"
 is "ghost-mining swapped"          new-ghost-mining  "$(ver ghost-mining)"
 is "pool_sv2 swapped"              new-pool_sv2      "$(ver pool_sv2)"
 is "translator_sv2 swapped"        new-translator_sv2 "$(ver translator_sv2)"
-is "stop order"  "sri-translator sri-pool ghost-pay ghost-mining ghostd" "$(order stop)"
-is "start order (masked ghost-pay not started)" "ghostd ghost-mining sri-pool sri-translator" "$(order start)"
+is "stop order"  "sri-translator sri-pool ghost-mining ghostd" "$(order stop)"
+is "start order" "ghostd ghost-mining sri-pool sri-translator" "$(order start)"
+is "retired ghost-pay: no systemctl call names it" 0 "$($G -c 'ghost-pay' "$NODE/calls" || true)"
+is "retired ghost-pay: its binary is not swapped" old-ghost-pay "$(ver ghost-pay)"
 is "version file"                  v1.0.1            "$(cat "$NODE/version")"
 
 echo "B. a failed health check restores the whole set"

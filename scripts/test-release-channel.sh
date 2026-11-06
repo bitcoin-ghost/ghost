@@ -13,7 +13,8 @@
 #   3. the installer resolves GHOST_VERSION: np-latest, an exact np- tag, and refuses old tags;
 #   4. the updater, run end to end against a signed fixture (file:// URLs, throwaway GPG key,
 #      fake systemctl): a node pool node follows np- only; a node without the marker is updated
-#      EXACTLY as the updater before the channel existed updates it; a node pool build without
+#      EXACTLY as the updater before the channel existed updates it (bar its probes for the
+#      retired ghost-pay unit); a node pool build without
 #      the marker, a bad marker and a `latest` that is an np- tag are all refused untouched;
 #   5. the dashboard toggle never touches the marker and refuses `on` under a bad one.
 #
@@ -211,10 +212,13 @@ is "a key other than the release key is warned about, once" 1 "$($G -c 'TEST REL
 echo " c. an install without the marker is updated exactly as before the channel existed"
 if git -C "$REPO_ROOT" show "$BASELINE_REF:scripts/ghost-auto-update.sh" > "$TMP/updater-before.sh" 2>/dev/null; then
     run_node c-before "$TMP/updater-before.sh" v1.0.0 - "$TMP/latest-old.json"
-    before="rc=$(cat "$NODE/rc") ver=$(cat "$NODE/version") bins=$(bins) result=$(field result) calls=$(paste -sd' ' "$NODE/calls")"
+    # The one intended difference: Ghost Pay is retired, so the updater no longer asks systemd
+    # about a ghost-pay unit (this node has none, so the baseline only ever probed for it).
+    before="rc=$(cat "$NODE/rc") ver=$(cat "$NODE/version") bins=$(bins) result=$(field result) calls=$($G -v ' ghost-pay\.service$' "$NODE/calls" | paste -sd' ')"
+    is "control: the baseline did probe for ghost-pay" yes "$($G -q ' ghost-pay\.service$' "$NODE/calls" && echo yes)"
     run_node c "$UPDATER" v1.0.0 - "$TMP/latest-old.json"
     after="rc=$(cat "$NODE/rc") ver=$(cat "$NODE/version") bins=$(bins) result=$(field result) calls=$(paste -sd' ' "$NODE/calls")"
-    is "same exit, version, binaries, status and systemctl calls as the updater at $BASELINE_REF" "$before" "$after"
+    is "same exit, version, binaries, status and systemctl calls as the updater at $BASELINE_REF (less its ghost-pay probes)" "$before" "$after"
 else
     echo "  [BAD] $BASELINE_REF is not in this clone; cannot compare against the updater before the channel"
     fail=$((fail+1))

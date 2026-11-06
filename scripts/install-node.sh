@@ -1967,24 +1967,15 @@ cat > /opt/ghost/bin/wait-for-ghostd-sync.sh <<'WAIT_FOR_GHOSTD_SYNC_EOF'
 #!/usr/bin/env bash
 #
 # Deployed to /opt/ghost/bin/wait-for-ghostd-sync.sh — the ExecStart of
-# ghost-mining-gate.service. ghost-mining and ghost-pay are BOTH disabled at boot;
-# this gate is what starts them, once ghostd reports it has left initial block
-# download. Starting ghost-mining against a syncing ghostd is what the gate exists
-# to prevent.
+# ghost-mining-gate.service. ghost-mining is disabled at boot; this gate is what
+# starts it, once ghostd reports it has left initial block download. Starting
+# ghost-mining against a syncing ghostd is what the gate exists to prevent.
 #
 # This file is the canonical copy (#759). It used to exist only on the fleet, in
-# three variants that no repo file governed:
+# three variants that no repo file governed.
 #
-#   * vm1-vm5  escaped-double-quote form — the signature of a payload pushed over
-#              ssh with its quotes eaten locally, and NO ghost-pay block
-#   * vm6-vm7  identical logic, single-quoted, still no ghost-pay block
-#   * vm8      this file — the only copy that starts ghost-pay, on the one node
-#              that has no ghost-pay installed
-#
-# The split was inert (vm1-vm4 start ghost-pay because ghost-gsp.service happens
-# to carry `Wants=ghost-pay.service`), but it was inert by accident. Drop that
-# Wants and ghost-pay silently stops coming back after a reboot, with nothing
-# reporting it. The gate owns the start explicitly instead.
+# Ghost Pay is retired: the gate starts nothing for it. A host that still has a
+# ghost-pay unit keeps it exactly as it is — not started here, not stopped.
 #
 # The gate owns the stratum stack's start too (#1020). `sri-pool.service` used to carry
 # `Wants=ghost-mining.service`, which made systemd start the node whenever sri-pool started —
@@ -2018,16 +2009,13 @@ while true; do
     # Without the node there is nothing for the stratum stack to serve; it would only restart
     # in a loop. Fail instead, so the unit shows as failed (and is retried where it has Restart=).
     systemctl start "$UNIT" || { echo "[ghost-mining-gate] $UNIT did not start"; exit 1; }
-    # ghost-pay (when installed) also needs a live ghostd + ghost-mining, so the
-    # gate owns its first start too — mirrors ghost-mining, which is not enabled
-    # at boot. Its failure is not the gate's: it is masked on nodes that keep the unit file.
     rc=0
-    for SVC in ghost-pay sri-pool sri-translator; do
+    for SVC in sri-pool sri-translator; do
       [ -f "$UNIT_DIR/$SVC.service" ] || continue
       echo "[ghost-mining-gate] starting $SVC"
       if ! systemctl start "$SVC"; then
         echo "[ghost-mining-gate] $SVC did not start"
-        [ "$SVC" = ghost-pay ] || rc=1
+        rc=1
       fi
     done
     exit "$rc"
@@ -2051,6 +2039,12 @@ RestartSec=30
 [Install]
 WantedBy=multi-user.target
 EOF
+# Ghost Pay is retired. A re-run on a host that still has its unit leaves the unit exactly as it
+# is: neither the gate nor the auto-updater starts, health-checks, stops or swaps it any more. Its
+# database (which may hold funds) stays in the nightly backup.
+if [[ -e /etc/systemd/system/ghost-pay.service ]]; then
+    log "ghost-pay.service found — Ghost Pay is retired; the unit is left as it is (not started, checked or updated)"
+fi
 
 # ─────────────────────────── 9. systemd units ────────────────────────────────
 log "Installing systemd units"
@@ -2287,7 +2281,7 @@ cat > /opt/ghost/bin/ghost-auto-update.sh <<'GHOST_AUTOUPDATE_SH_EOF'
 # strict no-op unless the operator has opted in via /etc/ghost/auto-update.conf
 # (AUTO_UPDATE=true). When opted in, it resolves the latest published release,
 # and — ONLY if it is newer than what is installed — downloads the signed
-# release tarball (which now bundles ghostd alongside ghost-mining/ghost-pay),
+# release tarball (which now bundles ghostd alongside ghost-mining),
 # verifies the detached GPG signature against the pinned release key and the
 # tarball's SHA256, backs up the current binaries, swaps them with a
 # stop→verify-inactive→swap→start sequence, health-checks, and rolls back on any
@@ -2524,8 +2518,8 @@ unit_present() {
   $SYSTEMCTL list-unit-files "$unit" >/dev/null 2>&1
 }
 
-# unit_in_use — present and not masked. ghost-pay is masked on nodes that keep its unit file;
-# starting or health-checking it there fails by design and would roll back every update.
+# unit_in_use — present and not masked. A masked unit is one the operator switched off; starting
+# or health-checking it would fail by design and roll back every update.
 unit_in_use() {
   unit_present "$1" || return 1
   [[ "$($SYSTEMCTL is-enabled "$1" 2>/dev/null || true)" != masked ]]
@@ -2604,39 +2598,23 @@ health_stratum() {
   return 0
 }
 
-health_ghost_pay() {
-  # Only meaningful when ghost-pay is installed. It serves TLS with an
-  # identity-derived cert, so -k (we are localhost, integrity is the binary swap
-  # we just verified, not the transport).
-  unit_in_use ghost-pay.service || { log "health: ghost-pay not installed or masked — skipped"; return 0; }
-  local code
-  for _ in $(seq 1 30); do
-    code="$(curl -k -s -o /dev/null -w '%{http_code}' --max-time 8 "https://127.0.0.1:8800/health" 2>/dev/null || true)"
-    if [[ "$code" == "200" ]]; then
-      log "health: ghost-pay /health=200"
-      return 0
-    fi
-    sleep 2
-  done
-  err "health: ghost-pay /health != 200 (last='${code:-none}')"
-  return 1
-}
-
 run_health_checks() {
   # GHOST_HEALTHCHECK_OVERRIDE lets an operator substitute a custom post-update
   # probe (and is the seam the test harness uses to drive the swap/rollback
-  # paths offline). Unset in production → the real ghostd/pool/pay probes run.
+  # paths offline). Unset in production → the real ghostd/pool/stratum probes run.
   if [[ -n "${GHOST_HEALTHCHECK_OVERRIDE:-}" ]]; then
     log "health: running override probe"
     bash -c "$GHOST_HEALTHCHECK_OVERRIDE"
     return $?
   fi
-  health_ghostd && health_ghost_pool && health_ghost_pay && health_stratum
+  health_ghostd && health_ghost_pool && health_stratum
 }
 
 # The node's units, in START order. Stops run this list backwards. Same order as the boot
 # gate (wait-for-ghostd-sync.sh): the stratum stack has nothing to serve until the node is up.
-START_ORDER=(ghostd.service ghost-mining.service ghost-pay.service sri-pool.service sri-translator.service)
+# Ghost Pay is retired and not in the list: a host that still has its unit keeps it as it is —
+# not stopped, swapped, started or health-checked by an update.
+START_ORDER=(ghostd.service ghost-mining.service sri-pool.service sri-translator.service)
 
 # stop_all — reverse start order, each verified inactive. Returns non-zero naming the first
 # unit that would not stop; units the node does not have are skipped by stop_and_wait.
@@ -2657,8 +2635,6 @@ start_all() {
       *) unit_in_use "$u" || continue ;;
     esac
     if ! $SYSTEMCTL start "$u"; then
-      # As in the boot gate: ghost-pay's failure is not the node's.
-      [[ "$u" == ghost-pay.service ]] && { warn "ghost-pay did not start — continuing"; continue; }
       START_FAILED="$u"; return 1
     fi
     [[ "$u" == ghostd.service ]] && sleep 3
@@ -2852,9 +2828,8 @@ main() {
   # 5. Unpack the verified tarball and locate the binaries it carries (ghostd is
   #    now bundled in the tarball, so it is covered by the checks above).
   tar -xzf "$tmp/$tarball" -C "$tmp"
-  local new_pool new_pay new_cli new_admin new_ghostd new_pool_sv2 new_translator new_audit
+  local new_pool new_cli new_admin new_ghostd new_pool_sv2 new_translator new_audit
   new_pool="$(find "$tmp" -name ghost-mining -type f | head -1 || true)"
-  new_pay="$(find "$tmp" -name ghost-pay -type f | head -1 || true)"
   new_cli="$(find "$tmp" -name ghost-cli -type f | head -1 || true)"
   new_admin="$(find "$tmp" -name ghost-admin -type f | head -1 || true)"
   new_ghostd="$(find "$tmp" -name ghostd -type f | head -1 || true)"
@@ -2886,14 +2861,10 @@ main() {
     fi
   fi
 
-  # Build the swap plan: (dest <- src), only for binaries currently installed
-  # (so we never introduce ghost-pay onto a node that opted out of it).
+  # Build the swap plan: (dest <- src), only for binaries currently installed.
   local -a SWAP_DEST=() SWAP_SRC=()
   SWAP_DEST+=("$BIN_DIR/ghostd");     SWAP_SRC+=("$new_ghostd")
   SWAP_DEST+=("$BIN_DIR/ghost-mining"); SWAP_SRC+=("$new_pool")
-  if [[ -x "$BIN_DIR/ghost-pay" && -n "$new_pay" ]]; then
-    SWAP_DEST+=("$BIN_DIR/ghost-pay"); SWAP_SRC+=("$new_pay")
-  fi
   # ghost-cli is the Core RPC client. A release up to v1.11.45 carries the admin tool under
   # that name; swapping it in would replace a working RPC client with a different program, so
   # the installed one is kept and the tarball's is treated as the admin tool it is.
@@ -2965,7 +2936,7 @@ main() {
     return 0  # never let the rollback's last status trip `set -e` in the caller
   }
 
-  # 7. Stop services (reverse start order: translator, pool, pay, ghost-mining, ghostd), each
+  # 7. Stop services (reverse start order: translator, pool, ghost-mining, ghostd), each
   #    verified inactive. Nothing has been swapped yet, so a refusal rolls back to a no-op.
   local STOP_FAILED="" START_FAILED=""
   PEERS_BEFORE="$(read_peer_count)"
@@ -2988,7 +2959,7 @@ main() {
     fi
   done
 
-  # 9. Start services (start order: ghostd, ghost-mining, pay, pool, translator).
+  # 9. Start services (start order: ghostd, ghost-mining, pool, translator).
   start_all || { err "$START_FAILED failed to start — rolling back"; rollback; write_status "rolled-back" "$START_FAILED failed to start" "$latest"; exit 1; }
 
   # 10. Health-check; roll back on any failure.

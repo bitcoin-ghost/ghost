@@ -6,7 +6,7 @@
 # strict no-op unless the operator has opted in via /etc/ghost/auto-update.conf
 # (AUTO_UPDATE=true). When opted in, it resolves the latest published release,
 # and — ONLY if it is newer than what is installed — downloads the signed
-# release tarball (which now bundles ghostd alongside ghost-mining/ghost-pay),
+# release tarball (which now bundles ghostd alongside ghost-mining),
 # verifies the detached GPG signature against the pinned release key and the
 # tarball's SHA256, backs up the current binaries, swaps them with a
 # stop→verify-inactive→swap→start sequence, health-checks, and rolls back on any
@@ -243,8 +243,8 @@ unit_present() {
   $SYSTEMCTL list-unit-files "$unit" >/dev/null 2>&1
 }
 
-# unit_in_use — present and not masked. ghost-pay is masked on nodes that keep its unit file;
-# starting or health-checking it there fails by design and would roll back every update.
+# unit_in_use — present and not masked. A masked unit is one the operator switched off; starting
+# or health-checking it would fail by design and roll back every update.
 unit_in_use() {
   unit_present "$1" || return 1
   [[ "$($SYSTEMCTL is-enabled "$1" 2>/dev/null || true)" != masked ]]
@@ -323,39 +323,23 @@ health_stratum() {
   return 0
 }
 
-health_ghost_pay() {
-  # Only meaningful when ghost-pay is installed. It serves TLS with an
-  # identity-derived cert, so -k (we are localhost, integrity is the binary swap
-  # we just verified, not the transport).
-  unit_in_use ghost-pay.service || { log "health: ghost-pay not installed or masked — skipped"; return 0; }
-  local code
-  for _ in $(seq 1 30); do
-    code="$(curl -k -s -o /dev/null -w '%{http_code}' --max-time 8 "https://127.0.0.1:8800/health" 2>/dev/null || true)"
-    if [[ "$code" == "200" ]]; then
-      log "health: ghost-pay /health=200"
-      return 0
-    fi
-    sleep 2
-  done
-  err "health: ghost-pay /health != 200 (last='${code:-none}')"
-  return 1
-}
-
 run_health_checks() {
   # GHOST_HEALTHCHECK_OVERRIDE lets an operator substitute a custom post-update
   # probe (and is the seam the test harness uses to drive the swap/rollback
-  # paths offline). Unset in production → the real ghostd/pool/pay probes run.
+  # paths offline). Unset in production → the real ghostd/pool/stratum probes run.
   if [[ -n "${GHOST_HEALTHCHECK_OVERRIDE:-}" ]]; then
     log "health: running override probe"
     bash -c "$GHOST_HEALTHCHECK_OVERRIDE"
     return $?
   fi
-  health_ghostd && health_ghost_pool && health_ghost_pay && health_stratum
+  health_ghostd && health_ghost_pool && health_stratum
 }
 
 # The node's units, in START order. Stops run this list backwards. Same order as the boot
 # gate (wait-for-ghostd-sync.sh): the stratum stack has nothing to serve until the node is up.
-START_ORDER=(ghostd.service ghost-mining.service ghost-pay.service sri-pool.service sri-translator.service)
+# Ghost Pay is retired and not in the list: a host that still has its unit keeps it as it is —
+# not stopped, swapped, started or health-checked by an update.
+START_ORDER=(ghostd.service ghost-mining.service sri-pool.service sri-translator.service)
 
 # stop_all — reverse start order, each verified inactive. Returns non-zero naming the first
 # unit that would not stop; units the node does not have are skipped by stop_and_wait.
@@ -376,8 +360,6 @@ start_all() {
       *) unit_in_use "$u" || continue ;;
     esac
     if ! $SYSTEMCTL start "$u"; then
-      # As in the boot gate: ghost-pay's failure is not the node's.
-      [[ "$u" == ghost-pay.service ]] && { warn "ghost-pay did not start — continuing"; continue; }
       START_FAILED="$u"; return 1
     fi
     [[ "$u" == ghostd.service ]] && sleep 3
@@ -571,9 +553,8 @@ main() {
   # 5. Unpack the verified tarball and locate the binaries it carries (ghostd is
   #    now bundled in the tarball, so it is covered by the checks above).
   tar -xzf "$tmp/$tarball" -C "$tmp"
-  local new_pool new_pay new_cli new_admin new_ghostd new_pool_sv2 new_translator new_audit
+  local new_pool new_cli new_admin new_ghostd new_pool_sv2 new_translator new_audit
   new_pool="$(find "$tmp" -name ghost-mining -type f | head -1 || true)"
-  new_pay="$(find "$tmp" -name ghost-pay -type f | head -1 || true)"
   new_cli="$(find "$tmp" -name ghost-cli -type f | head -1 || true)"
   new_admin="$(find "$tmp" -name ghost-admin -type f | head -1 || true)"
   new_ghostd="$(find "$tmp" -name ghostd -type f | head -1 || true)"
@@ -605,14 +586,10 @@ main() {
     fi
   fi
 
-  # Build the swap plan: (dest <- src), only for binaries currently installed
-  # (so we never introduce ghost-pay onto a node that opted out of it).
+  # Build the swap plan: (dest <- src), only for binaries currently installed.
   local -a SWAP_DEST=() SWAP_SRC=()
   SWAP_DEST+=("$BIN_DIR/ghostd");     SWAP_SRC+=("$new_ghostd")
   SWAP_DEST+=("$BIN_DIR/ghost-mining"); SWAP_SRC+=("$new_pool")
-  if [[ -x "$BIN_DIR/ghost-pay" && -n "$new_pay" ]]; then
-    SWAP_DEST+=("$BIN_DIR/ghost-pay"); SWAP_SRC+=("$new_pay")
-  fi
   # ghost-cli is the Core RPC client. A release up to v1.11.45 carries the admin tool under
   # that name; swapping it in would replace a working RPC client with a different program, so
   # the installed one is kept and the tarball's is treated as the admin tool it is.
@@ -684,7 +661,7 @@ main() {
     return 0  # never let the rollback's last status trip `set -e` in the caller
   }
 
-  # 7. Stop services (reverse start order: translator, pool, pay, ghost-mining, ghostd), each
+  # 7. Stop services (reverse start order: translator, pool, ghost-mining, ghostd), each
   #    verified inactive. Nothing has been swapped yet, so a refusal rolls back to a no-op.
   local STOP_FAILED="" START_FAILED=""
   PEERS_BEFORE="$(read_peer_count)"
@@ -707,7 +684,7 @@ main() {
     fi
   done
 
-  # 9. Start services (start order: ghostd, ghost-mining, pay, pool, translator).
+  # 9. Start services (start order: ghostd, ghost-mining, pool, translator).
   start_all || { err "$START_FAILED failed to start — rolling back"; rollback; write_status "rolled-back" "$START_FAILED failed to start" "$latest"; exit 1; }
 
   # 10. Health-check; roll back on any failure.
