@@ -639,7 +639,7 @@ async fn balances_include_the_genesis_table() {
 /// (its credit event is applied), not anchor 2's share at 902 (a losing fork, not applied).
 #[tokio::test]
 async fn the_status_carries_total_owed_and_the_pool_hashrate() {
-    let w = world();
+    let mut w = world();
     let s = w.api.status().await.unwrap();
     let owed = P1_CREDIT + 24_000 * ONE - 2_500 * ONE;
     assert_eq!(s.total_owed.units, owed.to_string());
@@ -686,7 +686,9 @@ async fn the_status_carries_total_owed_and_the_pool_hashrate() {
     assert_eq!(w.api.pool_hashrate(Some(999)).unwrap().credited_shares, 3);
     assert_eq!(w.api.pool_hashrate(Some(901)).unwrap().credited_shares, 2);
 
-    // A young share chain: the window starts at the first earning height.
+    // A young share chain: the window starts at the first earning height. (The world's
+    // checkpoint at 700 would make a pruning node refuse a window this low: an archive node.)
+    w.api.parts.prune = false;
     let young = w.api.pool_hashrate(Some(30)).unwrap();
     assert_eq!((young.from_job_height, young.window_blocks), (Some(21), 10));
     assert_eq!(young.hashes_per_sec, Some(0.0));
