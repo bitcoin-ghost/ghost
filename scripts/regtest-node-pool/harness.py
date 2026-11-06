@@ -329,9 +329,10 @@ class Node:
         # The relay listens here: a loopback address of its own for a node whose relay must be
         # told apart by IP (a ban is per IP, and every node else shares 127.0.0.1).
         self.relay_ip = "127.0.0.1"
-        # The address the translator serves SV1 on (and the miners dial): 127.0.0.1, or with
-        # --node-ips one loopback address per node, the relay's too, so each node has a host of
-        # its own as on a real network (the lister lists nodes by host; the website asks by host).
+        # The address the node serves miners on, SV1 (translator) and SV2 (pool_sv2): 127.0.0.1,
+        # or with --node-ips one loopback address per node, the relay's too, so each node has a
+        # host of its own as on a real network (a lister probes the stratum ports a relay
+        # advertises on the relay's own IP, and the website asks nodes by host).
         self.stratum_ip = "127.0.0.1"
         if h.args.node_ips:
             self.relay_ip = self.stratum_ip = f"127.0.0.{10 + idx}"
@@ -463,7 +464,7 @@ enabled = {"true" if self.h.is_ghostd and self.h.args.reaper else "false"}
         cfg = f"""authority_public_key = "{POOL_PUB}"
 authority_secret_key = "{POOL_SEC}"
 cert_validity_sec = 3600
-listen_address = "127.0.0.1:{self.pool}"
+listen_address = "{self.stratum_ip}:{self.pool}"
 coinbase_reward_script = "addr({self.fee_addr})"
 server_id = 1
 pool_signature = "- G H O S T -"
@@ -555,7 +556,7 @@ public_key = "{self.tdp_key}"
         self.procs["pool_sv2"] = Proc(
             "pool_sv2", [binary, "-c", os.path.join(d, "pool-config.toml")],
             self.log("pool_sv2"), cwd=d, env=env)
-        wait_for(lambda: port_open(self.pool) and port_open(self.relay, self.relay_ip)
+        wait_for(lambda: port_open(self.pool, self.stratum_ip) and port_open(self.relay, self.relay_ip)
                  and port_open(self.pool_mon), 120, what=f"node{self.i} pool_sv2 listening")
 
     def restart_pool(self, relay_peers=None, wipe=False):
@@ -614,7 +615,7 @@ job_keepalive_interval_secs = 60
 quantise_to_tiers = false
 
 [[upstreams]]
-address = "127.0.0.1"
+address = "{self.stratum_ip}"
 port = {self.pool}
 authority_pubkey = "{POOL_PUB}"
 """
@@ -647,7 +648,7 @@ authority_pubkey = "{POOL_PUB}"
         if not dev:
             return False
         self.procs["sv2-device"] = Proc(
-            "sv2-device", [dev, "-a", f"127.0.0.1:{self.pool}", "--cores", "1", "--handicap",
+            "sv2-device", [dev, "-a", f"{self.stratum_ip}:{self.pool}", "--cores", "1", "--handicap",
                            str(self.h.args.sv2_handicap), "--id-user", user,
                            "--pubkey-pool", POOL_PUB],
             self.log("sv2-device"), env={"RUST_LOG": "info", "NO_COLOR": "1"})
