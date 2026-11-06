@@ -209,6 +209,15 @@ jobs:
       # 22/tcp is never closed and nothing happens without a confirmation. Throwaway root.
       - name: Installer uninstall self-test
         run: ./scripts/test-installer-uninstall.sh
+      # --lister (W2.10): off by default, enabled only with a configuration it can run on, kept on
+      # by a re-run, its env file root-only, its node-list.json where ghost-mining serves it.
+      - name: Installer lister self-test
+        run: ./scripts/test-installer-lister.sh
+      # The Namecheap DNS hook for ghost-audit merge, against a local fake Namecheap API: setHosts
+      # replaces the whole record set, so only the pool's name may change and nothing is written
+      # when getHosts fails or returns nothing. No real API call.
+      - name: Namecheap DNS hook self-test
+        run: python3 -I scripts/dns-hooks/test_namecheap_hook.py
       # Fuzz targets depend on internal APIs and rot silently when a signature changes.
       # One had been importing a module that no longer existed, unnoticed, because no job
       # built them (#468). Build only — running the fuzzers belongs in a scheduled job.
