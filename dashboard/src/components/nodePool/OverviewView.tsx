@@ -57,6 +57,7 @@ export function OverviewView({ status, statusError, statusLoading, node, nodeErr
   const groups = status ? groupByAddress(status.miners) : [];
   const warnings = status ? status.miners.filter((m) => m.firmware_warning).length : null;
   const st = status?.settlement;
+  const interval = status?.pool_expected_block_interval_secs;
   return (
     <div className="space-y-6">
       <Card>
@@ -106,6 +107,18 @@ export function OverviewView({ status, statusError, statusLoading, node, nodeErr
           <Kv label="Checked to Bitcoin height" value={fmtInt(st?.synced_height)} />
           <Kv label="Bitcoin tip it last saw" value={fmtInt(st?.bitcoin_tip)} />
           <Kv label="Provisional blocks" value={fmtInt(st?.provisional.length)} />
+          <Kv label="Pool blocks found" value={fmtInt(status?.pool_blocks_found)} />
+          <Kv
+            label="Pool finds a block about every"
+            value={
+              interval === null
+                ? "no work credited yet"
+                : isNum(interval)
+                  ? fmtDuration(interval)
+                  : UNKNOWN
+            }
+            hint="what the work credited to every miner over the last day should find on average"
+          />
           <Kv label="Pool blocks listed" value={fmtInt(status?.recent_blocks.length)} />
           <Kv label="Ledger rows" value={fmtInt(status?.ledger_rows)} />
         </Grid>

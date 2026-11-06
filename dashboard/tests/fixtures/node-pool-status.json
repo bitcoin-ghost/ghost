@@ -54,6 +54,8 @@
   },
   "fee_address": "bcrt1qfeeaddressexample0000000000000000000",
   "ledger_rows": 3,
+  "pool_blocks_found": 41,
+  "pool_expected_block_interval_secs": 52000,
   "recent_blocks": [
     {
       "height": 960,

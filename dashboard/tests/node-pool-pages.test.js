@@ -92,6 +92,22 @@ test("overview: renders the status, health checks and start values", () => {
   assert.match(t, /Firmware warnings 1/);
   assert.match(t, /Synced/);
   assert.match(t, /Uptime 1h 1m/);
+  // Pool-wide: every block since genesis, not the listed few, and the credited work's rate.
+  assert.match(t, /Pool blocks found 41/);
+  assert.match(t, /Pool finds a block about every 14h 26m/);
+});
+
+test("overview: pool-wide figures an older pool_sv2 does not send read unknown; none credited says so", () => {
+  need();
+  const status = fixture("node-pool-status.json");
+  delete status.pool_blocks_found;
+  delete status.pool_expected_block_interval_secs;
+  let t = text(html(views.OverviewView, { status }));
+  assert.match(t, /Pool blocks found unknown/);
+  assert.match(t, /Pool finds a block about every unknown/);
+  status.pool_expected_block_interval_secs = null;
+  t = text(html(views.OverviewView, { status }));
+  assert.match(t, /Pool finds a block about every no work credited yet/);
 });
 
 test("overview: a healthy status reads healthy", () => {

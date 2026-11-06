@@ -132,6 +132,11 @@ export interface NodePoolStatus {
   settlement: NpSettlement;
   fee_address: string;
   ledger_rows: number;
+  /** Every pool block since the genesis anchor; `recent_blocks` lists only the latest. */
+  pool_blocks_found?: number;
+  /** What the pool's credited work over the last day should find: mean seconds between
+   *  pool blocks. `null` before any work is credited. */
+  pool_expected_block_interval_secs?: number | null;
   recent_blocks: NpBlock[];
   miners: NpMinerChannel[];
   earning?: NpEarning;

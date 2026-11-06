@@ -24,11 +24,14 @@
   // as their length.
   var FIELDS = {
     tip_height:   ['share_chain.anchor_height', 'share_chain.tip_height', 'share_chain.height', 'tip.height', 'anchor_height', 'tip_height', 'anchors'],
-    btc_height:   ['btc_height', 'bitcoin_height', 'tip.btc_height', 'share_chain.btc_height', 'block_height'],
+    // The Bitcoin tip settlement last saw, not share_chain.btc_height (the height the tip
+    // anchor's job was for, which trails the tip).
+    btc_height:   ['settlement.bitcoin_tip', 'btc_height', 'bitcoin_height', 'tip.btc_height', 'share_chain.btc_height', 'block_height'],
     hashrate:     ['pool_hashrate_ths', 'hashrate_ths', 'pool_hashrate_hs', 'hashrate_hs', 'pool_hashrate', 'hashrate'],
     peers:        ['relay.peer_count', 'relay.peers', 'peer_count', 'peers'],
     miners:       ['miners.connected', 'connected_miners', 'active_miners', 'miner_count', 'miners'],
-    blocks_found: ['blocks_found', 'pool_blocks', 'blocks.found', 'blocks'],
+    // Every pool block since the genesis anchor; recent_blocks is only the latest few.
+    blocks_found: ['pool_blocks_found', 'blocks_found', 'pool_blocks', 'blocks.found', 'blocks'],
     network_tier: ['share_chain.t_net', 't_net', 'network_tier', 'tier'],
     owed_sats:    ['ledger.total_owed_sats', 'total_owed_sats', 'owed_sats'],
     balances:     ['ledger_rows', 'ledger.balances', 'ledger.eligible', 'balances', 'eligible_balances']
