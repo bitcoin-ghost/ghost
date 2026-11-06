@@ -340,7 +340,13 @@ async function main() {
     if (!changeBlocks) fail("precondition", "no recent block left change to the treasury");
     if (!surplusBlocks) fail("precondition", "no recent block paid a cleared-ledger finder surplus");
     const paid = addresses.filter((a) => ledgers[a]?.payouts?.length);
-    if (!paid.length) fail("precondition", "no miner address has a payout");
+    if (!paid.length) note("precondition", "no running miner's address has a payout yet; payouts are checked on paid genesis addresses");
+    // Addresses the listed blocks paid that no running miner mines to (the genesis table's):
+    // their payout rows are checked on both front ends too.
+    const paidOnly = [...new Set(blocks.flatMap((b) => b.payouts.map((x) => x.address)))]
+      .filter((a) => !addresses.includes(a)).slice(0, 2);
+    for (const a of paidOnly) ledgers[a] = (await api(n0, `/api/v1/ledger/${a}`)).body;
+    if (!paid.length && !paidOnly.length) fail("precondition", "no address has a payout in the listed blocks");
 
     // ---------------- dashboard
     for (const vp of VIEWPORTS) for (const theme of THEMES) {
@@ -525,6 +531,36 @@ async function main() {
           if (Number.isFinite(hr) && !workers.includes(W.hashrate(hr))) fail(label, `worker ${w.name} hashrate ${W.hashrate(hr)} missing (node${own.index})`);
           if (!workers.includes(squash(`node ${own.ip}`))) fail(label, `worker ${w.name} does not name its node ${own.ip}`);
         }
+      }
+      await ctx.close();
+    }
+
+    // ---------------- paid addresses no running miner mines to
+    {
+      const ctx = await newContext(browser, VIEWPORTS[0], "dark");
+      const dpage = await login(ctx);
+      const spage = await ctx.newPage();
+      for (const [i, a] of paidOnly.entries()) {
+        const l = ledgers[a];
+        let label = `dashboard paid address ${i}`;
+        let r = await visit(dpage, `${A.dashboard}/miners/${a}`, `dash-paid-${i}`, { settle: dashSettle });
+        report(label, r, "dark");
+        expectKv(label, "Balance owed", await kv(dpage, "Balance owed"), D.sats(l.balance.sats));
+        const rows = await dpage.$$eval('[data-testid="payout-row"]', (trs) => trs.map((tr) => [...tr.children].map((td) => td.innerText.trim())));
+        if (rows.length !== l.payouts.length) fail(label, `${rows.length} payout rows, API ${l.payouts.length}`);
+        rows.forEach((c, k) => { if (c[0] !== D.int(l.payouts[k].height) || c[2] !== D.sats(l.payouts[k].sats)) fail(label, `payout ${k}: ${c[0]} ${c[2]} != ${l.payouts[k].height} ${D.sats(l.payouts[k].sats)}`); });
+        if (rows.length === l.payouts.length) pass(label, `${rows.length} payout row(s) match the ledger`);
+        label = `site paid address ${i}`;
+        r = await visit(spage, `${A.site}/miner.html?address=${a}`, `site-paid-${i}`, {
+          values: SITE_VALUES,
+          settle: (pg) => pg.waitForFunction(() => /Checked|Updated/.test(document.getElementById("mp-updated")?.innerText || ""), null, { timeout: 60_000 }),
+        });
+        report(label, r, "dark");
+        const pay = squash(await spage.$eval("#mp-payouts", (e) => e.innerText));
+        const missing = l.payouts.filter((x) => !pay.includes(W.sats(x.sats)) || !pay.includes(String(x.height)));
+        if (missing.length) fail(label, `payouts not shown: ${missing.map((x) => x.height).join(", ")}`);
+        else pass(label, `${l.payouts.length} payout(s) shown with height and amount`);
+        if (!squash(await spage.$eval("#mp-tiles", (e) => e.innerText)).includes(W.sats(l.balance.sats))) fail(label, `balance ${W.sats(l.balance.sats)} not shown`);
       }
       await ctx.close();
     }
