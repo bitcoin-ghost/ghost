@@ -26,7 +26,8 @@
 //! and judges every job it is sent, over Stratum V1, Stratum V2 or both. `ghost-audit probe` is the public prober: it checks a node's
 //! relay advert and jobs and prints a JSON verdict. `ghost-audit list` is open listing (W2.10):
 //! it finds nodes from relay gossip, probes them on a schedule, and writes the website's
-//! `node-list.json` and a DNS fragment. None of them submits a share.
+//! `node-list.json` and a DNS fragment. `ghost-audit merge` combines several listers' lists by
+//! majority and pushes DNS changes through a hook. None of them submits a share.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -41,6 +42,10 @@ use ghost_audit::check::{JobReport, ShareChainData, Verdict};
 use ghost_audit::discover::Limits;
 use ghost_audit::lister::{now_secs, run_round, write_atomic, LiveProber, RoundConfig};
 use ghost_audit::listing::{render_dns, render_node_list, DnsConfig, ListMeta, ListState, Policy};
+use ghost_audit::merge::{
+    display_source, fetch, merge, publish_dns, render_merged, render_merged_dns, Fetched, Hook,
+    MergeConfig, PushOutcome, SourceReport, SourceStatus,
+};
 use ghost_audit::probe::{probe, read_advert, ProbeConfig, ProbeVerdict, Sv2Endpoint};
 use ghost_audit::source::{start_share_chain, ChainConfig, ExportSource, GenesisSource};
 use ghost_audit::sv1::Sv1Config;
@@ -82,6 +87,9 @@ enum Cmd {
     /// Open listing: find nodes from relay gossip, probe them on a schedule, and write the
     /// website's node-list.json and a DNS fragment.
     List(ListArgs),
+    /// Merge several listers' node-list.json into one, listing a node only when a strict
+    /// majority of the configured listers list it, and push DNS changes through a hook.
+    Merge(MergeArgs),
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -145,15 +153,15 @@ struct ChainArgs {
     /// ledger-export.json. Its genesis table (the balances carried over at the cutover) is what
     /// every table folds onto. Checked as pool_sv2's import checks it and kept in the auditor's
     /// store, so later runs need not pass it again.
-    #[arg(long, requires = "export_digest")]
+    #[arg(long, requires = "export_digest", env = "GHOST_AUDIT_GENESIS_EXPORT")]
     genesis_export: Option<PathBuf>,
     /// The published sha256 of ledger-export.bin, 64 hex characters.
-    #[arg(long, requires = "genesis_export")]
+    #[arg(long, requires = "genesis_export", env = "GHOST_AUDIT_EXPORT_DIGEST")]
     export_digest: Option<String>,
     /// The network's pinned genesis table digest (the table_root nodes pin), 64 hex characters.
     /// Nothing is audited unless the auditor's genesis table hashes to it. Required except on
     /// regtest; on mainnet it must equal the compiled one once that is set.
-    #[arg(long)]
+    #[arg(long, env = "GHOST_AUDIT_GENESIS_TABLE_DIGEST")]
     genesis_table_digest: Option<String>,
     /// Tier 0 target, 64 hex characters, big-endian. Defaults to difficulty 1 (regtest: its
     /// proof-of-work limit).
@@ -353,6 +361,64 @@ struct ListArgs {
     /// Most records in the DNS fragment.
     #[arg(long, default_value_t = 32)]
     dns_max: usize,
+}
+
+#[derive(Args)]
+struct MergeArgs {
+    /// A lister's node-list.json: an http:// or https:// URL (for a node running a lister,
+    /// http://<node>:8080/api/v1/node-pool/node-list) or a file. Repeat for each lister. A node
+    /// is listed when more than half of the listers given here list it; one that cannot be
+    /// read, or whose list is not valid, votes for nothing.
+    #[arg(long = "lister", required = true)]
+    listers: Vec<String>,
+    /// The network every list must be for.
+    #[arg(long, value_enum, default_value = "mainnet")]
+    network: Network,
+    /// The share-chain genesis anchor every list must carry, 64 hex characters. Default: the one
+    /// a majority of the listers carry.
+    #[arg(long)]
+    genesis_anchor: Option<String>,
+    /// A list generated longer ago than this many seconds does not vote.
+    #[arg(long, default_value_t = 3_600)]
+    max_age: u64,
+    /// Seconds to wait for each lister.
+    #[arg(long, default_value_t = 20)]
+    timeout: u64,
+    /// Where to write the merged node-list.json.
+    #[arg(long)]
+    out_json: Option<PathBuf>,
+    /// Where to write the merged DNS zone fragment.
+    #[arg(long)]
+    out_dns: Option<PathBuf>,
+    /// DNS owner name for the fragment (relative to the zone, or absolute with a final dot).
+    #[arg(long, default_value = "pool")]
+    dns_name: String,
+    /// DNS TTL, seconds.
+    #[arg(long, default_value_t = 300)]
+    dns_ttl: u32,
+    /// Only merged nodes serving SV1 on this port go in the DNS fragment.
+    #[arg(long, default_value_t = 3333)]
+    dns_sv1_port: u16,
+    /// Most records in the DNS fragment.
+    #[arg(long, default_value_t = 32)]
+    dns_max: usize,
+    /// A program run, without a shell, when the fragment's records differ from the ones last
+    /// pushed: `<program> <--dns-hook-arg…> <fragment path>`, with GHOST_DNS_FRAGMENT,
+    /// GHOST_DNS_NAME, GHOST_DNS_OLD_RECORDS, GHOST_DNS_NEW_RECORDS and GHOST_DNS_FIRST_PUSH in
+    /// its environment. The push is recorded (<fragment>.pushed) only when it exits 0. Needs
+    /// --out-dns.
+    #[arg(long, requires = "out_dns")]
+    dns_hook: Option<PathBuf>,
+    /// An argument for the hook, before the fragment's path. Repeat for more.
+    #[arg(
+        long = "dns-hook-arg",
+        requires = "dns_hook",
+        allow_hyphen_values = true
+    )]
+    dns_hook_args: Vec<String>,
+    /// Seconds the hook may run before it is killed and the push counted as failed.
+    #[arg(long, default_value_t = 120)]
+    dns_hook_timeout: u64,
 }
 
 async fn resolve(s: &str) -> Result<SocketAddr, String> {
@@ -762,7 +828,8 @@ async fn run_list(a: ListArgs) -> Result<ExitCode, String> {
     let genesis = chain_cfg.genesis_anchor;
     let timeout = limits.timeout;
     eprintln!(
-        "ghost-audit list: probes submit no shares. Listing: {} passes in {} probes, delist          after {} non-passes or {} fails.",
+        "ghost-audit list: probes submit no shares. Listing: {} passes in {} probes, delist \
+         after {} non-passes or {} fails.",
         policy.list_after, policy.window, policy.delist_after, policy.delist_after_fail
     );
     loop {
@@ -793,7 +860,8 @@ async fn run_list(a: ListArgs) -> Result<ExitCode, String> {
                 .map_err(|e| format!("{}: {e}", p.display()))?;
         }
         eprintln!(
-            "round: {} relays answered, {} candidates, {} probed ({} pass, {} fail, {}              unmeasured), {} listed; listed {:?}, delisted {:?}, forgot {}",
+            "round: {} relays answered, {} candidates, {} probed ({} pass, {} fail, {} \
+             unmeasured), {} listed; listed {:?}, delisted {:?}, forgot {}",
             r.answered,
             r.candidates,
             r.probed,
@@ -813,6 +881,118 @@ async fn run_list(a: ListArgs) -> Result<ExitCode, String> {
     }
 }
 
+/// `ghost-audit merge`. Exit 0 when written (and pushed, or nothing to push), 2 on no quorum
+/// (nothing written), 4 when written but the DNS hook failed (retried on the next run).
+async fn run_merge(a: MergeArgs) -> Result<ExitCode, String> {
+    if a.out_json.is_none() && a.out_dns.is_none() {
+        return Err("nothing to write: pass --out-json, --out-dns or both".into());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for l in &a.listers {
+        if !seen.insert(display_source(l)) {
+            return Err(format!(
+                "--lister {} is given twice: each lister votes once",
+                display_source(l)
+            ));
+        }
+    }
+    let genesis_anchor = a
+        .genesis_anchor
+        .as_deref()
+        .map(|g| hex32(g, "--genesis-anchor").map(hex::encode))
+        .transpose()?;
+    let timeout = Duration::from_secs(a.timeout.max(1));
+    let mut tasks = tokio::task::JoinSet::new();
+    for (i, l) in a.listers.iter().enumerate() {
+        let l = l.clone();
+        tasks.spawn(async move { (i, fetch(&l, timeout).await) });
+    }
+    let mut fetched: Vec<Option<Fetched>> = vec![None; a.listers.len()];
+    while let Some(done) = tasks.join_next().await {
+        if let Ok((i, f)) = done {
+            fetched[i] = Some(f);
+        }
+    }
+    let inputs: Vec<(String, Fetched)> = a
+        .listers
+        .iter()
+        .zip(fetched)
+        .map(|(l, f)| {
+            (
+                display_source(l),
+                f.unwrap_or_else(|| Fetched::Unreachable("the fetch task failed".into())),
+            )
+        })
+        .collect();
+    let now = now_secs();
+    let cfg = MergeConfig {
+        network: a.network.name().to_string(),
+        genesis_anchor,
+        max_age_secs: a.max_age,
+        now,
+    };
+    let print_sources = |sources: &[SourceReport]| {
+        for s in sources {
+            match (s.status, &s.detail) {
+                (SourceStatus::Ok, _) => {
+                    eprintln!("lister {}: ok, {} listed", s.source, s.listed.unwrap_or(0))
+                }
+                (st, d) => eprintln!(
+                    "lister {}: SKIPPED, {}: {}; it votes for nothing",
+                    s.source,
+                    st.label(),
+                    d.as_deref().unwrap_or("")
+                ),
+            }
+        }
+    };
+    let m = match merge(&inputs, &cfg) {
+        Ok(m) => m,
+        Err(e) => {
+            print_sources(&e.sources);
+            eprintln!("ghost-audit merge: {e}");
+            return Ok(ExitCode::from(2));
+        }
+    };
+    print_sources(&m.sources);
+    if let Some(p) = &a.out_json {
+        write_atomic(p, &render_merged(&m, now)).map_err(|e| format!("{}: {e}", p.display()))?;
+    }
+    eprintln!(
+        "merged: {} of {} listers voted, a node needs {}; {} listed of {} candidates",
+        m.voting,
+        m.configured,
+        m.threshold,
+        m.nodes.len(),
+        m.candidates
+    );
+    let Some(out) = &a.out_dns else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    let dns = DnsConfig {
+        name: a.dns_name.clone(),
+        ttl: a.dns_ttl,
+        sv1_port: a.dns_sv1_port,
+        max_records: a.dns_max,
+    };
+    let hook = a.dns_hook.as_ref().map(|p| Hook {
+        program: p.clone(),
+        args: a.dns_hook_args.clone(),
+        timeout: Duration::from_secs(a.dns_hook_timeout.max(1)),
+        name: a.dns_name.clone(),
+    });
+    match publish_dns(out, &render_merged_dns(&m, &dns, now), hook.as_ref()).await? {
+        PushOutcome::NoHook => eprintln!("dns: written; no --dns-hook"),
+        PushOutcome::Unchanged => eprintln!("dns: records unchanged since the last push"),
+        PushOutcome::Pushed => eprintln!("dns: records changed; the hook pushed them"),
+        PushOutcome::Failed(why) => {
+            eprintln!("dns: records changed but the push FAILED ({why}); retried next run");
+            return Ok(ExitCode::from(4));
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -826,6 +1006,7 @@ async fn main() -> ExitCode {
         Cmd::Audit(a) => run_audit(a).await,
         Cmd::Probe(p) => run_probe(p).await,
         Cmd::List(l) => run_list(l).await,
+        Cmd::Merge(m) => run_merge(m).await,
     };
     r.unwrap_or_else(|e| {
         eprintln!("ghost-audit: {e}");

@@ -51,7 +51,8 @@
 //! machine-readable verdict that open listing (W2.10) calls to decide whether to list a node.
 //! Open listing itself is [`crate::discover`] (candidates from relay gossip), [`crate::listing`]
 //! (the policy and the generated `node-list.json` and DNS fragment) and [`crate::lister`] (one
-//! round), run by `ghost-audit list`.
+//! round), run by `ghost-audit list`. [`crate::merge`] combines several listers' lists into one by
+//! majority and pushes DNS changes through a hook (`ghost-audit merge`).
 
 #![warn(missing_docs)]
 
@@ -60,6 +61,7 @@ pub mod discover;
 pub mod job;
 pub mod lister;
 pub mod listing;
+pub mod merge;
 pub mod probe;
 pub mod source;
 pub mod sv1;

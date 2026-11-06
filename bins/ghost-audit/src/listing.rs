@@ -323,34 +323,77 @@ pub struct ListMeta {
     pub policy: Policy,
 }
 
-#[derive(Serialize)]
-struct Recent {
-    probes: usize,
-    pass: usize,
-    fail: usize,
-    unmeasured: usize,
-    pass_rate: f64,
+/// A listed node's probe counts in its window, as `node-list.json` writes them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Recent {
+    pub(crate) probes: usize,
+    pub(crate) pass: usize,
+    pub(crate) fail: usize,
+    pub(crate) unmeasured: usize,
+    pub(crate) pass_rate: f64,
 }
 
-#[derive(Serialize)]
-struct ListedNode {
-    relay: String,
-    host: String,
-    relay_port: u16,
-    sv1: Option<String>,
-    sv1_port: Option<u16>,
-    sv2: Option<String>,
-    sv2_port: Option<u16>,
-    sv2_authority_key: Option<String>,
-    node_id: Option<String>,
-    user_agent: Option<String>,
-    protocol_version: Option<u16>,
-    region: Option<String>,
-    listed_since: u64,
-    last_probe: Option<u64>,
-    last_verdict: Option<Outcome>,
-    reasons: Vec<String>,
-    recent: Recent,
+impl Recent {
+    /// The counts, with `pass_rate` computed from them (three decimals).
+    pub(crate) fn of(pass: usize, fail: usize, unmeasured: usize) -> Recent {
+        let probes = pass + fail + unmeasured;
+        Recent {
+            probes,
+            pass,
+            fail,
+            unmeasured,
+            pass_rate: if probes == 0 {
+                0.0
+            } else {
+                (pass as f64 * 1000.0 / probes as f64).round() / 1000.0
+            },
+        }
+    }
+}
+
+/// One listed node in `node-list.json`. Also what `ghost-audit merge` reads back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ListedNode {
+    pub(crate) relay: String,
+    pub(crate) host: String,
+    pub(crate) relay_port: u16,
+    pub(crate) sv1: Option<String>,
+    pub(crate) sv1_port: Option<u16>,
+    pub(crate) sv2: Option<String>,
+    pub(crate) sv2_port: Option<u16>,
+    pub(crate) sv2_authority_key: Option<String>,
+    pub(crate) node_id: Option<String>,
+    pub(crate) user_agent: Option<String>,
+    pub(crate) protocol_version: Option<u16>,
+    pub(crate) region: Option<String>,
+    pub(crate) listed_since: u64,
+    pub(crate) last_probe: Option<u64>,
+    pub(crate) last_verdict: Option<Outcome>,
+    pub(crate) reasons: Vec<String>,
+    pub(crate) recent: Recent,
+}
+
+/// A node's endpoints, as `node-list.json` writes them from its relay address and advert.
+pub(crate) struct Endpoints {
+    pub(crate) sv1: Option<String>,
+    pub(crate) sv2: Option<String>,
+    pub(crate) sv2_authority_key: Option<String>,
+}
+
+impl Endpoints {
+    pub(crate) fn of(
+        relay: SocketAddr,
+        sv1_port: Option<u16>,
+        sv2_port: Option<u16>,
+        key: &str,
+    ) -> Self {
+        let ip = relay.ip();
+        Endpoints {
+            sv1: sv1_port.map(|p| format!("stratum+tcp://{}", SocketAddr::new(ip, p))),
+            sv2: sv2_port.map(|p| SocketAddr::new(ip, p).to_string()),
+            sv2_authority_key: (sv2_port.is_some() && !key.is_empty()).then(|| key.to_string()),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -384,23 +427,21 @@ pub fn render_node_list(state: &ListState, meta: &ListMeta) -> String {
     let nodes: Vec<ListedNode> = state
         .listed()
         .map(|c| {
-            let ip = c.relay.ip();
             let a = c.advert.clone().unwrap_or_default();
             let sv1 = nonzero(a.sv1_port);
             let sv2 = nonzero(a.sv2_port);
+            let e = Endpoints::of(c.relay, sv1, sv2, &a.sv2_authority_key);
             let (pass, fail, unmeasured) = c.counts();
-            let probes = c.history.len();
             let last = c.history.back();
             ListedNode {
                 relay: c.relay.to_string(),
-                host: ip.to_string(),
+                host: c.relay.ip().to_string(),
                 relay_port: c.relay.port(),
-                sv1: sv1.map(|p| format!("stratum+tcp://{}", SocketAddr::new(ip, p))),
+                sv1: e.sv1,
                 sv1_port: sv1,
-                sv2: sv2.map(|p| SocketAddr::new(ip, p).to_string()),
+                sv2: e.sv2,
                 sv2_port: sv2,
-                sv2_authority_key: (sv2.is_some() && !a.sv2_authority_key.is_empty())
-                    .then(|| a.sv2_authority_key.clone()),
+                sv2_authority_key: e.sv2_authority_key,
                 node_id: a.node_id.clone(),
                 user_agent: a.user_agent.clone(),
                 protocol_version: a.protocol_version,
@@ -409,17 +450,7 @@ pub fn render_node_list(state: &ListState, meta: &ListMeta) -> String {
                 last_probe: last.map(|r| r.at),
                 last_verdict: last.map(|r| r.outcome),
                 reasons: last.map(|r| r.reasons.clone()).unwrap_or_default(),
-                recent: Recent {
-                    probes,
-                    pass,
-                    fail,
-                    unmeasured,
-                    pass_rate: if probes == 0 {
-                        0.0
-                    } else {
-                        (pass as f64 * 1000.0 / probes as f64).round() / 1000.0
-                    },
-                },
+                recent: Recent::of(pass, fail, unmeasured),
             }
         })
         .collect();
@@ -469,21 +500,52 @@ impl Default for DnsConfig {
 /// the best recent pass rate, then the longest listed, then the lowest address, so the choice is
 /// deterministic. Files only: this never calls a DNS provider.
 pub fn render_dns(state: &ListState, cfg: &DnsConfig, generated_at: u64) -> String {
+    let entries: Vec<DnsEntry> = state
+        .listed()
+        .map(|c| {
+            let (pass, ..) = c.counts();
+            DnsEntry {
+                ip: c.relay.ip(),
+                sv1_port: c.advert.as_ref().map(|a| a.sv1_port),
+                pass_permille: pass * 1000 / c.history.len().max(1),
+                listed_since: c.listed_since.unwrap_or(u64::MAX),
+            }
+        })
+        .collect();
+    render_dns_entries(&entries, cfg, generated_at, "list")
+}
+
+/// One listed node, as the DNS fragment ranks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DnsEntry {
+    /// The node's IP.
+    pub ip: IpAddr,
+    /// Its SV1 port, if it serves SV1.
+    pub sv1_port: Option<u16>,
+    /// Its recent pass rate, in thousandths.
+    pub pass_permille: usize,
+    /// Since when it is listed, Unix seconds.
+    pub listed_since: u64,
+}
+
+/// The fragment for `entries` (every listed node), as [`render_dns`] describes it; `by` names
+/// the command that wrote it (`list` or `merge`) in its header.
+pub fn render_dns_entries(
+    entries: &[DnsEntry],
+    cfg: &DnsConfig,
+    generated_at: u64,
+    by: &str,
+) -> String {
     // One entry per IP: its best node's rank.
     let mut by_ip: BTreeMap<IpAddr, (usize, u64)> = BTreeMap::new();
-    let mut listed = 0usize;
-    for c in state.listed() {
-        listed += 1;
-        if c.advert.as_ref().map(|a| a.sv1_port) != Some(cfg.sv1_port) {
+    let listed = entries.len();
+    for e in entries {
+        if e.sv1_port != Some(cfg.sv1_port) {
             continue;
         }
-        let (pass, ..) = c.counts();
-        let rank = (
-            pass * 1000 / c.history.len().max(1),
-            c.listed_since.unwrap_or(u64::MAX),
-        );
+        let rank = (e.pass_permille, e.listed_since);
         by_ip
-            .entry(c.relay.ip())
+            .entry(e.ip)
             .and_modify(|r| {
                 if rank.0 > r.0 || (rank.0 == r.0 && rank.1 < r.1) {
                     *r = rank
@@ -503,7 +565,7 @@ pub fn render_dns(state: &ListState, cfg: &DnsConfig, generated_at: u64) -> Stri
     let mut ips: Vec<IpAddr> = ranked.into_iter().map(|(ip, _)| ip).collect();
     ips.sort();
     let mut s = format!(
-        "; {DNS_SCHEMA}: generated by ghost-audit list at {}. Do not edit by hand.\n\
+        "; {DNS_SCHEMA}: generated by ghost-audit {by} at {}. Do not edit by hand.\n\
          ; {listed} listed, {eligible} on SV1 port {}, {} written (at most {}).\n",
         rfc3339(generated_at),
         cfg.sv1_port,
@@ -518,6 +580,18 @@ pub fn render_dns(state: &ListState, cfg: &DnsConfig, generated_at: u64) -> Stri
         s.push_str(&format!("{} {} IN {t} {ip}\n", cfg.name, cfg.ttl));
     }
     s
+}
+
+/// The records of a DNS fragment: every line that is not blank or a `;` comment, whitespace
+/// normalised, as a set. Two fragments publish the same records exactly when these are equal,
+/// whatever their comment headers say.
+pub fn dns_records(fragment: &str) -> std::collections::BTreeSet<String> {
+    fragment
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with(';'))
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect()
 }
 
 #[cfg(test)]
