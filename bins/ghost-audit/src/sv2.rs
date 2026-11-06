@@ -771,10 +771,21 @@ pub fn rebuild_standard(
     let template_tail = &outs[g + 1..];
     let total = outs.iter().try_fold(0u64, |a, (v, _)| a.checked_add(*v))?;
     let fees = total.checked_sub(subsidy(h, halving))?;
-    let finder: Vec<u8> = if fees > 0 {
-        outs.get(g.checked_sub(1)?)?.1.clone()
-    } else {
-        Vec::new()
+    // The finder output, when there is one, sits just before the ledger commitment. It holds the
+    // fees and, on a cleared ledger, the surplus, so it can be there with no fees at all (it
+    // used to be looked for only when there were fees, and every standard job of a node whose
+    // ledger had cleared failed as not canonical). The output there is the finder's unless it is
+    // the treasury (the first output) or a payee on a table: then the extended job has no
+    // finder output and its script is not known here.
+    let finder: Vec<u8> = {
+        let at = g.checked_sub(1)?;
+        let s = &outs.get(at)?.1;
+        let payee = at == 0 || tables.iter().any(|(_, t)| t.contains_key(s));
+        if fees > 0 || !payee {
+            s.clone()
+        } else {
+            Vec::new()
+        }
     };
 
     let mut head = Vec::with_capacity(41);

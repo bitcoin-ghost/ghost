@@ -802,6 +802,8 @@ async fn open_listing_lists_the_honest_node_and_never_the_cheat() {
             stamp: os,
             bend: HONEST,
             templates: 2,
+            zero_fees: false,
+            ext_class: EXT_CLASS,
         },
         me.clone(),
     );
@@ -845,6 +847,8 @@ async fn open_listing_lists_the_honest_node_and_never_the_cheat() {
             stamp: hs,
             bend: HONEST,
             templates: 2,
+            zero_fees: false,
+            ext_class: EXT_CLASS,
         },
         me.clone(),
     );
@@ -1001,12 +1005,26 @@ struct Sv2Pool {
     bend: Sv2Bend,
     /// Templates per connection: the first future and activated, the rest live.
     templates: u64,
+    /// Templates with no fees: a finder output then holds only a cleared ledger's surplus.
+    zero_fees: bool,
+    /// The extended channel's slot class.
+    ext_class: u16,
+}
+
+impl Sv2Pool {
+    fn fees(&self, k: u64) -> u64 {
+        if self.zero_fees {
+            0
+        } else {
+            fees_of(k)
+        }
+    }
 }
 
 /// Template `k`: a BIP34 push and nothing else in the prefix (pool_sv2 strips the template's
 /// own Ghost tags before stamping each channel's back in), a two-entry merkle path, the witness
 /// commitment as the template's output, and fees that differ per template.
-fn template(k: u64) -> NewTemplate<'static> {
+fn template(k: u64, fees: u64) -> NewTemplate<'static> {
     let prefix = bitcoin::script::Builder::new()
         .push_int(H as i64)
         .into_bytes();
@@ -1028,7 +1046,7 @@ fn template(k: u64) -> NewTemplate<'static> {
         coinbase_tx_value_remaining: ghost_common::canonical_payout::subsidy(
             H,
             NodePoolNetwork::Regtest.halving(),
-        ) + fees_of(k),
+        ) + fees,
         coinbase_tx_outputs_count: 1,
         coinbase_tx_outputs: bitcoin::consensus::serialize(&witness).try_into().unwrap(),
         coinbase_tx_locktime: 0,
@@ -1116,10 +1134,11 @@ fn open_standard(pool: &Sv2Pool, request_id: u32, identity: String, payee: &[u8]
             pool.bend.std,
             STD_CLASS,
             tier,
-            fees_of(k),
+            pool.fees(k),
         );
         ch.set_tier_commitment(Some((tier as u32, push)));
-        ch.on_new_template(template(k), reward(o)).unwrap();
+        ch.on_new_template(template(k, pool.fees(k)), reward(o))
+            .unwrap();
         if k == 1 {
             let id = ch.get_future_job_id_from_template_id(1).unwrap();
             let job = ch.get_future_job(id).unwrap().get_job_message().clone();
@@ -1168,12 +1187,13 @@ fn open_extended(pool: &Sv2Pool, request_id: u32, identity: String, payee: &[u8]
             pool.stamp,
             payee,
             pool.bend.ext,
-            EXT_CLASS,
+            pool.ext_class,
             tier,
-            fees_of(k),
+            pool.fees(k),
         );
         ch.set_tier_commitment(Some((tier as u32, push)));
-        ch.on_new_template(template(k), reward(o)).unwrap();
+        ch.on_new_template(template(k, pool.fees(k)), reward(o))
+            .unwrap();
         if k == 1 {
             let id = ch.get_future_job_id_from_template_id(1).unwrap();
             let job = ch.get_future_job(id).unwrap().get_job_message().clone();
@@ -1313,6 +1333,8 @@ async fn honest_sv2_jobs_pass_on_extended_and_standard_channels() {
         stamp: w.stamp,
         bend: HONEST,
         templates: 2,
+        zero_fees: false,
+        ext_class: EXT_CLASS,
     };
     let addr = sv2_pool(pool, &me).await;
     let stamps = RelayStamps {
@@ -1343,6 +1365,43 @@ async fn honest_sv2_jobs_pass_on_extended_and_standard_channels() {
     }
     let ids: Vec<String> = verdicts(&r).into_iter().map(|v| v.0).collect();
     assert_eq!(ids, ["ext-1", "ext-2", "std-1", "std-2"]);
+}
+
+/// A cleared ledger with no fees: the finder output holds only the surplus. The standard job is
+/// rebuilt with the finder script read from the extended job's coinbase, which used to be read
+/// only when there were fees, so every standard job of a node whose ledger had cleared failed
+/// as not canonical (found driving the dashboard against a live regtest pool, 11-06).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn standard_jobs_pass_on_a_cleared_ledger_with_no_fees() {
+    let w = world().await;
+    let me = p2tr("the miner");
+    // 30 balances: a class-44 extended job and the class-500 standard job both pay them all.
+    let pool = Sv2Pool {
+        prev: w.prev,
+        stamp: w.stamp,
+        bend: HONEST,
+        templates: 2,
+        zero_fees: true,
+        ext_class: 44,
+    };
+    let addr = sv2_pool(pool, &me).await;
+    let stamps = RelayStamps {
+        addr: w.node.listen_addr.unwrap(),
+        genesis: GENESIS,
+        timeout: Duration::from_secs(5),
+    };
+    let r = audit_sv2_jobs(
+        &sv2_target(addr, SV2_PUB, &me, 2, 20),
+        &stamps,
+        &w.chain,
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.len(), 4, "{r:#?}");
+    for j in &r {
+        assert_eq!(j.verdict, Verdict::Pass, "{}: {}", j.job_id, j.detail);
+    }
 }
 
 /// Each channel kind is judged on its own: a node that bends only its standard jobs, or only
@@ -1393,6 +1452,8 @@ async fn hostile_sv2_jobs_fail_on_the_channel_that_serves_them() {
             stamp: w.stamp,
             bend: Sv2Bend { ext, std },
             templates: 1,
+            zero_fees: false,
+            ext_class: EXT_CLASS,
         };
         let addr = sv2_pool(pool, &me).await;
         let r = audit_sv2_jobs(
@@ -1434,6 +1495,8 @@ async fn a_wrong_authority_key_is_refused() {
         stamp: w.stamp,
         bend: HONEST,
         templates: 1,
+        zero_fees: false,
+        ext_class: EXT_CLASS,
     };
     let addr = sv2_pool(pool, &me).await;
     let stamps = RelayStamps {
@@ -1481,6 +1544,8 @@ async fn a_node_serving_sv2_differently_fails_the_probe() {
             std,
         },
         templates: 2,
+        zero_fees: false,
+        ext_class: EXT_CLASS,
     };
     let honest_sv2 = sv2_pool(pool(Hostile::Honest), &me).await;
     let bent_sv2 = sv2_pool(pool(Hostile::RelabelledPayee), &me).await;
