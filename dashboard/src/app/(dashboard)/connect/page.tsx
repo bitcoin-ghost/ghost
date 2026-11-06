@@ -1,6 +1,6 @@
 "use client";
 
-import { ReactNode } from "react";
+import { ReactNode, useSyncExternalStore } from "react";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
@@ -69,6 +69,11 @@ function ConnectionEntry({
   );
 }
 
+// The browser's host does not change while the page is open: nothing to subscribe to.
+function noSubscribe(): () => void {
+  return () => {};
+}
+
 export default function ConnectPage() {
   const { data: nodeInfo } = useNodeInfo();
   const { data: swarmData } = useSwarm();
@@ -78,11 +83,15 @@ export default function ConnectPage() {
   // back to the browser host — which, over an SSH tunnel or localhost, is
   // whatever the operator is viewing the dashboard through.
   const selfAddr = swarmData?.self?.address;
-  const host = selfAddr
-    ? selfAddr.split(":")[0]
-    : typeof window !== "undefined"
-      ? window.location.hostname
-      : "<your-ip>";
+  // Read through useSyncExternalStore so the server render and the first client render agree
+  // ("<your-ip>") and the browser's host replaces it after hydration. Reading window during
+  // render made the two differ: React error #418, and the page rendered again from scratch.
+  const browserHost = useSyncExternalStore(
+    noSubscribe,
+    () => window.location.hostname,
+    () => "<your-ip>",
+  );
+  const host = selfAddr ? selfAddr.split(":")[0] : browserHost;
   const hostKnown = Boolean(selfAddr);
 
   const network = nodeInfo?.network ?? blockchain?.network ?? blockchain?.chain ?? undefined;

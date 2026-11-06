@@ -150,7 +150,7 @@ export function MinersView({ status, statusError, statusLoading, ledgers, miners
             {status.miners.map((c) => (
               <tr key={`${c.downstream_id}-${c.channel_id}`} data-testid="channel-row">
                 <Td mono>{shortHash(c.address, 8)}</Td>
-                <Td>{c.worker || <Unk />}</Td>
+                <Td>{c.worker || "(no worker name)"}</Td>
                 <Td>
                   {c.kind} {c.downstream_id}/{c.channel_id}
                 </Td>

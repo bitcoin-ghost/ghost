@@ -15,6 +15,10 @@ import {
 } from "@/lib/nodePool/view";
 import { Grid, Kv, Loading, Note, Table, Td, Unavailable } from "./parts";
 
+/** `last_share_at` is null when this node has seen no share from the address in its window:
+ *  a reported absence, not an unknown. */
+const NO_SHARE = "none on this node";
+
 export interface MinerDetailViewProps {
   address: string;
   ledger?: NodePoolLedger;
@@ -108,7 +112,10 @@ export function MinerDetailView({ address, ledger, ledgerError, miner, minerErro
                 label="Shares 24 h (accepted / stale / rejected)"
                 value={`${fmtInt(miner.summary.shares_24h.accepted)} / ${fmtInt(miner.summary.shares_24h.stale)} / ${fmtInt(miner.summary.shares_24h.rejected)}`}
               />
-              <Kv label="Last share" value={fmtAgo(miner.summary.last_share_at, now)} />
+              <Kv
+                label="Last share"
+                value={miner.summary.last_share_at == null ? NO_SHARE : fmtAgo(miner.summary.last_share_at, now)}
+              />
               <Kv label="Expected wait" value={waitLabel(miner.expected_wait)} />
               <Kv label="Earned, last 24 h" value={fmtSats(miner.expected_wait.credited_sats_24h)} />
               <Kv
@@ -136,7 +143,7 @@ export function MinerDetailView({ address, ledger, ledgerError, miner, minerErro
                       <Td>
                         {fmtInt(w.shares_24h.accepted)} / {fmtInt(w.shares_24h.stale)} / {fmtInt(w.shares_24h.rejected)}
                       </Td>
-                      <Td>{fmtAgo(w.last_share_at, now)}</Td>
+                      <Td>{w.last_share_at == null ? NO_SHARE : fmtAgo(w.last_share_at, now)}</Td>
                       <Td>{isNum(w.slot_class) ? w.slot_class : UNKNOWN}</Td>
                       <Td>
                         {w.connections.length === 0

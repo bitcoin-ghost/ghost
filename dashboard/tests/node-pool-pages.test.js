@@ -199,6 +199,14 @@ test("miners: channels, slot classes, sensing, warnings and per-address ledger/m
   assert.match(m, /href="\/miners\/bcrt1qminerone000000000000000000000000000"/);
 });
 
+test("miners: a channel opened with no worker name says so, not unknown", () => {
+  need();
+  const status = fixture("node-pool-status.json");
+  status.miners[0].worker = "";
+  const t = text(html(views.MinersView, { status, ledgers: {}, miners: {} }));
+  assert.match(t, /\(no worker name\)/);
+});
+
 test("miners: a failed API shows unavailable, no rows and no counts", () => {
   need();
   const m = html(views.MinersView, { statusError: FAILED, ledgers: {}, miners: {} });
@@ -242,6 +250,24 @@ test("miner detail: ledger, queue by class, workers, payouts and shares", () => 
   assert.match(t, /Earned, last 24 h 9,000 sats/);
   assert.match(t, /Pool finds a block about every 210 years/);
   assert.match(t, /paid only when the pool finds a block/);
+});
+
+test("miner detail: no share seen on this node reads as such, not as unknown", () => {
+  need();
+  // An address mining on another node: this node answers, and has seen nothing from it.
+  const miner = fixture("node-pool-miner.json");
+  miner.summary.last_share_at = null;
+  miner.workers = miner.workers.map((w) => ({ ...w, last_share_at: null }));
+  const t = text(
+    html(views.MinerDetailView, {
+      address: "bcrt1qminerone000000000000000000000000000",
+      ledger: fixture("node-pool-ledger.json"),
+      miner,
+      now: NOW,
+    }),
+  );
+  assert.match(t, /Last share none on this node/);
+  assert.doesNotMatch(t, /Last share unknown/);
 });
 
 test("miner detail: a failed API shows unavailable for both halves", () => {
