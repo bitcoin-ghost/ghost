@@ -12,7 +12,9 @@ import {
   fmtInt,
   isNum,
   poolHealth,
+  reachabilityText,
   shortHash,
+  submitNodes,
   UNKNOWN,
 } from "@/lib/pool/view";
 import { Grid, Kv, LevelBadge, Loading, Note, Unavailable } from "./parts";
@@ -24,6 +26,8 @@ export interface OverviewViewProps {
   /** The node backend's own status (`/api/v1/node/status`): the Bitcoin node's sync. */
   node?: NodeStatus;
   nodeError?: unknown;
+  /** Unix seconds now; defaults to the status's `generated_at`. */
+  now?: number;
 }
 
 const LEVEL_WORD = { ok: "Healthy", warn: "Needs attention", error: "Unhealthy", unknown: "Unknown" };
@@ -60,7 +64,9 @@ function BitcoinCard({ status, node, nodeError }: { status?: PoolStatus; node?: 
   );
 }
 
-export function OverviewView({ status, statusError, statusLoading, node, nodeError }: OverviewViewProps) {
+export function OverviewView({ status, statusError, statusLoading, node, nodeError, now }: OverviewViewProps) {
+  const at = now ?? status?.generated_at ?? 0;
+  const nodes = submitNodes(status);
   const health = poolHealth(status, statusError);
   const rate = bestRate(status?.pool_hashrate_hs);
   const mean = expectedSeconds(status?.bitcoin.network_difficulty, rate);
@@ -123,27 +129,34 @@ export function OverviewView({ status, statusError, statusLoading, node, nodeErr
 
       <Card>
         <CardHeader title="Other nodes" subtitle="Every block a miner finds here is also sent to these" />
-        {status && status.submit_nodes.length === 0 ? (
+        {status && nodes.length === 0 ? (
           <p className="text-sm" style={{ color: "var(--dim)" }}>
             None configured. A block found here reaches the network through this node only.
           </p>
         ) : null}
         <Grid>
-          {(status?.submit_nodes ?? []).map((n) => {
-            const lastResult = last?.submitted.find((s) => s.node === n);
+          {nodes.map((n) => {
+            const lastResult = last?.submitted.find((s) => s.node === n.node);
             return (
               <Kv
-                key={n}
-                label={n}
-                value={lastResult ? `last block: ${lastResult.result}` : "no block sent yet"}
+                key={n.node}
+                label={n.node}
+                value={
+                  <span data-testid="submit-node">
+                    <LevelBadge level={n.reachable === true ? "ok" : n.reachable === false ? "warn" : "unknown"}>
+                      {n.reachable === true ? "Reachable" : n.reachable === false ? "Unreachable" : "Not checked"}
+                    </LevelBadge>{" "}
+                    {reachabilityText(n, at)} · {lastResult ? `last block: ${lastResult.result}` : "no block sent yet"}
+                  </span>
+                }
                 mono
               />
             );
           })}
         </Grid>
         <Note>
-          A node is asked only when a block is found, so this shows what each said to the last block, not
-          whether it is reachable now.
+          Each node is checked every minute (<code>getblockchaininfo</code>); a found block is sent to every
+          one of them whatever the last check said.
         </Note>
       </Card>
 
@@ -156,6 +169,12 @@ export function OverviewView({ status, statusError, statusLoading, node, nodeErr
           <Kv label="Next block: miner, before fees" value={fmtBtc(fp?.miner_sats_next_block_before_fees)} />
           <Kv label="Transaction fees go to" value={fp ? (fp.fees_to === "miner" ? "the miner who found the block" : fp.fees_to) : UNKNOWN} />
           <Kv label="Ports" value={status ? `SV1 ${status.ports.sv1.join(", ")} · SV2 ${status.ports.sv2}` : UNKNOWN} />
+          <Kv
+            label="SV2 authority key"
+            value={status ? (status.ports.sv2_authority_public_key ?? "not reported by this pool_sv2") : UNKNOWN}
+            hint="the key SV2 miners pin"
+            mono
+          />
         </Grid>
       </Card>
     </div>

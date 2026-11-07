@@ -5,6 +5,9 @@
 //   GET /api/v1/pool/status                         the pool-wide view of this node
 //   GET /api/v1/miner/{address}                     one miner: workers, best shares, blocks found
 //   GET /api/v1/miner/{address}/history?window=...  the same over time
+//   GET /api/v1/pool/miners                         every active payout address (operator only:
+//                                                   the backend serves it to signed requests,
+//                                                   which this dashboard's proxy makes)
 // The shapes below follow the module docs of `bins/pool-sv2/src/lib/solo_api.rs`. pool_sv2 not
 // answering is a 503 from the backend, which `fetchApi` turns into a thrown Error: the pages show
 // that as "unavailable", never as zero.
@@ -68,6 +71,20 @@ export interface PoolFeePolicy {
   fees_to: string;
 }
 
+/** What the last reachability check (`getblockchaininfo`, every 60 s) of another node found. */
+export interface PoolSubmitNode {
+  /** `scheme://host:port`, never its credentials. */
+  node: string;
+  /** `null` until it has been checked once. */
+  reachable: boolean | null;
+  last_checked_at: number | null;
+  last_ok_at: number | null;
+  /** Its block height at the last answer. */
+  height: number | null;
+  /** Why the last check failed. */
+  error: string | null;
+}
+
 /** `GET /api/v1/pool/status`. */
 export interface PoolStatus {
   network: string;
@@ -90,9 +107,41 @@ export interface PoolStatus {
   /** Every block this pool found, oldest first. */
   blocks_found: PoolFoundBlock[];
   fee_policy: PoolFeePolicy;
-  ports: { sv1: number[]; sv2: number };
-  /** The other nodes every found block is also sent to, as `scheme://host:port`. */
-  submit_nodes: string[];
+  ports: {
+    sv1: number[];
+    sv2: number;
+    /** The SV2 authority public key miners pin; absent from an older pool_sv2. */
+    sv2_authority_public_key?: string | null;
+  };
+  /** The other nodes every found block is also sent to. An older pool_sv2 sends bare
+   *  `scheme://host:port` strings; read them through `submitNodes()` in `lib/pool/view`. */
+  submit_nodes: (PoolSubmitNode | string)[];
+}
+
+/** One payout address in `GET /api/v1/pool/miners`. */
+export interface PoolMinerListEntry {
+  address: string;
+  /** It has an open channel now. */
+  connected: boolean;
+  workers: number;
+  online: number;
+  idle: number;
+  offline: number;
+  hashrate_hs: PoolRates;
+  shares_24h: PoolCounts;
+  last_share_at: number | null;
+  best_share: PoolBestShare;
+  /** Blocks it found here. */
+  blocks_found: number;
+}
+
+/** `GET /api/v1/pool/miners`: every address with an open channel or a share in the last 24
+ *  hours, most hashrate first. */
+export interface PoolMinerList {
+  network: string;
+  generated_at: number;
+  collecting_since: number;
+  miners: PoolMinerListEntry[];
 }
 
 export interface PoolConnection {
@@ -177,6 +226,10 @@ export interface PoolHistory {
 
 export async function getPoolStatus(): Promise<PoolStatus> {
   return fetchApi<PoolStatus>("/api/v1/pool/status");
+}
+
+export async function getPoolMinerList(): Promise<PoolMinerList> {
+  return fetchApi<PoolMinerList>("/api/v1/pool/miners");
 }
 
 export async function getPoolMiner(address: string): Promise<PoolMiner> {

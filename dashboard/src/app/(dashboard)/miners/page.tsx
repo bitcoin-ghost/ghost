@@ -7,13 +7,13 @@ import { Card, CardHeader } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { MinersView, minerHref, type PerAddress } from "@/components/pool/MinersView";
-import { usePoolMiners, usePoolStatus } from "@/hooks/queries/usePoolQueries";
+import { usePoolMinerList, usePoolMiners, usePoolStatus } from "@/hooks/queries/usePoolQueries";
 import type { PoolMiner } from "@/lib/api/pool";
 import { addressesFromBlocks } from "@/lib/pool/view";
 import { useNow } from "@/hooks/useNow";
 
-// Addresses looked up on this page, kept in this browser only (a convenience; the pool status
-// does not name the connected addresses).
+// Addresses looked up on this page, kept in this browser only (a convenience: the active ones are
+// listed from `/api/v1/pool/miners` anyway; this keeps inactive ones a click away).
 const SAVED_KEY = "ghost-pool-looked-up";
 const CHANGE_EVENT = "ghost-pool-looked-up-change";
 
@@ -56,6 +56,7 @@ function writeSaved(list: string[]) {
 export default function MinersPage() {
   const router = useRouter();
   const { data, error, isLoading } = usePoolStatus();
+  const list = usePoolMinerList();
   const raw = useSyncExternalStore(subscribe, readRaw, () => "[]");
   const saved = useMemo(() => parseSaved(raw), [raw]);
   const [input, setInput] = useState("");
@@ -65,9 +66,14 @@ export default function MinersPage() {
     for (const a of saved) if (!out.includes(a)) out.push(a);
     return out;
   }, [data, saved]);
-  const results = usePoolMiners(addresses);
+  // Per-address answers only for the addresses the active list does not already cover.
+  const others = useMemo(() => {
+    const listed = new Set((list.data?.miners ?? []).map((m) => m.address));
+    return addresses.filter((a) => !listed.has(a));
+  }, [addresses, list.data]);
+  const results = usePoolMiners(others);
   const miners: Record<string, PerAddress<PoolMiner>> = {};
-  addresses.forEach((a, i) => {
+  others.forEach((a, i) => {
     miners[a] = { data: results[i]?.data, error: results[i]?.error ?? undefined };
   });
 
@@ -109,7 +115,10 @@ export default function MinersPage() {
           status={data}
           statusError={error ?? undefined}
           statusLoading={isLoading}
-          addresses={addresses}
+          list={list.data}
+          listError={list.error ?? undefined}
+          listLoading={list.isLoading}
+          addresses={others}
           miners={miners}
           now={now}
         />

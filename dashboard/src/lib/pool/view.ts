@@ -3,7 +3,7 @@
 // The rule throughout: a value the node did not report is shown as unknown, never as zero or as
 // healthy. `UNKNOWN` is the one word for it.
 
-import type { PoolFoundBlock, PoolRates, PoolStatus } from "@/lib/api/pool";
+import type { PoolFoundBlock, PoolRates, PoolStatus, PoolSubmitNode } from "@/lib/api/pool";
 
 export const UNKNOWN = "unknown";
 
@@ -119,6 +119,28 @@ export function addressesFromBlocks(blocks: PoolFoundBlock[] | null | undefined)
   return out;
 }
 
+/** The status's other nodes, each as a reachability record. An older pool_sv2 names them as bare
+ *  strings: their reachability is then unknown (`reachable: null`). */
+export function submitNodes(status: PoolStatus | null | undefined): PoolSubmitNode[] {
+  return (status?.submit_nodes ?? []).map((n) =>
+    typeof n === "string"
+      ? { node: n, reachable: null, last_checked_at: null, last_ok_at: null, height: null, error: null }
+      : n,
+  );
+}
+
+/** One other node's reachability in a few words. */
+export function reachabilityText(n: PoolSubmitNode, now: number): string {
+  if (n.reachable === true) {
+    return `reachable, height ${fmtInt(n.height)}${n.last_ok_at ? `, checked ${fmtAgo(n.last_ok_at, now)}` : ""}`;
+  }
+  if (n.reachable === false) {
+    const last = n.last_ok_at ? `last answered ${fmtAgo(n.last_ok_at, now)}` : "never answered";
+    return `NOT reachable: ${n.error ?? "no answer"} (${last})`;
+  }
+  return "not checked yet";
+}
+
 /** What the other nodes said to a found block, in a few words. */
 export function submitSummary(b: PoolFoundBlock): string {
   if (!b.submitted.length) return "sent to this node only";
@@ -150,12 +172,13 @@ export function poolHealth(status: PoolStatus | undefined, error: unknown): { le
       ? { label: "Templates", level: "ok", detail: `building jobs at height ${fmtInt(bt.job_height)}` }
       : { label: "Templates", level: "warn", detail: "no template yet: miners have no work" },
   );
+  const nodes = submitNodes(status);
   checks.push(
-    status.submit_nodes.length > 0
+    nodes.length > 0
       ? {
           label: "Backup submission",
           level: "ok",
-          detail: `found blocks are also sent to ${status.submit_nodes.join(", ")}`,
+          detail: `found blocks are also sent to ${nodes.map((n) => n.node).join(", ")}`,
         }
       : {
           label: "Backup submission",
@@ -163,6 +186,14 @@ export function poolHealth(status: PoolStatus | undefined, error: unknown): { le
           detail: "no other node configured: a found block goes to this node's Bitcoin node only",
         },
   );
+  const down = nodes.filter((n) => n.reachable === false);
+  if (down.length > 0) {
+    checks.push({
+      label: "Other node reachable",
+      level: "warn",
+      detail: `${down.map((n) => n.node).join(", ")} did not answer the last check: ${down[0].error ?? "no answer"}`,
+    });
+  }
   const bad = status.blocks_found.filter((b) => b.check !== null && b.check !== "ok");
   if (bad.length > 0) {
     checks.push({

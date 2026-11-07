@@ -1,9 +1,10 @@
 import { useQuery, useQueries } from "@tanstack/react-query";
-import { getPoolMiner, getPoolMinerHistory, getPoolStatus, type PoolHistoryWindow } from "@/lib/api/pool";
+import { getPoolMiner, getPoolMinerHistory, getPoolMinerList, getPoolStatus, type PoolHistoryWindow } from "@/lib/api/pool";
 
 export const poolKeys = {
   all: ["pool"] as const,
   status: () => [...poolKeys.all, "status"] as const,
+  minerList: () => [...poolKeys.all, "miner-list"] as const,
   miner: (address: string) => [...poolKeys.all, "miner", address] as const,
   history: (address: string, window: PoolHistoryWindow) => [...poolKeys.all, "history", address, window] as const,
 };
@@ -14,6 +15,16 @@ export function usePoolStatus(options?: { refetchInterval?: number }) {
     queryKey: poolKeys.status(),
     queryFn: getPoolStatus,
     refetchInterval: options?.refetchInterval ?? 15_000,
+    retry: 1,
+  });
+}
+
+/** Every active payout address on this node (operator only). */
+export function usePoolMinerList() {
+  return useQuery({
+    queryKey: poolKeys.minerList(),
+    queryFn: getPoolMinerList,
+    refetchInterval: 15_000,
     retry: 1,
   });
 }

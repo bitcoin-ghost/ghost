@@ -88,12 +88,14 @@ test("the API client asks the new routes, the address encoded", async () => {
     await views.api.getPoolStatus().catch(() => {});
     await views.api.getPoolMiner("bc1q/../x").catch(() => {});
     await views.api.getPoolMinerHistory(ADDR, "7d").catch(() => {});
+    await views.api.getPoolMinerList().catch(() => {});
   } finally {
     global.fetch = orig;
   }
   assert.ok(seen.some((u) => u.endsWith("/api/proxy/api/v1/pool/status")), seen.join(" "));
   assert.ok(seen.some((u) => u.endsWith("/api/proxy/api/v1/miner/bc1q%2F..%2Fx")), seen.join(" "));
   assert.ok(seen.some((u) => u.endsWith(`/api/proxy/api/v1/miner/${ADDR}/history?window=7d`)), seen.join(" "));
+  assert.ok(seen.some((u) => u.endsWith("/api/proxy/api/v1/pool/miners")), seen.join(" "));
   assert.ok(!seen.some((u) => /ledger|node-pool/.test(u)), "no removed route is asked");
 });
 
@@ -121,13 +123,14 @@ test("overview: renders the status, health checks, the payout rule and the other
   assert.match(t, /Uptime 1h 1m/);
   // 1.1e14 * 2^32 / 2.9e14 s, about 51 years.
   assert.match(t, /This node finds a block every ~5\d years/);
-  assert.match(t, /http:\/\/10\.0\.0\.2:8332 last block: accepted/);
+  assert.match(t, /http:\/\/10\.0\.0\.2:8332 Reachable reachable, height 974,899, checked 30s ago · last block: accepted/);
   assert.match(t, /Treasury address bc1qgxg5ywk835c9fp6arz6d6x50xpk6y0ualt900k/);
   assert.match(t, /Treasury share 0\.5% of the subsidy/);
   assert.match(t, /Next block: treasury 0\.015625 BTC/);
   assert.match(t, /Next block: miner, before fees 3\.109375 BTC/);
   assert.match(t, /Transaction fees go to the miner who found the block/);
   assert.match(t, /Ports SV1 3333, 4444 · SV2 34255/);
+  assert.match(t, /SV2 authority key 9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72/);
   assert.doesNotMatch(t, /share chain|ledger|slot class|genesis|relay/i);
 });
 
@@ -153,6 +156,30 @@ test("overview: another node refused a block: needs attention", () => {
   assert.match(t, /Needs attention/);
   assert.match(t, /Other node 1 found block\(s\) were not accepted by another node/);
   assert.match(t, /last block: connection refused/);
+});
+
+test("overview: an unreachable other node needs attention and says why", () => {
+  need();
+  const s = fixture("pool-status.json");
+  s.submit_nodes = [
+    { node: "http://10.0.0.2:8332", reachable: false, last_checked_at: NOW - 5, last_ok_at: NOW - 3600, height: 974890, error: "connection refused" },
+  ];
+  const t = text(html(views.OverviewView, { status: s, now: NOW }));
+  assert.match(t, /Needs attention/);
+  assert.match(t, /Other node reachable http:\/\/10\.0\.0\.2:8332 did not answer the last check: connection refused/);
+  assert.match(t, /Unreachable NOT reachable: connection refused \(last answered 1h 0m ago\)/);
+});
+
+test("overview: an older pool_sv2's bare node names read as not checked, never reachable", () => {
+  need();
+  const s = fixture("pool-status.json");
+  s.submit_nodes = ["http://10.0.0.2:8332"];
+  delete s.ports.sv2_authority_public_key;
+  const t = text(html(views.OverviewView, { status: s }));
+  assert.match(t, /Backup submission found blocks are also sent to http:\/\/10\.0\.0\.2:8332/);
+  assert.match(t, /Not checked not checked yet/);
+  assert.doesNotMatch(t, /Reachable reachable/);
+  assert.match(t, /SV2 authority key not reported by this pool_sv2/);
 });
 
 test("overview: a hashrate or tip the pool has not measured is unknown, never zero", () => {
@@ -183,6 +210,41 @@ test("overview: the pool service down: unavailable, nothing healthy, nothing zer
 
 // ---------------------------------------------------------------- miners
 
+test("miners: the active list names every connected address with its workers and hashrate", () => {
+  need();
+  const status = fixture("pool-status.json");
+  const list = fixture("pool-miners.json");
+  const addresses = views.view.addressesFromBlocks(status.blocks_found);
+  const m = html(views.MinersView, {
+    status,
+    list,
+    addresses,
+    miners: { [ADDR]: { data: fixture("pool-miner.json") } },
+    now: NOW,
+  });
+  assert.equal(count(m, "active-miner-row"), 2);
+  // The finder already in the active list is not repeated below; the other finder is.
+  assert.equal(count(m, "miner-row"), 1);
+  const t = text(m);
+  assert.match(t, /2 payout address\(es\) connected or seen in the last 24 hours/);
+  assert.match(t, /bc1p5d7r…usxg3297 yes 2 \/ 1 \/ 0 180\.00 TH\/s 1,500 99\.00 G 5s ago 1/);
+  assert.match(t, /bc1qar0s…zzwf5mdq no 0 \/ 0 \/ 1 2\.00 TH\/s 40 3\.00 M 13h 53m ago 0/);
+  assert.match(m, /href="\/miners\/bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq"/);
+  assert.match(t, /never shows it/);
+  assert.doesNotMatch(t, /No address to list|only block finders/);
+});
+
+test("miners: the active list unavailable says so; empty says none", () => {
+  need();
+  let t = text(html(views.MinersView, { status: fixture("pool-status.json"), listError: FAILED, addresses: [], miners: {}, now: NOW }));
+  assert.match(t, /Miner list unavailable/);
+  assertNothingHealthy(t);
+  const list = fixture("pool-miners.json");
+  list.miners = [];
+  t = text(html(views.MinersView, { status: fixture("pool-status.json"), list, addresses: [], miners: {}, now: NOW }));
+  assert.match(t, /No miner is connected, and none sent a share in the last 24 hours/);
+});
+
 test("miners: lists the addresses with their answers; a failed one says unavailable", () => {
   need();
   const status = fixture("pool-status.json");
@@ -210,7 +272,7 @@ test("miners: lists the addresses with their answers; a failed one says unavaila
 test("miners: nothing to list yet, and the pool down", () => {
   need();
   let t = text(html(views.MinersView, { status: fixture("pool-status.json"), addresses: [], miners: {}, now: NOW }));
-  assert.match(t, /No address to list yet/);
+  assert.match(t, /No other address to list/);
   t = text(html(views.MinersView, { statusError: FAILED, addresses: [], miners: {}, now: NOW }));
   assert.match(t, /Pool status unavailable/);
   assertNothingHealthy(t);
@@ -305,6 +367,7 @@ test("settings: read-only pool settings from the status", () => {
   assert.match(t, /SV1 ports 3333, 4444/);
   assert.match(t, /SV2 port 34255/);
   assert.match(t, /Found blocks also sent to http:\/\/10\.0\.0\.2:8332/);
+  assert.match(t, /SV2 authority key 9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72/);
   assert.match(t, /\[solo\]/);
   t = text(html(views.PoolSettingsView, { statusError: FAILED, statusLoading: false }));
   assert.match(t, /Pool status unavailable/);

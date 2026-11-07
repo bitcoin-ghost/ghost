@@ -44,6 +44,9 @@
     "miner_sats_next_block_before_fees": 310937500,
     "fees_to": "miner"
   },
-  "ports": { "sv1": [3333, 4444], "sv2": 34255 },
-  "submit_nodes": ["http://10.0.0.2:8332"]
+  "ports": { "sv1": [3333, 4444], "sv2": 34255, "sv2_authority_public_key": "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72" },
+  "submit_nodes": [
+    { "node": "http://10.0.0.2:8332", "reachable": true, "last_checked_at": 1799999970,
+      "last_ok_at": 1799999970, "height": 974899, "error": null }
+  ]
 }

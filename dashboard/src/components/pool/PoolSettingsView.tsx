@@ -1,6 +1,6 @@
 import { Card, CardHeader } from "@/components/ui/Card";
 import type { PoolStatus } from "@/lib/api/pool";
-import { UNKNOWN } from "@/lib/pool/view";
+import { submitNodes, UNKNOWN } from "@/lib/pool/view";
 import { Grid, Kv, Loading, Note, Unavailable } from "./parts";
 
 export interface PoolSettingsViewProps {
@@ -20,9 +20,18 @@ export function PoolSettingsView({ status, statusError, statusLoading }: PoolSet
         <Kv label="Network" value={status?.network ?? UNKNOWN} />
         <Kv label="SV1 ports" value={status ? status.ports.sv1.join(", ") : UNKNOWN} />
         <Kv label="SV2 port" value={status ? String(status.ports.sv2) : UNKNOWN} />
+        <Kv label="SV2 authority key" value={status?.ports.sv2_authority_public_key ?? UNKNOWN} mono />
         <Kv
           label="Found blocks also sent to"
-          value={status ? (status.submit_nodes.length ? status.submit_nodes.join(", ") : "no other node") : UNKNOWN}
+          value={
+            status
+              ? submitNodes(status).length
+                ? submitNodes(status)
+                    .map((n) => n.node)
+                    .join(", ")
+                : "no other node"
+              : UNKNOWN
+          }
           mono
         />
         <Kv label="Treasury address" value={status?.fee_policy.treasury_address ?? UNKNOWN} mono />

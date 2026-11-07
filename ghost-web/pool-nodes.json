@@ -1,5 +1,6 @@
 {
   "schema": "ghost-pool/nodes/v1",
+  "note": "sv2_authority_key is the fallback: pool.js shows each node's key from its live /api/v1/pool/status (ports.sv2_authority_public_key) when the node reports one.",
   "nodes": [
     {
       "id": "a",

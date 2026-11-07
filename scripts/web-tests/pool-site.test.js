@@ -140,6 +140,42 @@ test('no node answering: no figure is shown, and nothing reads as zero', () => {
   assert.strictEqual(P.blocksHtml(m, 0), '');
 });
 
+test('the SV2 key: each node\'s live status wins over pool-nodes.json; the file is the fallback', () => {
+  const LIVE = '9bDuixKmZqAJnrmP746n8zU1wyAQRrus7th9dxnkPg6RzQvCnan';
+  const nodes = P.nodesFromConfig({ nodes: [
+    { id: 'a', name: 'Node A', stratum_host: 'pool-a.example.org', sv2_authority_key: null },
+    { id: 'b', name: 'Node B', stratum_host: 'pool-b.example.org', sv2_authority_key: KEY },
+    { id: 'c', name: 'Node C', stratum_host: 'pool-c.example.org', sv2_authority_key: KEY }
+  ] });
+  const m = P.mergeStatus([
+    // a: the file has no key, the node reports one; and its submit nodes are objects now.
+    { node: 'a', ok: true, status: 200, body: status({ ports: { sv1: [3333, 4444], sv2: 34255, sv2_authority_public_key: LIVE },
+      submit_nodes: [{ node: 'http://10.0.0.9:8332', reachable: true, last_ok_at: 1, height: 2, error: null }] }) },
+    // b: an older pool_sv2 that reports no key, with bare submit node strings.
+    { node: 'b', ok: true, status: 200, body: status() },
+    // c: down.
+    { node: 'c', ok: false, status: 502, body: null }
+  ]);
+  assert.deepStrictEqual(m.liveKeys, { a: LIVE });
+  assert.deepStrictEqual(Object.keys(m.submitNodes).sort(), ['http://10.0.0.2:8332', 'http://10.0.0.9:8332']);
+  const live = P.withLiveKeys(nodes, m);
+  assert.deepStrictEqual(live.map((n) => [n.key, n.keySource]), [[LIVE, 'live'], [KEY, 'file'], [KEY, 'file']]);
+  assert.strictEqual(nodes[0].key, null, 'the file\'s list is not changed');
+  const h = P.connectHtml(live);
+  assert(h.includes('data-copy="stratum2+tcp://pool-a.example.org:34255/' + LIVE + '"'), h);
+  assert(h.includes('data-copy="stratum2+tcp://pool-b.example.org:34255/' + KEY + '"'), h);
+  assert(strip(h).includes('as the node reports it now'), strip(h));
+  assert(!strip(h).includes('not published here yet'), 'every node has a key now');
+  noJunk(h, 'connect live');
+  // A live key that differs from the published one is shown, and the difference is flagged.
+  const m2 = P.mergeStatus([{ node: 'b', ok: true, status: 200, body: status({ ports: { sv1: [3333], sv2: 34255, sv2_authority_public_key: LIVE } }) }]);
+  const t2 = strip(P.connectHtml(P.withLiveKeys(nodes, m2)));
+  assert(t2.includes('the published list has a different key'), t2);
+  // A malformed live key is ignored: the file's stays.
+  const m3 = P.mergeStatus([{ node: 'b', ok: true, status: 200, body: status({ ports: { sv1: [3333], sv2: 34255, sv2_authority_public_key: '<script>' } }) }]);
+  assert.strictEqual(P.withLiveKeys(nodes, m3)[1].key, KEY);
+});
+
 test('a node without hashrate or tip yet: unavailable, not zero', () => {
   const s = status({ pool_hashrate_hs: { '15m': null, '1h': null, '24h': null }, bitcoin: { tip_height: null, network_difficulty: null } });
   const t = strip(P.statsHtml(P.mergeStatus([{ node: 'a', ok: true, status: 200, body: s }]), []));

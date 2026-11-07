@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { Card, CardHeader } from "@/components/ui/Card";
-import type { PoolMiner, PoolStatus } from "@/lib/api/pool";
+import type { PoolMiner, PoolMinerList, PoolStatus } from "@/lib/api/pool";
 import {
   bestRate,
   errorText,
@@ -24,7 +24,12 @@ export interface MinersViewProps {
   status?: PoolStatus;
   statusError?: unknown;
   statusLoading?: boolean;
-  /** The addresses to list: finders of found blocks and the ones looked up here. */
+  /** Every active payout address on this node (`/api/v1/pool/miners`). */
+  list?: PoolMinerList;
+  listError?: unknown;
+  listLoading?: boolean;
+  /** Other addresses to show: finders of found blocks and the ones looked up here. Those already
+   *  in `list` are left out of this table. */
   addresses: string[];
   /** Miner answers by address. */
   miners: Record<string, PerAddress<PoolMiner>>;
@@ -54,7 +59,61 @@ function cell<T>(r: PerAddress<T> | undefined, f: (d: T) => React.ReactNode) {
   return <Unk />;
 }
 
-export function MinersView({ status, statusError, statusLoading, addresses, miners, now }: MinersViewProps) {
+function ActiveMiners({ list, error, loading, now }: { list?: PoolMinerList; error?: unknown; loading?: boolean; now: number }) {
+  return (
+    <Card>
+      <CardHeader
+        title="Active miners"
+        subtitle={list ? `${fmtInt(list.miners.length)} payout address(es) connected or seen in the last 24 hours` : undefined}
+      />
+      {loading && !list ? <Loading what="the miner list" /> : null}
+      {!list && error ? <Unavailable what="Miner list" error={error} /> : null}
+      {list && list.miners.length === 0 ? (
+        <p className="text-sm" style={{ color: "var(--dim)" }} data-testid="no-active-miners">
+          No miner is connected, and none sent a share in the last 24 hours.
+        </p>
+      ) : null}
+      {list && list.miners.length > 0 ? (
+        <Table head={["Address", "Connected", "Workers online / idle / offline", "Hashrate", "Shares, 24 h", "Best share", "Last share", "Blocks"]}>
+          {list.miners.map((m) => (
+            <tr key={m.address} data-testid="active-miner-row">
+              <Td mono>
+                <Link href={minerHref(m.address)} style={{ color: "var(--accent)" }}>
+                  {shortHash(m.address, 8)}
+                </Link>
+              </Td>
+              <Td>{m.connected ? "yes" : "no"}</Td>
+              <Td>{`${fmtInt(m.online)} / ${fmtInt(m.idle)} / ${fmtInt(m.offline)}`}</Td>
+              <Td>{fmtHashrate(bestRate(m.hashrate_hs))}</Td>
+              <Td>{fmtInt(m.shares_24h.accepted)}</Td>
+              <Td>{fmtDifficulty(m.best_share.ever)}</Td>
+              <Td>{m.last_share_at ? fmtAgo(m.last_share_at, now) : "never"}</Td>
+              <Td>{fmtInt(m.blocks_found)}</Td>
+            </tr>
+          ))}
+        </Table>
+      ) : null}
+      <Note>
+        This list names miners&apos; payout addresses, so the node serves it only to this dashboard (signed
+        requests); the public website never shows it.
+      </Note>
+    </Card>
+  );
+}
+
+export function MinersView({
+  status,
+  statusError,
+  statusLoading,
+  list,
+  listError,
+  listLoading,
+  addresses,
+  miners,
+  now,
+}: MinersViewProps) {
+  const listed = new Set((list?.miners ?? []).map((m) => m.address));
+  const others = addresses.filter((a) => !listed.has(a));
   return (
     <div className="space-y-6">
       <Card>
@@ -66,21 +125,19 @@ export function MinersView({ status, statusError, statusLoading, addresses, mine
           <Kv label="Worker connections" value={fmtInt(status?.miners.workers)} />
           <Kv label="Pool hashrate, 1 hour" value={fmtHashrate(status?.pool_hashrate_hs["1h"])} />
         </Grid>
-        <Note>
-          The pool status counts connections but does not name them. Look up an address below to see its
-          workers; addresses that found a block here, and the ones looked up in this browser, are listed.
-        </Note>
       </Card>
 
+      <ActiveMiners list={list} error={listError} loading={listLoading} now={now} />
+
       <Card>
-        <CardHeader title="Miners" subtitle={`${fmtInt(addresses.length)} listed`} />
-        {addresses.length === 0 ? (
+        <CardHeader title="Other addresses" subtitle={`${fmtInt(others.length)} block finder(s) and looked-up address(es) not active now`} />
+        {others.length === 0 ? (
           <p className="text-sm" style={{ color: "var(--dim)" }} data-testid="no-miners">
-            No address to list yet. Look one up above.
+            No other address to list. Look one up above.
           </p>
         ) : (
           <Table head={["Address", "Workers online", "Hashrate", "Shares, 24 h", "Best share", "Last share", "Blocks", "Expected time to a block"]}>
-            {addresses.map((a) => {
+            {others.map((a) => {
               const r = miners[a];
               return (
                 <tr key={a} data-testid="miner-row">

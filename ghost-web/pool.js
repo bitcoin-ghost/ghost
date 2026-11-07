@@ -162,11 +162,33 @@
       if (!n || typeof n.id !== 'string' || !/^[a-z0-9][a-z0-9-]{0,31}$/.test(n.id) || seen[n.id]) return;
       var host = typeof n.stratum_host === 'string' && /^[A-Za-z0-9.-]{1,253}$/.test(n.stratum_host) ? n.stratum_host : null;
       if (!host) return;
-      var key = typeof n.sv2_authority_key === 'string' && /^[1-9A-HJ-NP-Za-km-z]{20,120}$/.test(n.sv2_authority_key) ? n.sv2_authority_key : null;
+      var key = validKey(n.sv2_authority_key);
       seen[n.id] = true;
-      out.push({ id: n.id, name: typeof n.name === 'string' && n.name ? n.name : 'Node ' + n.id, host: host, key: key });
+      out.push({ id: n.id, name: typeof n.name === 'string' && n.name ? n.name : 'Node ' + n.id, host: host, key: key, keySource: key ? 'file' : null });
     });
     return out;
+  }
+
+  // An SV2 authority key (base58check) as a string, or null.
+  function validKey(k) {
+    return typeof k === 'string' && /^[1-9A-HJ-NP-Za-km-z]{20,120}$/.test(k) ? k : null;
+  }
+
+  // The nodes with each one's SV2 key taken from its own live status (`ports.sv2_authority_public_key`,
+  // in mergeStatus's `liveKeys`) where it reports one, else from pool-nodes.json. A node that has
+  // not answered keeps the file's key.
+  function withLiveKeys(nodes, merged) {
+    var live = (merged && merged.liveKeys) || {};
+    return (nodes || []).map(function (n) {
+      var k = live[n.id];
+      if (!k) return n;
+      var out = {};
+      Object.keys(n).forEach(function (f) { out[f] = n[f]; });
+      out.fileKey = n.key;
+      out.key = k;
+      out.keySource = 'live';
+      return out;
+    });
   }
 
   function urlRow(label, url, note) {
@@ -187,7 +209,10 @@
         urlRow('SV1, small miners (Bitaxe, NerdAxe)', 'stratum+tcp://' + n.host + ':' + PORTS.sv1Small) +
         urlRow('SV1, large miners (Antminer, Whatsminer, Avalon)', 'stratum+tcp://' + n.host + ':' + PORTS.sv1Large) +
         urlRow('SV2', 'stratum2+tcp://' + n.host + ':' + PORTS.sv2 + (n.key ? '/' + n.key : ''),
-          n.key ? 'The part after the last <code>/</code> is the node\'s authority key.' : 'Authority key: not published here yet. Ask the operator before using SV2.') +
+          n.key ? 'The part after the last <code>/</code> is the node\'s authority key' +
+            (n.keySource === 'live' ? ', as the node reports it now' +
+              (n.fileKey && n.fileKey !== n.key ? ' (the published list has a different key: ask the operator)' : '') : '') + '.'
+            : 'Authority key: not published here yet. Ask the operator before using SV2.') +
         '</div>';
     }).join('') + '</div>' +
       '<div class="connect-cred"><div><span class="url-label">Username</span><code>your Bitcoin address</code> or <code>address.worker</code></div>' +
@@ -206,7 +231,7 @@
     var out = {
       answered: [], failed: [], network: null, tipHeight: null, difficulty: null,
       miners: null, workers: null, hashrate: { '15m': null, '1h': null, '24h': null },
-      best: { ever: null, '24h': null }, blocks: [], feePolicy: null, submitNodes: {}
+      best: { ever: null, '24h': null }, blocks: [], feePolicy: null, submitNodes: {}, liveKeys: {}
     };
     var byHash = {};
     (results || []).forEach(function (r) {
@@ -232,7 +257,13 @@
         out.best['24h'] = maxOrNull(out.best['24h'], b.best_share['24h']);
       }
       if (!out.feePolicy && b.fee_policy) out.feePolicy = b.fee_policy;
-      (b.submit_nodes || []).forEach(function (s) { out.submitNodes[s] = true; });
+      (Array.isArray(b.submit_nodes) ? b.submit_nodes : []).forEach(function (s) {
+        // A bare `scheme://host:port` from an older pool_sv2, or { node, reachable, ... }.
+        var name = typeof s === 'string' ? s : s && typeof s.node === 'string' ? s.node : null;
+        if (name) out.submitNodes[name] = true;
+      });
+      var key = b.ports ? validKey(b.ports.sv2_authority_public_key) : null;
+      if (key) out.liveKeys[r.node] = key;
       (Array.isArray(b.blocks_found) ? b.blocks_found : []).forEach(function (blk) {
         if (!blk || typeof blk.hash !== 'string') return;
         var cur = byHash[blk.hash];
@@ -359,11 +390,19 @@
     if (!connect.length && !stats) return;
     loadNodes().then(function (nodes) {
       connect.forEach(function (el) { el.innerHTML = connectHtml(nodes); });
-      if (!stats) return;
+      // Each node's SV2 key as the node itself reports it replaces the file's.
+      function showKeys(m) {
+        if (connect.length) connect.forEach(function (el) { el.innerHTML = connectHtml(withLiveKeys(nodes, m)); });
+      }
+      if (!stats) {
+        if (nodes.length) askAll(nodes, '/api/v1/pool/status').then(function (rs) { showKeys(mergeStatus(rs)); });
+        return;
+      }
       function refresh() {
         if (!nodes.length) { stats.innerHTML = '<p class="na">No node is configured, so there are no live figures.</p>'; return; }
         askAll(nodes, '/api/v1/pool/status').then(function (rs) {
           var m = mergeStatus(rs);
+          showKeys(m);
           stats.innerHTML = statsHtml(m, nodes);
           if (blocks) blocks.innerHTML = blocksHtml(m, Date.now() / 1000);
           var nb = nextBlockHtml(m.feePolicy);
@@ -380,7 +419,7 @@
     hashrateHtml: hashrateHtml, fmtDifficulty: fmtDifficulty, fmtBtc: fmtBtc, fmtSats: fmtSats, fmtInt: fmtInt,
     fmtDuration: fmtDuration, ago: ago, shortHash: shortHash, blockUrl: blockUrl, expectedSeconds: expectedSeconds,
     chanceWithin: chanceWithin, fmtChance: fmtChance, payoutSplit: payoutSplit, nextBlockHtml: nextBlockHtml,
-    nodesFromConfig: nodesFromConfig, connectHtml: connectHtml, mergeStatus: mergeStatus, statsHtml: statsHtml,
+    nodesFromConfig: nodesFromConfig, validKey: validKey, withLiveKeys: withLiveKeys, connectHtml: connectHtml, mergeStatus: mergeStatus, statsHtml: statsHtml,
     blocksHtml: blocksHtml, bestRate: bestRate, fetchJson: fetchJson, askAll: askAll, loadNodes: loadNodes
   };
   if (typeof module !== 'undefined' && module.exports) {
