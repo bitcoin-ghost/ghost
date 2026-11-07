@@ -68,17 +68,8 @@ impl HandleCommonMessagesFromClientAsync for Downstream {
             ));
         }
 
-        // Kept for the node pool's sensing loop (native SV2 miners have no SV1 agent).
-        let setup_device = ghost_common::slot_class_sensing::Sv2Device::new(
-            &msg.vendor.as_utf8_or_hex(),
-            &msg.hardware_version.as_utf8_or_hex(),
-            &msg.firmware.as_utf8_or_hex(),
-        );
-        self.downstream_data
-            .super_safe_lock(|data| data.setup_device = setup_device);
-
         // Work selection (job declaration) is refused: a declared job's coinbase comes from the
-        // client and cannot pay the node pool's canonical outputs.
+        // client and cannot be held to the solo rule.
         if has_work_selection(msg.flags) {
             info!("Rejecting connection from {downstream_id}: work selection is not supported.");
             let response = SetupConnectionError {

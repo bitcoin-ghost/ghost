@@ -976,8 +976,6 @@ mod tests {
             last_batch_work_sum: 30.0,
             share_batch_size: 10,
             blocks_found: 0,
-            slot_class: None,
-            slot_class_warning: None,
         }
     }
 

@@ -68,33 +68,63 @@ pub struct ShareWebhookConfig {
     pub max_retries: u32,
 }
 
-/// `[node_pool]`: the node pool, the only mode this pool runs in. Required: startup refuses a
-/// config without it.
+fn default_sv1_ports() -> Vec<u16> {
+    vec![3333, 4444]
+}
+
+/// `[solo]`: the solo pool's settings. Optional: a config without it runs on mainnet, keeps its
+/// statistics and found blocks in memory, and submits found blocks to the local node only.
 ///
-/// Every channel gets its own job: a `GhostShare/v2` share tag (slot class, parent anchor), the
-/// canonical coinbase of the snapshot table for its slot class (spec 2.1), SV2 standard channels
-/// at the full class, and per-miner slot-class sensing. The translator must run with
-/// `quantise_to_tiers = true` and list the Ghost agent extension (`0x4748`) in its
-/// `supported_extensions` for SV1 user agents to reach the sensing loop. See `node_pool.rs`.
-#[derive(Clone, Debug, Default, serde::Deserialize)]
-pub struct NodePoolConfig {
-    /// This node's 32-byte identity, hex. Normally omitted: read from the co-located
-    /// ghost-mining's health endpoint, and checked against it when pinned.
+/// ```toml
+/// [solo]
+/// network = "mainnet"                 # mainnet, signet or regtest: the subsidy schedule and
+///                                     # which addresses miners may use
+/// state_dir = "/var/lib/ghost/solo"   # miner-stats.json and blocks-found.json
+/// submit_rpc = ["http://10.0.0.2:8332"]  # other nodes every found block is sent to
+/// submit_rpc_auth_file = "/etc/ghost/solo-submit-rpc.auth"  # their credentials (never logged)
+/// sv1_ports = [3333, 4444]            # the translator's ports, shown by /api/v1/pool/status
+/// ```
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct SoloConfig {
+    /// `mainnet` (the default), `signet` or `regtest`.
     #[serde(default)]
-    pub node_id: Option<String>,
-    /// Where to read this node's identity from. Defaults to the co-located ghost-mining.
+    pub network: Option<String>,
+    /// Where the miner statistics and the found blocks are saved. `None` keeps them in memory.
     #[serde(default)]
-    pub ghost_pool_health_url: Option<String>,
-    /// The node operator's fee address: the finder output, which takes every transaction fee of
-    /// a block this node's miners find (spec 1). P2SH, P2WPKH, P2WSH or P2TR.
-    pub fee_address: String,
-    /// Valid shares a class needs before a miner is stepped up. Defaults to 20.
+    pub state_dir: Option<PathBuf>,
+    /// Other Bitcoin nodes' JSON-RPC URLs: every found block is sent to each of them too, in
+    /// parallel, after the local node. See `submit_rpc.rs`.
     #[serde(default)]
-    pub sensing_min_shares: Option<u32>,
-    /// `[node_pool.relay]`: the share-chain relay and settlement. Required: without it this node
-    /// holds no ledger and cannot build a canonical coinbase.
+    pub submit_rpc: Vec<String>,
+    /// Their credentials, one `user:password` (or `url user:password`) a line. Falls back to the
+    /// `GHOST_SOLO_SUBMIT_RPC_AUTH_FILE` environment variable.
     #[serde(default)]
-    pub relay: Option<crate::node_pool_relay::NodePoolRelayConfig>,
+    pub submit_rpc_auth_file: Option<PathBuf>,
+    /// The translator's SV1 ports, for the status API.
+    #[serde(default = "default_sv1_ports")]
+    pub sv1_ports: Vec<u16>,
+}
+
+impl Default for SoloConfig {
+    fn default() -> Self {
+        Self {
+            network: None,
+            state_dir: None,
+            submit_rpc: vec![],
+            submit_rpc_auth_file: None,
+            sv1_ports: default_sv1_ports(),
+        }
+    }
+}
+
+impl SoloConfig {
+    /// The configured network; mainnet when unset.
+    pub fn network(&self) -> Result<ghost_common::solo::SoloNetwork, String> {
+        match &self.network {
+            Some(n) => ghost_common::solo::SoloNetwork::parse(n),
+            None => Ok(ghost_common::solo::SoloNetwork::Mainnet),
+        }
+    }
 }
 
 /// Configuration for the Pool, including connection, authority, and coinbase settings.
@@ -124,7 +154,11 @@ pub struct PoolConfig {
     #[serde(default)]
     share_webhook: Option<ShareWebhookConfig>,
     #[serde(default)]
-    node_pool: Option<NodePoolConfig>,
+    solo: Option<SoloConfig>,
+    /// A `[node_pool]` section left by an older installer: ignored (the share chain is gone),
+    /// and said so at start.
+    #[serde(default)]
+    node_pool: Option<serde::de::IgnoredAny>,
 
     /// Concurrent downstream connections allowed in total. `None` takes
     /// [`crate::connection_limit::DEFAULT_MAX_DOWNSTREAM_CONNECTIONS`].
@@ -143,15 +177,19 @@ impl PoolConfig {
         self.share_webhook.as_ref()
     }
 
-    /// The `[node_pool]` section, if the config has one. Startup refuses a config without it.
-    pub fn node_pool(&self) -> Option<&NodePoolConfig> {
-        self.node_pool.as_ref()
+    /// The `[solo]` section, defaulted when absent.
+    pub fn solo(&self) -> SoloConfig {
+        self.solo.clone().unwrap_or_default()
     }
 
-    /// Sets the `[node_pool]` section, for a config built with [`PoolConfig::new`] rather than
-    /// read from TOML. Startup checks it exactly as it checks one read from a file.
-    pub fn set_node_pool(&mut self, node_pool: NodePoolConfig) {
-        self.node_pool = Some(node_pool);
+    /// Sets the `[solo]` section, for a config built with [`PoolConfig::new`].
+    pub fn set_solo(&mut self, solo: SoloConfig) {
+        self.solo = Some(solo);
+    }
+
+    /// Whether the config still carries an old `[node_pool]` section (ignored).
+    pub fn has_legacy_node_pool_section(&self) -> bool {
+        self.node_pool.is_some()
     }
 }
 
@@ -192,6 +230,7 @@ impl PoolConfig {
             monitoring_address,
             monitoring_cache_refresh_secs,
             share_webhook: None,
+            solo: None,
             node_pool: None,
             // `None` is DEFAULTED, not unlimited — see the field docs. This constructor is the
             // programmatic path (tests); the TOML path gets the same defaults through serde.

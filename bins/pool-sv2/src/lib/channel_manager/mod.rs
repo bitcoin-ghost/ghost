@@ -48,15 +48,11 @@ use crate::{
     utils::DownstreamMessage,
 };
 
-#[cfg(test)]
-mod held_tip_tests;
 mod mining_message_handler;
-mod node_pool_jobs;
+mod solo_jobs;
 mod template_distribution_message_handler;
 
 const POOL_ALLOCATION_BYTES: usize = 4;
-/// How often the node pool's sensing clocks run.
-const NODE_POOL_TICK_SECS: u64 = 5;
 const CLIENT_SEARCH_SPACE_BYTES: usize = 16;
 
 /// Bytes of [`POOL_ALLOCATION_BYTES`] spent on the fixed server id. Everything left over is
@@ -165,11 +161,10 @@ pub struct ChannelManager {
     required_extensions: Vec<u16>,
     /// Optional ghost share webhook sender. When Some, every validated share is posted.
     pub(crate) share_webhook_sender: Option<crate::share_webhook::ShareWebhookSender>,
-    /// The node pool: share tags, slot classes and the canonical coinbase of every job. The only
-    /// mode. See `node_pool.rs`.
-    pub(crate) node_pool: Arc<crate::node_pool::NodePool>,
-    /// The node pool's ledger and status API (W2.11), served on the monitoring listener.
-    pub(crate) node_pool_api: Arc<crate::node_pool_api::NodePoolApi>,
+    /// The solo layer: every job pays the treasury and its own channel's miner. See `solo.rs`.
+    pub(crate) solo: Arc<crate::solo::Solo>,
+    /// The miner and pool status API, served on the monitoring listener.
+    pub(crate) solo_api: Arc<crate::solo_api::SoloApi>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -226,66 +221,65 @@ impl ChannelManager {
             downstream_receiver,
         };
 
-        // NODE_POOL: the only mode. A config without `[node_pool]` and its relay, or with a bad
-        // identity or fee address, refuses startup: without them no job can carry a canonical
-        // coinbase.
-        let cfg = config.node_pool().ok_or_else(|| {
-            PoolError::shutdown(PoolErrorKind::Configuration(
-                "the [node_pool] section is required: the node pool is the only mode".into(),
-            ))
-        })?;
-        let relay = cfg.relay.as_ref().ok_or_else(|| {
-            PoolError::shutdown(PoolErrorKind::Configuration(
-                "the [node_pool.relay] section is required: it holds the ledger every coinbase \
-                 pays"
-                    .into(),
-            ))
-        })?;
-        // Where the share chain starts (W2.8): a placeholder genesis (the installer's `UNSET`,
-        // for a network whose share chain has not been published), a mainnet node without a
-        // compiled start, or a configured genesis mainnet does not carry, refuses here, by name,
-        // before anything is opened or fetched.
-        relay
-            .network_start()
+        // SOLO: every job pays the treasury and its channel's own miner.
+        let solo_cfg = config.solo();
+        let network = solo_cfg
+            .network()
             .map_err(|e| PoolError::shutdown(PoolErrorKind::Configuration(e)))?;
-        let np = crate::node_pool::NodePool::resolve(cfg, config.shares_per_minute())
-            .await
-            .map_err(|e| PoolError::shutdown(PoolErrorKind::Configuration(e)))?;
-        // Per-worker share statistics for the miner pages (W2.17), saved beside the relay's
-        // store so a restart keeps the history.
-        let miner_stats = Arc::new(crate::miner_stats::MinerStats::open(
-            crate::miner_stats::MinerStats::path_beside(&relay.db_path),
-            crate::miner_stats::now_secs(),
-        ));
+        if config.has_legacy_node_pool_section() {
+            warn!(
+                "SOLO: the config's [node_pool] section is ignored: this pool is a solo pool, with \
+                 no share chain"
+            );
+        }
+        let (miner_stats, blocks) = match &solo_cfg.state_dir {
+            Some(dir) => {
+                if let Err(e) = std::fs::create_dir_all(dir) {
+                    warn!(dir = %dir.display(), "SOLO: cannot create the state directory: {e}");
+                }
+                (
+                    crate::miner_stats::MinerStats::open(
+                        crate::miner_stats::MinerStats::path_in(dir),
+                        crate::miner_stats::now_secs(),
+                    ),
+                    crate::blocks_found::BlocksFound::open(
+                        crate::blocks_found::BlocksFound::path_in(dir),
+                    ),
+                )
+            }
+            None => (
+                crate::miner_stats::MinerStats::in_memory(crate::miner_stats::now_secs()),
+                crate::blocks_found::BlocksFound::in_memory(),
+            ),
+        };
+        let miner_stats = Arc::new(miner_stats);
         miner_stats.spawn_saver();
-        let np = np.with_miner_stats(miner_stats.clone());
-        // The mining advert (W2.10): SV2 defaults to this pool's own listen port and key.
-        let advert = relay.advert(
-            Some(config.listen_address().port()),
-            &config.authority_public_key().to_string(),
+        let targets = crate::submit_rpc::SubmitTargets::new(
+            &solo_cfg.submit_rpc,
+            solo_cfg.submit_rpc_auth_file.as_deref(),
+        )
+        .map_err(|e| PoolError::shutdown(PoolErrorKind::Configuration(e)))?;
+        let submit_nodes = targets.labels();
+        let solo = Arc::new(
+            crate::solo::Solo::new(network)
+                .with_miner_stats(miner_stats)
+                .with_blocks_found(Arc::new(blocks))
+                .with_submit_targets(Arc::new(targets)),
         );
-        let (_relay_handle, relay_parts) =
-            crate::node_pool_relay::start_with_parts(relay, &np, advert)
-                .await
-                .map_err(|e| PoolError::shutdown(PoolErrorKind::Configuration(e)))?;
         warn!(
-            fee_address = %cfg.fee_address,
-            "NODE_POOL: every job carries its channel's share tag and the canonical coinbase"
+            network = %network,
+            submit_nodes = ?submit_nodes,
+            "SOLO: every job pays the treasury subsidy / 200 and its own miner the rest"
         );
-        let node_pool = Arc::new(np);
-        let node_pool_api = Arc::new(
-            crate::node_pool_api::NodePoolApi::new(
-                relay_parts,
-                cfg.fee_address.clone(),
-                node_pool.clone(),
-            )
-            .with_miner_stats(miner_stats),
-        );
+        let solo_api = Arc::new(crate::solo_api::SoloApi::new(
+            solo.clone(),
+            solo_cfg.sv1_ports.clone(),
+            config.listen_address().port(),
+            submit_nodes,
+        ));
         let mut supported_extensions = config.supported_extensions().to_vec();
-        if !supported_extensions
-            .contains(&ghost_common::slot_class_sensing::AGENT_TLV_EXTENSION_TYPE)
-        {
-            supported_extensions.push(ghost_common::slot_class_sensing::AGENT_TLV_EXTENSION_TYPE);
+        if !supported_extensions.contains(&ghost_common::solo::AGENT_TLV_EXTENSION_TYPE) {
+            supported_extensions.push(ghost_common::solo::AGENT_TLV_EXTENSION_TYPE);
         }
 
         let channel_manager = ChannelManager {
@@ -298,61 +292,11 @@ impl ChannelManager {
             supported_extensions,
             required_extensions: config.required_extensions().to_vec(),
             share_webhook_sender,
-            node_pool,
-            node_pool_api,
+            solo,
+            solo_api,
         };
 
         Ok(channel_manager)
-    }
-
-    /// A channel manager over `node_pool` with no template provider, relay or listener behind
-    /// it, for tests that drive its handlers directly. Returns it and the receiving end of the
-    /// template provider channel.
-    #[cfg(test)]
-    pub(crate) fn for_tests(
-        node_pool: crate::node_pool::NodePool,
-        api: crate::node_pool_api::NodePoolApi,
-    ) -> Self {
-        let (tp_sender, tp_receiver) = unbounded();
-        let (_, downstream_receiver) = unbounded();
-        let factory = || {
-            ExtendedExtranonce::new(
-                0..0,
-                0..POOL_ALLOCATION_BYTES,
-                POOL_ALLOCATION_BYTES..POOL_ALLOCATION_BYTES + CLIENT_SEARCH_SPACE_BYTES,
-                Some(vec![1]),
-            )
-            .expect("valid ranges")
-        };
-        ChannelManager {
-            channel_manager_data: Arc::new(Mutex::new(ChannelManagerData {
-                downstream: HashMap::new(),
-                extranonce_prefix_factory_extended: factory(),
-                extranonce_prefix_factory_standard: factory(),
-                downstream_id_factory: AtomicUsize::new(1),
-                vardiff: HashMap::new(),
-                last_future_template: None,
-                last_new_prev_hash: None,
-            })),
-            channel_manager_channel: ChannelManagerChannel {
-                tp_sender,
-                tp_receiver,
-                downstream_sender: Arc::new(Mutex::new(HashMap::new())),
-                downstream_receiver,
-            },
-            pool_tag_string: String::new(),
-            share_batch_size: 100,
-            shares_per_minute: 6.0,
-            coinbase_reward_script: CoinbaseRewardScript::from_descriptor(
-                "addr(bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4)",
-            )
-            .expect("a valid descriptor"),
-            supported_extensions: vec![],
-            required_extensions: vec![],
-            share_webhook_sender: None,
-            node_pool: Arc::new(node_pool),
-            node_pool_api: Arc::new(api),
-        }
     }
 
     // Bootstraps a group channel with the given parameters.
@@ -388,8 +332,8 @@ impl ChannelManager {
         };
 
         // The group channel tracks templates for its state; its job is never sent (every channel
-        // mines its own canonical job), so a single output for the whole value keeps the job
-        // factory's sum check satisfied.
+        // mines its own job, paying its own miner), so a single output for the whole value keeps
+        // the job factory's sum check satisfied.
         let coinbase_outputs = vec![TxOut {
             value: Amount::from_sat(last_future_template.coinbase_tx_value_remaining),
             script_pubkey: self.coinbase_reward_script.script_pubkey(),
@@ -657,11 +601,6 @@ impl ChannelManager {
             let cm = self.clone();
             let vardiff_future = self.run_vardiff_loop();
             tokio::pin!(vardiff_future);
-            // NODE_POOL: anchor publishes and the sensing clock.
-            let mut anchor_rx = cm.node_pool.subscribe();
-            let mut anchor_open = true;
-            let mut sensing_clock =
-                tokio::time::interval(std::time::Duration::from_secs(NODE_POOL_TICK_SECS));
             loop {
                 let mut cm_template = cm.clone();
                 let mut cm_downstreams = cm.clone();
@@ -694,16 +633,6 @@ impl ChannelManager {
                             }
                         }
                     }
-                    // Cancellation-safe: `changed()` only marks the value seen when it resolves.
-                    changed = anchor_rx.changed(), if anchor_open => {
-                        match changed {
-                            Ok(()) => cm.node_pool_rebuild(None).await,
-                            Err(_) => anchor_open = false,
-                        }
-                    }
-                    _ = sensing_clock.tick() => {
-                        cm.node_pool_tick().await;
-                    }
                     dm = cm_downstreams.channel_manager_channel.downstream_receiver.recv() => {
                         let res = cm_downstreams.process_downstream_mining_message(dm).await;
                         if let Err(e) = res {
@@ -734,7 +663,7 @@ impl ChannelManager {
     // 1. Removes the corresponding Downstream from the `downstream` map.
     // 2. Removes the channels of the corresponding Downstream from `vardiff` map.
     pub fn remove_downstream(&self, downstream_id: DownstreamId) {
-        self.node_pool.on_downstream_removed(downstream_id);
+        self.solo.on_downstream_removed(downstream_id);
         self.channel_manager_data.super_safe_lock(|cm_data| {
             cm_data.downstream.remove(&downstream_id);
             cm_data
@@ -808,7 +737,6 @@ impl ChannelManager {
         channel_state: &mut ExtendedChannel<'static, DefaultJobStore<ExtendedJob<'static>>>,
         vardiff_state: &mut VardiffState,
         updates: &mut Vec<RouteMessageTo>,
-        np: &crate::node_pool::NodePool,
     ) {
         let (hashrate, target, shares_per_minute) = (
             channel_state.get_nominal_hashrate(),
@@ -828,14 +756,6 @@ impl ChannelManager {
 
         match channel_state.update_channel(new_hashrate, None) {
             Ok(()) => {
-                // The announced target must BE a tier's exact target, or the share tag can only
-                // commit to (and the miner only be credited) up to half the difficulty it
-                // actually mines at.
-                let q = np.quantise_target(
-                    channel_state.get_target(),
-                    channel_state.get_requested_max_target(),
-                );
-                channel_state.set_target(q);
                 let updated_target = channel_state.get_target();
                 updates.push(
                     (
@@ -862,7 +782,6 @@ impl ChannelManager {
         channel: &mut StandardChannel<'static, DefaultJobStore<StandardJob<'static>>>,
         vardiff_state: &mut VardiffState,
         updates: &mut Vec<RouteMessageTo>,
-        np: &crate::node_pool::NodePool,
     ) {
         let hashrate = channel.get_nominal_hashrate();
         let target = channel.get_target();
@@ -877,11 +796,6 @@ impl ChannelManager {
         if let Some(new_hashrate) = new_hashrate_opt {
             match channel.update_channel(new_hashrate, None) {
                 Ok(()) => {
-                    // The announced target must BE a tier's exact target — see the
-                    // extended-channel twin above.
-                    let q = np
-                        .quantise_target(channel.get_target(), channel.get_requested_max_target());
-                    channel.set_target(q);
                     let updated_target = channel.get_target();
                     updates.push(
                         (
@@ -932,7 +846,6 @@ impl ChannelManager {
         let mut messages: Vec<RouteMessageTo> = vec![];
         self.channel_manager_data
             .super_safe_lock(|channel_manager_data| {
-                let np = &self.node_pool;
                 for (vardiff_key, vardiff_state) in channel_manager_data.vardiff.iter_mut() {
                     let downstream_id = &vardiff_key.downstream_id;
                     let channel_id = &vardiff_key.channel_id;
@@ -949,7 +862,6 @@ impl ChannelManager {
                                 standard_channel,
                                 vardiff_state,
                                 &mut messages,
-                                np,
                             );
                         }
                         if let Some(extended_channel) = data.extended_channels.get_mut(channel_id) {
@@ -959,7 +871,6 @@ impl ChannelManager {
                                 extended_channel,
                                 vardiff_state,
                                 &mut messages,
-                                np,
                             );
                         }
                     });

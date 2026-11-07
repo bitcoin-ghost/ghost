@@ -1,7 +1,7 @@
 use stratum_apps::stratum_core::{
     bitcoin::{Amount, TxOut},
     handlers_sv2::HandleTemplateDistributionMessagesFromServerAsync,
-    mining_sv2::{SetNewPrevHash as SetNewPrevHashMp, SetTarget},
+    mining_sv2::SetNewPrevHash as SetNewPrevHashMp,
     parsers_sv2::{Mining, Tlv},
     template_distribution_sv2::*,
 };
@@ -10,7 +10,7 @@ use tracing::{error, info, warn};
 use crate::{
     channel_manager::{ChannelManager, RouteMessageTo},
     error::{self, PoolError, PoolErrorKind},
-    node_pool::ChannelKind,
+    solo::ChannelKind,
 };
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -31,46 +31,25 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
-        let np = self.node_pool.clone();
+        let solo = self.solo.clone();
 
-        // The template provider hands over the whole coinbase value and the witness commitment
-        // as its only output; anything else cannot carry a canonical coinbase. That is a
+        // The template provider hands over the whole coinbase value and only zero-value outputs
+        // (the witness commitment); anything else cannot carry a solo coinbase. That is a
         // misconfigured template provider, not a bad block: refuse to mine on it.
-        if let Err(e) = np.template_parts(&msg) {
+        if let Err(e) = solo.template_parts(&msg) {
             error!(
                 template_id = msg.template_id,
-                "NODE_POOL: the template cannot carry a canonical coinbase: {e}"
+                "SOLO: the template cannot carry a solo coinbase: {e}"
             );
             return Err(PoolError::shutdown(PoolErrorKind::Custom(format!(
-                "template {} cannot carry a canonical coinbase: {e}",
+                "template {} cannot carry a solo coinbase: {e}",
                 msg.template_id
             ))));
         }
 
-        np.on_new_template(&msg);
-        // While a tip is held, a future template is kept for the replay after it is served
-        // (`node_pool_serve_held_tip`): serving the held tip drops every other future job.
-        np.note_future_template(&msg);
-        // The table this template's jobs pay, fetched before the channel locks are taken, and
-        // the anchor they build on. No table in time: the template is not served (see
-        // `NodePool::prepare_job_basis`), and miners keep their current job.
-        let served = np.prepare_job_basis(&msg).await;
-        if let Some(h) = crate::node_pool::NodePool::template_height(&msg) {
-            np.note_job_height(h);
-        }
-        if served {
-            np.mark_served(msg.template_id);
-        } else {
-            np.mark_unserved(msg.template_id);
-        }
-        // A template on the current tip while that tip is held for its table: its jobs would
-        // build on a prev hash the channels were never given. The held tip is served from the
-        // active template once the table arrives (`node_pool_serve_held_tip`).
-        let held = !msg.future_template && np.pending_tip().is_some();
-        let serve = served && !held;
-        // The template's Ghost tags taken out of the prefix, making room, byte for byte, for
-        // what each channel's factory stamps back in.
-        let prepared = np.prepare_template(&msg.clone().into_static());
+        solo.on_new_template(&msg);
+        // The template's Ghost tags taken out of the prefix: a solo coinbase carries neither.
+        let prepared = solo.prepare_template(&msg.clone().into_static());
         let template_id = msg.template_id;
 
         // No channel error on this path shuts the pool down: a channel that cannot take this
@@ -84,11 +63,10 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                 }
 
                 let mut messages: Vec<RouteMessageTo> = Vec::new();
-                let mut skipped = 0usize;
                 let mut failed = 0usize;
 
                 // The group channel tracks every template so its state stays coherent, but its job
-                // is never sent: one coinbase cannot carry every channel's share tag and slot class.
+                // is never sent: one coinbase cannot pay every channel's miner.
                 let group_outputs = vec![TxOut {
                     value: Amount::from_sat(msg.coinbase_tx_value_remaining),
                     script_pubkey: self.coinbase_reward_script.script_pubkey(),
@@ -104,61 +82,35 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                                 downstream_id = *downstream_id,
                                 template_id,
                                 error = ?e,
-                                "NODE_POOL_TEMPLATE_MISMATCH: the group channel did not take this \
+                                "SOLO_TEMPLATE_MISMATCH: the group channel did not take this \
                                  template; skipped (its job is never sent)"
                             );
                         }
 
-                        // Per-channel jobs: each channel's own factory builds its job, target
-                        // quantised to its tier, share tag stamped as the factory's extra push, the
-                        // canonical outputs of its slot class.
-                        if !serve {
-                            skipped += data.standard_channels.len() + data.extended_channels.len();
-                            return;
-                        }
-
+                        // Per-channel jobs: each channel's own factory builds its job, paying the
+                        // treasury and that channel's miner.
                         for (channel_id, standard_channel) in data.standard_channels.iter_mut() {
-                            let q = np.quantise_target(
-                                standard_channel.get_target(),
-                                standard_channel.get_requested_max_target(),
-                            );
-                            if &q != standard_channel.get_target() {
-                                standard_channel.set_target(q);
-                                messages.push(
-                                    (
-                                        *downstream_id,
-                                        Mining::SetTarget(SetTarget {
-                                            channel_id: *channel_id,
-                                            maximum_target: q.to_le_bytes().into(),
-                                        }),
-                                    )
-                                        .into(),
-                                );
-                            }
                             let key = (*downstream_id, *channel_id);
-                            standard_channel.set_tier_commitment(Some(np.stamp(
-                                key,
-                                ChannelKind::Standard,
-                                standard_channel.get_user_identity(),
-                                standard_channel.get_target(),
-                            )));
-                            let built = np.job_outputs(key, &msg).and_then(|outputs| {
-                                standard_channel
-                                    .on_new_template(prepared.clone(), outputs)
-                                    .map_err(|e| format!("{e:?}"))?;
-                                let job = match msg.future_template {
-                                    true => standard_channel
-                                        .get_future_job_id_from_template_id(template_id)
-                                        .and_then(|id| standard_channel.get_future_job(id)),
-                                    false => standard_channel.get_active_job(),
-                                };
-                                job.map(|j| j.get_job_message().clone()).ok_or_else(|| {
-                                    "the job just built is not in the channel".into()
-                                })
-                            });
+                            let identity = standard_channel.get_user_identity().clone();
+                            let built = solo
+                                .job_outputs(key, ChannelKind::Standard, &identity, &msg)
+                                .and_then(|outputs| {
+                                    standard_channel
+                                        .on_new_template(prepared.clone(), outputs)
+                                        .map_err(|e| format!("{e:?}"))?;
+                                    let job = match msg.future_template {
+                                        true => standard_channel
+                                            .get_future_job_id_from_template_id(template_id)
+                                            .and_then(|id| standard_channel.get_future_job(id)),
+                                        false => standard_channel.get_active_job(),
+                                    };
+                                    job.map(|j| j.get_job_message().clone()).ok_or_else(|| {
+                                        "the job just built is not in the channel".into()
+                                    })
+                                });
                             match built {
                                 Ok(job_message) => {
-                                    np.bind_job(key, job_message.job_id);
+                                    solo.bind_job(key, job_message.job_id);
                                     messages.push(
                                         (
                                             *downstream_id,
@@ -170,61 +122,41 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                                 Err(e) => {
                                     failed += 1;
                                     error!(
-                                    ?key,
-                                    template_id,
-                                    "NODE_POOL_TEMPLATE_MISMATCH: no job on this template for a \
-                                     standard channel; it keeps its current job: {e}"
-                                );
+                                        ?key,
+                                        template_id,
+                                        "SOLO_TEMPLATE_MISMATCH: no job on this template for a \
+                                         standard channel; it keeps its current job: {e}"
+                                    );
                                 }
                             }
                         }
 
                         for (channel_id, extended_channel) in data.extended_channels.iter_mut() {
+                            let key = (*downstream_id, *channel_id);
                             // A provisional channel gets its first job when its payee is bound.
-                            if np.awaits_payee((*downstream_id, *channel_id)) {
+                            if solo.awaits_payee(key) {
                                 continue;
                             }
-                            let q = np.quantise_target(
-                                extended_channel.get_target(),
-                                extended_channel.get_requested_max_target(),
-                            );
-                            if &q != extended_channel.get_target() {
-                                extended_channel.set_target(q);
-                                messages.push(
-                                    (
-                                        *downstream_id,
-                                        Mining::SetTarget(SetTarget {
-                                            channel_id: *channel_id,
-                                            maximum_target: q.to_le_bytes().into(),
-                                        }),
-                                    )
-                                        .into(),
-                                );
-                            }
-                            let key = (*downstream_id, *channel_id);
-                            extended_channel.set_tier_commitment(Some(np.stamp(
-                                key,
-                                ChannelKind::Extended,
-                                extended_channel.get_user_identity(),
-                                extended_channel.get_target(),
-                            )));
-                            let built = np.job_outputs(key, &msg).and_then(|outputs| {
-                                extended_channel
-                                    .on_new_template(prepared.clone(), outputs)
-                                    .map_err(|e| format!("{e:?}"))?;
-                                let job = match msg.future_template {
-                                    true => extended_channel
-                                        .get_future_job_id_from_template_id(template_id)
-                                        .and_then(|id| extended_channel.get_future_job(id)),
-                                    false => extended_channel.get_active_job(),
-                                };
-                                job.map(|j| j.get_job_message().clone()).ok_or_else(|| {
-                                    "the job just built is not in the channel".into()
-                                })
-                            });
+                            let identity = extended_channel.get_user_identity().clone();
+                            let built = solo
+                                .job_outputs(key, ChannelKind::Extended, &identity, &msg)
+                                .and_then(|outputs| {
+                                    extended_channel
+                                        .on_new_template(prepared.clone(), outputs)
+                                        .map_err(|e| format!("{e:?}"))?;
+                                    let job = match msg.future_template {
+                                        true => extended_channel
+                                            .get_future_job_id_from_template_id(template_id)
+                                            .and_then(|id| extended_channel.get_future_job(id)),
+                                        false => extended_channel.get_active_job(),
+                                    };
+                                    job.map(|j| j.get_job_message().clone()).ok_or_else(|| {
+                                        "the job just built is not in the channel".into()
+                                    })
+                                });
                             match built {
                                 Ok(job_message) => {
-                                    np.bind_job(key, job_message.job_id);
+                                    solo.bind_job(key, job_message.job_id);
                                     messages.push(
                                         (
                                             *downstream_id,
@@ -236,29 +168,21 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                                 Err(e) => {
                                     failed += 1;
                                     error!(
-                                    ?key,
-                                    template_id,
-                                    "NODE_POOL_TEMPLATE_MISMATCH: no job on this template for an \
-                                     extended channel; it keeps its current job: {e}"
-                                );
+                                        ?key,
+                                        template_id,
+                                        "SOLO_TEMPLATE_MISMATCH: no job on this template for an \
+                                         extended channel; it keeps its current job: {e}"
+                                    );
                                 }
                             }
                         }
                     });
                 }
-                if skipped > 0 {
-                    warn!(
-                        template_id,
-                        channels = skipped,
-                        served,
-                        "NODE_POOL: no job sent on this template; miners keep their current job"
-                    );
-                }
                 if failed > 0 {
                     error!(
                         template_id,
                         channels = failed,
-                        "NODE_POOL_TEMPLATE_MISMATCH: channels left on their current job"
+                        "SOLO_TEMPLATE_MISMATCH: channels left on their current job"
                     );
                 }
                 messages
@@ -283,6 +207,8 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         warn!("Received: {}", msg);
+        self.solo
+            .on_transaction_data_error(msg.template_id, &msg.error_code.as_utf8_or_hex());
         Ok(())
     }
 
@@ -292,7 +218,14 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         msg: RequestTransactionDataSuccess<'_>,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
-        info!("Received: {}", msg);
+        info!(
+            template_id = msg.template_id,
+            transactions = msg.transaction_list.to_vec().len(),
+            "Received RequestTransactionDataSuccess"
+        );
+        // A found block's transactions: the whole block goes to the other configured nodes.
+        self.solo
+            .on_transaction_data(msg.template_id, msg.transaction_list.to_vec());
         Ok(())
     }
 
@@ -304,80 +237,14 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
 
-        // A held tip is served (`node_pool_serve_held_tip`) by replaying the active template as
-        // a future one and activating it, which drops every future template the template
-        // provider sent for that same tip meanwhile. The provider's own SetNewPrevHash for one of
-        // those then names a template no channel holds, and the group channel's
-        // TemplateIdNotFound was a shutdown: seen 2026-11-03, a 24 h soak's node0 pool_sv2 shut
-        // itself down at 5 h 59 m this way. The tip is already active and every channel has its
-        // job on it, so there is nothing to do. (Serving the held tip now gives such templates
-        // back to the channels, so this is the backstop; a dropped template on a NEW tip is
-        // repaired below instead.)
-        let replayed = self.channel_manager_data.super_safe_lock(|data| {
-            same_tip_unknown_template(
-                data.last_new_prev_hash.as_ref(),
-                &msg,
-                data.downstream.values().any(|d| {
-                    d.downstream_data.super_safe_lock(|dd| {
-                        dd.group_channel
-                            .get_future_job_id_from_template_id(msg.template_id)
-                            .is_none()
-                    })
-                }),
-            )
-        });
-        if replayed {
-            warn!(
-                template_id = msg.template_id,
-                "NODE_POOL: SetNewPrevHash for a template dropped when the held tip was served; \
-                 the tip is already active, ignored"
-            );
-            return Ok(());
-        }
-
-        let np = self.node_pool.clone();
-        np.on_set_new_prev_hash(msg.template_id);
+        let solo = self.solo.clone();
+        solo.on_set_new_prev_hash(&msg);
         let template_id = msg.template_id;
-
-        // The new tip's template was not served (no snapshot table in time): no channel has a
-        // job on it, so nothing is activated or sent. The tip is held and served, with its jobs,
-        // as soon as the table arrives (`node_pool_serve_held_tip`); until then miners keep
-        // their current job.
-        if np.is_unserved(template_id) {
-            error!(
-                template_id,
-                "NODE_POOL_NO_TABLE: the new Bitcoin tip is held: its jobs wait for their \
-                 snapshot table"
-            );
-            np.hold_tip(msg.clone().into_static());
-            self.channel_manager_data.super_safe_lock(|data| {
-                data.last_new_prev_hash = Some(msg.clone().into_static());
-                for (downstream_id, downstream) in data.downstream.iter_mut() {
-                    downstream.downstream_data.super_safe_lock(|d| {
-                        if let Err(e) = d
-                            .group_channel
-                            .on_set_new_prev_hash(msg.clone().into_static())
-                        {
-                            error!(
-                                downstream_id = *downstream_id,
-                                template_id,
-                                error = ?e,
-                                "NODE_POOL_TIP_MISMATCH: the group channel does not hold the \
-                                 held tip's template; skipped (the held tip's replay rebuilds it)"
-                            );
-                        }
-                    });
-                }
-            });
-            return Ok(());
-        }
-        np.clear_pending_tip();
 
         // ⛔ No channel error here shuts the pool down (#898's rule, on the template side). A
         // channel that does not hold the template this prev hash names is NOT activated: its
         // job store would mark every job stale, or activate a job on another height, and it
-        // keeps its current job instead. The tip is then held for repair, so the next tick
-        // rebuilds it for every channel from the active template.
+        // keeps its current job until the next template instead.
         let mut mismatched = 0usize;
         let messages = self.channel_manager_data.super_safe_lock(|data| {
             data.last_new_prev_hash = Some(msg.clone().into_static());
@@ -395,7 +262,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                             downstream_id = *downstream_id,
                             template_id,
                             error = ?e,
-                            "NODE_POOL_TIP_MISMATCH: the group channel does not hold this tip's \
+                            "SOLO_TIP_MISMATCH: the group channel does not hold this tip's \
                              template; skipped"
                         );
                     }
@@ -404,9 +271,9 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                         let key = (*downstream_id, *channel_id);
                         // A provisional channel has no job yet: the new tip is recorded, nothing
                         // is sent.
-                        if np.awaits_payee(key) {
+                        if solo.awaits_payee(key) {
                             if let Err(e) = extended_channel.on_set_new_prev_hash(msg.clone().into_static()) {
-                                error!(?key, template_id, error = ?e, "NODE_POOL_TIP_MISMATCH: a provisional channel did not take the new tip");
+                                error!(?key, template_id, error = ?e, "SOLO_TIP_MISMATCH: a provisional channel did not take the new tip");
                             }
                             continue;
                         }
@@ -437,7 +304,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                                 error!(
                                     ?key,
                                     template_id,
-                                    "NODE_POOL_TIP_MISMATCH: an extended channel was not moved to \
+                                    "SOLO_TIP_MISMATCH: an extended channel was not moved to \
                                      the new tip; it keeps its current job: {e}"
                                 );
                             }
@@ -472,7 +339,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                                 error!(
                                     ?key,
                                     template_id,
-                                    "NODE_POOL_TIP_MISMATCH: a standard channel was not moved to \
+                                    "SOLO_TIP_MISMATCH: a standard channel was not moved to \
                                      the new tip; it keeps its current job: {e}"
                                 );
                             }
@@ -494,74 +361,14 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         }
 
         if mismatched > 0 {
-            if np.hold_tip_for_repair(msg.clone().into_static()) {
-                error!(
-                    template_id,
-                    channels = mismatched,
-                    "NODE_POOL_TIP_MISMATCH: channels did not hold this tip's template; the tip is \
-                     held and rebuilt for every channel from the active template on the next tick"
-                );
-            } else {
-                error!(
-                    template_id,
-                    channels = mismatched,
-                    "NODE_POOL_TIP_MISMATCH: channels did not hold this tip's template and it \
-                     cannot be rebuilt; they keep their current job until the next template"
-                );
-            }
+            error!(
+                template_id,
+                channels = mismatched,
+                "SOLO_TIP_MISMATCH: channels did not hold this tip's template; they keep their \
+                 current job until the next template"
+            );
         }
 
         Ok(())
-    }
-}
-
-/// Whether `msg` re-announces the tip already active (`last`) for a template the channels do not
-/// hold (`channels_lack_it`): a template dropped when a held tip was served. Such a
-/// SetNewPrevHash changes nothing and is ignored rather than failing the channels.
-fn same_tip_unknown_template(
-    last: Option<&SetNewPrevHash<'static>>,
-    msg: &SetNewPrevHash<'_>,
-    channels_lack_it: bool,
-) -> bool {
-    channels_lack_it && last.is_some_and(|p| p.prev_hash == msg.prev_hash)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn snph(template_id: u64, tip: u8) -> SetNewPrevHash<'static> {
-        SetNewPrevHash {
-            template_id,
-            prev_hash: [tip; 32].into(),
-            header_timestamp: 1,
-            n_bits: 0x1e0377ae,
-            target: [0xff; 32].into(),
-        }
-    }
-
-    /// The soak's sequence: tip held on 6775, 6776 sent for the same tip, the held tip served
-    /// from 6775 (dropping 6776), then the provider's SetNewPrevHash for 6776.
-    #[test]
-    fn a_dropped_template_on_the_active_tip_is_ignored_and_nothing_else_is() {
-        let active = snph(6775, 0xAA);
-        assert!(same_tip_unknown_template(
-            Some(&active),
-            &snph(6776, 0xAA),
-            true
-        ));
-        // The ordinary second template on a tip: the channels hold it.
-        assert!(!same_tip_unknown_template(
-            Some(&active),
-            &snph(6776, 0xAA),
-            false
-        ));
-        // A new tip is never skipped, known template or not.
-        assert!(!same_tip_unknown_template(
-            Some(&active),
-            &snph(6777, 0xBB),
-            true
-        ));
-        assert!(!same_tip_unknown_template(None, &snph(1, 0xAA), true));
     }
 }

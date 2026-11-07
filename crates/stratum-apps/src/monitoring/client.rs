@@ -26,14 +26,6 @@ pub struct ExtendedChannelInfo {
     pub last_batch_work_sum: f64,
     pub share_batch_size: usize,
     pub blocks_found: u32,
-    /// Node pool: miner outputs this channel's jobs carry. Absent when the pool's node pool
-    /// layer is not active for the channel.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub slot_class: Option<u16>,
-    /// Node pool: warning for known low-limit firmware, naming the model and the class it is
-    /// limited to. Absent for every other miner.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub slot_class_warning: Option<String>,
 }
 
 /// Information about a standard channel
@@ -169,8 +161,6 @@ mod tests {
             last_batch_work_sum: 30.0,
             share_batch_size: 10,
             blocks_found: 0,
-            slot_class: None,
-            slot_class_warning: None,
         }
     }
 
@@ -210,22 +200,6 @@ mod tests {
 
     /// The node pool fields are absent from the JSON unless set, so every existing reader sees
     /// the same document, and a document without them still parses.
-    #[test]
-    fn node_pool_fields_are_omitted_unless_set() {
-        let plain = create_extended_channel_info(1, 1.0);
-        let json = serde_json::to_string(&plain).unwrap();
-        assert!(!json.contains("slot_class"));
-        let back: ExtendedChannelInfo = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.slot_class, None);
-
-        let mut warned = plain;
-        warned.slot_class = Some(9);
-        warned.slot_class_warning = Some("Stock Antminer (default) firmware is limited".into());
-        let json = serde_json::to_string(&warned).unwrap();
-        assert!(json.contains("\"slot_class\":9"));
-        assert!(json.contains("slot_class_warning"));
-    }
-
     #[test]
     fn client_info_empty_channels() {
         let client = create_sv2_client_info(1, vec![], vec![]);

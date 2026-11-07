@@ -30,6 +30,7 @@ use crate::{
     },
 };
 
+pub mod blocks_found;
 pub mod channel_manager;
 pub mod config;
 pub mod connection_limit;
@@ -39,16 +40,11 @@ mod io_task;
 pub mod miner_stats;
 #[cfg(feature = "monitoring")]
 mod monitoring;
-pub mod node_pool;
-pub mod node_pool_api;
-#[cfg(feature = "np-fault-injection")]
-pub mod node_pool_fault;
-pub mod node_pool_genesis_import;
-pub mod node_pool_miner_api;
-pub mod node_pool_relay;
 pub mod share_webhook;
+pub mod solo;
+pub mod solo_api;
+pub mod submit_rpc;
 pub mod template_receiver;
-pub mod tier_binding;
 pub mod utils;
 
 #[derive(Debug, Clone)]
@@ -134,14 +130,8 @@ impl PoolSv2 {
                 ),
             )
             .expect("Failed to initialize monitoring server")
-            // The node pool's ledger and status API (W2.11), on the same loopback listener.
-            .with_routes(crate::node_pool_api::router(
-                channel_manager.node_pool_api.clone(),
-            ))
-            // The miner pages' API (W2.17).
-            .with_routes(crate::node_pool_miner_api::router(
-                channel_manager.node_pool_api.clone(),
-            ));
+            // The miner and pool status API, on the same loopback listener.
+            .with_routes(crate::solo_api::router(channel_manager.solo_api.clone()));
 
             let cancellation_token_clone = cancellation_token.clone();
             let shutdown_signal = async move {
