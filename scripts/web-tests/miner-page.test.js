@@ -1,8 +1,9 @@
-// Renders the miner page (ghost-web/miner.js) from sample API answers, and from failed ones,
-// under plain node: no browser, no dependencies. Run by scripts/check-miner-page.sh.
+// Renders the miner page (ghost-web/miner.js) from sample API answers shaped as pool_sv2 serves
+// them (bins/pool-sv2/src/lib/solo_api.rs), and from failed ones, under plain node: no browser,
+// no dependencies. Every section must show its data, or say "unavailable", and never print NaN,
+// undefined or a number it was not given. Run by scripts/check-miner-page.sh.
 'use strict';
 const assert = require('assert');
-const fs = require('fs');
 const path = require('path');
 
 const web = path.join(__dirname, '..', '..', 'ghost-web');
@@ -18,83 +19,68 @@ let failures = 0;
 function test(name, f) {
   try { f(); console.log('ok   ' + name); } catch (e) { failures++; console.log('FAIL ' + name + '\n     ' + e.message); }
 }
-
-function ledger() {
-  return {
-    address: ADDR, network: 'mainnet', script_hex: '0014', known: true, message: null,
-    balance: { units: '27917287424000', sats: 6500 }, queue_since: 901, min_payout_sats: 1000, units_per_sat: 4294967296,
-    queue: {
-      next_block_height: 1000, snapshot_height: 980, parent_anchor: 'aa', owed: { units: '1', sats: 6500 },
-      eligible: true, eligible_count: 3, is_top: false, age_rank: 2, size_rank: 2,
-      next_block: [{ slot_class: 3, oldest_slots: 2, in_oldest: true, sats: 6500 }, { slot_class: 500, oldest_slots: 250, in_oldest: true, sats: 6500 }]
-    },
-    queue_unavailable: null, recent_shares: [],
-    payouts: [{ height: 960, block_hash: 'b2'.repeat(32), sats: 1000, units: '1', status: 'provisional', confirmations: 40, mature: false, applied_at: 2300 }],
-    settlement: { caught_up: true, synced_height: 999, bitcoin_tip: 999, provisional_blocks: 1 }
-  };
+const strip = (h) => h.replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim();
+function noJunk(html, where) {
+  for (const bad of ['NaN', 'undefined', '[object Object]', 'Infinity', 'null']) {
+    assert(!strip(html).includes(bad), where + ' shows ' + bad + ': ' + strip(html).slice(0, 400));
+  }
 }
 
-function minerBody(node, workers, wait) {
-  return {
-    address: ADDR, network: 'mainnet', script_hex: '0014', node_id: node + 'id', generated_at: NOW, collecting_since: NOW - 3600,
-    summary: {
-      workers: workers.length, online: workers.filter((w) => w.status === 'online').length,
-      idle: workers.filter((w) => w.status === 'idle').length, offline: workers.filter((w) => w.status === 'offline').length,
-      hashrate_hs: { '15m': 7e14, '1h': 7.1e14, '24h': 7.1e14 },
-      shares_24h: { accepted: 600, stale: 1, rejected: 2, reject_reasons: { 'duplicate-share': 2 } }, last_share_at: NOW - 6
-    },
-    workers,
-    expected_wait: wait || { known: false, reason: 'the pool has found 2 blocks in the last 30 days; at least 3 are needed to estimate how often it finds one', seconds: null, blocks_needed: null, pool_blocks_counted: 2, assumptions: [] }
-  };
-}
+const rates = (h) => ({ '15m': h, '1h': h, '24h': h });
+const counts = () => ({ accepted: 600, stale: 1, rejected: 2, reject_reasons: { 'duplicate-share': 2 } });
 
 function worker(name, status, extra) {
   return Object.assign({
     name, status, last_share_at: NOW - 6, last_submit_at: NOW - 6,
-    hashrate_hs: { '15m': 7e14, '1h': 7.1e14, '24h': 7.1e14 },
-    shares_24h: { accepted: 600, stale: 1, rejected: 2, reject_reasons: { 'duplicate-share': 2 } },
-    slot_class: 9, firmware_warning: 'Stock Antminer firmware carries at most 9 miner outputs',
-    connections: [{ downstream_id: 4, channel_id: 1, kind: 'extended', slot_class: 9, model: 'Stock Antminer', firmware: '2.0.0', ceiling_class: 9, settled: true, firmware_warning: 'x' }]
+    hashrate_hs: rates(7e14), shares_24h: counts(), best_share: { ever: 4.1e9, '24h': 2.2e8 },
+    connections: status === 'offline' ? [] : [{ downstream_id: 4, channel_id: 1, kind: 'extended' }]
   }, extra || {});
 }
 
-function historyBody(node, workers) {
-  const series = (h) => ({ hashrate_hs: known(h), accepted: known(5), stale: known(0), rejected: known(1) });
+function found(height, hash) {
+  return { height, hash: hash.repeat(64 / hash.length), address: ADDR, worker: 'rig1', reward_sats: 311000000, treasury_sats: 1562500,
+           fees_sats: 62500, found_at: NOW - 3600, check: 'ok', submitted: [{ node: 'http://10.0.0.2:8332', result: 'accepted' }] };
+}
+
+function minerBody(workers, extra) {
+  const on = workers.filter((w) => w.status === 'online').length;
+  return Object.assign({
+    address: ADDR, network: 'mainnet', script_hex: '0014', generated_at: NOW, collecting_since: NOW - 3600,
+    summary: {
+      workers: workers.length, online: on, idle: workers.filter((w) => w.status === 'idle').length,
+      offline: workers.filter((w) => w.status === 'offline').length,
+      hashrate_hs: rates(7e14), shares_24h: counts(), last_share_at: NOW - 6,
+      best_share: { ever: Math.max(0, ...workers.map((w) => w.best_share.ever)), '24h': Math.max(0, ...workers.map((w) => w.best_share['24h'])) }
+    },
+    workers,
+    blocks_found: [],
+    expected_time_to_block: { known: true, seconds: 1.1e14 * 4294967296 / 7e14, hashrate_hs: 7e14, hashrate_window: '1h', network_difficulty: 1.1e14, reason: null }
+  }, extra || {});
+}
+
+function historyBody(workers) {
+  const series = (h) => ({ hashrate_hs: known(h), accepted: known(5), stale: known(0), rejected: known(1), best_share: known(1e8) });
   return {
-    address: ADDR, network: 'mainnet', node_id: node, window: '24h', bucket_seconds: 300, generated_at: NOW, collecting_since: NOW - 3600,
-    buckets,
-    total: series(7e14),
-    workers: workers.map((n) => ({ name: n, series: series(7e14 / workers.length) })),
-    workers_omitted: 0, reject_reasons: { 'duplicate-share': 2 },
-    balance: {
-      start_sats: 0, end_sats: buckets.map((_, i) => (i < 100 ? 0 : 6500)), credited_sats: buckets.map((_, i) => (i === 100 ? 9000 : 0)),
-      paid_sats: buckets.map((_, i) => (i === 150 ? 2500 : 0)),
-      payouts: [{ time: T0 + 150 * 300 + 10, height: 960, sats: 2500, block_hash: 'b2'.repeat(32) }], time_basis: 'x'
-    }
+    address: ADDR, network: 'mainnet', window: '24h', bucket_seconds: 300, generated_at: NOW, collecting_since: NOW - 3600,
+    buckets, total: series(7e14), workers: workers.map((n) => ({ name: n, series: series(7e14 / workers.length) })),
+    workers_omitted: 0, reject_reasons: { 'duplicate-share': 2 }
   };
 }
 
-const LISTED = ['203.0.113.10', '203.0.113.20'];
+const NAMES = { a: 'Node A', b: 'Node B', c: 'Node C', d: 'Node D' };
 
 function goodState(query) {
   const miners = MP.mergeMiners([
-    { node: '203.0.113.10', ok: true, status: 200, body: minerBody('203.0.113.10', [worker('rig1', 'online'), worker('rig2', 'offline', { slot_class: null, firmware_warning: null, connections: [] })]) },
-    { node: '203.0.113.20', ok: true, status: 200, body: minerBody('203.0.113.20', [worker('rig2', 'online', { slot_class: 500, firmware_warning: null })]) },
-    { node: '203.0.113.30', ok: false, status: 503, body: { error: 'down' } },
-    { node: '203.0.113.40', ok: false, status: 0, body: null }
+    { node: 'a', ok: true, status: 200, body: minerBody([worker('rig1', 'online'), worker('rig2', 'offline')], { blocks_found: [found(974000, 'aa')] }) },
+    { node: 'b', ok: true, status: 200, body: minerBody([worker('rig2', 'online', { best_share: { ever: 9e9, '24h': 1e8 } })], { blocks_found: [found(974000, 'aa'), found(974500, 'bb')] }) },
+    { node: 'c', ok: false, status: 502, body: { error: 'down' } }
   ]);
   const history = MP.mergeHistories([
-    { node: '203.0.113.10', ok: true, status: 200, body: historyBody('203.0.113.10', ['rig1']) },
-    { node: '203.0.113.20', ok: true, status: 200, body: historyBody('203.0.113.20', ['rig2']) },
-    { node: '203.0.113.30', ok: false, status: 503, body: null }
+    { node: 'a', ok: true, status: 200, body: historyBody(['rig1']) },
+    { node: 'b', ok: true, status: 200, body: historyBody(['rig2']) },
+    { node: 'c', ok: false, status: 502, body: null }
   ]);
-  return { query: query || MP.parseQuery('?address=' + ADDR), ledger: { ok: true, status: 200, body: ledger(), node: '203.0.113.10' }, miners, history, now: NOW };
-}
-
-function noJunk(html, where) {
-  for (const bad of ['NaN', 'undefined', '[object Object]', 'Infinity']) {
-    assert(!html.includes(bad), where + ' contains ' + bad);
-  }
+  return { query: query || MP.parseQuery('?address=' + ADDR), miners, history, now: NOW, names: NAMES };
 }
 
 test('the URL: ?address, ?id=address.worker and the window', () => {
@@ -105,195 +91,141 @@ test('the URL: ?address, ?id=address.worker and the window', () => {
   assert.strictEqual(MP.queryString({ address: ADDR, worker: 'rig 1', window: '30d' }), '?address=' + ADDR + '&worker=rig%201&window=30d');
 });
 
-test('workers from every node are merged, tagged with their node, offline duplicates dropped', () => {
+test('every node is merged: workers tagged with their node, offline duplicates dropped, blocks once', () => {
   const m = goodState().miners;
-  assert.deepStrictEqual(m.answered, ['203.0.113.10', '203.0.113.20']);
-  assert.deepStrictEqual(m.failed, ['203.0.113.30', '203.0.113.40']);
-  assert.deepStrictEqual(m.workers.map((w) => w.name + '@' + w.node + ':' + w.status), ['rig1@203.0.113.10:online', 'rig2@203.0.113.20:online']);
+  assert.deepStrictEqual([m.answered, m.failed], [['a', 'b'], ['c']]);
+  assert.deepStrictEqual(m.workers.map((w) => w.name + '@' + w.node + ':' + w.status), ['rig1@a:online', 'rig2@b:online']);
   assert.strictEqual(m.summary.shares_24h.accepted, 1200);
-  assert.strictEqual(m.summary.hashrate_hs['1h'], 2 * 7.1e14);
-  assert.strictEqual(m.wait.known, false);
+  assert.strictEqual(m.summary.hashrate_hs['1h'], 1.4e15);
+  assert.strictEqual(m.summary.best_share.ever, 9e9, 'the best of any node');
+  assert.deepStrictEqual(m.blocks.map((b) => b.height), [974500, 974000]);
 });
 
-test('histories are summed per bucket and unknown stays unknown', () => {
+test('the expected time is worked out again from the hashrate on every node together', () => {
+  const w = goodState().miners.wait;
+  assert.strictEqual(w.known, true);
+  assert.strictEqual(w.hashrate, 1.4e15);
+  assert(Math.abs(w.seconds - 1.1e14 * 4294967296 / 1.4e15) < 1);
+  assert(w.day > 0 && w.day < w.month && w.month < w.year && w.year < 1);
+  // No hashrate: unknown, with why.
+  const idle = MP.mergeMiners([{ node: 'a', ok: true, status: 200, body: minerBody([], { summary: Object.assign(minerBody([]).summary, { hashrate_hs: rates(null) }) }) }]);
+  assert.deepStrictEqual([idle.wait.known, idle.wait.reason], [false, 'no accepted shares in the last 24 hours, so no hashrate']);
+  // No tip: the node's own reason.
+  const notip = MP.mergeMiners([{ node: 'a', ok: true, status: 200, body: minerBody([worker('rig1', 'online')], {
+    expected_time_to_block: { known: false, seconds: null, network_difficulty: null, reason: 'the pool has no Bitcoin tip yet, so the difficulty is not known' } }) }]);
+  assert.strictEqual(notip.wait.reason, 'the pool has no Bitcoin tip yet, so the difficulty is not known');
+});
+
+test('histories are summed per bucket, the best share is the higher, unknown stays unknown', () => {
   const h = goodState().history;
-  assert.deepStrictEqual(h.answered, ['203.0.113.10', '203.0.113.20']);
+  assert.deepStrictEqual([h.answered, h.failed], [['a', 'b'], ['c']]);
   assert.strictEqual(h.total.accepted[0], null, 'before collection: null, not 0');
   assert.strictEqual(h.total.accepted[287], 10);
   assert.strictEqual(h.total.hashrate_hs[287], 1.4e15);
+  assert.strictEqual(h.total.best_share[287], 1e8);
   assert.deepStrictEqual(Object.keys(h.workers).sort(), ['rig1', 'rig2']);
   assert.strictEqual(h.reasons['duplicate-share'], 4);
-  assert.strictEqual(h.balance.end_sats[287], 6500, 'balance from one node, not summed');
+});
+
+test('a node one bucket ahead is lined up; one further out is left out', () => {
+  const ahead = historyBody(['rig2']);
+  ahead.buckets = buckets.map((t) => t + 300);
+  const far = historyBody(['rig3']);
+  far.buckets = buckets.map((t) => t + 900);
+  const h = MP.mergeHistories([
+    { node: 'a', ok: true, status: 200, body: historyBody(['rig1']) },
+    { node: 'b', ok: true, status: 200, body: ahead },
+    { node: 'd', ok: true, status: 200, body: far }
+  ]);
+  assert.deepStrictEqual([h.answered, h.failed], [['a', 'b'], ['d']]);
+  assert.strictEqual(h.total.accepted[276], 5, "b's first known bucket lands one later on a's grid");
+  assert.strictEqual(h.total.accepted[287], 10, "b's newest bucket is past a's grid and dropped");
 });
 
 test('the page renders every section from sample answers', () => {
   const out = MP.renderAll(goodState(), 640);
   for (const k of Object.keys(out)) noJunk(out[k], k);
-  assert(out.tiles.includes('6,500'), 'balance tile');
-  assert(out.tiles.includes('1.42<span class="unit">PH/s'), 'hashrate tile: ' + out.tiles);
-  assert(out.tiles.includes('unknown'), 'the wait is unknown, said so');
-  assert(out.workers.includes('rig1') && out.workers.includes('node 203.0.113.20'));
-  assert(out.workers.includes('Stock Antminer firmware carries at most 9'), 'firmware warning');
-  assert(out.workers.includes('stock Antminer S19'), 'slot class in words');
-  assert(out.workers.includes('Not answering: 203.0.113.30, 203.0.113.40'));
-  assert(out.hashrate.includes('<svg') && out.hashrate.includes('class="mpc-line s1"'));
+  const tiles = strip(out.tiles);
+  assert(out.tiles.includes('1.40<span class="unit">PH/s'), 'hashrate tile: ' + out.tiles);
+  assert(tiles.includes('Workers online 2 of 2'), tiles);
+  assert(tiles.includes('Shares, 24 hours 1,200'), tiles);
+  assert(tiles.includes('Best share 9.00 G'), tiles);
+  assert(tiles.includes('Blocks found 2 latest at height 974,500'), tiles);
+  assert(/Expected time to a block ~1[01]\.\d years an average, not a promise/.test(tiles), tiles);
+  const odds = strip(out.odds);
+  assert(/Within a day about 1 in [\d,]+/.test(odds), odds);
+  assert(/Within a year \d+(\.\d)?%/.test(odds), odds);
+  assert(odds.includes('Most small miners never find a block'), odds);
+  assert(out.workers.includes('rig1') && strip(out.workers).includes('Node B'), 'workers name their node');
+  assert(strip(out.workers).includes('Not answering: Node C'));
+  assert(out.hashrate.includes('<svg') && out.hashrate.includes('class="chart-line s1"'));
   assert(out.hashrate.includes('not collected yet'), 'the unknown stretch is marked');
-  assert(out.shares.includes('mpc-bar s1') && out.shares.includes('duplicate-share'));
-  assert(out.balance.includes('mpc-marker'), 'payout marker');
-  assert(out.payouts.includes('https://mempool.space/block/' + 'b2'.repeat(32)), 'block link');
-  assert(out.queue.includes('#2 in the oldest-first queue'));
-  assert(out.queue.includes('Expected wait: unknown') && out.queue.includes('2 blocks in the last 30 days'));
-  assert(out.settlement.includes('caught up'));
+  assert(out.shares.includes('chart-bar s1') && strip(out.shares).includes('2 the same share sent twice') === false);
+  assert(strip(out.shares).includes('4 the same share sent twice'), strip(out.shares));
+  const blocks = strip(out.blocks);
+  assert(blocks.includes('974,500') && blocks.includes('3.11 BTC') && blocks.includes('fees 0.000625 BTC') && blocks.includes('treasury 0.015625 BTC'), blocks);
+  assert(blocks.includes('backup node: accepted'), blocks);
+  assert(out.blocks.includes('https://mempool.space/block/' + 'bb'.repeat(32)));
+  assert(blocks.includes('100 more blocks'), 'coinbase maturity is stated');
+  assert(strip(out.header).includes('mining') && strip(out.header).includes('From Node A, Node B'), strip(out.header));
 });
 
-test('a known wait shows the estimate with its assumptions', () => {
-  const st = goodState();
-  st.miners.wait = { known: true, seconds: 3 * 86400, blocks_needed: 2, assumptions: ['the pool keeps finding blocks at its recent rate'] };
-  const out = MP.renderAll(st, 640);
-  assert(out.tiles.includes('~3.0 days'));
-  assert(out.queue.includes('about 3.0 days') && out.queue.includes('2 pool blocks') && out.queue.includes('recent rate'));
-});
-
-test('a balance carried over at the cutover is named, and absent when there is none', () => {
-  const st = goodState();
-  assert(!MP.renderAll(st, 640).queue.includes('carried over'), 'no genesis row, no sentence');
-  st.ledger.body = Object.assign(ledger(), { genesis: { owed: { units: '1', sats: 3000 }, export_height: 974500, queue_since: 974500 } });
-  const out = MP.renderAll(st, 640);
-  assert(out.queue.includes('3,000 sats carried over from the old pool at height 974500'), out.queue);
-  assert(!/NaN|undefined/.test(out.queue));
-});
-
-test('work before the first earning height is called out, and only then', () => {
-  const st = goodState();
-  assert(!MP.renderAll(st, 640).header.includes('mp-void'), 'no notice while work earns');
-  const body = minerBody(LISTED[0], [worker('rig1', 'online')]);
-  body.earning = { first_earning_height: 21, job_height: 9, earns: false,
-                   notice: 'Work on this node earns nothing until Bitcoin height 21.' };
-  st.miners = MP.mergeMiners([{ node: LISTED[0], ok: true, body }]);
-  const out = MP.renderAll(st, 640);
-  assert(out.header.includes('earns nothing until Bitcoin height 21'), out.header);
-  noJunk(out.header, 'header');
-});
-
-test('a selected worker gets its own chart and row highlight', () => {
-  const st = goodState(MP.parseQuery('?id=' + ADDR + '.rig2'));
-  const out = MP.renderAll(st, 640);
-  assert(out.hashrate.includes('worker rig2'));
-  assert(out.workers.includes('mpw-row mpw-selected'));
+test('one worker selected: its own charts, its row marked', () => {
+  const out = MP.renderAll(goodState(MP.parseQuery('?id=' + ADDR + '.rig2')), 640);
+  assert(out.workers.includes('<tr class="selected">'), 'the row is marked');
+  assert(out.hashrate.includes('aria-label="Hashrate of worker rig2"'));
   assert(out.header.includes('.rig2'));
-  assert(MP.tipHtml(st, 'shares', 287).includes('5 accepted'));
-  assert(MP.tipHtml(st, 'hashrate', 0).includes('not collected'));
-  assert(MP.tipHtml(st, 'balance', 287).includes('6,500'));
 });
 
-test('no worker seen while a node is down names that node instead of saying none exist', () => {
-  // The miner's own node is the one not answering: the others have never seen it.
-  const st = goodState();
-  st.miners = MP.mergeMiners([
-    { node: '203.0.113.10', ok: true, status: 200, body: minerBody('203.0.113.10', []) },
-    { node: '203.0.113.30', ok: false, status: 0, body: null }
-  ]);
-  const out = MP.renderAll(st, 640);
-  noJunk(out.workers, 'workers');
-  assert(out.workers.includes('Not answering: 203.0.113.30'), out.workers);
-  assert(!out.workers.includes('No node has seen a worker'), 'not the all-answered wording');
-  // Every node answered and none saw it: the plain wording.
-  st.miners = MP.mergeMiners([{ node: '203.0.113.10', ok: true, status: 200, body: minerBody('203.0.113.10', []) }]);
-  assert(MP.renderAll(st, 640).workers.includes('No node has seen a worker'));
-});
-
-test('a failed API shows unavailable everywhere and invents nothing', () => {
+test('no node answered: every section says unavailable, nothing reads as zero', () => {
   const st = {
-    query: MP.parseQuery('?address=' + ADDR),
-    ledger: { ok: false },
-    miners: MP.mergeMiners(LISTED.map((n) => ({ node: n, ok: false, status: 0, body: null }))),
-    history: MP.mergeHistories(LISTED.map((n) => ({ node: n, ok: false, status: 503, body: { error: 'x' } }))),
-    now: NOW
+    query: MP.parseQuery('?address=' + ADDR), now: NOW, names: NAMES,
+    miners: MP.mergeMiners([{ node: 'a', ok: false, status: 0, body: null }, { node: 'b', ok: false, status: 504, body: { error: 'x' } }]),
+    history: MP.mergeHistories([{ node: 'a', ok: false, status: 0, body: null }])
   };
   const out = MP.renderAll(st, 640);
   for (const k of Object.keys(out)) noJunk(out[k], k);
-  assert.strictEqual((out.tiles.match(/>unavailable</g) || []).length, 6, out.tiles);
-  assert(!/\d[\d,]* ?(sats|H\/s|PH\/s|TH\/s)/.test(out.tiles), 'no numbers in the tiles');
-  for (const k of ['workers', 'hashrate', 'shares', 'balance', 'queue', 'payouts']) {
-    assert(/unavailable/.test(out[k]), k + ' says unavailable');
-    assert(!out[k].includes('<svg'), k + ' draws no chart');
-  }
-  assert(out.header.includes('ledger unavailable'));
+  const t = strip(out.tiles);
+  assert(!/\b0\b/.test(t), 'no zero: ' + t);
+  assert((t.match(/unavailable/g) || []).length >= 5, t);
+  assert(strip(out.workers).includes('unavailable'));
+  assert(strip(out.hashrate).includes('unavailable'));
+  assert(strip(out.blocks).includes('unavailable'));
+  assert(strip(out.header).includes('no node answered'));
 });
 
-test('a node pool that has seen nothing yet says so plainly', () => {
-  const st = goodState();
-  st.ledger.body = Object.assign(ledger(), { known: false, message: 'This address has no balance', balance: { units: '0', sats: 0 }, payouts: [] });
-  st.miners = MP.mergeMiners([{ node: '203.0.113.10', ok: true, status: 200, body: minerBody('203.0.113.10', []) }]);
-  st.history = MP.mergeHistories([{ node: '203.0.113.10', ok: true, status: 200, body: Object.assign(historyBody('203.0.113.10', []), {
-    total: { hashrate_hs: buckets.map(() => null), accepted: buckets.map(() => null), stale: buckets.map(() => null), rejected: buckets.map(() => null) }
-  }) }]);
-  const out = MP.renderAll(st, 360);
-  assert(out.workers.includes('No node has seen a worker'));
-  assert(out.payouts.includes('No payouts yet'));
-  assert(out.hashrate.includes('No shares in this window'));
-  assert(out.header.includes('not on the ledger yet'));
+test('an address the pool cannot pay: the node\'s message is kept', () => {
+  const m = MP.mergeMiners([
+    { node: 'a', ok: false, status: 400, body: { error: 'P2PKH (1...) addresses are not accepted' } },
+    { node: 'b', ok: false, status: 400, body: { error: 'P2PKH (1...) addresses are not accepted' } }
+  ]);
+  assert.strictEqual(m.refused, 'P2PKH (1...) addresses are not accepted');
+  assert.deepStrictEqual(m.answered, []);
 });
 
-test('the nodes asked come from node-list.json, never a fixed list', () => {
-  const list = { schema: 'ghost-audit/node-list/v1', nodes: [
-    { host: '203.0.113.20' }, { host: '2a01:4f8::1' }, { host: '203.0.113.10' }, { host: '203.0.113.10' },
-    { host: '../../admin' }, { host: 'evil.example' }, { host: null }, {}
-  ] };
-  assert.deepStrictEqual(MP.nodesFromList(list), ['203.0.113.10', '203.0.113.20', '2a01:4f8::1'],
-    'listed IP hosts only, sorted, once each');
-  for (const bad of [null, undefined, {}, { nodes: null }, { nodes: [] }, 'x', { placeholder: true, nodes: [] }]) {
-    assert.deepStrictEqual(MP.nodesFromList(bad), [], 'no list means no nodes: ' + JSON.stringify(bad));
-  }
-  assert(!('NODES' in MP), 'no hard-coded node list is exported');
-  const src = fs.readFileSync(path.join(web, 'miner.js'), 'utf8');
-  assert(!/\bvm[1-8]\b/.test(src), 'miner.js names no old-fleet node');
-});
-
-test('a merged node list (ghost-audit merge) is read like a lister\'s', () => {
-  // The shape `ghost-audit merge` writes: the lister's fields plus `votes` and a `merge` object.
-  const merged = {
-    schema: 'ghost-audit/node-list/v1', network: 'mainnet', listed: 2, candidates: 3,
-    nodes: [
-      { relay: '203.0.113.20:8566', host: '203.0.113.20', sv1: 'stratum+tcp://203.0.113.20:3333', votes: 2 },
-      { relay: '[2a01:4f8::1]:8566', host: '2a01:4f8::1', sv1: 'stratum+tcp://[2a01:4f8::1]:3333', votes: 3 }
-    ],
-    merge: { configured: 3, voting: 3, threshold: 2, sources: [] }
+test('a known address with no workers yet and no blocks', () => {
+  const st = {
+    query: MP.parseQuery('?address=' + ADDR), now: NOW, names: NAMES,
+    miners: MP.mergeMiners([{ node: 'a', ok: true, status: 200, body: minerBody([], {
+      summary: { workers: 0, online: 0, idle: 0, offline: 0, hashrate_hs: rates(null), shares_24h: { accepted: 0, stale: 0, rejected: 0, reject_reasons: {} },
+                 last_share_at: null, best_share: { ever: 0, '24h': 0 } },
+      expected_time_to_block: { known: false, reason: 'no accepted shares in the last 24 hours, so no hashrate', network_difficulty: 1.1e14 } }) }]),
+    history: MP.mergeHistories([{ node: 'a', ok: true, status: 200, body: Object.assign(historyBody([]), { total: { hashrate_hs: known(null), accepted: known(null), stale: known(null), rejected: known(null), best_share: known(null) } }) }])
   };
-  assert.deepStrictEqual(MP.nodesFromList(merged), ['203.0.113.20', '2a01:4f8::1']);
-  // A merge with no quorum writes nothing, so the page never sees an empty merged list from an
-  // outage; a merged list that lists nobody means nobody.
-  assert.deepStrictEqual(MP.nodesFromList(Object.assign({}, merged, { nodes: [], listed: 0 })), []);
+  const out = MP.renderAll(st, 640);
+  for (const k of Object.keys(out)) noJunk(out[k], k);
+  assert(strip(out.workers).includes('No answering node has seen a worker'));
+  assert(strip(out.tiles).includes('Expected time to a block unknown'), strip(out.tiles));
+  assert(strip(out.odds).includes('no accepted shares'));
+  assert(strip(out.blocks).includes('has not found a block'));
+  assert(strip(out.header).includes('not seen'));
+  assert(strip(out.hashrate).includes('No shares in this window'));
 });
 
-test('with no node listed the page says so and asks nobody', () => {
-  const out = MP.renderAll({ query: MP.parseQuery('?address=' + ADDR), noNodes: true, ledger: null, miners: null, history: null, now: NOW }, 640);
-  for (const k of ['header', 'workers', 'hashrate', 'shares', 'balance', 'queue', 'payouts']) {
-    assert(out[k].includes('No node is listed yet'), k + ' says no node is listed');
-  }
-  for (const k of Object.keys(out)) assert(!/NaN|undefined/.test(out[k]), k + ' invents nothing');
-});
-
-test('charts fit a phone and only link blocks on mainnet', () => {
-  const svg = MP.chartSvg({ id: 'x', buckets: [1, 2, 3], bucketSeconds: 300, kind: 'line', series: [{ values: [1, null, 3], cls: 's1' }], yFmt: String, width: 200 });
-  assert(svg.includes('width="280"'), 'a minimum width');
-  assert((svg.match(/M/g) || []).length === 2, 'a null breaks the line');
-  assert.strictEqual(MP.blockUrl('regtest', 'ab'), null);
-  assert.strictEqual(MP.blockUrl('mainnet', 'ab'), 'https://mempool.space/block/ab');
-  assert.strictEqual(MP.fmtDuration(130 * 86400), '4.3 months');
-});
-
-test('miner.html has a container for every section miner.js renders', () => {
-  const html = fs.readFileSync(path.join(web, 'miner.html'), 'utf8');
-  for (const k of Object.keys(MP.renderAll(goodState(), 640))) {
-    assert(html.includes('id="mp-' + k + '"'), 'miner.html lacks #mp-' + k);
-  }
-  for (const id of ['lookup-form', 'lookup-input', 'error-msg', 'miner-body', 'mp-updated', 'mp-tip', 'rl-notice']) {
-    assert(html.includes('id="' + id + '"'), 'miner.html lacks #' + id);
-  }
-  assert(html.includes('NOT READY'), 'the banner stays');
-  assert(html.includes('src="/miner.js'));
-  assert(!/<script[^>]+src="https?:/.test(html), 'no external scripts');
+test('the node list could not be loaded', () => {
+  const out = MP.renderAll({ query: MP.parseQuery('?address=' + ADDR), noNodes: true, now: NOW }, 640);
+  for (const k of Object.keys(out)) noJunk(out[k], k);
+  assert(strip(out.tiles).includes('node list could not be loaded'));
 });
 
 if (failures) { console.log(failures + ' failed'); process.exit(1); }

@@ -1,137 +1,75 @@
-<!-- Bitcoin Ghost · 404 -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Not found · Bitcoin Ghost</title>
-  <meta name="robots" content="noindex">
+  <title>Not found · Ghost Pool</title>
+  <meta name="description" content="This page does not exist on Ghost Pool.">
+  <meta property="og:site_name" content="Ghost Pool">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Not found · Ghost Pool">
+  <meta property="og:description" content="This page does not exist on Ghost Pool.">
+  <meta property="og:url" content="https://bitcoinghost.org/404.html">
+  <meta property="og:image" content="https://bitcoinghost.org/logo.png">
+  <meta name="twitter:card" content="summary">
+  <link rel="icon" href="/logo.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/style.css?v=20260424">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css?v=20261107">
   <script>
     (function () {
-      var saved = localStorage.getItem('ghost-theme');
-      var system = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-      document.documentElement.setAttribute('data-theme', saved || system);
+      var saved = null;
+      try { saved = localStorage.getItem('ghost-theme'); } catch (e) {}
+      var dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+      document.documentElement.setAttribute('data-theme', saved || (dark ? 'dark' : 'light'));
     })();
   </script>
-  <style>
-    .e404 {
-      min-height: calc(100vh - 72px);
-      display: flex; align-items: center; justify-content: center;
-      text-align: center;
-      padding: 48px 24px;
-    }
-    .e404 .logo-ghost {
-      width: 72px; height: 72px;
-      color: var(--accent);
-      opacity: 0.6;
-      margin: 0 auto 32px;
-      animation: float 4s ease-in-out infinite;
-    }
-    @keyframes float {
-      0%, 100% { transform: translateY(0); }
-      50%      { transform: translateY(-8px); }
-    }
-    .e404 .code {
-      font-family: var(--font-mono); font-size: 11px;
-      color: var(--dim); letter-spacing: 0.2em; text-transform: uppercase;
-      margin-bottom: 18px;
-    }
-    .e404 h1 {
-      font-family: var(--font-sans); font-size: 44px; font-weight: 700;
-      letter-spacing: -0.02em; color: var(--fg); margin-bottom: 14px;
-    }
-    .e404 p {
-      max-width: 440px; margin: 0 auto 32px;
-      color: var(--dim); font-size: 15px; line-height: 1.7;
-    }
-    .e404 .path-tag {
-      font-family: var(--font-mono); font-size: 12px;
-      color: var(--fg);
-      background: var(--surface); border: 1px solid var(--rule);
-      border-radius: 4px; padding: 3px 8px;
-    }
-    .e404 .actions { display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; }
-  </style>
 </head>
 <body>
 
 <header class="site-header">
-  <div class="container">
-    <a href="/" class="brand bare">
-      <svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <path d="M9 10h.01"/>
-        <path d="M15 10h.01"/>
-        <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
-      </svg>
-      <span class="wordmark">bitcoinghost</span>
-    </a>
-    <nav class="primary">
-      <a href="/">overview</a>
-      <a href="/pool.html">pool</a>
-      <a href="/nodes.html">nodes</a>
-      <a href="/miners.html">miners</a>
-      <a href="/downloads.html">downloads</a>
-      <a href="/docs/">docs</a>
+  <div class="container header-row">
+    <a href="/" class="brand"><svg class="logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg><span>Ghost Pool</span></a>
+    <nav class="nav" aria-label="Site">
+      <a href="/">home</a>
+      <a href="/connect.html">connect</a>
+      <a href="/miner.html">miner lookup</a>
+      <a href="/faq.html">faq</a>
+      <a href="/run-a-node.html">run a node</a>
     </nav>
-    <div class="utils">
-      <a href="https://github.com/bitcoin-ghost" class="bare icon-btn" aria-label="GitHub">
-        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/>
-        </svg>
-      </a>
-      <button id="theme-toggle" class="theme-toggle" aria-label="Toggle colour scheme"></button>
-    </div>
+    <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle colour scheme"></button>
   </div>
 </header>
 
-<main class="e404">
-  <div>
-    <svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <path d="M8 10h.01"/>
-      <path d="M16 10h.01"/>
-      <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
-    </svg>
-    <div class="code">404 · not found</div>
-    <h1>The ghost isn't here.</h1>
-    <p>
-      You asked for <span class="path-tag" id="path-tag">—</span>
-      and we haven't got it. Broken link, moved page, or a typo. Head home or
-      dive into the docs.
-    </p>
-    <div class="actions">
-      <a href="/" class="btn btn-primary">Home <span class="arrow">→</span></a>
-      <a href="/docs/" class="btn btn-ghost">Docs</a>
-    </div>
+<main>
+<section class="hero hero-small">
+  <div class="container">
+    <p class="eyebrow">404</p>
+    <h1>No page here.</h1>
+    <p class="lead">It may have belonged to an older version of this site. Try the <a href="/">home page</a>, <a href="/connect.html">connect your miner</a> or the <a href="/miner.html">miner lookup</a>.</p>
   </div>
+</section>
 </main>
 
-<script>
-  (function () {
-    var html = document.documentElement;
-    var btn = document.getElementById('theme-toggle');
-    var sun = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>';
-    var moon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
-    function render() { btn.innerHTML = html.getAttribute('data-theme') === 'dark' ? sun : moon; }
-    render();
-    btn.addEventListener('click', function () {
-      var next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
-      html.setAttribute('data-theme', next);
-      localStorage.setItem('ghost-theme', next);
-      render();
-    });
+<footer class="site-footer">
+  <div class="container footer-row">
+    <div>
+      <div class="brand"><svg class="logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg><span>Ghost Pool</span></div>
+      <p class="muted">A solo Bitcoin mining pool. Open source under the MIT license.</p>
+    </div>
+    <ul class="footer-links">
+      <li><a href="/connect.html">Connect a miner</a></li>
+      <li><a href="/miner.html">Miner lookup</a></li>
+      <li><a href="/faq.html">FAQ</a></li>
+      <li><a href="/run-a-node.html">Run a node</a></li>
+      <li><a href="/security.html">Security</a></li>
+      <li><a href="https://github.com/bitcoin-ghost/ghost">Source code</a></li>
+    </ul>
+  </div>
+</footer>
 
-    // Show the path that 404'd (escaped for safety)
-    var el = document.getElementById('path-tag');
-    if (el) {
-      var p = (location.pathname + location.search).slice(0, 120);
-      el.textContent = p || '/';
-    }
-  })();
-</script>
+<script src="/pool.js"></script>
 
 </body>
 </html>

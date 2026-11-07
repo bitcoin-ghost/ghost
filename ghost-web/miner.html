@@ -1,275 +1,141 @@
-<!-- Bitcoin Ghost · Miner -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Miner · Bitcoin Ghost</title>
-  <meta name="description" content="A miner's node pool stats: hashrate and shares per worker, balance over time, place in the payout queue with an honest wait, and every payout.">
-  <meta property="og:site_name" content="Bitcoin Ghost">
+  <title>Miner lookup · Ghost Pool</title>
+  <meta name="description" content="Look up a Ghost Pool miner by its Bitcoin address: hashrate, workers, shares, best share, blocks found and the honest odds of finding a block.">
+  <meta property="og:site_name" content="Ghost Pool">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="Miner ledger · Bitcoin Ghost">
-  <meta property="og:description" content="Your node pool ledger: balance, queue position, credited shares and payouts, straight from the share chain.">
+  <meta property="og:title" content="Miner lookup · Ghost Pool">
+  <meta property="og:description" content="Look up a Ghost Pool miner by its Bitcoin address: hashrate, workers, shares, best share, blocks found and the honest odds of finding a block.">
   <meta property="og:url" content="https://bitcoinghost.org/miner.html">
   <meta property="og:image" content="https://bitcoinghost.org/logo.png">
   <meta name="twitter:card" content="summary">
-  <meta name="twitter:site" content="@defenwycke">
-  <meta name="twitter:creator" content="@defenwycke">
-  <meta name="twitter:title" content="Miner ledger · Bitcoin Ghost">
-  <meta name="twitter:description" content="Your node pool ledger: balance, queue position, credited shares and payouts, straight from the share chain.">
-  <meta name="twitter:image" content="https://bitcoinghost.org/logo.png">
+  <link rel="icon" href="/logo.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/style.css?v=20261102b">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css?v=20261107">
   <script>
     (function () {
       var saved = null;
       try { saved = localStorage.getItem('ghost-theme'); } catch (e) {}
-      var system = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-      document.documentElement.setAttribute('data-theme', saved || system);
+      var dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+      document.documentElement.setAttribute('data-theme', saved || (dark ? 'dark' : 'light'));
     })();
   </script>
 </head>
 <body>
 
 <header class="site-header">
-  <div class="container">
-    <a href="/" class="brand bare">
-      <svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <path d="M9 10h.01"/>
-        <path d="M15 10h.01"/>
-        <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
-      </svg>
-      <span class="wordmark">bitcoinghost</span>
-    </a>
-
-    <nav class="primary">
-      <a href="/">overview</a>
-      <a href="/pool.html" class="current">pool</a>
-      <a href="/nodes.html">nodes</a>
-      <a href="/miners.html">miners</a>
-      <a href="/downloads.html">downloads</a>
-      <a href="/docs/">docs</a>
+  <div class="container header-row">
+    <a href="/" class="brand"><svg class="logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg><span>Ghost Pool</span></a>
+    <nav class="nav" aria-label="Site">
+      <a href="/">home</a>
+      <a href="/connect.html">connect</a>
+      <a href="/miner.html" class="current" aria-current="page">miner lookup</a>
+      <a href="/faq.html">faq</a>
+      <a href="/run-a-node.html">run a node</a>
     </nav>
-
-    <div class="utils">
-      <a href="https://github.com/bitcoin-ghost" class="bare icon-btn" aria-label="GitHub">
-        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/>
-        </svg>
-      </a>
-      <button id="theme-toggle" class="theme-toggle" aria-label="Toggle colour scheme"></button>
-    </div>
+    <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle colour scheme"></button>
   </div>
 </header>
 
-<!-- NOT READY banner. Remove only after Phases 3 and 4 of docs/NODE_POOL_PLAN.md pass. -->
-<div class="np-banner" role="note">
+<main>
+<section class="hero hero-small" id="lookup-mode" hidden>
   <div class="container">
-    <strong>NOT READY</strong> The node pool is under construction and has not run on signet or mainnet. No block has ever been found and no payout ever made. Do not point hashrate at it. <a href="/docs/#honest-reading">Before you mine →</a>
-  </div>
-</div>
-
-<div class="rl-notice-wrap">
-  <div class="container">
-    <div class="rl-notice" id="rl-notice" role="status" aria-live="polite">
-      <span class="rl-dot"></span>
-      <span class="rl-text">Statistics API is exceeding rate limits. Limits will reset soon.</span>
-    </div>
-  </div>
-</div>
-
-<!-- ───── Lookup ───── -->
-<section class="block mp-hero" id="lookup-mode" hidden>
-  <div class="container">
-    <div class="section-label"><a href="/pool.html" style="color:inherit">← pool</a> · miner</div>
-    <h1 class="mp-worker">Your miner.</h1>
-    <p class="section-lead">Enter the payout address your miner uses as its username. You get your balance, every worker's hashrate and shares, your place in the payout queue with an honest wait, and every payout with its block.</p>
-    <form class="miner-lookup" id="lookup-form">
-      <input id="lookup-input" type="text" placeholder="bc1q… or bc1p… or 3…" autocomplete="off" spellcheck="false" aria-label="Payout address">
-      <button type="submit">Look up</button>
+    <p class="eyebrow">miner lookup</p>
+    <h1>Your miner.</h1>
+    <p class="lead">Enter the Bitcoin address your miner uses as its username. Every node is asked, and the answers are added up.</p>
+    <form class="lookup" id="lookup-form">
+      <input id="lookup-input" type="text" placeholder="bc1q…, bc1p… or 3…" autocomplete="off" spellcheck="false" aria-label="Bitcoin address">
+      <button type="submit" class="btn btn-primary">Look up</button>
     </form>
-    <p class="payout-note">A link to <code>?address=&lt;address&gt;</code> can be bookmarked or shared; add <code>&amp;worker=&lt;name&gt;</code> to open on one worker.</p>
+    <p class="note">The page's link (<code>?address=…</code>) can be bookmarked; add <code>&amp;worker=&lt;name&gt;</code> to open on one worker.</p>
   </div>
 </section>
 
-<!-- ───── Error ───── -->
 <section class="block" id="error-mode" hidden>
-  <div class="container">
-    <div class="placeholder-panel" style="padding: 48px 32px">
-      <div id="error-msg"></div>
-    </div>
-  </div>
+  <div class="container"><div class="alert" id="error-msg" role="alert"></div></div>
 </section>
 
-<!-- ───── The miner ───── -->
 <div id="miner-body" hidden>
-  <section class="block mp-hero mp2-hero">
+  <section class="hero hero-small">
     <div class="container">
-      <div class="section-label"><a href="/miner.html" style="color:inherit">← lookup</a> · miner</div>
+      <p class="eyebrow"><a href="/miner.html">← look up another</a></p>
       <div id="mp-header"></div>
       <div id="mp-tiles"></div>
-      <div class="mp2-updated" id="mp-updated" aria-live="polite"></div>
+      <p class="note" id="mp-updated" aria-live="polite"></p>
     </div>
   </section>
 
-  <section class="block mp2-section">
+  <section class="block">
     <div class="container">
-      <div class="mp2-head">
-        <div>
-          <div class="section-label">over time</div>
-          <h2 class="section-title">Hashrate, shares and balance.</h2>
-        </div>
-        <div class="mpc-chips" role="group" aria-label="Time window">
-          <button type="button" class="mpc-chip" data-window="24h">24 h</button>
-          <button type="button" class="mpc-chip" data-window="7d">7 days</button>
-          <button type="button" class="mpc-chip" data-window="30d">30 days</button>
-        </div>
-      </div>
-      <div class="mp2-chart">
-        <h3 class="mp2-h3">Hashrate</h3>
-        <div id="mp-hashrate" class="mp2-plot"></div>
-      </div>
-      <div class="mp2-chart">
-        <h3 class="mp2-h3">Shares</h3>
-        <div id="mp-shares" class="mp2-plot"></div>
-      </div>
-      <div class="mp2-chart">
-        <h3 class="mp2-h3">Balance</h3>
-        <div id="mp-balance" class="mp2-plot"></div>
-      </div>
-      <p class="payout-note">Hashrate is worked out from the difficulty of the shares the nodes accepted, so it is an estimate, and noisy over short spans. Shaded time is before a node began keeping statistics: unknown, not zero.</p>
+      <p class="section-label">your odds</p>
+      <h2>Chance of finding a block.</h2>
+      <div id="mp-odds"></div>
     </div>
   </section>
 
-  <section class="block mp2-section">
+  <section class="block">
     <div class="container">
-      <div class="section-label">workers</div>
-      <h2 class="section-title">What each machine is doing.</h2>
-      <p class="section-lead">Each node sees only the miners connected to it, so every node is asked. <em>Online</em>: connected and sent a share in the last 10 minutes. <em>Idle</em>: connected, nothing for 10 minutes. <em>Offline</em>: not connected. Pick a worker to see its charts.</p>
+      <p class="section-label">workers</p>
+      <h2>What each machine is doing.</h2>
+      <p class="section-lead"><em>Online</em>: connected and sent a share in the last 10 minutes. <em>Idle</em>: connected, nothing for 10 minutes. <em>Offline</em>: not connected. Pick a worker to see its charts.</p>
       <div id="mp-workers"></div>
     </div>
   </section>
 
-  <section class="block mp2-section">
+  <section class="block">
     <div class="container">
-      <div class="section-label">getting paid</div>
-      <h2 class="section-title">Where you stand.</h2>
-      <div id="mp-queue"></div>
+      <div class="head-row">
+        <div>
+          <p class="section-label">over time</p>
+          <h2>Hashrate and shares.</h2>
+        </div>
+        <div class="chips" role="group" aria-label="Time window">
+          <button type="button" class="chip" data-window="24h">24 h</button>
+          <button type="button" class="chip" data-window="7d">7 days</button>
+          <button type="button" class="chip" data-window="30d">30 days</button>
+        </div>
+      </div>
+      <h3>Hashrate</h3>
+      <div id="mp-hashrate" class="chart"></div>
+      <h3>Shares</h3>
+      <div id="mp-shares" class="chart"></div>
+      <p class="note">Hashrate is worked out from the difficulty of the shares the nodes accepted, so it is an estimate, and noisy over short spans. Shaded time is before a node began keeping statistics: unknown, not zero.</p>
     </div>
   </section>
 
-  <section class="block mp2-section">
+  <section class="block">
     <div class="container">
-      <div class="section-label">payouts</div>
-      <h2 class="section-title">Paid from the coinbase.</h2>
-      <div id="mp-payouts"></div>
-      <div class="payout-note">
-        <code>settled</code>: the node checked the block against the share chain and it paid exactly what the ledger said.
-        <code>provisional</code>: the node does not hold the block's anchor yet, so it trusted the coinbase for now and will check it when the anchor arrives.
-        A coinbase can be spent after 100 confirmations.
-      </div>
-      <div class="payout-note" id="mp-settlement"></div>
+      <p class="section-label">blocks</p>
+      <h2>Blocks you found.</h2>
+      <div id="mp-blocks"></div>
     </div>
   </section>
 </div>
-
-<!-- ───── What this means ───── -->
-<section class="block" id="explain" hidden>
-  <div class="container">
-    <div class="section-label">what this means</div>
-    <h2 class="section-title">In plain words.</h2>
-    <div class="np-prose">
-      <p><strong>Your balance.</strong> Your miner's username is your payout address. Every share it finds at or above the network tier is credited to that address, in sats worked out from the share's own difficulty. Every node runs the same arithmetic on the same share chain, so every node shows the same balance.</p>
-      <p><strong>Hashrate and shares.</strong> Your miner sends shares at its own difficulty; the page counts them and works out a hashrate from their difficulty. <em>Stale</em> shares were mined on a block that had just been replaced; a few are normal. <em>Rejected</em> shares failed a check, and the reason is listed. Only the larger shares that reach the network tier earn credit, so a worker can show hashrate before its balance moves.</p>
-      <p><strong>Getting paid.</strong> When the pool finds a block, the coinbase pays miners directly. Of the subsidy, 0.5% goes to the treasury and 99.5% pays balances as they stood 20 blocks earlier. Half of a block's miner outputs go to the oldest balances (those that reached 1,000 sats first), half to the largest; the largest of all is paid last with whatever is left. Nobody is paid more than they are owed, and nobody holds your money in between. Transaction fees go to the node whose miner found the block.</p>
-      <p><strong>The wait is an estimate.</strong> Blocks are found at random. The page uses how often the pool found blocks recently and how many balances they paid; when there is too little to go on, it says <em>unknown</em> instead of inventing a number. Waits can be long.</p>
-      <p><strong>Firmware matters.</strong> A block can only pay as many balances as the coinbase the finding miner's firmware can carry: a stock Antminer S19 about 9, an S21 about 44, Whatsminer and Avalon about 135-143, Braiins OS and ePIC 364 or more, SV2 on a standard channel the full 500. Each node senses what a miner can carry (its <em>slot class</em>) and never sends it more. A low-limit miner is warned about, not refused; your own balance is never reduced by it.</p>
-      <p><strong>Trust.</strong> Without an audit with <code>ghost-audit</code>, you are trusting the node you mine on to credit you.</p>
-    </div>
-  </div>
-</section>
-
-<div class="mp-tip" id="mp-tip" role="tooltip" hidden></div>
+</main>
 
 <footer class="site-footer">
-  <div class="container">
-    <div class="colophon">
-      <div class="brand">
-        <svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="width:22px;height:22px;">
-        <path d="M9 10h.01"/>
-        <path d="M15 10h.01"/>
-        <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
-        </svg>
-        <span class="wordmark">bitcoinghost</span>
-      </div>
-      <div class="meta">Open source under the MIT license. No ICO, no foundation, no venture money.</div>
-    </div>
+  <div class="container footer-row">
     <div>
-      <h4>Node pool</h4>
-      <ul>
-        <li><a href="/">How it works</a></li>
-        <li><a href="/pool.html">Pool status</a></li>
-        <li><a href="/endpoints.html">Node list</a></li>
-        <li><a href="/miner.html">Miner stats</a></li>
-      </ul>
+      <div class="brand"><svg class="logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg><span>Ghost Pool</span></div>
+      <p class="muted">A solo Bitcoin mining pool. Open source under the MIT license.</p>
     </div>
-    <div>
-      <h4>Mine</h4>
-      <ul>
-        <li><a href="/miners.html">Point a miner</a></li>
-        <li><a href="/miners.html#firmware">Firmware</a></li>
-        <li><a href="/docs/#payouts">Payout rule</a></li>
-      </ul>
-    </div>
-    <div>
-      <h4>Run a node</h4>
-      <ul>
-        <li><a href="/nodes.html">Run a node</a></li>
-        <li><a href="/downloads.html">Downloads</a></li>
-        <li><a href="/docs/#deployment">Deployment</a></li>
-      </ul>
-    </div>
-    <div>
-      <h4>Read first</h4>
-      <ul>
-        <li><a href="/docs/#honest-reading">Before you mine</a></li>
-        <li><a href="/docs/#ghost-audit">Auditing a node</a></li>
-        <li><a href="/security.html">Security</a></li>
-      </ul>
-    </div>
-    <div>
-      <h4>Project</h4>
-      <ul>
-        <li><a href="https://github.com/bitcoin-ghost">GitHub</a></li>
-        <li><a href="https://x.com/defenwycke">@defenwycke</a></li>
-        <li><a href="https://defenwycke.org">defenwycke.org</a></li>
-        <li><a href="https://github.com/bitcoin-ghost/ghost/blob/main/LICENSE">MIT License</a></li>
-      </ul>
-    </div>
+    <ul class="footer-links">
+      <li><a href="/connect.html">Connect a miner</a></li>
+      <li><a href="/miner.html">Miner lookup</a></li>
+      <li><a href="/faq.html">FAQ</a></li>
+      <li><a href="/run-a-node.html">Run a node</a></li>
+      <li><a href="/security.html">Security</a></li>
+      <li><a href="https://github.com/bitcoin-ghost/ghost">Source code</a></li>
+    </ul>
   </div>
 </footer>
 
-<script>
-  // Theme toggle (shared across all pages)
-  (function () {
-    var html = document.documentElement;
-    var btn = document.getElementById('theme-toggle');
-    var sun = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>';
-    var moon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
-    function render() { btn.innerHTML = html.getAttribute('data-theme') === 'dark' ? sun : moon; }
-    render();
-    btn.addEventListener('click', function () {
-      var next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
-      html.setAttribute('data-theme', next);
-      localStorage.setItem('ghost-theme', next);
-      render();
-    });
-  })();
-
-</script>
-<script src="/miner.js?v=20261102c"></script>
-
+<script src="/pool.js"></script>
+<script src="/miner.js"></script>
 </body>
 </html>
