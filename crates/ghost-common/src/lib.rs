@@ -31,12 +31,8 @@
 
 #![deny(unreachable_pub)]
 
-/// Node pool anchor chain: fork choice, ancestry and retarget, in memory.
-pub mod anchor_chain;
 pub mod atomic_file;
 
-/// Node pool: the canonical payout rule, a port of `docs/node-pool-reference/refimpl_v3.py`.
-pub mod canonical_payout;
 pub mod circuit_breaker;
 pub mod clock;
 pub mod coinbase_tags;
@@ -49,28 +45,14 @@ pub mod identity_rotation;
 pub mod internal_auth;
 pub mod metrics;
 
-/// Node pool protocol constants (new names only; nothing live reads them).
-pub mod node_pool_constants;
-
-/// The cutover's ledger export, read and checked as a share-chain genesis table (Phase 4).
-pub mod node_pool_genesis_export;
-
-/// Where each network's node pool share chain starts (W2.8).
-pub mod node_pool_network;
-
-/// Node pool 256-bit arithmetic.
-pub mod node_pool_u256;
 pub mod rpc;
 
 pub mod sanitize;
 pub mod serde_hex;
 pub mod setup;
 
-/// Node pool share tag and the pure share checks.
-pub mod share_commit;
-
-/// Node pool slot-class sensing: the firmware ceiling table and the per-miner stepping loop.
-pub mod slot_class_sensing;
+/// Ghost Solo: the coinbase rule every job pays (treasury, miner, witness commitment).
+pub mod solo;
 
 pub mod signer;
 pub mod template_verifier;
