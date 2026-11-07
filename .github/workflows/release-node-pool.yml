@@ -460,7 +460,10 @@ jobs:
           REF_SLUG="${GITHUB_REF_NAME//\//-}"
           ./scripts/package-dashboard.sh "dist/bitcoin-ghost-${REF_SLUG}-dashboard.tar.gz" "$REF_SLUG"
           # Read the archive back: what the installer looks for must be in it.
-          tar -tzf "dist/bitcoin-ghost-${REF_SLUG}-dashboard.tar.gz" | grep -qx 'ghost-dashboard/server.js' \
+          # Captured, not piped into `grep -q`: under pipefail, grep stopping at the first match
+          # leaves tar writing into a closed pipe, and the pipeline fails though the file is there.
+          listing="$(tar -tzf "dist/bitcoin-ghost-${REF_SLUG}-dashboard.tar.gz")"
+          grep -qx 'ghost-dashboard/server.js' <<<"$listing" \
             || { echo "::error::the dashboard archive does not carry ghost-dashboard/server.js"; exit 1; }
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
@@ -505,7 +508,9 @@ jobs:
           done
           # The node dashboard the installer and the updater fetch by this exact name.
           dash="$(find artifacts -type f -name "bitcoin-ghost-${GITHUB_REF_NAME}-dashboard.tar.gz" | head -1)"
-          if [ -n "$dash" ] && tar -tzf "$dash" | grep -qx 'ghost-dashboard/server.js'; then
+          dash_listing=""
+          [ -n "$dash" ] && dash_listing="$(tar -tzf "$dash")"
+          if [ -n "$dash" ] && grep -qx 'ghost-dashboard/server.js' <<<"$dash_listing"; then
             echo "  ok  dashboard"
           else
             echo "::error::no bitcoin-ghost-${GITHUB_REF_NAME}-dashboard.tar.gz carrying ghost-dashboard/server.js"; rc=1
