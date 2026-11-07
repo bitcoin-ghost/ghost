@@ -30,7 +30,7 @@
 //! - **regtest**: configuration. The default is [`regtest_default_genesis`](crate::node_pool_network::regtest_default_genesis) at height 0, the
 //!   value the installer writes, so every regtest node shares it without being told.
 //! - **signet**: configuration, required. Our signet's start is published with its launch.
-//! - **mainnet**: compiled in, [`MAINNET_START`](crate::node_pool_network::MAINNET_START). It is unset until the flag day: a mainnet node
+//! - **mainnet**: compiled in, [`MAINNET_START`](crate::node_pool_network::MAINNET_START). It is set at the flag day (genesis 974,875): a mainnet node
 //!   refuses to start rather than guess, and a configured genesis is accepted only when it equals
 //!   the compiled one.
 //!
@@ -114,10 +114,34 @@ pub struct CompiledStart {
     pub genesis_table_digest: Option<[u8; 32]>,
 }
 
-/// Mainnet's share-chain start. **Unset**: it is set, with the genesis table's digest, once the
-/// flag day and the imported table are agreed (plan Phase 4). Until then a mainnet node refuses
-/// to start.
-pub const MAINNET_START: Option<CompiledStart> = None;
+/// Mainnet's share-chain start, set at the flag day (2026-11-07).
+///
+/// - Genesis height 974,875: the old network's freeze, where all 8 old nodes held the
+///   byte-identical finalised checkpoint (ledger root `e3cb77a2…dc8afe56`).
+/// - Genesis table: the old ledger exported at that height at `Rm / D_avg` =
+///   310,937,500 / 137,301,110,231,780 sats per difficulty-1 unit (the year's average
+///   difficulty, floored); export digest `cfb62020…44dcb74e`, 4 rows, table root `43e8165e…71410d2d`.
+/// - Genesis anchor: `sha256("GhostNodePool/genesis/mainnet" || table_root)`.
+pub const MAINNET_START: Option<CompiledStart> = Some(CompiledStart {
+    genesis_anchor: MAINNET_GENESIS_ANCHOR,
+    genesis_btc_height: 974_875,
+    genesis_table_digest: Some(MAINNET_GENESIS_TABLE_ROOT),
+});
+
+/// The label mainnet's genesis anchor hashes, followed by the genesis table root.
+pub const MAINNET_GENESIS_LABEL: &[u8] = b"GhostNodePool/genesis/mainnet";
+
+/// Mainnet's genesis table root (`table_root` of the imported old ledger), `43e8165e7ac1ba4b67b328ab0a2ecb8aa20cb2fb2a780b3e3527e59e71410d2d`.
+pub const MAINNET_GENESIS_TABLE_ROOT: [u8; 32] = [
+    0x43, 0xe8, 0x16, 0x5e, 0x7a, 0xc1, 0xba, 0x4b, 0x67, 0xb3, 0x28, 0xab, 0x0a, 0x2e, 0xcb, 0x8a,
+    0xa2, 0x0c, 0xb2, 0xfb, 0x2a, 0x78, 0x0b, 0x3e, 0x35, 0x27, 0xe5, 0x9e, 0x71, 0x41, 0x0d, 0x2d,
+];
+
+/// Mainnet's genesis anchor, `a512f0c9378c31fe34160ee6388b62289596e46110d45079eec8eafe8c4c4526`.
+pub const MAINNET_GENESIS_ANCHOR: [u8; 32] = [
+    0xa5, 0x12, 0xf0, 0xc9, 0x37, 0x8c, 0x31, 0xfe, 0x34, 0x16, 0x0e, 0xe6, 0x38, 0x8b, 0x62, 0x28,
+    0x95, 0x96, 0xe4, 0x61, 0x10, 0xd4, 0x50, 0x79, 0xee, 0xc8, 0xea, 0xfe, 0x8c, 0x4c, 0x45, 0x26,
+];
 
 /// The label regtest's default genesis anchor is the SHA-256 of.
 pub const REGTEST_GENESIS_LABEL: &[u8] = b"GhostNodePool/genesis/regtest";
@@ -206,8 +230,19 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_is_unset_until_the_flag_day() {
-        assert!(MAINNET_START.is_none());
+    fn mainnet_starts_at_the_flag_day() {
+        let c = MAINNET_START.expect("set at the flag day");
+        assert_eq!(c.genesis_btc_height, 974_875);
+        assert_eq!(c.genesis_table_digest, Some(MAINNET_GENESIS_TABLE_ROOT));
+        let mut h = Sha256::new();
+        h.update(MAINNET_GENESIS_LABEL);
+        h.update(MAINNET_GENESIS_TABLE_ROOT);
+        let anchor: [u8; 32] = h.finalize().into();
+        assert_eq!(c.genesis_anchor, anchor);
+        assert_eq!(
+            hex::encode(c.genesis_anchor),
+            "a512f0c9378c31fe34160ee6388b62289596e46110d45079eec8eafe8c4c4526"
+        );
     }
 
     #[test]

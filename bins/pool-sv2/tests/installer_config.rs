@@ -7,8 +7,9 @@
 //!   `[node_pool]` and `[node_pool.relay]` sections startup requires;
 //! - on regtest, whose genesis the installer defines, [`NodePool::resolve`] accepts it and the
 //!   relay starts on it and publishes the genesis anchor;
-//! - on mainnet, whose start is compiled into pool_sv2 and not set yet, the `UNSET` placeholder
-//!   is refused by name, and a genesis passed to the installer is refused too (W2.8);
+//! - on mainnet, whose start is compiled into pool_sv2 (set at the flag day), the `UNSET`
+//!   placeholder runs on the compiled start, and any other genesis passed to the installer is
+//!   refused (W2.8);
 //! - the shell's fee address check agrees with [`NodePool::fee_script`] plus the network on every
 //!   address class, so the installer neither writes an address pool_sv2 refuses nor refuses one
 //!   it accepts.
@@ -183,7 +184,7 @@ async fn regtest_config_is_accepted_by_resolve_and_starts_the_relay() {
 }
 
 #[test]
-fn mainnet_config_parses_and_its_unset_genesis_is_refused_by_name() {
+fn mainnet_config_parses_and_runs_on_the_compiled_start() {
     let toml = render("mainnet", MAINNET_FEE, "", None);
     assert!(toml.contains("PLACEHOLDER"), "the placeholder is marked");
     let config = load(&toml);
@@ -194,22 +195,32 @@ fn mainnet_config_parses_and_its_unset_genesis_is_refused_by_name() {
     assert!(relay.peers.is_empty());
     assert!(relay.tier_base.is_none(), "mainnet tier 0 is difficulty 1");
     assert_eq!(relay.network.as_deref(), Some("mainnet"));
-    let e = relay.genesis_hash().unwrap_err();
-    assert!(e.contains("has not been published"), "{e}");
-    assert!(
-        e.contains("--genesis-anchor"),
-        "the refusal names the fix: {e}"
+    // Mainnet's start is compiled in: the installer's UNSET runs on it.
+    let compiled = ghost_common::node_pool_network::MAINNET_START.expect("set at the flag day");
+    let start = relay
+        .network_start()
+        .expect("UNSET takes the compiled start");
+    assert_eq!(
+        (
+            start.genesis_anchor,
+            start.genesis_btc_height,
+            start.pinned_table_digest
+        ),
+        (
+            compiled.genesis_anchor,
+            compiled.genesis_btc_height,
+            compiled.genesis_table_digest
+        )
     );
-    assert_eq!(relay.network_start().unwrap_err(), e, "the same refusal");
 
-    // A genesis passed on mainnet is written, and refused: mainnet's start is compiled in.
+    // A genesis passed on mainnet is written, and refused: it is not the compiled start.
     let given = "cd".repeat(32);
     let config = load(&render("mainnet", MAINNET_FEE, "", Some((&given, 975_000))));
     let relay = config.node_pool().unwrap().relay.clone().unwrap();
     assert_eq!(relay.genesis_hash().unwrap(), [0xcd; 32]);
     assert_eq!(relay.genesis_btc_height, 975_000);
     let e = relay.network_start().unwrap_err();
-    assert!(e.contains("compiled into pool_sv2"), "{e}");
+    assert!(e.contains("is not mainnet's compiled start"), "{e}");
 }
 
 #[test]

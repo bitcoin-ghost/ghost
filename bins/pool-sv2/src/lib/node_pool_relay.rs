@@ -629,15 +629,14 @@ mod tests {
 
     #[test]
     fn mainnet_refuses_while_its_start_is_not_compiled_in() {
-        assert!(MAINNET_START.is_none(), "these cases cover the unset build");
         // An absent network is mainnet.
         for net in [None, Some("mainnet")] {
             let e = relay_cfg(net, GENESIS_UNSET, 0)
-                .network_start()
+                .network_start_with(None)
                 .unwrap_err();
             assert!(e.contains("has not been published"), "{net:?}: {e}");
             let e = relay_cfg(net, GENESIS, 974_400)
-                .network_start()
+                .network_start_with(None)
                 .unwrap_err();
             assert!(e.contains("compiled into pool_sv2"), "{net:?}: {e}");
             assert!(e.contains("flag day is not set"), "{e}");
