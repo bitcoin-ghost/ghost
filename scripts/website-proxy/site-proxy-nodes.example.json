@@ -1,0 +1,7 @@
+{
+  "_comment": "Copy to /etc/ghost/site-proxy-nodes.json on the website host and put the two nodes' public IPs in. The ids must match ghost-web/pool-nodes.json. The 203.0.113.x / 198.51.100.x addresses are documentation placeholders and are refused without --allow-private.",
+  "nodes": [
+    { "id": "a", "host": "203.0.113.10", "api_port": 8080 },
+    { "id": "b", "host": "198.51.100.20", "api_port": 8080 }
+  ]
+}

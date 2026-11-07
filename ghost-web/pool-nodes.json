@@ -1,0 +1,17 @@
+{
+  "schema": "ghost-pool/nodes/v1",
+  "nodes": [
+    {
+      "id": "a",
+      "name": "Node A",
+      "stratum_host": "pool-a.bitcoinghost.org",
+      "sv2_authority_key": null
+    },
+    {
+      "id": "b",
+      "name": "Node B",
+      "stratum_host": "pool-b.bitcoinghost.org",
+      "sv2_authority_key": null
+    }
+  ]
+}
