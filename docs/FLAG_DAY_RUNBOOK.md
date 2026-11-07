@@ -14,7 +14,7 @@ Nothing below is to be run until every one of these is set. They are not default
 | `<FREEZE_HEIGHT>` (F) | Export height: the old ledger's last counted state | Must be a height with a **finalised** checkpoint held byte-identical by every exporting node (step 2). Since a 4-node fleet finalises nothing new (plan, "Old fleet with 4 nodes"), choose it while 8 nodes still run, or from what is already finalised |
 | `<SATS_PER_WORK>` | Work-to-sats rate | `N`, `N/D` or `I.F`, exact; never defaulted |
 | `<EXPORT_SOURCE>` | Which old table the balances come from | The exporter reads **finalised checkpoints only**: since 963,388 the top 200 balances (see "What the export carries"). **Decided 2026-11-03: checkpoint export.** The live fleet owed 3 addresses on 11-03 (public `/api/v1/pool/next_payout`), all inside the top 200; a full-shard-table source is not built. Check at F that the payee count matches `next_payout` |
-| `<TREASURY_ADDRESS>` | Compiled treasury | Plan section 5 item 1 |
+| `<TREASURY_ADDRESS>` | Compiled treasury | **Set, decided 2026-11-07:** `bc1qgxg5ywk835c9fp6arz6d6x50xpk6y0ualt900k` (P2WPKH, script `00144191423ac78d3054875d18b4dd1a8f306da23f9d`), compiled as `node_pool_constants::TREASURY_SCRIPT` on every network. Plan section 5 item 1 |
 | `<GENESIS_ANCHOR>` | Mainnet share-chain genesis anchor, 64 hex | Compiled into `MAINNET_START` |
 | `<GENESIS_HEIGHT>` (G) | Its `btc_height` | `G + 21 <= R`. Rehearsed with `G = F` |
 | `<REPOINT_HEIGHT>` (R) | When miners are told to move | `R >= G + 21`, so no live work is void |
@@ -107,7 +107,7 @@ after F is only the short window up to repoint.
   `pin it: [node_pool.relay] genesis_table_digest = "<ROOT>"`.
 - **Then**: set `node_pool_network::MAINNET_START = Some(CompiledStart { genesis_anchor:
   <GENESIS_ANCHOR>, genesis_btc_height: <GENESIS_HEIGHT>, genesis_table_digest: Some(<ROOT>) })`,
-  the treasury `<TREASURY_ADDRESS>`, merge, and cut `<NP_VERSION>`
+  (the treasury `<TREASURY_ADDRESS>` is already compiled in), merge, and cut `<NP_VERSION>`
   (`scripts/release.sh --node-pool <version>`). The release must carry the digest: a mainnet
   build with the anchor but no compiled digest cannot be pinned by config (pool_sv2 refuses a
   configured `genesis_table_digest` that differs from the compiled one, `None` included), so the

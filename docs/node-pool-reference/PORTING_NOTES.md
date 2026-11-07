@@ -14,8 +14,9 @@ Code: `crates/ghost-common/src/{canonical_payout,share_commit,anchor_chain,node_
 - `build_outputs` refuses fewer than 2 slots. The reference never calls it with fewer, and at 1 slot
   its `[:L - 1]` slice would mean "all but the last".
 - `cut(H)` returns `None` below height 20 instead of a negative height.
-- The treasury script is the reference's placeholder, `TREASURY_SCRIPT_PLACEHOLDER`. It must be
-  replaced by the user's address before any network uses it, and the golden vectors regenerated.
+- The treasury script is `TREASURY_SCRIPT`, the P2WPKH of `bc1qgxg5ywk835c9fp6arz6d6x50xpk6y0ualt900k`
+  (`00144191423ac78d3054875d18b4dd1a8f306da23f9d`, decided 2026-11-07), the same on every network. The reference uses
+  the same bytes and the golden vectors are generated with it.
 
 ## Share tag and checks (`share_commit.rs`)
 - Tag field encodings: `node_id` 32 bytes (the existing `NodeId`), `tier` 1 byte, `slot_class` as

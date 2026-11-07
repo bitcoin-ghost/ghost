@@ -23,7 +23,7 @@ Status: draft 11, 2026-11-02, against `main` at `f1cc40519`. Replaces the #608 p
 2. **Waits are long.** Even if every miner can carry large coinbases, a 100 TH/s miner at 1% of the network waits about 4.5 months for a first payment. On a low-limit mix, about half of small miners were not paid within the simulated 2 years. See section 7.
 3. **The pool is about 100,000x short of 1% of the network.** The protocol makes the pool safe. It does not create hashrate.
 
-**Still needed from you.** The treasury address, a Bitaxe run of the sensing loop, the old S19 when you have it, and later a real outside operator.
+**Still needed from you.** A Bitaxe run of the sensing loop, the old S19 when you have it, and later a real outside operator.
 
 ## How it works, start to finish
 
@@ -49,7 +49,7 @@ Anyone can run a node without approval. A miner runs a node and chooses their ow
 | Miner payment | Coinbase, from subsidy only, via a persistent ledger | Decided |
 | Minimum payout | 1,000 sats | Decided; simulation supports it |
 | Outputs | Up to 500 miners + treasury + finder, plus witness commitment and one ledger commitment output | Decided as a maximum; must work on every miner, so each job carries what that miner's firmware can hold (W0.2) |
-| Treasury | User's fixed address, `S/200` of subsidy plus any change a block can't pay to owed balances (a cleared ledger's surplus goes to the finder instead, 11-05) | Decided 11-02; address needed as a compiled constant |
+| Treasury | User's fixed address, `S/200` of subsidy plus any change a block can't pay to owed balances (a cleared ledger's surplus goes to the finder instead, 11-05) | Decided 11-02; address decided 11-07: `bc1qgxg5ywk835c9fp6arz6d6x50xpk6y0ualt900k` (P2WPKH `00144191423ac78d3054875d18b4dd1a8f306da23f9d`), compiled as `TREASURY_SCRIPT`, the same on every network |
 | Finder | All tx fees to the node whose miner found the block | Decided |
 | Node rewards, elders, capabilities | Removed | Decided |
 | Membership | Open: no roster, no approval, no signed-by-8 gate on listing | Decided |

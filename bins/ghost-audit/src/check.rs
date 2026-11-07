@@ -56,8 +56,8 @@ use ghost_common::canonical_payout::{
 };
 use ghost_common::coinbase_tags::{extract_node_tag, extract_payout_tag};
 use ghost_common::node_pool_constants::{
-    PARENT_ANCHOR_TAG_LEN, SHARE_TAG_DOMAIN, SHARE_TAG_LEN, SLOT_CLASSES,
-    TREASURY_SCRIPT_PLACEHOLDER, T_NET_FLOOR,
+    PARENT_ANCHOR_TAG_LEN, SHARE_TAG_DOMAIN, SHARE_TAG_LEN, SLOT_CLASSES, TREASURY_SCRIPT,
+    T_NET_FLOOR,
 };
 use ghost_common::share_commit::check_outputs;
 use ghost_np_relay::wire::JobStamps;
@@ -268,13 +268,13 @@ pub fn classify_outputs(
             "no GHNP ledger commitment before the witness commitment".into(),
         ));
     };
-    if actual[0].1 != TREASURY_SCRIPT_PLACEHOLDER {
+    if actual[0].1 != TREASURY_SCRIPT {
         return Err((
             FailReason::WrongTreasury,
             format!(
                 "the first output pays {}, not the treasury {}",
                 hex::encode(&actual[0].1),
-                hex::encode(TREASURY_SCRIPT_PLACEHOLDER)
+                hex::encode(TREASURY_SCRIPT)
             ),
         ));
     }

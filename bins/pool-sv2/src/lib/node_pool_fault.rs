@@ -256,6 +256,11 @@ mod tests {
         assert_eq!(apply_fault(Fault::None, outs(), &[0x53]), outs());
         let w = apply_fault(Fault::WrongTreasury, outs(), &[0x53]);
         assert_eq!(w[0], (1_000_000, hostile_treasury()));
+        assert_ne!(
+            hostile_treasury(),
+            ghost_common::node_pool_constants::TREASURY_SCRIPT,
+            "the hostile script must not be the real treasury"
+        );
         assert_eq!(w[1..], outs()[1..]);
         let s = apply_fault(Fault::FeeSkim, outs(), &[0x53]);
         assert_eq!(s.len(), 5);

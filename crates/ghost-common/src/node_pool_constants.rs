@@ -66,15 +66,14 @@ pub const HALVING_INTERVAL: u32 = 210_000;
 /// Regtest's halving interval (Core's regtest `nSubsidyHalvingInterval`).
 pub const REGTEST_HALVING_INTERVAL: u32 = 150;
 
-/// PLACEHOLDER treasury output script. NOT the real treasury: the user supplies the address later
-/// (plan section 5, item 1), and this constant must be replaced before any network uses it.
+/// The treasury output script, the first output of every node pool coinbase. The same on every
+/// network (regtest and signet included): the P2WPKH of
+/// `bc1qgxg5ywk835c9fp6arz6d6x50xpk6y0ualt900k`, decided 2026-11-07 (plan section 5, item 1).
 ///
-/// It is the reference's placeholder, byte for byte, so the golden vectors match:
-/// `0x51 0x20 || sha256("placeholder treasury, compiled constant, see plan section 5")`.
-pub const TREASURY_SCRIPT_PLACEHOLDER: [u8; 34] = [
-    0x51, 0x20, 0x99, 0x25, 0x16, 0x78, 0x15, 0xd1, 0x20, 0x2e, 0x98, 0x5d, 0xc6, 0x07, 0xbc, 0xea,
-    0xb1, 0x62, 0xcb, 0x70, 0xc9, 0x8d, 0x29, 0x2d, 0xa3, 0x59, 0x2c, 0x08, 0x7b, 0x44, 0xa3, 0xfe,
-    0xfb, 0x2f,
+/// The reference (`refimpl_v3.py`) uses the same bytes, so the golden vectors match.
+pub const TREASURY_SCRIPT: [u8; 22] = [
+    0x00, 0x14, 0x41, 0x91, 0x42, 0x3a, 0xc7, 0x8d, 0x30, 0x54, 0x87, 0x5d, 0x18, 0xb4, 0xdd, 0x1a,
+    0x8f, 0x30, 0x6d, 0xa2, 0x3f, 0x9d,
 ];
 
 /// Magic of the ledger commitment `OP_RETURN`:

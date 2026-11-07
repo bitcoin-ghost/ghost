@@ -116,7 +116,7 @@ About 5,000 new lines, removals of about 140,000 lines, and 16-22 weeks end to e
 
 ## 5. User decisions needed
 0. (2026-11-03) After a share-chain partition longer than the 20-block cut, blocks the losing side found stay provisional for good on nodes that never held its anchors. They retire the same amounts either way. Leave it, or drop provisional entries past a depth (say 100 blocks) and log them as final. **Decided 2026-11-03: leave them provisional. Also decided: a split longer than the cut costs the losing side its split-era credit (accepted); no per-session cap on re-sensing.**
-1. Treasury address, compiled in by W1.1. A single key is a single point of loss; a multisig address is possible.
+1. Treasury address, compiled in by W1.1. **Decided 2026-11-07:** `bc1qgxg5ywk835c9fp6arz6d6x50xpk6y0ualt900k` (P2WPKH, script `00144191423ac78d3054875d18b4dd1a8f306da23f9d`, confirmed by a mainnet node's `validateaddress`), the same on every network; compiled as `node_pool_constants::TREASURY_SCRIPT`, and the reference and its golden vectors use it. A single key is a single point of loss; a multisig address was possible.
 2. Hardware access for the signet stage of Phase 3.
 3. A real outside operator for the ninth-node stage.
 4. Every merge, roll, and the freeze height.

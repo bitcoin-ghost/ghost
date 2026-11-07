@@ -254,7 +254,9 @@ def p2wpkh(tag):
     return b"\x00\x14" + hashlib.sha256(tag if isinstance(tag, bytes) else str(tag).encode()).digest()[:20]
 
 
-TREASURY_SCRIPT = p2tr(b"placeholder treasury, compiled constant, see plan section 5")
+# The treasury, the same on every network: P2WPKH of bc1qgxg5ywk835c9fp6arz6d6x50xpk6y0ualt900k
+# (decided 2026-11-07, plan section 5 item 1).
+TREASURY_SCRIPT = bytes.fromhex("00144191423ac78d3054875d18b4dd1a8f306da23f9d")
 
 
 def commitment_script(root, n_miners):

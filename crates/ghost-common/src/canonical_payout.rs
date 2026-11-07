@@ -63,7 +63,7 @@ use sha2::{Digest, Sha256};
 use crate::node_pool_constants::{
     FACE_PER_SAT, HALVING_INTERVAL, INITIAL_SUBSIDY_SATS, LEDGER_COMMITMENT_MAGIC, MIN_PAYOUT_SATS,
     PAYOUT_FLOOR_FACE, REGTEST_HALVING_INTERVAL, SNAPSHOT_CUT_LAG, TREASURY_DIVISOR,
-    TREASURY_SCRIPT_PLACEHOLDER,
+    TREASURY_SCRIPT,
 };
 use crate::node_pool_u256::U256;
 
@@ -590,7 +590,7 @@ pub fn coinbase_outputs(
     let n_miners = u16::try_from(pay.outputs.len()).map_err(|_| PayoutError::Overflow)?;
     let finder_value = fees.checked_add(pay.surplus).ok_or(PayoutError::Overflow)?;
     let mut o = Vec::with_capacity(pay.outputs.len() + 4);
-    o.push((pay.treasury, TREASURY_SCRIPT_PLACEHOLDER.to_vec()));
+    o.push((pay.treasury, TREASURY_SCRIPT.to_vec()));
     o.extend(pay.outputs.into_iter().map(|(a, p)| (p, a)));
     if finder_value > 0 {
         o.push((finder_value, finder_script.to_vec()));
@@ -638,7 +638,7 @@ pub fn provisional_retirements(
     let miners = n as usize;
     let body = &outputs[..outputs.len() - 2];
     let (treasury, rest) = body.split_first()?;
-    if treasury.1 != TREASURY_SCRIPT_PLACEHOLDER || rest.len() < miners || rest.len() - miners > 1 {
+    if treasury.1 != TREASURY_SCRIPT || rest.len() < miners || rest.len() - miners > 1 {
         return None;
     }
     let (t, _) = split(h, halving);
@@ -1248,10 +1248,15 @@ mod tests {
         // The rule-6 boundary it names: no anchor below cut(H) until H = genesis + 21.
         assert_eq!((cut(20), cut(21)), (Some(0), Some(1)));
         assert_eq!(subsidy(64 * HALVING_INTERVAL, Halving::MAINNET), 0);
-        let mut want = p2tr("placeholder treasury, compiled constant, see plan section 5");
+        // P2WPKH of bc1qgxg5ywk835c9fp6arz6d6x50xpk6y0ualt900k, as a mainnet node's
+        // validateaddress gives it.
         assert_eq!(
-            TREASURY_SCRIPT_PLACEHOLDER.to_vec(),
-            std::mem::take(&mut want)
+            hex::encode(TREASURY_SCRIPT),
+            "00144191423ac78d3054875d18b4dd1a8f306da23f9d"
+        );
+        assert_eq!(
+            crate::share_commit::payee_script_class(&TREASURY_SCRIPT),
+            Some(crate::share_commit::PayeeScriptClass::P2wpkh)
         );
         assert_eq!(select(&Table::new(), 1), Err(PayoutError::InvalidSlots(1)));
         let corrupt = BTreeMap::from([(
@@ -1425,13 +1430,7 @@ mod tests {
             &[0; 32],
         )
         .unwrap();
-        assert_eq!(
-            o[..2],
-            [
-                (t, TREASURY_SCRIPT_PLACEHOLDER.to_vec()),
-                (rm, p2tr("nodeA"))
-            ]
-        );
+        assert_eq!(o[..2], [(t, TREASURY_SCRIPT.to_vec()), (rm, p2tr("nodeA"))]);
         assert_eq!(
             ledger_commitment_of(&o),
             Some((table_root(&Table::new()), 0))

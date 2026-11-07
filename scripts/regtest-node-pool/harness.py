@@ -43,7 +43,9 @@ POOL_SEC = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n"
 # Installer regtest defaults (scripts/install-node.sh, np_network_defaults).
 REGTEST_GENESIS = "8d8cd561340ff83e99410e115619d64ad94516264d3e5cd6a991109c69f1229c"
 REGTEST_TIER_BASE = "7fffff" + "00" * 29
-TREASURY_SCRIPT = "51209925167815d1202e985dc607bceab162cb70c98d292da3592c087b44a3fefb2f"
+# The treasury, the same on every network: P2WPKH of bc1qgxg5ywk835c9fp6arz6d6x50xpk6y0ualt900k
+# (node_pool_constants.rs TREASURY_SCRIPT).
+TREASURY_SCRIPT = "00144191423ac78d3054875d18b4dd1a8f306da23f9d"
 LEDGER_MAGIC = b"GHNP".hex()
 # OP_RETURN PUSH38 "GHNP" || table root || miner output count (u16 big-endian), draft 3.2
 LEDGER_PREFIX = "6a26" + LEDGER_MAGIC

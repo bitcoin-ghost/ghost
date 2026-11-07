@@ -1049,7 +1049,7 @@ mod tests {
     #[test]
     fn provisional_retirements_refuse_a_coinbase_of_another_shape() {
         use crate::canonical_payout::provisional_retirements;
-        use crate::node_pool_constants::TREASURY_SCRIPT_PLACEHOLDER;
+        use crate::node_pool_constants::TREASURY_SCRIPT;
         let f = Fixture::new(H);
         let good = f.outputs();
         let mut no_commitment = good.clone();
@@ -1080,7 +1080,7 @@ mod tests {
         let treasury_only = vec![
             (
                 crate::canonical_payout::subsidy(H, Halving::MAINNET),
-                TREASURY_SCRIPT_PLACEHOLDER.to_vec(),
+                TREASURY_SCRIPT.to_vec(),
             ),
             (0, crate::canonical_payout::commitment_script(&[0; 32], 0)),
             good[good.len() - 1].clone(),

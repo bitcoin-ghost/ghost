@@ -1534,8 +1534,8 @@
    ],
    "input": "400 x (p2tr('gt'+i), (5000+i) sats, 900000+i//450) + 300 x (p2tr('topt'+i), (600000+i) sats, 900100)",
    "coinbase_outputs": 504,
-   "output_section_bytes": 21685,
-   "output_digest": "9916d7a22eaef48b1ff8d394c26bf27e6d6927a0ad00a14c21096477c33fc765"
+   "output_section_bytes": 21673,
+   "output_digest": "ed93084e916fe9b0f839fb4264217f2d58527d64dd23f82746e8862d33b7aa12"
   },
   {
    "name": "503 outputs, P2TR, finder 0",
@@ -1573,8 +1573,8 @@
    ],
    "input": "400 x (p2tr('gt'+i), (5000+i) sats, 900000+i//450) + 300 x (p2tr('topt'+i), (600000+i) sats, 900100)",
    "coinbase_outputs": 503,
-   "output_section_bytes": 21642,
-   "output_digest": "72aa4d9f2ffdbf3f82bd611c04975efc72af4a4e5d1fda8d9a0ac82beaf444f3"
+   "output_section_bytes": 21630,
+   "output_digest": "dbb9cad4f1b04a5dd8c6562cdebacd907d53f05c9bc59b953140463182faa5a6"
   },
   {
    "name": "504 outputs, P2WPKH, finder 123456",
@@ -1612,8 +1612,8 @@
    ],
    "input": "400 x (p2wpkh('gw'+i), (5000+i) sats, 900000+i//450) + 300 x (p2wpkh('topw'+i), (600000+i) sats, 900100)",
    "coinbase_outputs": 504,
-   "output_section_bytes": 15673,
-   "output_digest": "881af7b1e8bdbf9adf882b0d02655c0325dd1b9c05200611590fbeeb6008624c"
+   "output_section_bytes": 15661,
+   "output_digest": "195fc0caa8d622f61f163a2b97f758d4f8156054317f6269d98f26c3fa17871d"
   },
   {
    "name": "503 outputs, P2WPKH, finder 0",
@@ -1651,8 +1651,8 @@
    ],
    "input": "400 x (p2wpkh('gw'+i), (5000+i) sats, 900000+i//450) + 300 x (p2wpkh('topw'+i), (600000+i) sats, 900100)",
    "coinbase_outputs": 503,
-   "output_section_bytes": 15642,
-   "output_digest": "f5a3b502f5a641656576efa84d8d730c2d4b35a6c423df6e61470fb38f71a947"
+   "output_section_bytes": 15630,
+   "output_digest": "fd02eefedee6cf8a8e2a9554cbe125e7d9564b16515fd19156592521750c66b9"
   },
   {
    "name": "cut: block H sees credits through H-20 only",
