@@ -103,3 +103,28 @@ if those are renamed, update that test with them.
   addresses; nothing reports whether the other submit node is reachable now (only what it said to
   the last found block); the SV2 authority key is not in the status, so the website's
   `pool-nodes.json` carries it by hand.
+
+## Installer (Ghost Pool)
+- `scripts/install-node.sh` is the Ghost Pool installer: `[solo]` rendered by
+  `np_render_pool_config`; `--peer-node <host>` (addnode, found-block target `http://host:8332`,
+  rpcallowip/rpcbind, ufw 8332 from that address only), `--submit-node`, `--submit-auth` /
+  `GHOST_SUBMIT_AUTH` (root-only `/etc/ghost/solo-submit-rpc.auth`), `--reaper` (off by default,
+  `-ghostreaper=disabled`); relay, genesis, lister and fee-address flags gone (the fee/payout
+  address flags are accepted and ignored). A re-run or `--uninstall` removes an older install's
+  lister. `np_fee_address_check` is now `np_payout_address_check`. User-facing text says
+  "Ghost Pool".
+- `quantise_to_tiers = false` in both the installer and `config/sri/translator-config.toml`.
+- Block reserve: `ghost_common::solo::MAX_COINBASE_BYTES` 22,000 -> 1,000 and
+  `BLOCK_RESERVED_WEIGHT` 90,000 -> 8,000 (Core's default); the installer writes
+  `blockreservedweight=8000`. The largest solo coinbase as ghost-mining counts it is 284 B
+  (42 fixed + 112 scriptSig with a 20-byte extranonce + 9 + 47 commitment + 31 treasury + 43
+  P2TR/P2WSH miner); 1,000 leaves room for two 92-byte OP_RETURN outputs with ~2x margin, and
+  1,000*4 + 36 + 85*4 = 4,376 WU <= 8,000 (compile-time asserts in solo.rs). Fee transactions
+  get 82,000 WU (~2%) more of every block. Existing nodes keep 90,000 until re-installed
+  (harmless: ghost-mining only trims when the reserve is too small).
+- Tests: test-installer-node-pool.sh (348), -reserve (28), -uninstall (87), -lister (23, now the
+  lister's absence and clean-up), test-auto-update-swap.sh section E (/health block_height),
+  `bins/pool-sv2/tests/installer_config.rs` (renders [solo], one- and two-node).
+- CI run 42415953502 on ff6ba0f8, all 12 jobs success.
+- Left for the website worker: `ghost-web/docs/deployment.md` (if it still exists) mentioned
+  `blockreservedweight=90000` and `--fee-address`.
