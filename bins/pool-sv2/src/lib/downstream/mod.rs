@@ -160,39 +160,6 @@ impl Downstream {
         }
     }
 
-    /// A downstream with no connection behind it, for channel manager tests: its channel state
-    /// is real, its I/O is two unbounded channels nobody reads.
-    #[cfg(test)]
-    pub(crate) fn for_tests(
-        downstream_id: DownstreamId,
-        group_channel: GroupChannel<'static, DefaultJobStore<ExtendedJob<'static>>>,
-    ) -> Self {
-        let (channel_manager_sender, _) = unbounded();
-        let (_, channel_manager_receiver) = unbounded();
-        let (downstream_sender, downstream_receiver) = unbounded();
-        Downstream {
-            downstream_channel: DownstreamChannel {
-                channel_manager_sender,
-                channel_manager_receiver,
-                downstream_sender,
-                downstream_receiver,
-            },
-            downstream_data: Arc::new(Mutex::new(DownstreamData {
-                extended_channels: HashMap::new(),
-                standard_channels: HashMap::new(),
-                group_channel,
-                channel_id_factory: AtomicU32::new(1),
-                negotiated_extensions: vec![],
-            })),
-            downstream_id,
-            requires_standard_jobs: Arc::new(AtomicBool::new(false)),
-            supported_extensions: vec![],
-            required_extensions: vec![],
-            downstream_connection_token: CancellationToken::new(),
-            peer_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-        }
-    }
-
     /// Starts the downstream loop.
     ///
     /// Responsibilities:

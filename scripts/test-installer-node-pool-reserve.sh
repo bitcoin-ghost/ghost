@@ -16,7 +16,7 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALLER="${INSTALLER:-$REPO_ROOT/scripts/install-node.sh}"
-CONSTANTS="$REPO_ROOT/crates/ghost-common/src/node_pool_constants.rs"
+CONSTANTS="$REPO_ROOT/crates/ghost-common/src/solo.rs"
 G=/usr/bin/grep
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -68,7 +68,7 @@ done
 
 echo "3. the value"
 shell_value="$(printf '%s\n' "$step" | $G -oE 'blockreservedweight=[0-9]+' | cut -d= -f2)"
-rust_value="$($G -oE 'NODE_POOL_BLOCK_RESERVED_WEIGHT: u64 = [0-9_]+' "$CONSTANTS" | $G -oE '[0-9_]+$' | tr -d _)"
+rust_value="$($G -oE 'BLOCK_RESERVED_WEIGHT: u64 = [0-9_]+' "$CONSTANTS" | $G -oE '[0-9_]+$' | tr -d _)"
 is "the installer writes 90000" 90000 "$shell_value"
 is "it matches the Rust constant" "$rust_value" "$shell_value"
 
