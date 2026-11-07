@@ -2,19 +2,28 @@
 
 Running note for the solo pivot on `ghost-solo` (branched from `feat/node-pool` at fb687f804).
 No local builds: verified through GitHub CI only (`gh workflow run ci.yml --ref ghost-solo`).
+The product is described in `SOLO.md`.
 
-## Done
+## Done (code written, CI iterating)
 - `ghost_common::solo`: treasury script, halving/subsidy, `solo_outputs`, `check_solo_outputs`,
   `SoloNetwork`, payee classes, the 0x4748 TLV constants, coinbase/reserve constants.
-- Deleted from ghost-common: canonical_payout, share_commit, anchor_chain, slot_class_sensing,
-  node_pool_constants, node_pool_genesis_export, node_pool_network, node_pool_u256.
+- Deleted: ghost-common canonical_payout, share_commit, anchor_chain, slot_class_sensing,
+  node_pool_constants, node_pool_genesis_export, node_pool_network, node_pool_u256;
+  `crates/ghost-np-relay`; `fuzz/` (its only target was the relay wire); ghost-storage
+  `node_pool_{store,views,genesis}`; pool_sv2 node_pool*, tier_binding, held-tip and genesis
+  import (`--np-import-genesis` flags), monitoring slot_class fields.
+- pool_sv2: `solo.rs` (per-channel solo outputs, post-submit alarm, found blocks, multi-node
+  submit via RequestTransactionData), `submit_rpc.rs`, `blocks_found.rs`, `solo_api.rs`
+  (`/api/v1/miner/{address}`, `/history`, `/api/v1/pool/status`), `[solo]` config, best share in
+  `miner_stats.rs`, tests `solo_tests.rs`, `solo_api_tests.rs`, `tests/solo_jobs.rs`,
+  `tests/installer_config.rs`.
+- ghost-audit reduced to `ghost-audit check --sv1/--sv2`.
+- ghost-mining: payee_class/block_limits/template on `ghost_common::solo`; relay-peers monitor
+  no longer started. ghost-verification forwards the new routes (`/api/v1/node-pool/status`
+  kept as an alias; ledger routes 410). ghost-cli `node status` reads `/pool/status`.
+- Integration harness starts pools with `[solo]` only.
+- Translator: `quantise_to_tiers` off in `config/sri/translator-config.toml`;
+  `config/sri/pool-config.toml` has `[solo]` instead of `[node_pool]`.
 
 ## Next
-1. Delete `crates/ghost-np-relay` (+ fuzz target `fuzz_relay_wire`), ghost-storage `node_pool_*`.
-2. pool_sv2: replace `node_pool.rs` with `solo.rs` (per-channel solo outputs, post-submit
-   alarm, blocks found, multi-node submit via RequestTransactionData), drop relay/settlement/
-   sensing/genesis import, `[solo]` config, API `/api/v1/miner/{address}` + `/api/v1/pool/status`.
-3. Fix users: ghost-mining (payee_class, block_limits, template.rs, alert_monitors),
-   ghost-verification forwarding, ghost-cli, translator constants, integration-sv2 harness.
-4. ghost-audit reduced to the solo check.
-5. Tests, docs/SOLO.md, archive NODE_POOL_SPEC/PLAN, CI green.
+- Get CI green.
