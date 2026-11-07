@@ -16,10 +16,45 @@
 //!
 //! A Bitcoin Core `.cookie` file (`__cookie__:<hex>`) is a valid file: one line for every node.
 
-use std::{path::Path, time::Duration};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use serde::Serialize;
+use tracing::{info, warn};
 
 /// Longest a node may take to answer `submitblock`.
 pub const SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often every node's reachability is checked (`getblockchaininfo`).
+pub const HEALTH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Longest a node may take to answer the reachability check.
+pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Longest error message kept from a check.
+const HEALTH_ERROR_MAX: usize = 200;
+
+/// What the last reachability check of one node found. Shown in `/api/v1/pool/status`
+/// `submit_nodes[]`; it never carries credentials (the node is its `scheme://host:port` label,
+/// and errors are the transport's or the node's own message, with no URL).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct NodeHealth {
+    /// The node, `scheme://host:port`.
+    pub node: String,
+    /// It answered the last check; `null` until it has been checked once.
+    pub reachable: Option<bool>,
+    /// When it was last checked, unix seconds.
+    pub last_checked_at: Option<u64>,
+    /// When it last answered, unix seconds.
+    pub last_ok_at: Option<u64>,
+    /// Its block height at that answer (`blocks`).
+    pub height: Option<u64>,
+    /// Why the last check failed; `null` when it answered.
+    pub error: Option<String>,
+}
 
 /// The environment variable that names the credentials file when the config does not.
 pub const AUTH_FILE_ENV: &str = "GHOST_SOLO_SUBMIT_RPC_AUTH_FILE";
@@ -46,6 +81,7 @@ impl std::fmt::Debug for Endpoint {
 pub struct SubmitTargets {
     endpoints: Vec<Endpoint>,
     client: reqwest::Client,
+    health: Mutex<Vec<NodeHealth>>,
 }
 
 /// `scheme://host:port` of a URL: what is logged, with no credentials or path.
@@ -100,6 +136,7 @@ impl SubmitTargets {
         SubmitTargets {
             endpoints: vec![],
             client: reqwest::Client::new(),
+            health: Mutex::new(vec![]),
         }
     }
 
@@ -157,7 +194,108 @@ impl SubmitTargets {
             .timeout(SUBMIT_TIMEOUT)
             .build()
             .map_err(|e| format!("submit_rpc HTTP client: {e}"))?;
-        Ok(SubmitTargets { endpoints, client })
+        let health = endpoints
+            .iter()
+            .map(|e| NodeHealth {
+                node: e.label.clone(),
+                ..Default::default()
+            })
+            .collect();
+        Ok(SubmitTargets {
+            endpoints,
+            client,
+            health: Mutex::new(health),
+        })
+    }
+
+    /// What the last reachability check of every node found, in the configured order.
+    pub fn health(&self) -> Vec<NodeHealth> {
+        self.health
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Check every node at once with `getblockchaininfo` (at most [`HEALTH_TIMEOUT`] each) and
+    /// record what each answered at `now`.
+    pub async fn check_health(&self, now: u64) {
+        let body = serde_json::json!({
+            "jsonrpc": "1.0",
+            "id": "ghost-solo-health",
+            "method": "getblockchaininfo",
+            "params": [],
+        });
+        let tasks: Vec<_> = self
+            .endpoints
+            .iter()
+            .map(|e| {
+                let e = e.clone();
+                let client = self.client.clone();
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut req = client.post(&e.url).json(&body).timeout(HEALTH_TIMEOUT);
+                    if let Some((u, p)) = &e.auth {
+                        req = req.basic_auth(u, Some(p));
+                    }
+                    match req.send().await {
+                        Ok(resp) => {
+                            let status = resp.status();
+                            match resp.json::<serde_json::Value>().await {
+                                Ok(v) => health_verdict(&v),
+                                Err(_) => Err(format!("HTTP {status}, not a JSON-RPC answer")),
+                            }
+                        }
+                        Err(err) => Err(err.without_url().to_string()),
+                    }
+                })
+            })
+            .collect();
+        let mut results = Vec::with_capacity(tasks.len());
+        for t in tasks {
+            results.push(match t.await {
+                Ok(r) => r,
+                Err(e) => Err(format!("check task failed: {e}")),
+            });
+        }
+        let mut health = self.health.lock().unwrap_or_else(|p| p.into_inner());
+        for (h, r) in health.iter_mut().zip(results) {
+            record_health(h, r, now);
+        }
+    }
+
+    /// Check every node now and then every [`HEALTH_INTERVAL`], for as long as the pool runs.
+    /// Changes of reachability are logged.
+    pub fn spawn_health_checks(self: &Arc<Self>) {
+        if self.endpoints.is_empty() {
+            return;
+        }
+        let me = self.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(HEALTH_INTERVAL);
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                every.tick().await;
+                let before = me.health();
+                me.check_health(crate::miner_stats::now_secs()).await;
+                for (old, new) in before.iter().zip(me.health()) {
+                    if old.reachable == new.reachable {
+                        continue;
+                    }
+                    match new.reachable {
+                        Some(true) => info!(
+                            node = %new.node,
+                            height = ?new.height,
+                            "SOLO: submit node reachable"
+                        ),
+                        _ => warn!(
+                            node = %new.node,
+                            error = ?new.error,
+                            "SOLO: submit node NOT reachable: found blocks may not reach it"
+                        ),
+                    }
+                }
+            }
+        });
     }
 
     /// Whether there are no other nodes.
@@ -212,6 +350,44 @@ impl SubmitTargets {
             }
         }
         out
+    }
+}
+
+/// A `getblockchaininfo` answer: the node's height, or why not.
+pub fn health_verdict(v: &serde_json::Value) -> Result<u64, String> {
+    if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
+        return Err(err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .map_or_else(|| err.to_string(), str::to_string));
+    }
+    v.get("result")
+        .and_then(|r| r.get("blocks"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "the answer carries no block height".to_string())
+}
+
+/// Record one check's outcome at `now`.
+pub fn record_health(h: &mut NodeHealth, result: Result<u64, String>, now: u64) {
+    h.last_checked_at = Some(now);
+    match result {
+        Ok(height) => {
+            h.reachable = Some(true);
+            h.last_ok_at = Some(now);
+            h.height = Some(height);
+            h.error = None;
+        }
+        Err(mut e) => {
+            if e.len() > HEALTH_ERROR_MAX {
+                let mut cut = HEALTH_ERROR_MAX;
+                while !e.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                e.truncate(cut);
+            }
+            h.reachable = Some(false);
+            h.error = Some(e);
+        }
     }
 }
 
@@ -295,6 +471,120 @@ mod tests {
         assert!(!format!("{:?}", t.endpoints).contains("pa"));
         assert!(SubmitTargets::new(&["ftp://x".to_string()], None).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stand-in node answering every request with `answer` and recording the authorization
+    /// header it was sent.
+    async fn fake_node(answer: &'static str) -> (String, Arc<Mutex<Vec<Option<String>>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(vec![]));
+        let s = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut c, _)) = l.accept().await else {
+                    return;
+                };
+                // Read the whole request (headers, then content-length bytes of body).
+                let mut buf = vec![];
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = c.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text[..end]
+                            .lines()
+                            .find_map(|l| {
+                                let l = l.to_ascii_lowercase();
+                                l.strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf).to_string();
+                let auth = req
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                    .map(|l| l.to_string());
+                s.lock().unwrap().push(auth);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{answer}",
+                    answer.len()
+                );
+                let _ = c.write_all(resp.as_bytes()).await;
+            }
+        });
+        (url, seen)
+    }
+
+    #[tokio::test]
+    async fn health_checks_record_height_and_errors_without_credentials() {
+        let (up, seen) =
+            fake_node(r#"{"result":{"chain":"regtest","blocks":321},"error":null}"#).await;
+        // A port nothing listens on.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let down = format!("http://{}", l.local_addr().unwrap());
+        drop(l);
+        let up_auth = up.replace("http://", "http://alice:s3cret@");
+        let down_auth = down.replace("http://", "http://bob:hunter2@");
+        let t = SubmitTargets::new(&[up_auth, down_auth], None).unwrap();
+        let before = t.health();
+        assert_eq!(before.len(), 2);
+        assert_eq!(before[0].reachable, None, "unknown until checked");
+        assert_eq!(before[0].node, up);
+
+        t.check_health(1_000).await;
+        let h = t.health();
+        assert_eq!(h[0].reachable, Some(true));
+        assert_eq!(h[0].height, Some(321));
+        assert_eq!(h[0].last_ok_at, Some(1_000));
+        assert_eq!(h[0].error, None);
+        assert_eq!(h[1].reachable, Some(false));
+        assert_eq!(h[1].last_checked_at, Some(1_000));
+        assert_eq!(h[1].last_ok_at, None);
+        assert!(h[1].error.is_some());
+        // The node got its credentials; the report never carries them.
+        assert!(seen.lock().unwrap()[0]
+            .as_deref()
+            .unwrap()
+            .contains("Basic"));
+        let json = serde_json::to_string(&h).unwrap();
+        for secret in ["alice", "s3cret", "bob", "hunter2"] {
+            assert!(!json.contains(secret), "{json}");
+        }
+
+        // A later failure keeps the last good answer's time and height.
+        let mut x = h[0].clone();
+        record_health(&mut x, Err("x".repeat(500)), 2_000);
+        assert_eq!(x.reachable, Some(false));
+        assert_eq!(x.last_ok_at, Some(1_000));
+        assert_eq!(x.height, Some(321));
+        assert_eq!(x.last_checked_at, Some(2_000));
+        assert!(x.error.as_ref().unwrap().len() <= 200);
+    }
+
+    #[test]
+    fn health_answers() {
+        assert_eq!(
+            health_verdict(&serde_json::json!({"result": {"blocks": 7}, "error": null})),
+            Ok(7)
+        );
+        assert_eq!(
+            health_verdict(
+                &serde_json::json!({"result": null, "error": {"code": -28, "message": "Loading block index..."}})
+            ),
+            Err("Loading block index...".to_string())
+        );
+        assert!(health_verdict(&serde_json::json!({"result": {}})).is_err());
     }
 
     #[test]

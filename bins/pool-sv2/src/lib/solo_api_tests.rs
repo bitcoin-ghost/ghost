@@ -5,12 +5,29 @@ use crate::miner_stats::{MinerStats, Outcome};
 
 const T0: u64 = 1_800_000_000;
 const ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+const ADDR2: &str = "bcrt1qqqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0scjhmyt";
+const KEY: &str = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72";
+
+fn accept(api: &SoloApi, addr: &str, worker: &str, n: u64, difficulty: f64, from: u64, step: u64) {
+    let script = api.payee_script(addr).unwrap();
+    for i in 0..n {
+        api.solo.miner_stats().record(
+            &script,
+            worker,
+            Outcome::Accepted {
+                difficulty,
+                share_difficulty: difficulty * 1.5,
+            },
+            from + i * step,
+        );
+    }
+}
 
 fn api() -> SoloApi {
     let stats = Arc::new(MinerStats::in_memory(T0 - 7_200));
     let solo =
         Arc::new(Solo::new(ghost_common::solo::SoloNetwork::Regtest).with_miner_stats(stats));
-    let mut api = SoloApi::new(solo, vec![3333, 4444], 34255, vec![]);
+    let mut api = SoloApi::new(solo, vec![3333, 4444], 34255, Some(KEY.to_string()));
     api.clock = || T0;
     api
 }
@@ -102,4 +119,95 @@ fn the_expected_time_is_difficulty_times_2_32_over_hashrate() {
     assert_eq!(e.hashrate_window, Some("24h"));
     assert!(!expected_time(&Rates::default(), Some(1.0e6)).known);
     assert!(!expected_time(&rates, None).known);
+}
+
+#[test]
+fn the_status_carries_the_authority_key_and_no_submit_nodes_by_default() {
+    let api = api();
+    let s = api.status();
+    assert_eq!(s.ports.sv2_authority_public_key.as_deref(), Some(KEY));
+    assert!(s.submit_nodes.is_empty());
+    let v = serde_json::to_value(&s).unwrap();
+    assert_eq!(v["ports"]["sv2_authority_public_key"], KEY);
+    assert!(v["submit_nodes"].is_array());
+}
+
+#[tokio::test]
+async fn submit_nodes_report_their_reachability_without_credentials() {
+    // A port nothing listens on.
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    drop(l);
+    let targets = Arc::new(
+        crate::submit_rpc::SubmitTargets::new(
+            &[url.replace("http://", "http://op:pa55word@")],
+            None,
+        )
+        .unwrap(),
+    );
+    let solo = Arc::new(
+        Solo::new(ghost_common::solo::SoloNetwork::Regtest).with_submit_targets(targets.clone()),
+    );
+    let api = SoloApi::new(solo, vec![3333], 34255, None);
+    let s = api.status();
+    assert_eq!(s.submit_nodes.len(), 1);
+    assert_eq!(s.submit_nodes[0].node, url);
+    assert_eq!(s.submit_nodes[0].reachable, None, "not checked yet");
+    targets.check_health(T0).await;
+    let s = api.status();
+    assert_eq!(s.submit_nodes[0].reachable, Some(false));
+    assert_eq!(s.submit_nodes[0].last_checked_at, Some(T0));
+    assert!(s.submit_nodes[0].error.is_some());
+    let json = serde_json::to_string(&s).unwrap();
+    assert!(
+        !json.contains("pa55word") && !json.contains("op:"),
+        "{json}"
+    );
+    assert!(json.contains("\"reachable\":false"), "{json}");
+}
+
+#[test]
+fn the_operator_list_names_active_addresses_most_hashrate_first() {
+    let api = api();
+    // ADDR: two workers, 100 shares each over the last hour. ADDR2: one worker, 10 shares.
+    accept(&api, ADDR, "rig1", 100, 1_000.0, T0 - 3_600, 36);
+    accept(&api, ADDR, "rig2", 100, 1_000.0, T0 - 3_600, 36);
+    accept(&api, ADDR2, "", 10, 1_000.0, T0 - 3_600, 360);
+    // A third address silent for two days is not listed.
+    accept(
+        &api,
+        "bcrt1qqurswpc8qurswpc8qurswpc8qurswpc8dxm0gk",
+        "old",
+        5,
+        1_000.0,
+        T0 - 2 * 86_400,
+        60,
+    );
+    let r = api.miners();
+    assert_eq!(r.network, "regtest");
+    assert_eq!(r.generated_at, T0);
+    let addrs: Vec<&str> = r.miners.iter().map(|m| m.address.as_str()).collect();
+    assert_eq!(addrs, vec![ADDR, ADDR2]);
+    let a = &r.miners[0];
+    assert!(!a.connected, "no open channel in this test");
+    assert_eq!(a.summary.workers, 2);
+    assert_eq!(a.summary.offline, 2);
+    assert_eq!(a.summary.shares_24h.accepted, 200);
+    assert!(a.summary.hashrate_hs.h1.unwrap() > r.miners[1].summary.hashrate_hs.h1.unwrap());
+    assert_eq!(a.blocks_found, 0);
+    // The summary is flattened into the entry.
+    let v = serde_json::to_value(&r).unwrap();
+    let m = &v["miners"][0];
+    assert_eq!(m["address"], ADDR);
+    assert_eq!(m["workers"], 2);
+    for k in [
+        "online",
+        "idle",
+        "offline",
+        "hashrate_hs",
+        "best_share",
+        "last_share_at",
+    ] {
+        assert!(m.get(k).is_some(), "{k} missing: {m}");
+    }
 }

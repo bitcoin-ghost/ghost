@@ -8,6 +8,10 @@
 //!   code and its body pass through unchanged. pool_sv2 not answering is a 503 that says so. The
 //!   JSON is documented in pool_sv2's `solo_api.rs`. `GET /api/v1/node-pool/status` is kept as
 //!   an alias of `/api/v1/pool/status` until every caller has moved.
+//! - `GET /api/v1/pool/miners` (operator only) is forwarded the same way, but it names every
+//!   connected miner's payout address, so it is not on the public tier: [`operator_router`] is
+//!   merged into the HMAC-authenticated internal router (the dashboard's proxy signs its GETs),
+//!   and the website proxy never forwards it.
 //! - `GET /api/v1/node-pool/node-list` (dormant: the open-listing lister is gone) serves this node's open-listing lister's `node-list.json`
 //!   (`ghost-audit list`, enabled with `install-node.sh --lister`) read-only, so `ghost-audit
 //!   merge` can collect each lister's list over the API port every node already exposes, with no
@@ -137,6 +141,12 @@ async fn status_handler(State(state): State<Arc<VerificationState>>) -> Response
     forward(&state, "/api/v1/pool/status").await
 }
 
+/// `GET /api/v1/pool/miners`: every active payout address with its workers and hashrate. On
+/// the authenticated tier only (see [`operator_router`]).
+async fn miners_handler(State(state): State<Arc<VerificationState>>) -> Response {
+    forward(&state, "/api/v1/pool/miners").await
+}
+
 /// Schema of a lister's `node-list.json`.
 const NODE_LIST_SCHEMA: &str = "ghost-audit/node-list/v1";
 /// Largest node list served (the merge reads at most this much from one lister).
@@ -191,6 +201,12 @@ pub(crate) fn node_pool_router() -> Router<Arc<VerificationState>> {
         .route("/api/v1/miner/:address/history", get(miner_history_handler))
         .route("/api/v1/pool/status", get(status_handler))
         .route("/api/v1/node-pool/status", get(status_handler))
+}
+
+/// The operator's pool routes. Merged into the internal router, behind its HMAC check: never on
+/// the public tier.
+pub(crate) fn operator_router() -> Router<Arc<VerificationState>> {
+    Router::new().route("/api/v1/pool/miners", get(miners_handler))
 }
 
 /// A removed feature: what it was, and where its replacement is.
@@ -523,6 +539,63 @@ mod tests {
         std::fs::write(&path, list).unwrap();
         let (code, _) = call(app(), "POST", "/api/v1/node-pool/node-list").await;
         assert_eq!(code, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    fn secret(seed: u8) -> [u8; 32] {
+        let mut s = [0u8; 32];
+        for (i, b) in s.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(31).wrapping_add(seed);
+        }
+        s
+    }
+
+    #[tokio::test]
+    async fn the_miner_list_is_forwarded_only_to_signed_requests() {
+        let (base, seen) = upstream(200, r#"{"miners":[{"address":"bcrt1qx"}]}"#).await;
+        let auth = crate::auth::InternalAuth::new(&secret(0x42)).unwrap();
+        let st = Arc::new(
+            VerificationState::new("test_node".into(), "1.0.0".into())
+                .with_node_pool_api(&base)
+                .with_internal_auth(auth.clone()),
+        );
+        let app = crate::routes::create_router(st);
+        // Unsigned (the public, a website proxy): refused, and pool_sv2 is never asked.
+        let (code, _) = call(app.clone(), "GET", "/api/v1/pool/miners").await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        // A wrong signature: refused too.
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let bad = crate::auth::InternalAuth::new(&secret(0x17)).unwrap();
+        for (key, want) in [(&bad, StatusCode::UNAUTHORIZED), (&auth, StatusCode::OK)] {
+            let r = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/pool/miners")
+                        .header("X-Ghost-Signature", key.sign(ts, b""))
+                        .header("X-Ghost-Timestamp", ts.to_string())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.status(), want);
+            if want == StatusCode::OK {
+                let body = r.into_body().collect().await.unwrap().to_bytes();
+                let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(v["miners"][0]["address"], "bcrt1qx");
+            }
+        }
+        assert_eq!(*seen.lock(), vec!["/api/v1/pool/miners".to_string()]);
+
+        // With no internal auth configured at all, the route refuses everything.
+        let (base, seen) = upstream(200, "{}").await;
+        let app = crate::routes::create_router(state(&base));
+        let (code, _) = call(app, "GET", "/api/v1/pool/miners").await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        assert!(seen.lock().is_empty());
     }
 
     #[tokio::test]

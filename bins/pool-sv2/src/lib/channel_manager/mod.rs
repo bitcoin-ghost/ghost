@@ -260,11 +260,13 @@ impl ChannelManager {
         )
         .map_err(|e| PoolError::shutdown(PoolErrorKind::Configuration(e)))?;
         let submit_nodes = targets.labels();
+        let targets = Arc::new(targets);
+        targets.spawn_health_checks();
         let solo = Arc::new(
             crate::solo::Solo::new(network)
                 .with_miner_stats(miner_stats)
                 .with_blocks_found(Arc::new(blocks))
-                .with_submit_targets(Arc::new(targets)),
+                .with_submit_targets(targets),
         );
         warn!(
             network = %network,
@@ -275,7 +277,7 @@ impl ChannelManager {
             solo.clone(),
             solo_cfg.sv1_ports.clone(),
             config.listen_address().port(),
-            submit_nodes,
+            Some(config.authority_public_key().to_string()),
         ));
         let mut supported_extensions = config.supported_extensions().to_vec();
         if !supported_extensions.contains(&ghost_common::solo::AGENT_TLV_EXTENSION_TYPE) {

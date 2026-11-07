@@ -77,14 +77,43 @@
 //!   "fee_policy": { "treasury_address": "bc1qgxg5ywk835c9fp6arz6d6x50xpk6y0ualt900k",
 //!                   "treasury_share_of_subsidy": 0.005, "treasury_sats_next_block": 1562500,
 //!                   "miner_sats_next_block_before_fees": 310937500, "fees_to": "miner" },
-//!   "ports": { "sv1": [3333, 4444], "sv2": 34255 },
-//!   "submit_nodes": ["http://10.0.0.2:8332"]
+//!   "ports": { "sv1": [3333, 4444], "sv2": 34255,
+//!              "sv2_authority_public_key": "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72" },
+//!   "submit_nodes": [{ "node": "http://10.0.0.2:8332", "reachable": true,
+//!                      "last_checked_at": 1799999990, "last_ok_at": 1799999990,
+//!                      "height": 974899, "error": null }]
 //! }
 //! ```
 //!
 //! `miners.connected` counts distinct payout addresses with an open channel, `miners.workers`
 //! open channels. `pool_hashrate_hs` is the sum of every worker's hashrate. `tip_height` is the
 //! job height less one; both are `null` before the first template.
+//! `ports.sv2_authority_public_key` is the key SV2 miners pin (base58check, as
+//! `authority_public_key` in the pool's config). `submit_nodes` are the other nodes found blocks
+//! are sent to, each with what the last reachability check (`getblockchaininfo`, every 60 s, 10 s
+//! timeout) found: `reachable` is `null` until the first check, `height` and `last_ok_at` are from
+//! the last answer, `error` is why the last check failed. Credentials never appear.
+//!
+//! ## `GET /api/v1/pool/miners` (operator only)
+//!
+//! Every payout address with an open channel or a share in the last 24 hours, the most hashrate
+//! (last hour) first. It names miners' addresses, so it is served on the loopback monitoring
+//! listener only, and ghost-mining forwards it only to HMAC-signed requests (the dashboard); the
+//! website proxy never forwards it.
+//!
+//! ```json
+//! {
+//!   "network": "mainnet", "generated_at": 1800000000, "collecting_since": 1799990000,
+//!   "miners": [{
+//!     "address": "bc1q…", "connected": true,
+//!     "workers": 2, "online": 1, "idle": 1, "offline": 0,
+//!     "hashrate_hs": { "15m": 1.2e14, "1h": 1.1e14, "24h": 9.8e13 },
+//!     "shares_24h": { "accepted": 812, "stale": 3, "rejected": 1, "reject_reasons": { … } },
+//!     "last_share_at": 1799999990, "best_share": { "ever": 4.1e9, "24h": 2.2e8 },
+//!     "blocks_found": 1
+//!   }]
+//! }
+//! ```
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -395,6 +424,8 @@ pub struct Ports {
     pub sv1: Vec<u16>,
     /// This pool's SV2 port.
     pub sv2: u16,
+    /// The SV2 authority public key miners pin (base58check).
+    pub sv2_authority_public_key: Option<String>,
 }
 
 /// `GET /api/v1/pool/status`.
@@ -420,8 +451,35 @@ pub struct StatusResponse {
     pub fee_policy: FeePolicy,
     /// The ports miners connect to.
     pub ports: Ports,
-    /// The other nodes found blocks are sent to.
-    pub submit_nodes: Vec<String>,
+    /// The other nodes found blocks are sent to, and whether each answers now.
+    pub submit_nodes: Vec<crate::submit_rpc::NodeHealth>,
+}
+
+/// One payout address in the operator's list.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MinerListEntry {
+    /// The payout address.
+    pub address: String,
+    /// It has an open channel.
+    pub connected: bool,
+    /// Its workers, online, idle and offline, hashrate, shares, last share and best share.
+    #[serde(flatten)]
+    pub summary: MinerSummary,
+    /// Blocks it found here.
+    pub blocks_found: usize,
+}
+
+/// `GET /api/v1/pool/miners`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MinersResponse {
+    /// The pool's network.
+    pub network: &'static str,
+    /// When this answer was built.
+    pub generated_at: u64,
+    /// When the share statistics begin.
+    pub collecting_since: u64,
+    /// The addresses, most hashrate first.
+    pub miners: Vec<MinerListEntry>,
 }
 
 fn worker_rates(ring: &Ring, since: u64, now: u64) -> (Rates, [Option<SpanTotals>; 3]) {
@@ -648,7 +706,7 @@ pub struct SoloApi {
     pub(crate) solo: Arc<Solo>,
     sv1_ports: Vec<u16>,
     sv2_port: u16,
-    submit_nodes: Vec<String>,
+    authority_public_key: Option<String>,
     /// Unix seconds now; a fixed clock in tests.
     pub(crate) clock: fn() -> u64,
 }
@@ -659,13 +717,13 @@ impl SoloApi {
         solo: Arc<Solo>,
         sv1_ports: Vec<u16>,
         sv2_port: u16,
-        submit_nodes: Vec<String>,
+        authority_public_key: Option<String>,
     ) -> SoloApi {
         SoloApi {
             solo,
             sv1_ports,
             sv2_port,
-            submit_nodes,
+            authority_public_key,
             clock: now_secs,
         }
     }
@@ -846,8 +904,78 @@ impl SoloApi {
             ports: Ports {
                 sv1: self.sv1_ports.clone(),
                 sv2: self.sv2_port,
+                sv2_authority_public_key: self.authority_public_key.clone(),
             },
-            submit_nodes: self.submit_nodes.clone(),
+            submit_nodes: self
+                .solo
+                .submit_targets()
+                .map(|t| t.health())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Every payout address with an open channel or a share in the last 24 hours.
+    pub fn miners(&self) -> MinersResponse {
+        let now = (self.clock)();
+        let stats = self.solo.miner_stats();
+        let since = stats.collecting_since();
+        let mut by_script: BTreeMap<Vec<u8>, Snapshot> = BTreeMap::new();
+        for (script, name, w) in stats.all(now) {
+            by_script
+                .entry(script)
+                .or_insert_with(|| Snapshot {
+                    collecting_since: since,
+                    workers: BTreeMap::new(),
+                })
+                .workers
+                .insert(name, w);
+        }
+        let mut channels: HashMap<Vec<u8>, Vec<ChannelStatus>> = HashMap::new();
+        for c in self.solo.channel_status() {
+            channels.entry(c.payee_script.clone()).or_default().push(c);
+        }
+        for script in channels.keys() {
+            by_script.entry(script.clone()).or_insert_with(|| Snapshot {
+                collecting_since: since,
+                workers: BTreeMap::new(),
+            });
+        }
+        let blocks = self.solo.blocks_found().all();
+        let mut miners: Vec<MinerListEntry> = by_script
+            .into_iter()
+            .filter_map(|(script, snap)| {
+                let open = channels.get(&script).map_or(&[][..], Vec::as_slice);
+                let recent = snap
+                    .workers
+                    .values()
+                    .any(|w| now.saturating_sub(w.last_submit_at) <= 86_400);
+                if open.is_empty() && !recent {
+                    return None;
+                }
+                let workers = worker_views(&snap, open, now);
+                let summary = summarize(&workers, &snap, now);
+                let address = self.solo.address_of(&script);
+                let found = blocks.iter().filter(|b| b.address == address).count();
+                Some(MinerListEntry {
+                    address,
+                    connected: !open.is_empty(),
+                    summary,
+                    blocks_found: found,
+                })
+            })
+            .collect();
+        let key = |m: &MinerListEntry| m.summary.hashrate_hs.h1.unwrap_or(0.0);
+        miners.sort_by(|a, b| {
+            key(b)
+                .partial_cmp(&key(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.address.cmp(&b.address))
+        });
+        MinersResponse {
+            network: self.solo.network().as_str(),
+            generated_at: now,
+            collecting_since: since,
+            miners,
         }
     }
 }
@@ -891,10 +1019,15 @@ pub fn router(api: Arc<SoloApi>) -> stratum_apps::monitoring::axum::Router {
         Json(api.status()).into_response()
     }
 
+    async fn miners(State(api): State<Arc<SoloApi>>) -> Response {
+        Json(api.miners()).into_response()
+    }
+
     Router::new()
         .route("/api/v1/miner/{address}", get(miner))
         .route("/api/v1/miner/{address}/history", get(history))
         .route("/api/v1/pool/status", get(status))
+        .route("/api/v1/pool/miners", get(miners))
         .with_state(api)
 }
 

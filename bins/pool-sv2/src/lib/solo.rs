@@ -204,6 +204,11 @@ impl Solo {
         &self.blocks
     }
 
+    /// The other nodes found blocks are sent to, when there are any.
+    pub fn submit_targets(&self) -> Option<&Arc<SubmitTargets>> {
+        self.submit.as_ref()
+    }
+
     /// Whether found blocks go to other nodes too (their transactions must then be asked for).
     pub fn submits_elsewhere(&self) -> bool {
         self.submit.is_some()

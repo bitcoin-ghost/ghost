@@ -230,6 +230,10 @@ class ProxyTest(unittest.TestCase):
             "/api/pool/a/api/v1/ledger/" + ADDR,
             "/api/pool/a/api/v1/node-pool/status",
             "/api/pool/a/api/v1/node-pool/node-list",
+            # The operator's miner list names every miner's address: never public.
+            "/api/pool/a/api/v1/pool/miners",
+            "/api/pool/a/api/v1/pool/miners?all=1",
+            "/api/pool/a/api/v1/pool/status/../miners",
             "/api/pool/a/admin/restart",
             "/api/pool/a//api/v1/pool/status",
             "/api/pool/a/api/v1/miner/" + "a" * 101,
