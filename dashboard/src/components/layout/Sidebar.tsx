@@ -9,7 +9,6 @@ import {
   Gauge,
   Boxes,
   Users,
-  Link2,
   Blocks,
   Network as NetworkIcon,
   Eye,
@@ -64,12 +63,11 @@ const GROUPS: NavGroup[] = [
     ],
   },
   {
-    label: "node pool",
+    label: "ghost pool",
     items: [
       { href: "/", label: "Overview", icon: <LayoutDashboard {...ICON} /> },
       { href: "/miners", label: "Miners", icon: <Users {...ICON} /> },
-      { href: "/blocks", label: "Pool Blocks", icon: <Boxes {...ICON} /> },
-      { href: "/share-chain", label: "Share Chain", icon: <Link2 {...ICON} /> },
+      { href: "/blocks", label: "Blocks Found", icon: <Boxes {...ICON} /> },
       { href: "/mining", label: "Connect Miners", icon: <Pickaxe {...ICON} /> },
     ],
   },

@@ -6,10 +6,10 @@ import { Badge } from "@/components/ui/Badge";
 import { StatusDot } from "@/components/ui/StatusDot";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { SkeletonCard } from "@/components/ui/Skeleton";
-import { OverviewView } from "@/components/nodePool/OverviewView";
+import { OverviewView } from "@/components/pool/OverviewView";
 import { useNodeInfo, useNodeStatus, useNickname } from "@/hooks/queries/useNodeQueries";
 import { useWatchdogStatus } from "@/hooks/queries/useWatchdogQueries";
-import { useNodePoolStatus } from "@/hooks/queries/useNodePoolQueries";
+import { usePoolStatus } from "@/hooks/queries/usePoolQueries";
 
 function ServicesSection() {
   const { data: watchdog, isLoading, error } = useWatchdogStatus();
@@ -60,13 +60,13 @@ export default function OverviewPage() {
   const { data: info } = useNodeInfo();
   const { data: nickname } = useNickname();
   const node = useNodeStatus();
-  const pool = useNodePoolStatus();
+  const pool = usePoolStatus();
 
   return (
     <div className="space-y-6">
       <PageHeader
         eyebrow="overview"
-        title="Your node pool node."
+        title="Your Ghost Pool node."
         subtitle={
           nickname?.nickname
             ? `${nickname.nickname} · v${info?.version ?? ""}`
@@ -75,7 +75,7 @@ export default function OverviewPage() {
               : undefined
         }
       />
-      <SectionErrorBoundary section="Node pool">
+      <SectionErrorBoundary section="Ghost Pool">
         <OverviewView
           status={pool.data}
           statusError={pool.error ?? undefined}

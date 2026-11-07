@@ -4,8 +4,8 @@ export * from './useNodeQueries';
 // Mining queries
 export * from './useMiningQueries';
 
-// Node pool queries
-export * from './useNodePoolQueries';
+// Ghost Pool queries
+export * from './usePoolQueries';
 
 // Config queries
 export * from './useConfigQueries';

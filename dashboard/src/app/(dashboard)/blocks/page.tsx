@@ -2,21 +2,21 @@
 
 import { PageHeader } from "@/components/ui/PageHeader";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
-import { BlocksView } from "@/components/nodePool/BlocksView";
-import { useNodePoolStatus } from "@/hooks/queries/useNodePoolQueries";
+import { BlocksView } from "@/components/pool/BlocksView";
+import { usePoolStatus } from "@/hooks/queries/usePoolQueries";
 import { useNow } from "@/hooks/useNow";
 
 export default function BlocksPage() {
-  const { data, error, isLoading } = useNodePoolStatus();
+  const { data, error, isLoading } = usePoolStatus();
   const now = useNow();
   return (
     <div className="space-y-6">
       <PageHeader
-        eyebrow="node pool"
-        title="Pool blocks."
-        subtitle="Blocks the pool found, what each paid, the treasury change, and settlement"
+        eyebrow="ghost pool"
+        title="Blocks found."
+        subtitle="Every block a miner on this node found, what it paid, its coinbase check and what the other nodes said"
       />
-      <SectionErrorBoundary section="Pool blocks">
+      <SectionErrorBoundary section="Blocks found">
         <BlocksView status={data} statusError={error} statusLoading={isLoading} now={now} />
       </SectionErrorBoundary>
     </div>

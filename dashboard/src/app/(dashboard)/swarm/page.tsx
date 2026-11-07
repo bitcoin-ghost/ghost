@@ -58,7 +58,7 @@ const TOOLTIPS = {
   connectionAddress: "The endpoint other nodes add to reach this node.",
   // Per-node fields
   uptime: "Trailing-7-day uptime %. — means this peer did not gossip it.",
-  peers: "Share-chain relay peers this node is connected to. — means not reported.",
+  peers: "Relay peers the node reports. Ghost Pool has no relay, so this is normally — (not reported).",
   l1Height: "Bitcoin (L1) chain height. — means not gossiped.",
   // Status badges
   statusOnline: "Whether this node is reachable and reporting healthy.",

@@ -3,7 +3,7 @@ export * from './client';
 export * from './node';
 export * from './config';
 export * from './mining';
-export * from './nodePool';
+export * from './pool';
 export * from './swarm';
 export * from './backup';
 export * from './logs';

@@ -1,6 +1,6 @@
 import { ReactNode } from "react";
 import { Badge } from "@/components/ui/Badge";
-import { errorText, UNKNOWN, type Level } from "@/lib/nodePool/view";
+import { errorText, UNKNOWN, type Level } from "@/lib/pool/view";
 
 /** Shown in place of data the node did not give: says what is missing and why. */
 export function Unavailable({ what, error }: { what: string; error?: unknown }) {

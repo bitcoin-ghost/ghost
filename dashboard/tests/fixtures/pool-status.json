@@ -1,0 +1,49 @@
+{
+  "network": "mainnet",
+  "generated_at": 1800000000,
+  "collecting_since": 1799990000,
+  "bitcoin": {
+    "tip_height": 974899,
+    "tip_hash": "00000000000000000001a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7",
+    "job_height": 974900,
+    "network_difficulty": 1.1e14
+  },
+  "miners": { "connected": 3, "workers": 5 },
+  "pool_hashrate_hs": { "15m": 3.0e14, "1h": 2.9e14, "24h": 2.5e14 },
+  "best_share": { "ever": 9.9e10, "24h": 1.2e9 },
+  "blocks_found": [
+    {
+      "height": 974000,
+      "hash": "000000000000000000011111111111111111111111111111111111111111aaaa",
+      "address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+      "worker": "rig1",
+      "reward_sats": 311000000,
+      "treasury_sats": 1562500,
+      "fees_sats": 62500,
+      "found_at": 1799000000,
+      "check": "ok",
+      "submitted": [{ "node": "http://10.0.0.2:8332", "result": "duplicate" }]
+    },
+    {
+      "height": 974800,
+      "hash": "000000000000000000022222222222222222222222222222222222222222bbbb",
+      "address": "bc1p5d7rjq7g6rdk2yhzks9smlaqtedr4dekq08ge8ztwac72sfr9rusxg3297",
+      "worker": "",
+      "reward_sats": 310990000,
+      "treasury_sats": 1562500,
+      "fees_sats": 52500,
+      "found_at": 1799990000,
+      "check": "ok",
+      "submitted": [{ "node": "http://10.0.0.2:8332", "result": "accepted" }]
+    }
+  ],
+  "fee_policy": {
+    "treasury_address": "bc1qgxg5ywk835c9fp6arz6d6x50xpk6y0ualt900k",
+    "treasury_share_of_subsidy": 0.005,
+    "treasury_sats_next_block": 1562500,
+    "miner_sats_next_block_before_fees": 310937500,
+    "fees_to": "miner"
+  },
+  "ports": { "sv1": [3333, 4444], "sv2": 34255 },
+  "submit_nodes": ["http://10.0.0.2:8332"]
+}

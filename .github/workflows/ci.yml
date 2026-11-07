@@ -229,6 +229,34 @@ jobs:
       - name: Fuzz targets build
         run: ./scripts/check-fuzz-targets.sh
 
+  # The node dashboard (Next.js): types, lint, the page tests and a production build. The
+  # release workflows build it too, but only on a tag; this catches a broken page before then.
+  dashboard:
+    name: Dashboard
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v5
+      # Node 22, as dashboard/Dockerfile and the release workflows; the page tests need
+      # module.registerHooks (22.15 and later).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+      - name: Type check
+        run: npx tsc --noEmit
+      - name: Lint
+        run: npm run lint
+      - name: Page tests
+        run: npm test
+      - name: Build
+        run: npm run build
+
   # Clippy lints
   clippy:
     name: Clippy

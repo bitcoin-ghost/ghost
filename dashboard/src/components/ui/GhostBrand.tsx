@@ -6,7 +6,7 @@ import { Ghost } from "lucide-react";
 interface GhostBrandProps {
   /** Visual scale. `sm` = sidebar header, `md` = top header. */
   size?: "sm" | "md";
-  /** Override the wordmark text. Default "ghost node". */
+  /** Override the wordmark text. Default "ghost pool". */
   label?: string;
   /** Where the brand links to. Default `/home`. Pass `null` to render unlinked. */
   href?: string | null;
@@ -21,7 +21,7 @@ interface GhostBrandProps {
  */
 export function GhostBrand({
   size = "md",
-  label = "ghost node",
+  label = "ghost pool",
   href = "/home",
   className = "",
 }: GhostBrandProps) {

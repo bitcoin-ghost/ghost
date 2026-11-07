@@ -25,7 +25,7 @@ import { SettingsSection, ToggleRow } from "../shared";
 const EVENT_META: { key: keyof AlertEvents; label: string; description: string }[] = [
   { key: "low_disk", label: "Low disk space", description: "Free disk fell below the safe threshold." },
   { key: "restart_needed", label: "Restart needed", description: "A change or update needs a node restart to apply." },
-  { key: "peer_count_drop", label: "Relay peers dropped", description: "Share-chain relay peers were lost, or there are none (the node then neither hears nor relays shares)." },
+  { key: "peer_count_drop", label: "Relay peers dropped", description: "The old node pool relay's peers were lost. Ghost Pool has no relay, so this alert has nothing to watch." },
   { key: "block_found", label: "Block found", description: "This node found a block." },
   { key: "reorg_detected", label: "Chain reorg detected", description: "A Bitcoin block was disconnected from the tip (chain reorganisation)." },
   { key: "behind_tip", label: "Node behind tip", description: "The node fell behind the network — a stale tip or a lagging local height." },
