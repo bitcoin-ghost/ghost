@@ -69,3 +69,37 @@ if those are renamed, update that test with them.
   `coinbase_tags` GHPP/GHNT (ghost-mining still emits placeholder slots; pool_sv2 strips them),
   `docs/node-pool-reference/`, np_* migrations (by instruction), translator agent TLV sending and
   `quantise_to_tiers` branch, stale "node pool" comments in the translator.
+
+## Website, proxy and dashboard (Ghost Pool)
+- `ghost-web/` rebuilt as Ghost Pool: `index.html` (what it is, the payout rule worked at 3.125 BTC,
+  the connect box for both nodes, live stats and blocks found), `connect.html` (Bitaxe/AxeOS,
+  Avalon, Antminer, Braiins OS, SV2 with the authority key; primary + backup), `miner.html` +
+  `miner.js` (asks every node, adds the answers up, odds from network difficulty x 2^32 / hashrate),
+  `faq.html`, `run-a-node.html` (the installer, short), `security.html`, `404.html`. Shared code in
+  `pool.js`; the nodes in `pool-nodes.json` (id, name, stratum host, SV2 authority key).
+  Removed: pool/nodes/miners/endpoints/downloads pages, `node-pool.js`, `node-list.json`, `docs/`
+  (node pool, Haze, Shroud, Reaper, buds, ...), `vendor/three`.
+- **To fill in before the site goes live**: `ghost-web/pool-nodes.json` has placeholder stratum
+  hosts `pool-a.bitcoinghost.org` / `pool-b.bitcoinghost.org` and no authority keys (the page then
+  says the key is not published); the proxy's `/etc/ghost/site-proxy-nodes.json` needs the two
+  nodes' public IPs (`scripts/website-proxy/site-proxy-nodes.example.json`).
+- `scripts/website-proxy/ghost-site-proxy.py`: a static node list from `--nodes` (read once at
+  start; a bad file refuses to start), nodes addressed by id (`/api/pool/<id>/...`), routes
+  `/api/v1/pool/status`, `/api/v1/miner/<addr>`, `/api/v1/miner/<addr>/history`; per-node status
+  cache; the old first-node `/api/v1/node-pool/status` location is gone (nginx conf updated).
+- `dashboard/`: overview, miners (lookup + listed addresses), miner detail, blocks found and
+  read-only pool settings from the solo API (`src/lib/api/pool.ts`, `src/lib/pool/view.ts`,
+  `src/components/pool/`); share chain page, ledger/sensing/slot-class/genesis types removed;
+  relay peers removed from the network page and vitals overlay. Node pages (Zero-Sync, Haze,
+  mempool, ...) kept. New CI job **Dashboard** (tsc, lint, `npm test`, `next build`).
+- Tests: `scripts/check-miner-page.sh` runs `scripts/web-tests/pool-site.test.js` (10) and
+  `miner-page.test.js` (11); proxy `test_ghost_site_proxy.py` (16); dashboard `npm test` 30
+  (16 in `tests/pool-pages.test.js`).
+- **Pending**: `scripts/frontend-proof/` still drives the node pool regtest harness
+  (`scripts/regtest-node-pool/harness.py`, share chain, lister/merge, the old pages). It is not run
+  by CI and has not been ported; it needs a solo regtest harness first.
+- **API gaps** seen from the front ends: `/api/v1/pool/status` counts connected addresses but does
+  not name them, so the dashboard's miner list can only show block finders and looked-up
+  addresses; nothing reports whether the other submit node is reachable now (only what it said to
+  the last found block); the SV2 authority key is not in the status, so the website's
+  `pool-nodes.json` carries it by hand.

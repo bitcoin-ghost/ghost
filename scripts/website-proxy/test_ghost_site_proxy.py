@@ -292,7 +292,8 @@ class ProxyTest(unittest.TestCase):
         path = os.path.join(HERE, "site-proxy-nodes.example.json")
         nodes = sp.load_nodes(path, True)
         self.assertGreaterEqual(len(nodes), 2)
-        site = json.load(open(os.path.join(HERE, "..", "..", "ghost-web", "pool-nodes.json")))
+        with open(os.path.join(HERE, "..", "..", "ghost-web", "pool-nodes.json")) as f:
+            site = json.load(f)
         self.assertEqual(sorted(nodes), sorted(n["id"] for n in site["nodes"]),
                          "the website's pool-nodes.json and the proxy's example name the same node ids")
 
