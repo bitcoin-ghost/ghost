@@ -48,19 +48,44 @@ pub const AGENT_TLV_FIELD_TYPE: u8 = 0x01;
 /// the authorised miner's `address.worker`, which binds a provisional channel to its payee.
 pub const PAYEE_TLV_FIELD_TYPE: u8 = 0x02;
 
-/// Ceiling on a coinbase this pool builds, non-witness bytes. A solo coinbase is about 250 bytes;
-/// the ceiling is kept as the block template's reserve is sized from it
-/// ([`BLOCK_RESERVED_WEIGHT`]).
-pub const MAX_COINBASE_BYTES: usize = 22_000;
+/// Ceiling on a coinbase this pool builds, non-witness bytes, as ghost-mining counts it
+/// (`block_limits::CoinbaseFootprint`): it trims every template so a coinbase this large still
+/// fits, and refuses a job whose coinbase is larger.
+///
+/// The largest solo coinbase, counted that way:
+///
+/// | part | bytes |
+/// |---|---|
+/// | version, input count, prevout, scriptSig length | 4 + 1 + 36 + 1 = 42 |
+/// | scriptSig: at most 100 by consensus (`bad-cb-length`), its 8-byte extranonce counted at the widest 20 | 112 |
+/// | sequence, output count, locktime | 4 + 1 + 4 = 9 |
+/// | witness commitment: value, length, 38-byte script | 8 + 1 + 38 = 47 |
+/// | treasury P2WPKH: value, length, 22-byte script | 31 |
+/// | miner, at most P2TR or P2WSH: value, length, 34-byte script | 43 |
+/// | **total** | **284** |
+///
+/// pool_sv2 declares the treasury and miner outputs to ghost-mining as 74 bytes
+/// (`CoinbaseOutputConstraints`: the group output's 31 plus stratum-apps' 43 for the largest
+/// address type). Room is left on top for two more zero-value outputs a template may carry, each
+/// an OP_RETURN at Core's standard maximum (83-byte script: 8 + 1 + 83 = 92), which makes 468;
+/// the ceiling is about twice that.
+pub const MAX_COINBASE_BYTES: usize = 1_000;
 
 /// `blockreservedweight` ghostd is given: the weight `getblocktemplate` leaves free for the
-/// header, the transaction count and the coinbase. Far more than a solo coinbase needs; kept so
-/// a node's configuration does not have to change.
-pub const BLOCK_RESERVED_WEIGHT: u64 = 90_000;
+/// header, the transaction count and the coinbase. Bitcoin Core's default (8,000 WU), which holds
+/// the [`MAX_COINBASE_BYTES`] coinbase with room to spare (4,376 WU, below). The node pool's
+/// 90,000 (for a 22 KB coinbase) left 82,000 WU, about 2% of every block, empty of fee-paying
+/// transactions. `scripts/install-node.sh` writes this value
+/// (`scripts/test-installer-node-pool-reserve.sh` holds the two together).
+pub const BLOCK_RESERVED_WEIGHT: u64 = 8_000;
 
 // The reserve must hold the largest coinbase the ceiling allows, plus the 80-byte header, a
-// 5-byte transaction count and the 36 witness bytes of a segwit coinbase.
+// 5-byte transaction count and the 36 witness bytes of a segwit coinbase:
+// 1,000 * 4 + 36 + (80 + 5) * 4 = 4,376 <= 8,000.
 const _: () = assert!((MAX_COINBASE_BYTES as u64) * 4 + 36 + (80 + 5) * 4 <= BLOCK_RESERVED_WEIGHT);
+
+// The ceiling holds the largest solo coinbase (284 bytes, above) with two 92-byte extra outputs.
+const _: () = assert!(42 + 112 + 9 + 47 + 31 + 43 + 2 * 92 <= MAX_COINBASE_BYTES);
 
 /// The subsidy schedule of a Bitcoin network: blocks between halvings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

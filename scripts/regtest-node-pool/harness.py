@@ -373,8 +373,8 @@ class Node:
             "fixedseeds=0", "listenonion=0", "fallbackfee=0.0002", "txindex=0",
             f"zmqpubhashblock=tcp://127.0.0.1:{self.zmq_block}",
             f"zmqpubhashtx=tcp://127.0.0.1:{self.zmq_tx}",
-            # Must match NODE_POOL_BLOCK_RESERVED_WEIGHT, as the installer writes it.
-            "blockreservedweight=90000", "dbcache=16", "maxmempool=50", "rpcworkqueue=64",
+            # Must match ghost_common::solo::BLOCK_RESERVED_WEIGHT, as the installer writes it.
+            "blockreservedweight=8000", "dbcache=16", "maxmempool=50", "rpcworkqueue=64",
         ] + [f"addnode=127.0.0.1:{p}" for p in peers]
         with open(os.path.join(d, "bitcoin.conf"), "w") as f:
             f.write("\n".join(conf) + "\n")

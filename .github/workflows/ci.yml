@@ -196,12 +196,13 @@ jobs:
       # the job on every node and enables it unless --no-backups.
       - name: Installer nightly-backup option self-test
         run: ./scripts/test-installer-backups.sh
-      # The node pool's coinbase runs to 22 KB and ghostd's default 8,000 WU block reserve lost a
-      # block at 2.25 KB. The installer always writes blockreservedweight=90000 (node pool only).
+      # blockreservedweight: the installer writes ghost_common::solo::BLOCK_RESERVED_WEIGHT (Core's
+      # 8,000 WU), which must hold ghost-mining's coinbase ceiling, MAX_COINBASE_BYTES.
       - name: Installer node pool reserve self-test
         run: ./scripts/test-installer-node-pool-reserve.sh
-      # The fee address check, per-network defaults, rendered pool_sv2 config, preflight lines,
-      # flags and wizard (W2.12). pool_sv2 itself loads the rendered config in
+      # Ghost Pool: the payout address check, per-network defaults, the rendered pool_sv2 [solo]
+      # config, preflight lines, flags (--peer-node, --submit-node, --submit-auth), wizard,
+      # firewall and mempool policy. pool_sv2 itself loads the rendered config in
       # bins/pool-sv2/tests/installer_config.rs.
       - name: Installer node pool self-test
         run: ./scripts/test-installer-node-pool.sh
@@ -209,8 +210,8 @@ jobs:
       # 22/tcp is never closed and nothing happens without a confirmation. Throwaway root.
       - name: Installer uninstall self-test
         run: ./scripts/test-installer-uninstall.sh
-      # --lister (W2.10): off by default, enabled only with a configuration it can run on, kept on
-      # by a re-run, its env file root-only, its node-list.json where ghost-mining serves it.
+      # The lister is gone with the share chain: nothing installs one, and a re-run or --uninstall
+      # removes what an older install left.
       - name: Installer lister self-test
         run: ./scripts/test-installer-lister.sh
       # The Namecheap DNS hook for ghost-audit merge, against a local fake Namecheap API: setHosts

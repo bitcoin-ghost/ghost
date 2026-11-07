@@ -10,11 +10,11 @@
 //! - [`assess`](crate::block_limits::assess) / [`trim_to_fit`](crate::block_limits::trim_to_fit) / [`check_built_coinbase`](crate::block_limits::check_built_coinbase): the template-time checks, against
 //!   the template's own limits, the operator's `target_weight` and what the SV2 pool said it adds
 //!   to the coinbase (`CoinbaseOutputConstraints`). Every template is trimmed to leave room for
-//!   the largest coinbase the node pool builds, and a job that still does not fit, or whose
+//!   the largest coinbase the pool builds, and a job that still does not fit, or whose
 //!   coinbase is above `MAX_COINBASE_BYTES`, is refused.
 
 use ghost_common::rpc::{BlockTemplate, TemplateTransaction};
-use ghost_common::solo::MAX_COINBASE_BYTES;
+use ghost_common::solo::{BLOCK_RESERVED_WEIGHT, MAX_COINBASE_BYTES};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Consensus maximum block weight (BIP141).
@@ -168,9 +168,9 @@ impl CoinbaseFootprint {
         })
     }
 
-    /// The largest coinbase the node pool can build: `MAX_COINBASE_BYTES`, whose payee scripts
-    /// (P2SH, P2WPKH, P2WSH, P2TR), treasury and commitments carry no sigops, plus whatever the
-    /// SV2 pool reserves.
+    /// The largest coinbase the pool can build: `MAX_COINBASE_BYTES` (the SV2 pool's own outputs
+    /// included, see its derivation), whose payee scripts (P2SH, P2WPKH, P2WSH, P2TR), treasury
+    /// and commitment carry no sigops, plus the sigops the SV2 pool reserves.
     pub fn ceiling(reserve: &CoinbaseOutputReserve) -> Self {
         Self {
             non_witness_bytes: MAX_COINBASE_BYTES as u64,
@@ -278,7 +278,7 @@ pub fn trim_to_fit(
     removed
 }
 
-/// Trim `txs` so the largest coinbase the node pool can build still fits. Returns how many
+/// Trim `txs` so the largest coinbase the pool can build still fits. Returns how many
 /// transactions were dropped.
 pub fn make_room_for_coinbase(
     height: u64,
@@ -294,8 +294,9 @@ pub fn make_room_for_coinbase(
             height,
             removed,
             limit = limits.weight,
-            "dropped transactions to leave room for the coinbase; is ghostd's \
-             blockreservedweight below 90000?"
+            reserved_weight = BLOCK_RESERVED_WEIGHT,
+            "dropped transactions to leave room for the coinbase; ghostd's \
+             blockreservedweight should be at least reserved_weight"
         );
     }
     removed
@@ -549,16 +550,15 @@ mod tests {
         assert!(assess(limits, large, &txs).over_weight());
     }
 
-    /// Under the node pool's 90,000 WU reserve the ceiling coinbase fits a full template.
+    /// Under the reserve the installer writes, the ceiling coinbase fits a full template.
     #[test]
-    fn node_pool_reserve_carries_the_ceiling_coinbase() {
-        use ghost_common::solo::BLOCK_RESERVED_WEIGHT as NODE_POOL_BLOCK_RESERVED_WEIGHT;
+    fn the_reserve_carries_the_ceiling_coinbase() {
         let limits = BlockLimits {
             weight: MAX_BLOCK_WEIGHT,
             sigop_cost: MAX_BLOCK_SIGOPS_COST,
         };
         // Many transactions, so the count takes 3 bytes.
-        let per = (MAX_BLOCK_WEIGHT - NODE_POOL_BLOCK_RESERVED_WEIGHT) / 1_000;
+        let per = (MAX_BLOCK_WEIGHT - BLOCK_RESERVED_WEIGHT) / 1_000;
         let mut txs = vec![tx(per, 0); 1_000];
         let r = CoinbaseOutputReserve::default();
         let ceiling = CoinbaseFootprint::ceiling(&r);
@@ -647,9 +647,9 @@ mod tests {
         };
         // Small coinbase on a full template: fine.
         assert!(check(3, &full).is_ok());
-        // 44 outputs on a full template under the default reserve: over weight.
+        // 44 outputs on a full template under the default reserve: over weight (and the ceiling).
         assert!(check(44, &full).is_err());
-        // 600 outputs is above the 22 KB ceiling even on an empty template.
+        // 600 outputs is above the ceiling even on an empty template.
         let e = check(600, &[]).unwrap_err().to_string();
         assert!(e.contains("coinbase"), "{e}");
         // Unparseable outputs are refused.
@@ -661,8 +661,9 @@ mod tests {
     fn every_template_makes_room_for_the_largest_coinbase() {
         let t = template(MAX_BLOCK_WEIGHT, MAX_BLOCK_SIGOPS_COST);
         let r = CoinbaseOutputReserve::default();
+        // Filled to Core's minimum reserve (2,000 WU), less than the ceiling coinbase needs.
         let mut full: Vec<_> = (0..100)
-            .map(|_| tx((MAX_BLOCK_WEIGHT - 8_000) / 100, 0))
+            .map(|_| tx((MAX_BLOCK_WEIGHT - 2_000) / 100, 0))
             .collect();
         let removed = make_room_for_coinbase(100, &t, 0, &r, &mut full);
         assert!(removed > 0);

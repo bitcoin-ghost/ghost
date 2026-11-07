@@ -1511,10 +1511,12 @@ EOF
   for p in $RPC_ALLOW; do echo "rpcallowip=${p}"; done
   # The other node (--peer-node) and any --bitcoin-peer: a standing connection each.
   for p in $BITCOIN_PEERS; do echo "addnode=${p}"; done
-  # ghost_common::solo::BLOCK_RESERVED_WEIGHT: the weight getblocktemplate leaves for the header,
-  # the transaction count and the coinbase. ghost-mining trims a template to fit a coinbase of
-  # MAX_COINBASE_BYTES, so the two move together (test-installer-node-pool-reserve.sh).
-  echo "blockreservedweight=90000"
+  # ghost_common::solo::BLOCK_RESERVED_WEIGHT, Bitcoin Core's default: the weight getblocktemplate
+  # leaves for the header, the transaction count and the coinbase. ghost-mining trims a template
+  # to fit a coinbase of MAX_COINBASE_BYTES (1,000 B, 4,376 WU with the header); a solo coinbase is
+  # under 300 B. The node pool's 90,000 left about 2% of every block empty of fee-paying
+  # transactions. test-installer-node-pool-reserve.sh holds this to the Rust constant.
+  echo "blockreservedweight=8000"
 } > /etc/bitcoin/bitcoin.conf
 
 # Tor wiring. `listen=1` is already written above; here we add the onion service
