@@ -3,84 +3,110 @@
 > This software runs on Bitcoin **mainnet** and handles real funds. It is under active
 > development and testing. Do not point hashrate, funds, or production infrastructure at it.
 
-# Bitcoin Ghost
+# Ghost Pool
 
 [![CI](https://img.shields.io/github/actions/workflow/status/bitcoin-ghost/ghost/ci.yml?label=CI)](https://github.com/bitcoin-ghost/ghost/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/github/v/release/bitcoin-ghost/ghost?label=version)](https://github.com/bitcoin-ghost/ghost/releases/latest)
 
-Bitcoin Ghost is a Bitcoin mainnet project built around a Bitcoin Core fork
-(`ghostd`) and a node pool: a mining pool with no operator. Anyone can run a
-node; miners' balances are decided by a light share chain, and every block's
-coinbase pays them directly (see [`docs/NODE_POOL_SPEC.md`](docs/NODE_POOL_SPEC.md)).
-No separate token, no altcoin — it settles in Bitcoin.
+Ghost Pool is a solo Bitcoin mining pool. No accounts, no sign-up, no KYC: a miner
+connects with its own Bitcoin address as its username, and when it finds a block,
+the block pays it directly, in the coinbase. Nobody holds a miner's money; there is
+no balance, ledger or payout queue. It runs on Bitcoin mainnet, on a Bitcoin Core
+fork (`ghostd`). See [`docs/SOLO.md`](docs/SOLO.md).
 
 - **Website:** <https://bitcoinghost.org>
-- **Documentation:** <https://bitcoinghost.org/docs/>
-- **Latest release:** <https://github.com/bitcoin-ghost/ghost/releases/latest>
+- **Latest release:** <https://github.com/bitcoin-ghost/ghost/releases>
+
+## The payout rule
+
+Every job a miner is given pays, and nothing else:
+
+1. **The treasury** (`bc1qgxg5ywk835c9fp6arz6d6x50xpk6y0ualt900k`): exactly 0.5% of the
+   block subsidy (`subsidy / 200`, rounded down), never any part of the fees.
+2. **The miner**, at the address in its username: the subsidy minus that 0.5%, plus
+   **every** transaction fee.
+3. The witness commitment.
+
+At today's 3.125 BTC subsidy that is 1,562,500 sats to the treasury and 310,937,500
+sats plus all fees to the miner. The rule is code in one place
+(`ghost_common::solo`), and `ghost-audit check` lets a miner verify that a node's
+jobs pay it.
 
 ## Components
 
 | Component | Path | Description |
 |-----------|------|-------------|
-| `ghostd` (Ghost Core) | `ghost-core/` | A fork of Bitcoin Core v30 running on Bitcoin mainnet, with Reaper mempool filtering and Ghost Haze block stripping. Separate C++/CMake build. |
-| `ghost-mining` | `bins/ghost-pool/` | Pool node: block templates for pool_sv2, round statistics and the operator API. |
-| SV2 mining apps | `bins/translator-sv2/`, `bins/pool-sv2/` | Stratum V2 translator and pool, amalgamated in-tree. pool_sv2 builds every job's canonical coinbase and runs the node pool share-chain relay. |
-
-The workspace contains over 40 crates and binaries under `crates/` and `bins/`.
-See [`docs/protocols/ARCHITECTURE.md`](https://bitcoinghost.org/docs/) on the
-website for the full crate map, or browse the source directly.
+| `ghostd` (Ghost Core) | `ghost-core/` | A fork of Bitcoin Core v30 running on Bitcoin mainnet, with optional Reaper mempool filtering and Ghost Haze block stripping. Separate C++/CMake build. |
+| `ghost-mining` | `bins/ghost-pool/` | Block templates for pool_sv2 (the template provider), and the node's public API. |
+| SV2 mining apps | `bins/translator-sv2/`, `bins/pool-sv2/` | Stratum V2 translator and pool, amalgamated in-tree. pool_sv2 builds every job's solo coinbase, submits found blocks and serves the miner statistics. |
+| `ghost-audit` | `bins/ghost-audit/` | `ghost-audit check`: connects as a miner and checks a node's jobs against the payout rule. |
 
 ## Architecture
 
 ```
-                       ┌────────────────────────────────┐
-                       │  NODE POOL SHARE-CHAIN RELAY   │
-                       │  shares · anchors · sync (8566)│
-                       └────────────────────────────────┘
-                        ▲              ▲              ▲
-                  ┌─────┴─────┐  ┌─────┴─────┐  ┌─────┴─────┐
-                  │  Node A   │  │  Node B   │  │  Node C   │
-                  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘
-                     ghostd         ghostd         ghostd
-                        │              │              │
-                   Your miners    Their miners    Their miners
-                  (Stratum V1)   (Stratum V1)    (Stratum V1)
+   miners (SV1)            miners (SV1)          miners (SV2)
+   :3333 small             :4444 farm tier       :34255
+        \                     /                     |
+         translator_sv2 ------                      |
+                      \                             |
+                       pool_sv2 (solo coinbase per channel) ----> other node's ghostd
+                          |                                       (found blocks, --peer-node)
+                     ghost-mining (template provider)
+                          |
+                        ghostd  <---- addnode ---->  other node's ghostd
 ```
 
-Every node is a peer. Miners connect to whichever node they choose. Nodes agree
-who is owed what through the node pool share chain (most-work fork choice, no
-votes), and each node selects its own transactions according to its configured
-mempool policy.
+Each miner's job pays that miner. A block found is submitted to the node's own
+`ghostd` first, then sent to every other node listed in `[solo] submit_rpc`, so it
+reaches the network even if one node is slow or down.
 
 ### Network ports
 
 | Port | Purpose |
 |------|---------|
-| 3333 | Stratum V1 — hobby tier, ~2,328 starting difficulty |
-| 4444 | Stratum V1 — farm/rental tier, ~232,827 starting difficulty |
-| 34255 | Stratum V2 — via SRI pool |
-| 8566 | Node pool share-chain relay |
+| 3333 | Stratum V1, small miners (Bitaxe, NerdAxe): the lower starting difficulty |
+| 4444 | Stratum V1, the farm tier (S19/S21-class, rented hashrate): the higher starting difficulty |
+| 34255 | Stratum V2 (pool_sv2, Noise-authenticated) |
+| 8333 | Bitcoin P2P |
 | 8080 | REST API |
+| 8332 | Bitcoin RPC, opened only to the other node of a pair (`--peer-node`) |
 
 ## Running a node
 
-The install script provisions `ghostd`, `ghost-mining` and the SV2 stratum stack
-as a node pool node, writes the configs, and sets up the systemd services. It
-runs a preflight first and changes nothing if a check fails. Supply the address
-that takes the transaction fees of blocks your node's miners find (P2SH, P2WPKH,
-P2WSH or P2TR):
+The install script provisions `ghostd`, `ghost-mining` and the SV2 stratum stack,
+writes the configs and sets up the systemd services. It runs a preflight first and
+changes nothing if a check fails. Nothing is required; with no flags on a terminal it
+runs a guided setup:
 
 ```sh
-curl -sSL https://get.bitcoinghost.org | sudo bash -s -- --fee-address bc1q... --alert-webhook https://ntfy.sh
+curl -sSL https://get.bitcoinghost.org | sudo GHOST_VERSION=np-latest bash -s -- --alert-webhook https://ntfy.sh
 ```
 
-Run `sudo bash -s -- --help` to see options such as `--network`, `--relay-peer`,
-`--archive` and `--sync`. Full setup guidance is in
-[`ghost-web/docs/deployment.md`](ghost-web/docs/deployment.md).
+Run it with `--help` for the options (`--network`, `--peer-node`, `--submit-auth`,
+`--reaper`, `--archive`, `--sync`, `--uninstall`, ...). The Reaper (mempool spam filter)
+is off by default: blocks built from the standard policy propagate fastest.
 
-Point a miner at your node with `stratum+tcp://<your-ip>:3333` and a worker name
-of `<your payout address>.worker1`; the address must be P2SH, P2WPKH, P2WSH or P2TR.
+Point a miner at your node with `stratum+tcp://<your-ip>:3333` (or `:4444` for the
+farm tier) and a username of `<your Bitcoin address>.<worker>`; the address must be
+P2SH, P2WPKH, P2WSH or P2TR (P2PKH `1...` addresses are refused). Any password.
+
+### Two nodes
+
+Two nodes back each other up: each sends every block its miners find to the other as
+well as to its own `ghostd`, and each keeps a direct Bitcoin connection to the other.
+Once both are installed, run on each:
+
+```sh
+sudo bash install-node.sh --peer-node <the other node's IP> --submit-auth <its rpcuser:rpcpassword>
+```
+
+`--peer-node` adds the other node as a Bitcoin peer (`addnode`), sends found blocks to
+its RPC (`http://<ip>:8332`), and lets that one address reach this node's RPC
+(`rpcallowip` and a ufw rule for it alone). The other node's credentials are its
+`/etc/bitcoin/bitcoin.conf` `rpcuser`/`rpcpassword`, kept root-only in
+`/etc/ghost/solo-submit-rpc.auth`. Keep the link between the two private (a VPN or a
+private network): the RPC password crosses it.
 
 ### Verifying releases
 
@@ -119,7 +145,7 @@ Common development commands:
 EXCLUDES="--workspace"
 
 cargo test $EXCLUDES --lib --bins             # test suite, as CI runs it
-cargo test -p ghost-np-relay                  # a single crate
+cargo test -p ghost-common                    # a single crate
 cargo clippy $EXCLUDES --all-targets --all-features -- -D warnings
 cargo fmt --all                               # format
 cargo audit                                   # dependency advisory check
@@ -145,8 +171,8 @@ own:
 ## Documentation
 
 Protocol and operator documentation is published at
-<https://bitcoinghost.org/docs/>, covering Ghost Keys, Ghost Haze, the Reaper,
-and deployment. The node pool is specified in `docs/NODE_POOL_SPEC.md`.
+<https://bitcoinghost.org>. Ghost Pool is described in `docs/SOLO.md`; the node pool's
+share chain it replaced is archived in `docs/NODE_POOL_SPEC.md`.
 
 ## Contributing
 
