@@ -3,8 +3,10 @@
 # Self-test for `install-node.sh --uninstall` (and `--purge`).
 #
 # What must hold: the units, timers, drop-ins, /opt/ghost, the firewall rules the installer opened,
-# its sudoers files and the release channel marker go; the node's data stays (the chain,
-# node-pool.db, node.key, the configs, the backups) unless --purge is given; 22/tcp is never
+# its sudoers files and the release channel marker go, and so does what an older (node pool)
+# install left (the lister's unit, the relay's firewall rule); the node's data stays (the chain,
+# the miner statistics and found blocks, node.key, the configs, the backups) unless --purge is
+# given; 22/tcp is never
 # closed; and nothing happens without a confirmation, which a script gives with --yes.
 #
 # Hermetic: the installer's NP_UNINSTALL block is run against a throwaway root (UNINSTALL_ROOT),
@@ -37,7 +39,7 @@ make_node() {
     for u in ghostd.service ghost-mining.service ghost-mining-gate.service sri-pool.service sri-translator.service \
              ghost-dashboard.service ghost-auto-update.service ghost-auto-update.timer ghost-restart-watch.service \
              ghost-restart-watch.timer ghost-backup.service ghost-backup.timer ghost-mining-firewall.service \
-             ghost-mining-firewall.path; do echo "[Unit]" > "$r/etc/systemd/system/$u"; done
+             ghost-mining-firewall.path ghost-lister.service; do echo "[Unit]" > "$r/etc/systemd/system/$u"; done
     mkdir -p "$r/etc/systemd/system/ghost-dashboard.service.d" "$r/etc/systemd/system/ghost-mining.service.d" \
              "$r/etc/systemd/system/ghost-auto-update.service.d"
     echo x > "$r/etc/systemd/system/ghost-dashboard.service.d/internal-auth.conf"
@@ -58,6 +60,7 @@ make_node() {
     echo x > "$r/etc/systemd/journald.conf.d/10-ghost.conf"
     echo key > "$r/home/ghost/.ghost/node.key"
     echo db > "$r/var/lib/ghost/node-pool.db"
+    mkdir -p "$r/var/lib/ghost/solo"; echo '{}' > "$r/var/lib/ghost/solo/blocks-found.json"
     echo chain > "$r/var/lib/bitcoin/signet/blocks"
     echo gz > "$r/var/backups/ghost/db/ghost-202611030300.db.gz"
     echo "$r"
@@ -87,7 +90,8 @@ echo "1. --uninstall --yes keeps the data"
 uninstall keep false true
 is "exits 0" 0 "$(cat "$R/rc")"
 for u in ghostd.service ghost-mining.service ghost-mining-gate.service sri-pool.service sri-translator.service \
-         ghost-dashboard.service ghost-auto-update.timer ghost-restart-watch.timer ghost-backup.timer ghost-mining-firewall.path; do
+         ghost-dashboard.service ghost-auto-update.timer ghost-restart-watch.timer ghost-backup.timer ghost-mining-firewall.path \
+         ghost-lister.service; do
     is "unit $u removed" gone "$(gone "/etc/systemd/system/$u")"
     has "... after it was disabled and stopped" "systemctl disable --now $u" "$(calls)"
 done
@@ -106,14 +110,15 @@ for f in /etc/sudoers.d/ghost-autoupdate /etc/sudoers.d/ghost-backup-offsite /et
     is "$f removed" gone "$(gone "$f")"
 done
 is "another sudoers file is left alone" present "$(gone /etc/sudoers.d/someone-else)"
-for f in /var/lib/bitcoin/signet/blocks /var/lib/ghost/node-pool.db /home/ghost/.ghost/node.key /etc/ghost/pool.toml \
+for f in /var/lib/bitcoin/signet/blocks /var/lib/ghost/solo/blocks-found.json /var/lib/ghost/node-pool.db /home/ghost/.ghost/node.key /etc/ghost/pool.toml \
          /etc/ghost/pool-config.toml /etc/ghost/dashboard.env /etc/bitcoin/bitcoin.conf /var/backups/ghost/db/ghost-202611030300.db.gz; do
     is "kept: $f" present "$(gone "$f")"
 done
 is "the ghost user is kept" 0 "$(calls | $G -c userdel || true)"
 out="$(cat "$R/out")"
 has "it says what it kept" "Kept (installing again reuses all of it):" "$out"
-has "... naming node-pool.db" "node-pool.db (share chain and ledger)" "$out"
+has "... naming the found blocks" "solo/ (miner statistics, found blocks)" "$out"
+has "... it says it removed the Ghost Pool node" "Ghost Pool node removed. Kept" "$out"
 has "... and node.key" ".ghost/node.key (node identity)" "$out"
 has "... and how to delete it too" "--uninstall --purge" "$out"
 

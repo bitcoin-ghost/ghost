@@ -109,7 +109,7 @@ resolve() { ( GHOST_NP_RELEASES_API_URL="$2"; source "$TMP/np.sh"; np_resolve_re
 is "np-latest resolves to the newest np- release"  "np-v1.1.0" "$(resolve np-latest "file://$TMP/list.json")"
 is "an exact np- tag is taken as given"            "np-v1.0.0" "$(resolve np-v1.0.0 "file://$TMP/list.json")"
 is "an exact np- rc tag is taken as given"         "np-v1.2.0-rc1" "$(resolve np-v1.2.0-rc1 "file://$TMP/list.json")"
-case "$(resolve np-latest "file://$TMP/list-none.json")" in *"no node pool release"*) r=refused;; *) r=accepted;; esac
+case "$(resolve np-latest "file://$TMP/list-none.json")" in *"no Ghost Pool release"*) r=refused;; *) r=accepted;; esac
 is "np-latest with only old releases and drafts is refused" refused "$r"
 case "$(resolve np-latest "file://$TMP/missing.json")" in *"could not fetch"*) r=refused;; *) r=accepted;; esac
 is "np-latest with no list is refused" refused "$r"

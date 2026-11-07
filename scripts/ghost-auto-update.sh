@@ -280,7 +280,7 @@ read_node_height() {
 }
 
 # ghost-mining answers /health. ⛔ Not its peer_count any more: that was the node pool's share-chain
-# relay peers, which no Ghost Solo node has, so it stays null and would roll back every update.
+# relay peers, which no Ghost Pool node has, so it stays null and would roll back every update.
 # pool_sv2 and the translator are checked by health_stratum (their listening ports).
 health_ghost_pool() {
   local h=""

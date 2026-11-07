@@ -159,25 +159,22 @@ is "pool_sv2 not installed"        absent            "$(ver pool_sv2)"
 is "translator_sv2 not installed"  absent            "$(ver translator_sv2)"
 is "start order"                   "ghostd ghost-mining" "$(order start)"
 
-echo "E. the relay-peer health check: a node pool node may have no peers"
-# read_peer_count and health_ghost_pool, run against a stand-in for ghost-mining's /health.
-fns="$(awk '/^read_peer_count\(\) \{$/,/^\}$/{print} /^health_ghost_pool\(\) \{$/,/^\}$/{print}' "$UPDATER")"
-is "both functions are present" 2 "$(printf '%s\n' "$fns" | $G -cE '^(read_peer_count|health_ghost_pool)\(\) \{$' || true)"
-# shellcheck disable=SC2034  # PEERS_BEFORE is read by the eval'd health_ghost_pool
-peers_health() {   # BEFORE AFTER_JSON: health_ghost_pool's verdict
+echo "E. the ghost-mining health check: it answers /health (no relay peers on a Ghost Pool node)"
+# read_node_height and health_ghost_pool, run against a stand-in for ghost-mining's /health.
+fns="$(awk '/^read_node_height\(\) \{$/,/^\}$/{print} /^health_ghost_pool\(\) \{$/,/^\}$/{print}' "$UPDATER")"
+is "both functions are present" 2 "$(printf '%s\n' "$fns" | $G -cE '^(read_node_height|health_ghost_pool)\(\) \{$' || true)"
+node_health() {   # AFTER_JSON: health_ghost_pool's verdict
     ( log() { :; }; err() { echo "ERR $*"; }; sleep() { :; }; seq() { echo 1; echo 2; }
       curl() { [ -n "$HEALTH" ] && printf '%s' "$HEALTH"; }
-      eval "$fns"; PEERS_BEFORE="$1" HEALTH="$2"
+      eval "$fns"; HEALTH="$1"
       if health_ghost_pool; then echo ok; fi ) 2>&1 | tail -1
 }
-is "no peers before, none after: healthy"              ok "$(peers_health 0 '{"response":{"peer_count":0}}')"
-is "peers before and after: healthy"                   ok "$(peers_health 2 '{"response":{"peer_count":1}}')"
-has "peers before, none after: rolls back"             "it had 2 before the update" "$(peers_health 2 '{"response":{"peer_count":0}}')"
-has "no count at all (pool_sv2 down): rolls back"      "reports no peer count" "$(peers_health 0 '{"response":{"peer_count":null}}')"
-has "ghost-mining not answering: rolls back"           "reports no peer count" "$(peers_health 0 '')"
-is "unknown before (ghost-mining was down): a count is enough" ok "$(peers_health '' '{"response":{"peer_count":0}}')"
-is "the count is read before anything is stopped" yes \
-   "$(awk '/^  PEERS_BEFORE="\$\(read_peer_count\)"$/{p=NR} /^  stop_all \|\| \{/{if(!s)s=NR} END{print (p && s && p<s)?"yes":"no"}' "$UPDATER")"
+is "ghost-mining answers with a height: healthy"        ok "$(node_health '{"response":{"block_height":974500,"peer_count":null}}')"
+is "a node with no relay peers at all is healthy"       ok "$(node_health '{"response":{"block_height":0,"peer_count":0}}')"
+has "ghost-mining not answering: rolls back"            "ghost-mining /health does not answer" "$(node_health '')"
+has "an answer without a height: rolls back"            "ghost-mining /health does not answer" "$(node_health '{"response":{"peer_count":3}}')"
+is "the updater no longer reads relay peers" 0 "$($G -cE 'read_peer_count|PEERS_BEFORE|"peer_count"' "$UPDATER" || true)"
+is "nor restarts the removed lister" 0 "$($G -c 'ghost-lister' "$UPDATER" || true)"
 
 echo "F. the node dashboard moves with a node pool release"
 # make_np_release DIR DASH(yes|no|badsum) — np-v1.0.1 with the full stack, and the dashboard.

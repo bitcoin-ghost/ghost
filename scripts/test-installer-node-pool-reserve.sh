@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 #
-# Self-test for the installer's node pool block reserve.
+# Self-test for the installer's block reserve (Ghost Pool).
 #
-# ghostd's default block reserve (8,000 WU) has no room for the node pool's coinbase, which runs
-# to 22 KB: regtest lost a block at 2.25 KB on a full template. The node pool is the only mode, so
-# the installer always writes blockreservedweight=90000 into bitcoin.conf. Asserted here, against
-# the installer's OWN text:
+# ghostd's `blockreservedweight` is the weight getblocktemplate leaves free for the header, the
+# transaction count and the coinbase; ghost-mining trims a template so a coinbase of up to
+# ghost_common::solo::MAX_COINBASE_BYTES fits, and the reserve is sized from it
+# (ghost_common::solo::BLOCK_RESERVED_WEIGHT). Asserted here, against the installer's OWN text:
 #   1. --node-pool, which used to switch the reserve on, is still accepted and does nothing;
 #   2. the bitcoin.conf write carries the line exactly once on every network, inside the chain's
 #      section on signet and regtest, and the mainnet-only assumevalid only on mainnet;
-#   3. the value matches NODE_POOL_BLOCK_RESERVED_WEIGHT in the Rust constants.
+#   3. the value matches BLOCK_RESERVED_WEIGHT in ghost_common::solo.
 #
 # Hermetic: the installer is never run; its pieces are extracted and run against a temp file.
 set -uo pipefail
@@ -46,13 +46,18 @@ is "the write step is present" yes "$([ -n "$step" ] && echo yes)"
 conf="$TMP/bitcoin.conf"
 run_step() {
     # shellcheck disable=SC2034  # read by the extracted step
-    ( NETWORK="$1" SIGNET_CHALLENGE="" BITCOIN_PEERS="" ARCHIVE=false SYNC_MODE=ibd RPCPW=pw NP_P2P_PORT="$2" ASSUMEVALID=00ab
+    ( NETWORK="$1" SIGNET_CHALLENGE="" BITCOIN_PEERS="" RPC_ALLOW="" ARCHIVE=false SYNC_MODE=ibd RPCPW=pw NP_P2P_PORT="$2" ASSUMEVALID=00ab
+      pf_mem_mb() { echo 8000; }
+      eval "$(sed -n '/^np_dbcache() {$/,/^}$/p' "$INSTALLER")"
       eval "${step//\/etc\/bitcoin\/bitcoin.conf/$conf}" )
 }
+rust_value="$($G -oE 'BLOCK_RESERVED_WEIGHT: u64 = [0-9_]+' "$CONSTANTS" | $G -oE '[0-9_]+$' | tr -d _)"
+is "the Rust constant is found" yes "$([[ "$rust_value" =~ ^[0-9]+$ ]] && echo yes)"
 for n in mainnet:8333 signet:38333 regtest:18444; do
     net="${n%%:*}"; port="${n##*:}"
     run_step "$net" "$port"
-    is "$net: one blockreservedweight=90000" 1 "$($G -cx 'blockreservedweight=90000' "$conf" || true)"
+    is "$net: one blockreservedweight=$rust_value" 1 "$($G -cx "blockreservedweight=$rust_value" "$conf" || true)"
+    is "$net: no other blockreservedweight" 1 "$($G -c '^blockreservedweight=' "$conf" || true)"
     is "$net: P2P port $port" 1 "$($G -cx "port=$port" "$conf" || true)"
     if [ "$net" = mainnet ]; then
         is "mainnet: no chain section" 0 "$($G -c '^chain=\|^\[' "$conf" || true)"
@@ -68,8 +73,7 @@ done
 
 echo "3. the value"
 shell_value="$(printf '%s\n' "$step" | $G -oE 'blockreservedweight=[0-9]+' | cut -d= -f2)"
-rust_value="$($G -oE 'BLOCK_RESERVED_WEIGHT: u64 = [0-9_]+' "$CONSTANTS" | $G -oE '[0-9_]+$' | tr -d _)"
-is "the installer writes 90000" 90000 "$shell_value"
+is "the installer writes one value" yes "$([[ "$shell_value" =~ ^[0-9]+$ ]] && echo yes)"
 is "it matches the Rust constant" "$rust_value" "$shell_value"
 
 echo
