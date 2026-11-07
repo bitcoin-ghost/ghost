@@ -16,7 +16,7 @@ use stratum_apps::stratum_core::{
 #[tokio::test]
 async fn test_sniffer_interception() {
     start_tracing();
-    let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
+    let (tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
     let ignore_message =
         IgnoreMessage::new(MessageDirection::ToDownstream, MESSAGE_TYPE_NEW_TEMPLATE);
     let setup_connection_message =
@@ -65,7 +65,8 @@ async fn test_sniffer_interception() {
         vec![setup_connection_replacement.into()],
         None,
     );
-    let (pool, _, _) = start_pool(sv2_tp_config(sniffer_b_addr), vec![], vec![], false).await;
+    // Sniffer A drops every NewTemplate, so this pool never gets one and never listens.
+    let pool = start_pool_without_templates(sv2_tp_config(sniffer_b_addr), tp.bitcoin_core()).await;
     sniffer_a
         .wait_for_message_type(MessageDirection::ToUpstream, MESSAGE_TYPE_SETUP_CONNECTION)
         .await;
@@ -110,9 +111,16 @@ async fn test_sniffer_interception() {
 #[tokio::test]
 async fn test_sniffer_wait_for_message_type_with_remove() {
     start_tracing();
-    let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
+    let (tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
     let (sniffer, sniffer_addr) = start_sniffer("", tp_addr, false, vec![], None);
-    let (pool, _, _) = start_pool(sv2_tp_config(sniffer_addr), vec![], vec![], false).await;
+    let (pool, _, _) = start_pool(
+        sv2_tp_config(sniffer_addr),
+        tp.bitcoin_core(),
+        vec![],
+        vec![],
+        false,
+    )
+    .await;
     assert!(
         sniffer
             .wait_for_message_type_and_clean_queue(

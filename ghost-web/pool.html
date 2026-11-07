@@ -1,52 +1,34 @@
-<!-- Bitcoin Ghost · Pool -->
+<!-- Bitcoin Ghost — bitcoinghost.org -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Pool · Bitcoin Ghost</title>
-  <meta name="description" content="Ghost Pool — flat 1% fee on subsidy + transaction fees, miners keep 99% shared by work, every node runs its own policy.">
+  <title>Pool status · Bitcoin Ghost</title>
+  <meta name="description" content="Live status of the Bitcoin Ghost node pool: share-chain tip, hashrate, miners and blocks found.">
   <meta property="og:site_name" content="Bitcoin Ghost">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="Ghost Pool · Bitcoin Ghost">
-  <meta property="og:description" content="Decentralised mining pool on Bitcoin Ghost. Live leaderboard, ledger-model payouts, BFT-voted coinbase — no operator, no fee.">
+  <meta property="og:title" content="Pool status · Bitcoin Ghost">
+  <meta property="og:description" content="Live status of the Bitcoin Ghost node pool: share-chain tip, hashrate, miners and blocks found.">
   <meta property="og:url" content="https://bitcoinghost.org/pool.html">
   <meta property="og:image" content="https://bitcoinghost.org/logo.png">
   <meta name="twitter:card" content="summary">
   <meta name="twitter:site" content="@defenwycke">
   <meta name="twitter:creator" content="@defenwycke">
-  <meta name="twitter:title" content="Ghost Pool · Bitcoin Ghost">
-  <meta name="twitter:description" content="Decentralised mining pool on Bitcoin Ghost. Live leaderboard, ledger-model payouts, BFT-voted coinbase — no operator, no fee.">
+  <meta name="twitter:title" content="Pool status · Bitcoin Ghost">
+  <meta name="twitter:description" content="Live status of the Bitcoin Ghost node pool: share-chain tip, hashrate, miners and blocks found.">
   <meta name="twitter:image" content="https://bitcoinghost.org/logo.png">
-  <!-- The Quasar tab is the DEFAULT view and renders through three.js. It is SELF-HOSTED
-       (#686): it used to come from unpkg, so every visitor pulled 257 KB gzipped from a third
-       party — ~10x this page — before the default view could render, and the default tab did
-       not render at all if unpkg was slow, rate-limited or blocked on their network. importmap
-       has no `integrity`, so it was unpinned against tampering too.
-       Same-origin now, over the connection already open for the page itself. modulepreload
-       still matters: without it the browser cannot start the download until it has parsed the
-       importmap and reached the module script near the end of the body.
-       ⚠ This does not make it smaller — self-hosting or lazy-loading it behind the tab switch
-       would, and both are worth considering; this only stops it starting late. -->
-  <link rel="modulepreload" href="/vendor/three@0.160.0/build/three.module.js">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/style.css?v=20260422">
+  <link rel="stylesheet" href="/style.css?v=20261102">
   <script>
     (function () {
-      var saved = localStorage.getItem('ghost-theme');
+      var saved = null;
+      try { saved = localStorage.getItem('ghost-theme'); } catch (e) {}
       var system = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
       document.documentElement.setAttribute('data-theme', saved || system);
     })();
-  </script>
-  <script type="importmap">
-  {
-    "imports": {
-      "three": "/vendor/three@0.160.0/build/three.module.js",
-      "three/addons/": "/vendor/three@0.160.0/examples/jsm/"
-    }
-  }
   </script>
 </head>
 <body>
@@ -61,17 +43,16 @@
       </svg>
       <span class="wordmark">bitcoinghost</span>
     </a>
+
     <nav class="primary">
       <a href="/">overview</a>
-      <a href="/core.html">core</a>
       <a href="/pool.html" class="current">pool</a>
-      <a href="/pay.html">pay</a>
       <a href="/nodes.html">nodes</a>
-      <a href="/hazync.html">hazync</a>
       <a href="/miners.html">miners</a>
       <a href="/downloads.html">downloads</a>
       <a href="/docs/">docs</a>
     </nav>
+
     <div class="utils">
       <a href="https://github.com/bitcoin-ghost" class="bare icon-btn" aria-label="GitHub">
         <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
@@ -83,246 +64,100 @@
   </div>
 </header>
 
-<section class="hero">
+<!-- NOT READY banner. Remove only after Phases 3 and 4 of docs/NODE_POOL_PLAN.md pass. -->
+<div class="np-banner" role="note">
   <div class="container">
-    <span class="eyebrow">Pool</span>
-    <h1>Ghost Pool.</h1>
-    <p class="lead">Decentralised mining. 1% fee. SV1 + SV2.</p>
-    <div class="hero-actions">
-      <a href="/miners.html" class="btn btn-primary">Connect a miner <span class="arrow">→</span></a>
-      <a href="#your-miner" class="btn btn-ghost">Your stats</a>
-    </div>
-  </div>
-</section>
-
-<section class="pool-metrics">
-  <div class="container">
-    <div class="pool-metric">
-      <span class="label">pool hashrate</span>
-      <span class="value" id="m-hashrate">—</span>
-    </div>
-    <div class="pool-metric">
-      <span class="label">active miners</span>
-      <span class="value" id="m-miners">—</span>
-    </div>
-    <div class="pool-metric">
-      <span class="label">blocks found</span>
-      <span class="value" id="m-blocks">—</span>
-    </div>
-    <div class="pool-metric">
-      <span class="label">block height</span>
-      <span class="value" id="m-height">—</span>
-    </div>
-  </div>
-</section>
-
-<div class="rl-notice-wrap">
-  <div class="container">
-    <div class="rl-notice" id="rl-notice" role="status" aria-live="polite">
-      <span class="rl-dot"></span>
-      <span class="rl-text">Statistics API is exceeding rate limits. Limits will reset soon.</span>
-    </div>
+    <strong>NOT READY</strong> The node pool is under construction and has not run on signet or mainnet. No block has ever been found and no payout ever made. Do not point hashrate at it. <a href="/docs/#honest-reading">Before you mine →</a>
   </div>
 </div>
 
-<section class="viz-section">
+<section class="hero">
   <div class="container">
-    <div class="viz-tabs">
-      <button class="active" data-viz="quasar">Quasar</button>
-      <button data-viz="hashrate">Hashrate</button>
-      <button data-viz="miners">Miners</button>
-    </div>
-
-    <div class="viz-panel active" data-viz-panel="quasar">
-      <div class="quasar-frame" id="quasar-frame">
-        <canvas id="quasar-canvas"></canvas>
-        <div class="quasar-readout">
-          <span class="v" id="q-hash">—</span>
-          <span class="sep">·</span>
-          <span class="v" id="q-miners">—</span> miners
-          <span class="sep">·</span>
-          last block <span class="v" id="q-clock">0:00</span> ago
-        </div>
-        <div class="qbanner" id="q-banner"><span id="q-banner-text"></span><span class="sub" id="q-banner-sub"></span></div>
-        <button class="quasar-expand" id="quasar-expand" type="button" aria-label="Expand to fullscreen">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <path id="quasar-expand-icon" d="M3 9V3h6M21 9V3h-6M3 15v6h6M21 15v6h-6"/>
-          </svg>
-        </button>
-      </div>
-    </div>
-
-    <div class="viz-panel" data-viz-panel="hashrate">
-      <div class="chart-frame">
-        <div class="chart-legend">
-          <span class="k">latest</span><span class="v" id="hashrate-latest">—</span>
-          <span class="k">peak</span><span class="v" id="hashrate-peak">—</span>
-          <span class="k">window</span><span class="v" id="hashrate-window">—</span>
-        </div>
-        <svg id="hashrate-chart"></svg>
-      </div>
-    </div>
-
-    <div class="viz-panel" data-viz-panel="miners">
-      <div class="chart-frame">
-        <div class="chart-legend">
-          <span class="k">latest</span><span class="v" id="miners-latest">—</span>
-          <span class="k">peak</span><span class="v" id="miners-peak">—</span>
-          <span class="k">window</span><span class="v" id="miners-window">—</span>
-        </div>
-        <svg id="miners-chart"></svg>
-      </div>
-    </div>
-  </div>
-</section>
-
-<section class="block your-miner" id="your-miner">
-  <div class="container">
-    <div class="section-label">your miner</div>
-    <h2 class="section-title">Look up your hashrate, workers and shares.</h2>
-    <p class="section-lead">
-      Enter the full miner ID in the form <code>address.workername</code>
-      (the string your ASIC is authorising with). Exact match only — no
-      enumeration. We remember your last query in this browser.
-    </p>
-    <div class="miner-lookup">
-      <input type="text" id="miner-query" placeholder="bc1q…yourAddress.bitaxe1">
-      <button id="miner-search">Look up</button>
-    </div>
-    <div id="miner-result"></div>
-  </div>
-</section>
-
-<section class="block records-section">
-  <div class="container">
-    <div class="section-label">records</div>
-    <h2 class="section-title">Best hashes, by window.</h2>
-    <p class="section-lead">
-      Lowest-value share hash the pool has submitted per time window — the
-      rarer the hash (more leading zeros), the closer it came to being an
-      actual block.
-    </p>
-    <div class="records-strip">
-      <div class="record-tile" id="rec-tile-block">
-        <div class="label">last 10 min</div>
-        <div class="value" id="rec-block">—</div>
-        <div class="meta" id="rec-block-meta">&nbsp;</div>
-      </div>
-      <div class="record-tile" id="rec-tile-day">
-        <div class="label">last day</div>
-        <div class="value" id="rec-day">—</div>
-        <div class="meta" id="rec-day-meta">&nbsp;</div>
-      </div>
-      <div class="record-tile" id="rec-tile-week">
-        <div class="label">last week</div>
-        <div class="value" id="rec-week">—</div>
-        <div class="meta" id="rec-week-meta">&nbsp;</div>
-      </div>
-      <div class="record-tile" id="rec-tile-month">
-        <div class="label">last month</div>
-        <div class="value" id="rec-month">—</div>
-        <div class="meta" id="rec-month-meta">&nbsp;</div>
-      </div>
-    </div>
-  </div>
-</section>
-
-<section class="block leaderboard-section">
-  <div class="container">
-    <div class="section-label">leaderboards</div>
-    <h2 class="section-title">Who's on top.</h2>
-    <p class="section-lead">
-      Top miners by highest share difficulty reached and by total shares
-      contributed over the window. Pool-wide — merged across every node.
-    </p>
-
-    <div class="lb-controls">
-      <div class="viz-tabs lb-tabs">
-        <button class="active" data-lb="best_hash">Best hash</button>
-        <button data-lb="shares">Shares contributed</button>
-      </div>
-      <div class="lb-window">
-        <label for="lb-window">window</label>
-        <select id="lb-window">
-          <option value="day" selected>last day</option>
-          <option value="week">last week</option>
-          <option value="month">last month</option>
-        </select>
-      </div>
-    </div>
-
-    <div class="lb-table-wrap">
-      <table class="lb-table" id="lb-table"><tbody></tbody></table>
-    </div>
-  </div>
-</section>
-
-<section class="block payout-section">
-  <div class="container">
-    <div class="section-label">next block payout</div>
-    <h2 class="section-title">In line to get paid.</h2>
-    <p class="section-lead">
-      The ledger. Every share you submit accumulates on your unpaid balance.
-      When a block is found the top 200 miners by unpaid work (filtered to
-      those above the 546-sat dust threshold) get included in the coinbase,
-      proportional to their share. Everyone else keeps their ledger intact
-      and carries it forward to compete for the next block. Your unpaid
-      work never expires while you keep mining — it is only reclaimed if a
-      miner goes completely dark for over a year.
-    </p>
-
-    <div class="payout-summary">
-      <div class="ps-tile">
-        <div class="k">block subsidy</div>
-        <div class="v" id="py-subsidy">—</div>
-      </div>
-      <div class="ps-tile">
-        <div class="k">miner pool <span class="sub">99%</span></div>
-        <div class="v accent" id="py-miner-pool">—</div>
-      </div>
-      <div class="ps-tile">
-        <div class="k">treasury <span class="sub">0.5%</span></div>
-        <div class="v" id="py-treasury">—</div>
-      </div>
-      <div class="ps-tile">
-        <div class="k">node reward pool <span class="sub">0.5%</span></div>
-        <div class="v" id="py-node-pool">—</div>
-      </div>
-    </div>
-
-    <div class="payout-meta">
-      <span>block <span id="py-height">—</span></span>
-      <span>·</span>
-      <span><span id="py-paid-this">—</span> in next coinbase</span>
-      <span>·</span>
-      <span><span id="py-miners">—</span> on the ledger</span>
-    </div>
-
-    <div class="lb-table-wrap payout-wrap">
-      <table class="lb-table payout-table" id="py-table"><tbody></tbody></table>
-    </div>
-    <div class="payout-note">
-      Ledger model — your unpaid work carries forward across blocks until
-      you're included in a coinbase. Miners below the <code>546</code>-sat
-      dust line are skipped for that block and their ledger stays intact.
-      Unpaid shares are only reclaimed into the node reward pool if a miner
-      has been dark for over a year.
-    </div>
-  </div>
-</section>
-
-<section class="block connect-cta" style="border-bottom:none">
-  <div class="container">
-    <div class="section-label">get started</div>
-    <h2 class="section-title">Ready to connect?</h2>
-    <p class="section-lead">
-      Stratum V1 or V2. Any ASIC. No registration. No KYC. Point and
-      connect to a node offering a public pool or run your own node and
-      build your own block templates to mine.
+    <span class="eyebrow">pool status</span>
+    <h1>Live node pool status.</h1>
+    <p class="lead">
+      What one node reports about the share chain and the pool. Until the node pool launches there is little or
+      nothing to show, and that is the honest reading.
     </p>
     <div class="hero-actions">
-      <a href="/miners.html" class="btn btn-primary">Connection guide <span class="arrow">→</span></a>
-      <a href="/nodes.html" class="btn btn-ghost">Run a node</a>
+      <a href="#your-miner" class="btn btn-primary">Your miner stats <span class="arrow">→</span></a>
+      <a href="/endpoints.html" class="btn btn-ghost">Node list</a>
+    </div>
+  </div>
+</section>
+
+<section class="block" id="your-miner" style="padding: 40px 0;">
+  <div class="container">
+    <div class="section-label">your miner</div>
+    <form action="/miner.html" method="get" class="np-lookup">
+      <label for="np-lookup-id" class="np-status-note">Payout address, or address.worker: hashrate and shares per worker, balance over time, your place in the payout queue and every payout</label>
+      <div class="hero-actions" style="margin-top:8px;">
+        <input id="np-lookup-id" name="address" type="text" required autocomplete="off" spellcheck="false" placeholder="bc1q…" class="np-lookup-input">
+        <button type="submit" class="btn btn-primary">Look up <span class="arrow">→</span></button>
+      </div>
+    </form>
+  </div>
+</section>
+
+<div data-np-status data-status-url="/api/v1/node-pool/status">
+<section class="metrics">
+  <div class="container">
+    <div class="metric"><div class="label">share-chain tip</div><div class="value" data-np-field="tip_height">—</div></div>
+    <div class="metric"><div class="label">bitcoin height</div><div class="value" data-np-field="btc_height">—</div></div>
+    <div class="metric"><div class="label">pool hashrate</div><div class="value" data-np-field="hashrate">—</div></div>
+    <div class="metric"><div class="label">network tier</div><div class="value" data-np-field="network_tier">—</div></div>
+  </div>
+</section>
+<section class="metrics" style="border-top:none;">
+  <div class="container">
+    <div class="metric"><div class="label">relay peers</div><div class="value" data-np-field="peers">—</div></div>
+    <div class="metric"><div class="label">connected miners</div><div class="value" data-np-field="miners">—</div></div>
+    <div class="metric"><div class="label">blocks found</div><div class="value" data-np-field="blocks_found">—</div></div>
+    <div class="metric"><div class="label">total owed</div><div class="value" data-np-field="owed_sats">—</div></div>
+  </div>
+</section>
+
+<section class="block">
+  <div class="container">
+    <div class="section-label">about these numbers</div>
+    <h2 class="section-title">One node's view, read live.</h2>
+    <p class="np-status-note" data-np-updated>Loading live status…</p>
+    <div class="np-prose">
+      <p>These come from <code>GET /api/v1/node-pool/status</code> on a node pool node, polled every 30 seconds.
+      If it does not answer, every tile reads <strong>unavailable</strong>; a tile the node does not report reads —.
+      Nothing is filled in.</p>
+      <p>One tile is an estimate, and says what from: the <strong>pool hashrate</strong> is the work of every share credited
+      on the share chain over the last 144 Bitcoin blocks (a share credited at tier <em>t</em> stands for 2<sup><em>t</em></sup>
+      difficulty-1 shares, about 2<sup>32</sup> hashes each), divided by 144 blocks of ten minutes. It is exact work, not a guess
+      from blocks found, but Bitcoin's blocks are not exactly ten minutes apart, so it can be a few percent off. A node that has
+      pruned part of that day says <strong>not measured</strong>. <strong>Relay peers</strong> and <strong>connected miners</strong>
+      are this node's own; the rest are the pool's.</p>
+      <p>Every node computes the same ledger from the same share chain, so any honest node should give the same balances,
+      the same <strong>total owed</strong> (every balance summed) and the same hashrate.
+      A node that is still syncing, or cut off from its peers, can lag.</p>
+      <p>The <strong>blocks found</strong> count is the node pool's. It has never found a block.</p>
+    </div>
+    <details class="np-raw">
+      <summary>Raw response</summary>
+      <pre data-np-raw>(loading)</pre>
+    </details>
+  </div>
+</section>
+</div>
+
+<section class="block" style="border-bottom: none;">
+  <div class="container">
+    <div class="section-label">read this first</div>
+    <h2 class="section-title">Before you mine.</h2>
+    <ul class="np-honest">
+      <li><strong>No block has ever been found</strong> by the node pool.</li>
+      <li><strong>No payout has ever been made.</strong></li>
+      <li><strong>Your balance may stay unpaid for a long time.</strong></li>
+      <li><strong>An unaudited node can cheat you.</strong> The tool to audit one, <code>ghost-audit</code>, is built but not released yet.</li>
+      <li><strong>If you need steady income, use an established pool.</strong></li>
+    </ul>
+    <div class="hero-actions">
+      <a href="/docs/#honest-reading" class="btn btn-ghost">The full reading <span class="arrow">→</span></a>
     </div>
   </div>
 </section>
@@ -332,18 +167,47 @@
     <div class="colophon">
       <div class="brand">
         <svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="width:22px;height:22px;">
-          <path d="M9 10h.01"/>
-          <path d="M15 10h.01"/>
-          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
+        <path d="M9 10h.01"/>
+        <path d="M15 10h.01"/>
+        <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
         </svg>
         <span class="wordmark">bitcoinghost</span>
       </div>
       <div class="meta">Open source under the MIT license. No ICO, no foundation, no venture money.</div>
     </div>
-    <div><h4>Core</h4><ul></ul></div>
-    <div><h4>Pool</h4><ul></ul></div>
-    <div><h4>Pay</h4><ul></ul></div>
-    <div><h4>Products</h4><ul></ul></div>
+    <div>
+      <h4>Node pool</h4>
+      <ul>
+        <li><a href="/">How it works</a></li>
+        <li><a href="/pool.html">Pool status</a></li>
+        <li><a href="/endpoints.html">Node list</a></li>
+        <li><a href="/miner.html">Miner stats</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Mine</h4>
+      <ul>
+        <li><a href="/miners.html">Point a miner</a></li>
+        <li><a href="/miners.html#firmware">Firmware</a></li>
+        <li><a href="/docs/#payouts">Payout rule</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Run a node</h4>
+      <ul>
+        <li><a href="/nodes.html">Run a node</a></li>
+        <li><a href="/downloads.html">Downloads</a></li>
+        <li><a href="/docs/#deployment">Deployment</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Read first</h4>
+      <ul>
+        <li><a href="/docs/#honest-reading">Before you mine</a></li>
+        <li><a href="/docs/#ghost-audit">Auditing a node</a></li>
+        <li><a href="/security.html">Security</a></li>
+      </ul>
+    </div>
     <div>
       <h4>Project</h4>
       <ul>
@@ -357,7 +221,6 @@
 </footer>
 
 <script>
-  // Theme toggle
   (function () {
     var html = document.documentElement;
     var btn = document.getElementById('theme-toggle');
@@ -368,1477 +231,13 @@
     btn.addEventListener('click', function () {
       var next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
       html.setAttribute('data-theme', next);
-      localStorage.setItem('ghost-theme', next);
+      try { localStorage.setItem('ghost-theme', next); } catch (e) {}
       render();
     });
   })();
-
-  // Viz toggle (Quasar / Hashrate / Miners)
-  // Scope selector to `[data-viz]` so the shared `.viz-tabs` class on the
-  // leaderboard tabs doesn't match here — otherwise clicking an lb tab
-  // hides every viz panel and throws on `data-viz-panel="undefined"`.
-  (function () {
-    var btns = document.querySelectorAll('.viz-tabs button[data-viz]');
-    var panels = document.querySelectorAll('.viz-panel');
-    btns.forEach(function (b) {
-      b.addEventListener('click', function () {
-        btns.forEach(function (x) { x.classList.remove('active'); });
-        panels.forEach(function (p) { p.classList.remove('active'); });
-        b.classList.add('active');
-        document.querySelector('.viz-panel[data-viz-panel="' + b.dataset.viz + '"]').classList.add('active');
-        renderCharts();
-      });
-    });
-  })();
-
-  function formatHashrate(ths) {
-    if (!isFinite(ths) || ths <= 0) return '0<span class="unit"> TH/s</span>';
-    if (ths < 0.001) return (ths * 1e6).toFixed(1) + '<span class="unit"> MH/s</span>';
-    if (ths < 1)     return (ths * 1000).toFixed(1) + '<span class="unit"> GH/s</span>';
-    if (ths < 1000)  return ths.toFixed(2) + '<span class="unit"> TH/s</span>';
-    if (ths < 1e6)   return (ths / 1000).toFixed(2) + '<span class="unit"> PH/s</span>';
-    return (ths / 1e6).toFixed(2) + '<span class="unit"> EH/s</span>';
-  }
-
-  // ─── Sliding-window smoothers ──────────────────────────────────────────
-  // Damp poll-cycle jitter on numeric metrics. Each `smooth(key, raw)` call
-  // appends `raw` to the named ring buffer (default 8 samples ≈ 4 min at
-  // 30s polls) and returns a smoothed value:
-  //   • mode 'ema' (default)    — exponential moving average, alpha=0.35
-  //   • mode 'median'           — middle of the buffer, ideal for discrete
-  //                               counts where fractional EMAs look silly
-  // Drop-in: replace `raw` with `smooth('hashrate', raw)` at render time.
-  // The buffers live only in-memory — page refresh resets them, which keeps
-  // the smoothing honest after a real outage.
-  var __smoothers = {};
-  function smooth(key, raw, opts) {
-    opts = opts || {};
-    var maxN = opts.window || 8;
-    var mode = opts.mode || 'ema';
-    var alpha = opts.alpha != null ? opts.alpha : 0.35;
-    var s = __smoothers[key] || (__smoothers[key] = []);
-    if (raw != null && isFinite(raw)) s.push(raw);
-    while (s.length > maxN) s.shift();
-    if (!s.length) return null;
-    if (mode === 'median') {
-      var sorted = s.slice().sort(function (a, b) { return a - b; });
-      var mid = Math.floor(sorted.length / 2);
-      return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-    }
-    var v = s[0];
-    for (var i = 1; i < s.length; i++) v = alpha * s[i] + (1 - alpha) * v;
-    return v;
-  }
-  // Smooth a stored history series of [t, v] points into a new EMA series
-  // for charting. Same alpha as point-wise smoother so headline tile and
-  // chart line agree visually.
-  function smoothSeries(series, alpha) {
-    if (!series || !series.length) return [];
-    alpha = alpha != null ? alpha : 0.35;
-    var out = [series[0].slice()];
-    for (var i = 1; i < series.length; i++) {
-      out.push([series[i][0], alpha * series[i][1] + (1 - alpha) * out[i - 1][1]]);
-    }
-    return out;
-  }
-
-  var POOL_NODES = [
-    { id: 'vm1' }, { id: 'vm2' }, { id: 'vm3' }, { id: 'vm4' },
-    { id: 'vm5' }, { id: 'vm6' }, { id: 'vm7' }, { id: 'vm8' }
-  ];
-  // ───────── Server-side snapshot ─────────
-  // Every panel on this page used to fan out to all eight nodes itself: status, records,
-  // leaderboard and payout, at roughly 145 requests per minute PER VIEWER. The cost scaled with
-  // the number of people watching rather than with the data, and several of the underlying
-  // queries take seconds — `records?window=month` costs 7-20s and 504s at the proxy — so tiles
-  // arrived late, blanked on a transient failure, or never arrived at all.
-  //
-  // `ghost-stats` now does that fan-out once, server-side, on a cadence matched to each query's
-  // cost, and holds the merged result in memory. This page asks it one question a minute.
-  //
-  // The snapshot is ALWAYS last-good: a refresh that fails upstream leaves the previous answer
-  // standing rather than emptying it, and it survives a service restart via disk. So `summary`
-  // here can be treated as "the best answer that exists", never as "nothing yet" — which is why
-  // the panels below no longer need their own per-node failure handling.
-  var SUMMARY_URL = '/api/pool/summary';
-  var lastSummary = null;
-  var summaryInflight = null;
-
-  // One fetch per cycle shared by all four panels. Without this, four refreshers firing on the
-  // same interval would each issue their own request for the identical payload.
-  var lastSummaryAt = 0;
-  var SUMMARY_REUSE_MS = 5000;
-  function fetchSummary(force) {
-    if (summaryInflight && !force) return summaryInflight;
-    // The four panels are refreshed together. On the timer they share the in-flight promise, but
-    // at page load they are called one after another, so a short reuse window is what keeps a
-    // cold load to a single request instead of four identical ones.
-    if (!force && lastSummary && (Date.now() - lastSummaryAt) < SUMMARY_REUSE_MS) {
-      return Promise.resolve(lastSummary);
-    }
-    summaryInflight = fetch(SUMMARY_URL, { cache: 'no-store' })
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (d) {
-        if (d && d.ready) { lastSummary = d; lastSummaryAt = Date.now(); setRateLimited(false); }
-        return lastSummary;
-      })
-      .catch(function () {
-        // Keep whatever we last had. A failed poll is not evidence the pool is empty.
-        return lastSummary;
-      })
-      .then(function (d) { summaryInflight = null; return d; });
-    return summaryInflight;
-  }
-
-  var lastStats = { hashrate: 0, miners: 0, blocks: 0, height: 0, nodes: [] };
-
-  // History + charts — 24h window at 30s polling = 2880 points
-  var HISTORY_KEY = 'ghost-pool-history-v1';
-  var HISTORY_MAX = 2880;
-  var chartHistory = (function () {
-    try {
-      var raw = JSON.parse(localStorage.getItem(HISTORY_KEY)) || {};
-      return {
-        hashrate: Array.isArray(raw.hashrate) ? raw.hashrate : [],
-        miners:   Array.isArray(raw.miners)   ? raw.miners   : [],
-      };
-    } catch (e) { return { hashrate: [], miners: [] }; }
-  })();
-  function saveHistory() { try { localStorage.setItem(HISTORY_KEY, JSON.stringify(chartHistory)); } catch (e) {} }
-  function pushHistory(hashrate, miners) {
-    var now = Date.now();
-    chartHistory.hashrate.push([now, hashrate]);
-    chartHistory.miners.push([now, miners]);
-    while (chartHistory.hashrate.length > HISTORY_MAX) chartHistory.hashrate.shift();
-    while (chartHistory.miners.length > HISTORY_MAX) chartHistory.miners.shift();
-    saveHistory();
-  }
-
-  function formatWindow(series) {
-    if (series.length < 2) return '—';
-    var span = series[series.length-1][0] - series[0][0];
-    var mins = Math.round(span / 60000);
-    if (mins < 60) return mins + 'm';
-    return (mins / 60).toFixed(1) + 'h';
-  }
-
-  // Pick a "nice" upper-bound for the y-axis so the 4 gridlines at
-  // 25/50/75/100% of scale fall on round numbers (1/2/5 × 10^n scheme).
-  function niceScale(peak) {
-    if (peak <= 0) return 4;
-    var quarterExp = Math.pow(10, Math.floor(Math.log10(peak / 4)));
-    var quarterFrac = peak / 4 / quarterExp;
-    var step;
-    if      (quarterFrac <= 1) step = 1 * quarterExp;
-    else if (quarterFrac <= 2) step = 2 * quarterExp;
-    else if (quarterFrac <= 5) step = 5 * quarterExp;
-    else                        step = 10 * quarterExp;
-    return step * 4;
-  }
-
-  // Time axis label for a timestamp given the whole visible span.
-  function formatTimeLabel(ts, spanMs) {
-    var d = new Date(ts);
-    var hh = d.getHours().toString().padStart(2, '0');
-    var mm = d.getMinutes().toString().padStart(2, '0');
-    if (spanMs >= 2 * 24 * 3600 * 1000) {
-      return (d.getDate()) + '/' + (d.getMonth() + 1) + ' ' + hh + ':00';
-    }
-    return hh + ':' + mm;
-  }
-
-  function renderLineChart(svg, series, color, format, opts) {
-    opts = opts || {};
-    // Native-pixel viewBox: measure the actual rendered container so text
-    // and strokes render at natural size. Preserves no aspect ratio
-    // distortion from the default 800x300 viewBox under preserveAspectRatio="none".
-    var rect = svg.getBoundingClientRect();
-    var w = Math.max(320, Math.floor(rect.width));
-    var h = Math.max(200, Math.floor(rect.height));
-    svg.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
-    if (!series.length) {
-      svg.innerHTML = '<text x="50%" y="50%" text-anchor="middle" fill="#8b8a84" font-size="14" font-family="IBM Plex Mono">collecting data…</text>';
-      return { latest: null, peak: null };
-    }
-    // padX must fit the widest Y-axis label. With hashrate values up to
-    // 100s of TH/s and a "TH/s" unit suffix the rendered text can exceed
-    // 80 px, so 72 was clipping the leading "1" off "10.00 TH/s". Bumped
-    // to 96 to keep labels fully on-screen at common-case magnitudes.
-    var padX = 96, padY = 24, padBottom = 36;
-    // Filter entries down to finite numeric values — guards against stale
-    // localStorage rows with null / undefined values.
-    var clean = series.filter(function (s) { return Array.isArray(s) && typeof s[1] === 'number' && isFinite(s[1]); });
-    if (!clean.length) {
-      svg.innerHTML = '<text x="50%" y="50%" text-anchor="middle" fill="#8b8a84" font-size="14" font-family="IBM Plex Mono">waiting for first sample…</text>';
-      return { latest: null, peak: null };
-    }
-    var ys = clean.map(function (s) { return s[1]; });
-    var xs = clean.map(function (s) { return s[0]; });
-    var latest = ys[ys.length - 1];
-    var peak = Math.max.apply(null, ys);
-    var scale = niceScale(Math.max(peak, opts.floor || 0));
-    var plotH = h - padY - padBottom, plotW = w - padX - 16;
-    function px(i) { return padX + (clean.length === 1 ? plotW/2 : (i/(clean.length-1)) * plotW); }
-    function py(y) { return padY + plotH - (y/scale) * plotH; }
-
-    var d = 'M' + px(0).toFixed(2) + ',' + py(ys[0]).toFixed(2);
-    for (var i = 1; i < clean.length; i++) {
-      d += ' L' + px(i).toFixed(2) + ',' + py(ys[i]).toFixed(2);
-    }
-    var area = d + ' L' + px(clean.length-1).toFixed(2) + ',' + (padY + plotH).toFixed(2)
-                 + ' L' + px(0).toFixed(2) + ',' + (padY + plotH).toFixed(2) + ' Z';
-
-    // Y-axis gridlines + value labels (pool total at 25/50/75/100% of scale)
-    var grid = '';
-    for (var g = 1; g <= 4; g++) {
-      var gy = padY + plotH * (1 - g/4);
-      var val = scale * g / 4;
-      grid += '<line x1="' + padX + '" x2="' + (w - 16) + '" y1="' + gy + '" y2="' + gy + '" stroke="#2a2e35" stroke-width="0.5" stroke-dasharray="2 4"/>';
-      grid += '<text x="' + (padX - 10) + '" y="' + (gy + 4) + '" text-anchor="end" fill="#8b8a84" font-size="11" font-family="IBM Plex Mono">' + format(val) + '</text>';
-    }
-    // X-axis time labels — 5 ticks evenly spaced, showing clock time or
-    // date+hour for spans over 2 days
-    var xticks = '';
-    var spanMs = xs[xs.length-1] - xs[0];
-    if (spanMs > 0) {
-      var N = 5;
-      for (var t = 0; t < N; t++) {
-        var idx = Math.round((clean.length - 1) * (t / (N - 1)));
-        var xp = px(idx);
-        var label = formatTimeLabel(xs[idx], spanMs);
-        xticks += '<line x1="' + xp + '" x2="' + xp + '" y1="' + (padY + plotH) + '" y2="' + (padY + plotH + 4) + '" stroke="#2a2e35" stroke-width="0.5"/>';
-        var anchor = t === 0 ? 'start' : (t === N-1 ? 'end' : 'middle');
-        xticks += '<text x="' + xp + '" y="' + (padY + plotH + 18) + '" text-anchor="' + anchor + '" fill="#8b8a84" font-size="11" font-family="IBM Plex Mono">' + label + '</text>';
-      }
-    }
-    // Y-axis title (top-left corner) — makes clear what the scale represents
-    var yTitle = opts.yTitle
-      ? '<text x="' + padX + '" y="' + (padY - 8) + '" text-anchor="start" fill="#e6e4de" font-size="11" font-weight="500" font-family="IBM Plex Mono" letter-spacing="0.08em" text-transform="uppercase">' + opts.yTitle + '</text>'
-      : '';
-
-    svg.innerHTML =
-      yTitle + grid + xticks +
-      '<line x1="' + padX + '" x2="' + padX + '" y1="' + padY + '" y2="' + (padY + plotH) + '" stroke="#2a2e35" stroke-width="0.5"/>' +
-      '<line x1="' + padX + '" x2="' + (w - 16) + '" y1="' + (padY + plotH) + '" y2="' + (padY + plotH) + '" stroke="#2a2e35" stroke-width="0.5"/>' +
-      '<path d="' + area + '" fill="' + color + '" fill-opacity="0.1"/>' +
-      '<path d="' + d + '" fill="none" stroke="' + color + '" stroke-width="1.8" stroke-linejoin="round"/>';
-    return { latest: latest, peak: peak };
-  }
-
-  function renderCharts() {
-    // Plot smoothed series so single-poll dips (rate-limit, miner reconnect,
-    // peer broadcast freshness expiring) don't flicker the line. Raw points
-    // remain in chartHistory for honesty + future re-smoothing.
-    var hrSmooth = smoothSeries(chartHistory.hashrate);
-    var hrStats = renderLineChart(
-      document.getElementById('hashrate-chart'),
-      hrSmooth,
-      '#f7931a',
-      function (v) { return formatHashrate(v).replace(/<[^>]+>/g, '').trim(); },
-      { yTitle: 'pool hashrate' }
-    );
-    document.getElementById('hashrate-latest').innerHTML = hrStats.latest == null ? '—' : formatHashrate(hrStats.latest);
-    document.getElementById('hashrate-peak').innerHTML   = hrStats.peak   == null ? '—' : formatHashrate(hrStats.peak);
-    document.getElementById('hashrate-window').textContent = formatWindow(chartHistory.hashrate);
-
-    var mnSmooth = smoothSeries(chartHistory.miners);
-    var mnStats = renderLineChart(
-      document.getElementById('miners-chart'),
-      mnSmooth,
-      '#06b6d4',
-      function (v) { return Math.round(v).toString(); },
-      { floor: 4, yTitle: 'active miners' }
-    );
-    document.getElementById('miners-latest').textContent = mnStats.latest == null ? '—' : Math.round(mnStats.latest).toString();
-    document.getElementById('miners-peak').textContent   = mnStats.peak   == null ? '—' : Math.round(mnStats.peak).toString();
-    document.getElementById('miners-window').textContent = formatWindow(chartHistory.miners);
-  }
-
-  // Rate-limit notice: shown when the pool API throttles us (HTTP 429) and a
-  // poll yields no fresh data; cleared the moment any node answers cleanly. A
-  // 429 poll returns the { __rl: true } marker so refreshPool can tell "the
-  // node is protecting itself" apart from an ordinary dropped fetch (null).
-  var rlNotice = document.getElementById('rl-notice');
-  function setRateLimited(on) {
-    if (rlNotice) rlNotice.classList.toggle('show', !!on);
-  }
-
-  // Have we ever had a real answer from a node? Until we have, the tiles keep the
-  // `—` they ship with, because a measured 0 and an unknown are different claims and
-  // only one of them is ours to make. `failedPolls` counts consecutive empty polls
-  // from a cold start so we can say "unreachable" instead of dashing forever.
-  var haveData = false;
-  var failedPolls = 0;
-  function setPoolUnreachable(on) {
-    var el = document.getElementById('m-hashrate');
-    if (!el) return;
-    // Only ever touches the tiles while haveData is false, so this cannot overwrite
-    // real numbers with an error state.
-    if (on) {
-      document.getElementById('m-hashrate').textContent = '—';
-      document.getElementById('m-miners').textContent = '—';
-      document.getElementById('m-blocks').textContent = '—';
-      document.getElementById('m-height').textContent = '—';
-      dbg('all nodes unreachable — tiles left blank rather than zeroed');
-    }
-  }
-
-  function renderMetrics() {
-    // Smoothed values for the rate/count tiles (jittery underlying metrics).
-    // Block height and blocks-found stay raw — those are exact counters.
-    var hr = smooth('hashrate', lastStats.hashrate);
-    var mn = smooth('miners', lastStats.miners, { mode: 'median' });
-    document.getElementById('m-hashrate').innerHTML = formatHashrate(hr != null ? hr : lastStats.hashrate);
-    document.getElementById('m-miners').textContent = (mn != null ? Math.round(mn) : lastStats.miners).toString();
-    document.getElementById('m-blocks').textContent = lastStats.blocks.toString();
-    document.getElementById('m-height').textContent = lastStats.height ? lastStats.height.toLocaleString() : '—';
-  }
-
-  // Debug strip — fires only with ?debug=1 so it doesn't pollute normal view
-  var debugStrip = null;
-  if (new URLSearchParams(location.search).get('debug') === '1') {
-    debugStrip = document.createElement('div');
-    debugStrip.style.cssText = 'position:fixed;bottom:12px;right:12px;padding:10px 14px;background:#111;color:#eee;font:11px/1.6 monospace;border:1px solid #333;border-radius:4px;z-index:9999;min-width:220px';
-    document.body.appendChild(debugStrip);
-  }
-  function dbg(msg) {
-    console.log('[pool]', msg);
-    if (debugStrip) debugStrip.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg;
-  }
-
-  async function refreshPool() {
-    try {
-      dbg('reading pool snapshot…');
-      var summary = await fetchSummary();
-      // `good` is the per-node status array exactly as the nodes reported it — the aggregator
-      // passes it through untouched, so every merge rule below (mesh hashrate is a MAX, blocks
-      // found is a SUM, height is a MAX) still runs here, unchanged and on the same shape it
-      // always did. Moving the fan-out server-side deliberately did NOT move this arithmetic.
-      var rateLimited = false;
-      var good = (summary && summary.status && summary.status.data.nodes) || [];
-      var okCount = (summary && summary.status) ? summary.status.ok_nodes : 0;
-      var nodeTotal = (summary && summary.status) ? summary.status.total_nodes : POOL_NODES.length;
-      // Clear the notice the instant any node answers cleanly; raise it when
-      // we were throttled this tick and have no fresh data to show.
-      if (okCount > 0) setRateLimited(false);
-      else if (rateLimited) setRateLimited(true);
-      // No usable responses (throttled or transient) — don't blank the tiles, and
-      // never paint zeros we have not measured.
-      //
-      // This used to be gated on `lastStats.height`, i.e. "only preserve if we have
-      // something to preserve". That inverted the intent on the very first poll:
-      // lastStats starts all-zero, so height was falsy, the guard did not fire, and
-      // the code fell through and rendered `0 TH/s · 0 MINERS · 0 BLOCKS`. The one
-      // moment we have nothing to show was the one moment we claimed the pool was
-      // dead — on the public page a prospective miner lands on. Zero is a factual
-      // claim about the pool; we must not make it while we simply do not know yet.
-      //
-      // The markup ships the tiles as `—`, so returning early on a first-poll
-      // failure leaves them in their loading state, which is the honest answer.
-      if (okCount === 0) {
-        if (haveData) {
-          dbg(rateLimited ? 'poll skip · rate-limited — preserving last view'
-                          : 'poll skip · 0/4 nodes — preserving last view');
-        } else {
-          // Nothing measured yet AND nobody answered. Distinguish "still connecting"
-          // from "every node is unreachable" rather than showing a bare dash forever.
-          failedPolls++;
-          dbg('poll skip · 0/' + nodeTotal + ' nodes, no data yet (attempt ' + failedPolls + ')');
-          if (failedPolls >= 3) setPoolUnreachable(true);
-        }
-        return;
-      }
-      // Somebody answered: we now have measured numbers, so the tiles may show them.
-      // No need to clear an unreachable state — renderMetrics below overwrites every
-      // tile with a real value on this same tick.
-      haveData = true;
-      failedPolls = 0;
-      var hashrate = 0, meshHashrate = null, sumLocal = 0, blocks = 0, height = 0, mesh = null, maxActive = 0;
-      good.forEach(function (r) {
-        if (!r) return;
-        // Pool hashrate: prefer the mesh-wide `total_hashrate` (every post-PR#27
-        // node reports the SAME pool-wide figure, built from gossiped per-node
-        // rates) and take the MAX across responders — NOT the sum. Summing 4
-        // equal mesh values ~4x's it; and a node missing a peer reports low, so
-        // max picks the most complete view. Using the mesh figure means ONE
-        // responding node yields the correct total, so a single dropped fetch no
-        // longer craters the headline. The old `local_hashrate_th` SUM needed all
-        // 4 nodes, and with one dominant miner a single miss swung the total to a
-        // fraction (the "sometimes 3 TH/s" bug). `sumLocal` is kept only as a
-        // pre-PR#27 fallback for any node that doesn't report a mesh figure.
-        if (typeof r.total_hashrate === 'number') {
-          if (meshHashrate === null || r.total_hashrate > meshHashrate) meshHashrate = r.total_hashrate;
-        }
-        if (typeof r.local_hashrate_th === 'number') sumLocal += r.local_hashrate_th;
-        blocks += r.blocks_found || 0;
-        if (r.block_height && r.block_height > height) height = r.block_height;
-        var a = r.active_miners || 0;
-        if (a > maxActive) maxActive = a;
-        if (typeof r.mesh_active_miners === 'number') {
-          if (mesh === null || r.mesh_active_miners > mesh) mesh = r.mesh_active_miners;
-        }
-      });
-      // Mesh-wide total from any single responder; per-node sum only if no node
-      // reported a mesh figure. Robust to partial fetch failures.
-      hashrate = (meshHashrate !== null) ? meshHashrate : sumLocal;
-      // Detect block events by comparing against the previous tick:
-      //   blocks_found increment → we mined a block (green flash)
-      //   block_height increment with blocks_found flat → someone else
-      //     found it, our round ends in a miss
-      // First tick after reload just seeds the watermarks.
-      var prevHeight = lastStats.height;
-      var prevBlocksFound = lastStats.blocks;
-      var blockEvent = null;
-      if (prevHeight && height > prevHeight) {
-        blockEvent = (blocks > prevBlocksFound) ? 'ours' : 'theirs';
-      }
-
-      // Pick up the real tip timestamp from whichever VM responded.
-      // Used by the quasar HUD clock so "time since last block" is
-      // real on first page load, not just "time since page open".
-      var tipTime = null;
-      good.forEach(function (r) {
-        if (r && typeof r.last_block_time === 'number') {
-          if (tipTime === null || r.last_block_time > tipTime) tipTime = r.last_block_time;
-        }
-      });
-      if (tipTime !== null && window.__ghostPool && typeof window.__ghostPool.onTipTime === 'function') {
-        window.__ghostPool.onTipTime(tipTime);
-      }
-
-      lastStats.hashrate = hashrate;
-      lastStats.miners = mesh !== null ? mesh : maxActive;
-      lastStats.blocks = blocks;
-      lastStats.height = height;
-      lastStats.nodes = good;
-      renderMetrics();
-      pushHistory(hashrate, lastStats.miners);
-      renderCharts();
-
-      if (blockEvent && window.__ghostPool && typeof window.__ghostPool.onBlockEvent === 'function') {
-        window.__ghostPool.onBlockEvent(blockEvent, height);
-      }
-
-      dbg('poll ok · ' + okCount + '/' + nodeTotal + ' nodes · ' + hashrate.toFixed(2) + ' TH/s · ' + lastStats.miners + ' miners · history ' + chartHistory.hashrate.length);
-    } catch (e) {
-      dbg('POLL ERROR: ' + (e && e.message ? e.message : e));
-    }
-  }
-  refreshPool();
-  renderCharts();
-
-  window.__ghostPool = {
-    getHashrate: function () { return lastStats.hashrate; },
-    getMiners:   function () { return lastStats.miners; }
-  };
-
-  // ───────── Difficulty helpers (shared by Records + Leaderboards) ─────────
-  // Bitcoin "difficulty 1" target. Dividing it by a share's hash-as-int
-  // gives the share's difficulty in the standard pool sense — the same
-  // number miners see in logs and that every other pool displays.
-  var DIFF_1_TARGET = BigInt('0x00000000FFFF0000000000000000000000000000000000000000000000000000');
-  function hashToDifficulty(hashHex) {
-    try {
-      var h = BigInt('0x' + hashHex);
-      if (h === 0n) return Infinity;
-      return Number(DIFF_1_TARGET / h);
-    } catch (e) { return 0; }
-  }
-  function formatDifficulty(d) {
-    if (!isFinite(d) || d <= 0) return '—';
-    if (d < 1000) return d.toFixed(2);
-    if (d < 1e6) return (d / 1e3).toFixed(2) + 'K';
-    if (d < 1e9) return (d / 1e6).toFixed(2) + 'M';
-    if (d < 1e12) return (d / 1e9).toFixed(2) + 'G';
-    if (d < 1e15) return (d / 1e12).toFixed(2) + 'T';
-    if (d < 1e18) return (d / 1e15).toFixed(2) + 'P';
-    return (d / 1e18).toFixed(2) + 'E';
-  }
-
-  // ───────── Pool records (best hash per window) ─────────
-  // Fans out to every VM for each window, picks the single lowest
-  // share_hash across all nodes. One request × 4 windows × 4 nodes = 16
-  // concurrent calls; each node's handler is DB-only so it's fast.
-  var REC_WINDOWS = ['block', 'day', 'week', 'month'];
-  function fmtAgo(tsSec) {
-    var diff = Math.max(0, Math.floor(Date.now() / 1000) - tsSec);
-    if (diff < 60) return diff + 's ago';
-    if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
-    if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
-    return Math.floor(diff / 86400) + 'd ago';
-  }
-  // Cache of last-good per-window best so a transient fetch failure
-  // doesn't blank the record tiles.
-  var lastRecords = {};
-  async function refreshRecords() {
-    var summary = await fetchSummary();
-    // The cross-node reduce, the temporal latch and the window-monotonicity pass all used to run
-    // here, once per viewer, on top of a 32-request fan-out. They now run once server-side against
-    // every node, on a cadence matched to each window's cost, and each rule is unit-tested in
-    // `bins/ghost-stats/src/merge.rs`. What arrives here is already the answer.
-    var bestPerWindow = {};
-    var windowSawAny = {};
-    REC_WINDOWS.forEach(function (w) {
-      var rec = (summary && summary.records) ? summary.records[w] : null;
-      if (rec) bestPerWindow[w] = rec;
-      // `records_updated` holds a timestamp only for a window at least one node has answered for.
-      // That is what separates "this window genuinely has no shares" from "we have not read it
-      // yet" — two states that look identical in the record itself and must not render the same.
-      if (summary && summary.records_updated && summary.records_updated[w]) windowSawAny[w] = true;
-    });
-    REC_WINDOWS.forEach(function (w) {
-      var v = document.getElementById('rec-' + w);
-      var m = document.getElementById('rec-' + w + '-meta');
-      var best = bestPerWindow[w];
-      if (!best) {
-        // No data this cycle. If we had a last-good value AND this
-        // window's responses were all-null, preserve. Otherwise the
-        // window legitimately has no shares, show em dash.
-        if (lastRecords[w] && !windowSawAny[w]) return;
-        v.textContent = '—';
-        m.textContent = 'no shares in window';
-        return;
-      }
-      lastRecords[w] = best;
-      // Display: difficulty (standard pool metric) + short hash + relative time
-      var diff = hashToDifficulty(best.share_hash);
-      v.innerHTML = '<span style="color:var(--accent)">' + formatDifficulty(diff) + '</span> <span style="color:var(--dim); font-size:12px">difficulty</span>';
-      m.innerHTML = '<span style="color:var(--fainter); word-break:break-all">' + best.share_hash.slice(0, 20) + '…</span><br>' +
-                    fmtAgo(best.timestamp) + ' · ' + (best.miner_id_redacted || '—').replace(/</g, '&lt;');
-    });
-  }
-  refreshRecords();
-
-  // ───────── Leaderboards ─────────
-  // `shares` tab is lifetime by default (stable, matches per-miner pages);
-  // `best_hash` tab uses a time window since a best hash only makes sense
-  // within one.
-  var lbState = {
-    category: 'best_hash',
-    windowByCategory: { best_hash: 'day', shares: 'lifetime' },
-    data: null,
-  };
-  function lbCurrentWindow() { return lbState.windowByCategory[lbState.category]; }
-
-  async function refreshLeaderboard() {
-    try {
-      var win = lbCurrentWindow();
-      // The aggregator keeps one merged leaderboard per category+window the UI can ask for, each
-      // on its own cadence: `shares:lifetime` is cheap and refreshes every minute, while the
-      // best-hash windows cost seconds upstream (day 6.7s, week and month over 10s) and refresh
-      // every 2-10 minutes. A best hash can only improve within its window, so a slower cadence
-      // makes the answer older, never wrong.
-      var key = lbState.category + ':' + win;
-      var summary = await fetchSummary();
-      var section = (summary && summary.leaderboards) ? summary.leaderboards[key] : null;
-      if (!section) {
-        // Nothing for this combination yet. Keep any view we already have rather than replacing
-        // real rows with an empty table; only show the honest empty state on a cold start.
-        console.warn('[lb] no snapshot section for', key);
-        if (lbState.data) return;
-        lbState.data = { best_hash: [], shares: [] };
-        renderLeaderboard();
-        return;
-      }
-      lbState.data = { best_hash: section.data.best_hash || [], shares: section.data.shares || [] };
-      console.log('[lb] snapshot', key, {
-        best: lbState.data.best_hash.length,
-        shares: lbState.data.shares.length,
-        nodes: section.ok_nodes + '/' + section.total_nodes,
-        age_secs: section.age_secs,
-      });
-      renderLeaderboard();
-    } catch (err) {
-      console.error('[lb] refresh failed:', err);
-      var tbody = document.querySelector('#lb-table tbody');
-      if (tbody) {
-        tbody.innerHTML = '<tr><td colspan="4" style="padding:40px; text-align:center; color:var(--accent); font-family:var(--font-mono); font-size:12px">leaderboard error — ' + (err && err.message ? err.message : err) + '</td></tr>';
-      }
-    }
-  }
-
-  function renderLeaderboard() {
-    var tbody = document.querySelector('#lb-table tbody');
-    if (!tbody) { console.warn('[lb] tbody not found'); return; }
-    if (!lbState.data) {
-      tbody.innerHTML = '<tr><td colspan="4" style="padding:40px; text-align:center; color:var(--fainter); font-family:var(--font-mono)">loading…</td></tr>';
-      return;
-    }
-    var rows = lbState.data[lbState.category] || [];
-    if (!rows.length) {
-      tbody.innerHTML = '<tr><td colspan="4" style="padding:40px; text-align:center; color:var(--fainter); font-family:var(--font-mono)">no miners in this window yet</td></tr>';
-      return;
-    }
-    if (lbState.category === 'best_hash') {
-      tbody.innerHTML = rows.map(function (r, i) {
-        var diff = hashToDifficulty(r.share_hash);
-        return '<tr>' +
-          '<td class="lb-rank">' + (i + 1) + '</td>' +
-          '<td class="lb-diff"><span class="lb-diff-val">' + formatDifficulty(diff) + '</span><span class="lb-diff-sub">difficulty</span></td>' +
-          '<td class="lb-hash" title="' + r.share_hash + '">' + r.share_hash.slice(0, 24) + '…</td>' +
-          '<td class="lb-miner">' + r.miner_id_redacted.replace(/</g, '&lt;') + '</td>' +
-        '</tr>';
-      }).join('');
-    } else {
-      tbody.innerHTML = rows.map(function (r, i) {
-        return '<tr>' +
-          '<td class="lb-rank">' + (i + 1) + '</td>' +
-          '<td class="lb-diff"><span class="lb-diff-val">' + r.share_count.toLocaleString() + '</span><span class="lb-diff-sub">shares</span></td>' +
-          '<td class="lb-hash">' + formatDifficulty(r.total_work) + ' <span style="color:var(--dim); font-size:11px">total work</span></td>' +
-          '<td class="lb-miner">' + r.miner_id_redacted.replace(/</g, '&lt;') + '</td>' +
-        '</tr>';
-      }).join('');
-    }
-  }
-
-  (function () {
-    // Sync the window selector + its visibility to the active tab.
-    // Shares tab uses lifetime via state (selector hidden — only one
-    // valid choice). Best-hash tab shows day/week/month; `lifetime` is
-    // not offered because the node only keeps raw share hashes for a
-    // bounded window (see api_pool_leaderboard_handler).
-    function syncWindowSelect() {
-      var select = document.getElementById('lb-window');
-      var wrap = select.parentElement;
-      if (lbState.category === 'best_hash' && lbState.windowByCategory.best_hash === 'lifetime') {
-        lbState.windowByCategory.best_hash = 'day';
-      }
-      if (lbState.category === 'best_hash') select.value = lbCurrentWindow();
-      wrap.style.visibility = (lbState.category === 'shares') ? 'hidden' : 'visible';
-    }
-    document.querySelectorAll('.lb-tabs button').forEach(function (b) {
-      b.addEventListener('click', function () {
-        document.querySelectorAll('.lb-tabs button').forEach(function (x) { x.classList.remove('active'); });
-        b.classList.add('active');
-        lbState.category = b.dataset.lb;
-        lbState.data = null;
-        syncWindowSelect();
-        renderLeaderboard();
-        refreshLeaderboard();
-      });
-    });
-    document.getElementById('lb-window').addEventListener('change', function (e) {
-      lbState.windowByCategory[lbState.category] = e.target.value;
-      lbState.data = null;
-      renderLeaderboard();
-      refreshLeaderboard();
-    });
-    syncWindowSelect();
-  })();
-  renderLeaderboard(); // show "loading…" row while the first fetch is in flight
-  refreshLeaderboard();
-
-  // ───────── Next block payout projection ─────────
-  // Pulls the current round's top miners from every VM, merges by
-  // redacted miner_id, and projects each miner's share of the 99%
-  // miner pool. Also renders the full subsidy split (treasury + node
-  // pool) and the header meta (round id, block height, miner count).
-  function fmtBtc(sats) {
-    if (!sats) return '0<span class="unit"> BTC</span>';
-    var btc = sats / 1e8;
-    if (btc >= 1) return btc.toFixed(4) + '<span class="unit"> BTC</span>';
-    if (btc >= 0.001) return btc.toFixed(6) + '<span class="unit"> BTC</span>';
-    return sats.toLocaleString() + '<span class="unit"> sats</span>';
-  }
-
-  var lastPayoutMiners = null;
-  async function refreshPayout() {
-    var summary = await fetchSummary();
-    var section = summary ? summary.payout : null;
-    // No section means every node failed this cycle, or none has been read yet. Keep whatever is
-    // already rendered: an empty payout table asserts that nobody is owed anything, which is a
-    // different claim from "we do not know", and only one of them is ours to make.
-    if (!section) return;
-    var payout = section.data;
-    // Subsidy and fee split are consensus-wide values derived from the block height, so the
-    // aggregator takes them from the first node that answered.
-    var base = payout.base;
-    if (!base) return;
-
-    // Paint the summary tiles first (miners list may still be merging)
-    document.getElementById('py-subsidy').innerHTML = fmtBtc(base.subsidy_sats);
-    document.getElementById('py-miner-pool').innerHTML = fmtBtc(base.miner_pool_sats);
-    document.getElementById('py-treasury').innerHTML = fmtBtc(base.treasury_sats);
-    document.getElementById('py-node-pool').innerHTML = fmtBtc(base.node_reward_pool_sats);
-    document.getElementById('py-height').textContent = base.block_height.toLocaleString();
-
-    // The ledger merge, the iterative dust filter and the re-rank all run server-side now, in
-    // `merge_payout`. The iteration matters and is easy to miss: each node dust-filtered against
-    // its OWN total, but merging changes the denominator, so removing one duster raises everyone
-    // else's share and can pull the next miner over the line. What arrives here is the final list
-    // that would go into the next block's coinbase.
-    var miners = payout.miners || [];
-    var minerPool = base.miner_pool_sats;
-    var totalWork = payout.total_work || 0;
-    // "On the ledger" counts DISTINCT miners carrying unpaid shares, before dust filtering — a
-    // miner active on three nodes is three ledger rows but one miner. "In next coinbase" is the
-    // dust-filtered count. At current scale they match; the gap widens as the pool grows.
-    var mergedUnique = payout.unique_miners || 0;
-    document.getElementById('py-paid-this').textContent = miners.length.toLocaleString();
-    document.getElementById('py-miners').textContent = mergedUnique.toLocaleString();
-
-    var tbody = document.querySelector('#py-table tbody');
-    if (!miners.length) {
-      // If some VMs responded with empty ledgers but others failed, and
-      // we had rows before, assume transient and keep the previous render.
-      if (lastPayoutMiners && lastPayoutMiners.length) return;
-      tbody.innerHTML = '<tr><td colspan="4" style="padding:40px; text-align:center; color:var(--fainter); font-family:var(--font-mono)">no miners on the ledger yet — submit a share to queue for the next payout</td></tr>';
-      return;
-    }
-    lastPayoutMiners = miners;
-
-    tbody.innerHTML = miners.map(function (m, i) {
-      var pct = totalWork > 0 ? (m.unpaid_work / totalWork * 100) : 0;
-      var sats = totalWork > 0 ? Math.floor(minerPool * m.unpaid_work / totalWork) : 0;
-      return '<tr>' +
-        '<td class="lb-rank">' + (i + 1) + '</td>' +
-        '<td class="py-miner">' + m.miner_id_redacted.replace(/</g, '&lt;') + '</td>' +
-        '<td class="py-pct"><span class="py-bar" style="width:' + Math.max(2, Math.min(100, pct)) + '%"></span><span class="py-pct-v">' + pct.toFixed(2) + '%</span></td>' +
-        '<td class="py-sats">' + fmtBtc(sats) + '</td>' +
-      '</tr>';
-    }).join('');
-  }
-  refreshPayout();
-
-  // ───────── One timer for every stats panel ─────────
-  // All four panels read the same server-side snapshot, so they refresh together on a single 60s
-  // tick and share one request between them. This replaces four independent timers that between
-  // them issued roughly 145 requests per minute, per viewer.
-  //
-  // Polling faster than this would not make the page fresher: the snapshot's own cadence is what
-  // decides how current each section is, and every section reports its `age_secs` so the page can
-  // say so rather than imply the numbers are live.
-  function refreshAllStats() {
-    return Promise.all([refreshPool(), refreshRecords(), refreshLeaderboard(), refreshPayout()])
-      .catch(function (e) { console.warn('[pool] stats refresh failed', e); });
-  }
-  setInterval(refreshAllStats, 60000);
-
-  // Miner lookup (client-side fan-out — aggregator endpoint is next up)
-  (function () {
-    var input = document.getElementById('miner-query');
-    var btn = document.getElementById('miner-search');
-    var out = document.getElementById('miner-result');
-
-    // Remember last query per browser
-    var LAST_KEY = 'ghost-pool-last-miner-query';
-    var stored = localStorage.getItem(LAST_KEY);
-    if (stored) { input.value = stored; }
-
-    function fmtTs(ts) {
-      if (!ts) return '—';
-      var d = new Date(ts * 1000);
-      return d.toLocaleString();
-    }
-    function fmtSats(s) {
-      if (!s) return '0 sats';
-      if (s < 100000) return s.toLocaleString() + ' sats';
-      return (s / 1e8).toFixed(8) + ' BTC';
-    }
-
-    // Accept three input shapes:
-    //   1. `bc1q...`                 → address only, list all workers
-    //   2. `bc1q....worker`          → single worker card
-    //   3. trailing dot is stripped and treated as (1)
-    function parseQuery(raw) {
-      var q = (raw || '').trim().replace(/\.+$/, '');
-      if (!q) return null;
-      var dot = q.indexOf('.');
-      if (dot < 0) return { kind: 'address', address: q };
-      var worker = q.slice(dot + 1);
-      if (!worker) return { kind: 'address', address: q.slice(0, dot) };
-      return { kind: 'worker', miner_id: q, address: q.slice(0, dot), worker: worker };
-    }
-
-    async function lookup() {
-      var parsed = parseQuery(input.value);
-      if (!parsed) { out.innerHTML = ''; return; }
-      localStorage.setItem(LAST_KEY, input.value.trim());
-      out.innerHTML = '<div class="placeholder-panel" style="padding:24px">Searching across the pool…</div>';
-
-      if (parsed.kind === 'address') {
-        await renderWorkers(parsed.address);
-        return;
-      }
-
-      // Single-worker lookup path
-      var q = parsed.miner_id;
-      var perNode = await Promise.all(POOL_NODES.map(function (n) {
-        var ctl = new AbortController();
-        var t = setTimeout(function () { ctl.abort(); }, 5000);
-        return fetch('/api/pool/' + n.id + '/api/v1/miners/lookup?miner_id=' + encodeURIComponent(q), { signal: ctl.signal })
-          .then(function (r) { clearTimeout(t); return r.ok ? r.json() : null; })
-          .catch(function () { clearTimeout(t); return null; })
-          .then(function (data) { return { node: n.id.toUpperCase(), data: data }; });
-      }));
-
-      var hits = perNode.filter(function (r) { return r.data && r.data.found === true; });
-
-      if (!hits.length) {
-        out.innerHTML =
-          '<div class="placeholder-panel" style="padding:40px 24px">' +
-            'No record for <code>' + q.replace(/</g,'&lt;') + '</code>.<br>' +
-            '<span style="color:var(--fainter); font-size:11px">Paste your full <code>address.worker</code> string, or just the address to list every worker.</span>' +
-          '</div>';
-        return;
-      }
-
-      // Aggregate across nodes (same miner_id can appear on multiple)
-      var first_seen = Infinity, last_seen = 0;
-      var total_shares = 0, total_work = 0, blocks_won = 0, total_payouts_sats = 0;
-      var unpaid_shares = 0;
-      var hashrate_sum = 0, active = false;
-      var payout_address = null;
-      hits.forEach(function (h) {
-        var d = h.data;
-        if (d.first_seen && d.first_seen < first_seen) first_seen = d.first_seen;
-        if (d.last_seen && d.last_seen > last_seen) last_seen = d.last_seen;
-        total_shares += d.total_shares || 0;
-        total_work += d.total_work || 0;
-        blocks_won += d.blocks_won || 0;
-        total_payouts_sats += d.total_payouts_sats || 0;
-        unpaid_shares += d.unpaid_shares || 0;
-        if (d.active) active = true;
-        // Only sum hashrate from nodes currently active — otherwise stale values distort
-        if (d.active && typeof d.avg_hashrate_ths === 'number') hashrate_sum += d.avg_hashrate_ths;
-        payout_address = d.payout_address || payout_address;
-      });
-
-      var href = '/miner.html?id=' + encodeURIComponent(q);
-      var render = function (ths) {
-        out.innerHTML =
-          '<a class="miner-card" href="' + href + '">' +
-            '<div class="mc-head">' +
-              '<div class="mc-id">' + q.replace(/</g,'&lt;') + '</div>' +
-              '<div class="mc-status ' + (active ? 'online' : 'offline') + '">' + (active ? 'active' : 'inactive') + '</div>' +
-            '</div>' +
-            '<div class="mc-hashrate">' + formatHashrate(ths) + '</div>' +
-            '<div class="mc-tiles mc-tiles-4">' +
-              '<div class="mc-tile"><div class="k k-help" title="Unpaid shares currently on the ledger, queued for the next block\'s coinbase. Resets when this miner is paid.">unpaid</div><div class="v">' + unpaid_shares.toLocaleString() + '</div></div>' +
-              '<div class="mc-tile"><div class="k k-help" title="Lifetime shares — running total of every valid share this miner has ever submitted. Doesn\'t reset when they\'re paid.">lifetime</div><div class="v">' + total_shares.toLocaleString() + '</div></div>' +
-              '<div class="mc-tile"><div class="k">blocks won</div><div class="v">' + blocks_won + '</div></div>' +
-              '<div class="mc-tile"><div class="k">payouts</div><div class="v">' + fmtSats(total_payouts_sats) + '</div></div>' +
-            '</div>' +
-            '<div class="mc-foot">' +
-              '<span>last share ' + fmtTs(last_seen || null) + '</span>' +
-              '<span class="mc-cta">Open full stats →</span>' +
-            '</div>' +
-          '</a>';
-      };
-      // First paint with 0 while history fetch is in flight
-      render(0);
-      // Derive live hashrate from the last two 5-min buckets of history
-      // (miners.avg_hashrate_ths isn't populated server-side)
-      var HASH_PER_WORK = Math.pow(2, 32);
-      try {
-        var hist = await Promise.all(POOL_NODES.map(function (n) {
-          return fetch('/api/pool/' + n.id + '/api/v1/miners/history?miner_id=' + encodeURIComponent(q) + '&window=day')
-            .then(function (r) { return r.ok ? r.json() : null; })
-            .catch(function () { return null; });
-        }));
-        var merged = new Map();
-        var bucketSecs = 300;
-        hist.forEach(function (d) {
-          if (!d || !Array.isArray(d.points)) return;
-          bucketSecs = d.bucket_secs || bucketSecs;
-          d.points.forEach(function (p) {
-            var prev = merged.get(p.t);
-            if (!prev) merged.set(p.t, { work: p.work || 0 });
-            else prev.work += p.work || 0;
-          });
-        });
-        var sorted = Array.from(merged.entries()).sort(function (a, b) { return a[0] - b[0]; });
-        var last = sorted.slice(-2);
-        if (last.length) {
-          var w = last.reduce(function (s, e) { return s + e[1].work; }, 0);
-          var secs = last.length * bucketSecs;
-          var ths = w * HASH_PER_WORK / secs / 1e12;
-          render(ths);
-        }
-      } catch (e) { /* keep the 0 hashrate paint — lookup data still useful */ }
-    }
-
-    // Address-mode: list every worker under the given payout address.
-    // Merges across nodes (a worker can be active on multiple nodes at
-    // once — we keep the most-recent last_seen and sum shares / blocks /
-    // payouts so the card reflects pool-wide totals).
-    async function renderWorkers(address) {
-      var perNode = await Promise.all(POOL_NODES.map(function (n) {
-        return fetch('/api/pool/' + n.id + '/api/v1/miners/workers?address=' + encodeURIComponent(address))
-          .then(function (r) { return r.ok ? r.json() : null; })
-          .catch(function () { return null; });
-      }));
-      var byWorker = new Map();
-      perNode.forEach(function (d) {
-        if (!d || !Array.isArray(d.workers)) return;
-        d.workers.forEach(function (w) {
-          var prev = byWorker.get(w.miner_id);
-          if (!prev) {
-            byWorker.set(w.miner_id, Object.assign({}, w));
-          } else {
-            prev.total_shares = Math.max(prev.total_shares, w.total_shares);
-            prev.total_work = Math.max(prev.total_work, w.total_work);
-            prev.blocks_won = Math.max(prev.blocks_won, w.blocks_won);
-            prev.total_payouts_sats = Math.max(prev.total_payouts_sats, w.total_payouts_sats);
-            prev.last_seen = Math.max(prev.last_seen, w.last_seen);
-            prev.first_seen = Math.min(prev.first_seen, w.first_seen);
-            prev.active = prev.active || w.active;
-          }
-        });
-      });
-      var workers = Array.from(byWorker.values())
-        .sort(function (a, b) {
-          return (a.worker || '').localeCompare(b.worker || '', undefined, { numeric: true, sensitivity: 'base' });
-        });
-
-      if (!workers.length) {
-        out.innerHTML =
-          '<div class="placeholder-panel" style="padding:40px 24px">' +
-            'No workers found under <code>' + address.replace(/</g,'&lt;') + '</code>.<br>' +
-            '<span style="color:var(--fainter); font-size:11px">Addresses are matched exactly. A miner shows up once it has submitted at least one share.</span>' +
-          '</div>';
-        return;
-      }
-
-      var header =
-        '<div class="worker-group-head">' +
-          '<div>' +
-            '<div class="section-label">address</div>' +
-            '<div class="mc-id" style="margin-top:2px">' + address.replace(/</g,'&lt;') + '</div>' +
-          '</div>' +
-          '<div class="worker-group-count">' + workers.length + ' worker' + (workers.length === 1 ? '' : 's') + '</div>' +
-        '</div>';
-
-      var cards = workers.map(function (w) {
-        var href = '/miner.html?id=' + encodeURIComponent(w.miner_id);
-        var status = w.active ? 'online' : 'offline';
-        var statusText = w.active ? 'active' : 'inactive';
-        return '<a class="worker-card" href="' + href + '">' +
-          '<div class="wc-head">' +
-            '<div class="wc-name">' + (w.worker || '(no worker)').replace(/</g, '&lt;') + '</div>' +
-            '<div class="mc-status ' + status + '">' + statusText + '</div>' +
-          '</div>' +
-          '<div class="wc-stats">' +
-            '<div class="wc-stat"><span class="k">shares</span><span class="v">' + w.total_shares.toLocaleString() + '</span></div>' +
-            '<div class="wc-stat"><span class="k">blocks</span><span class="v">' + w.blocks_won + '</span></div>' +
-            '<div class="wc-stat"><span class="k">payouts</span><span class="v">' + fmtSats(w.total_payouts_sats) + '</span></div>' +
-          '</div>' +
-          '<div class="wc-foot">last share ' + fmtTs(w.last_seen) + ' <span class="mc-cta">Open →</span></div>' +
-        '</a>';
-      }).join('');
-
-      out.innerHTML = header + '<div class="worker-grid">' + cards + '</div>';
-    }
-
-    btn.addEventListener('click', lookup);
-    input.addEventListener('keydown', function (e) { if (e.key === 'Enter') lookup(); });
-  })();
 </script>
 
-<script type="module">
-import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-
-const frame = document.getElementById('quasar-frame');
-const canvas = document.getElementById('quasar-canvas');
-
-// The Quasar needs a WebGL context. If the browser can't create one — hardware
-// acceleration disabled, GPU blocklisted, or a headless/sandboxed context — the
-// WebGLRenderer constructor throws. Catch it and show a helpful message in the
-// frame instead of a blank void (and never let it break the rest of the page).
-let renderer = null;
-try {
-  renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-} catch (err) {
-  console.warn('Quasar disabled — WebGL unavailable:', err && err.message);
-  canvas.style.display = 'none';
-  const msg = document.createElement('div');
-  msg.className = 'quasar-nowebgl';
-  msg.style.cssText =
-    'position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;' +
-    'justify-content:center;text-align:center;gap:10px;padding:32px;color:var(--fainter,#9aa4b2);' +
-    'font-size:14px;line-height:1.5;';
-  msg.innerHTML =
-    '<strong style="color:var(--fg,#e6e9ee);font-size:15px;">3D visualisation unavailable</strong>' +
-    '<span>The Quasar needs WebGL, which your browser has disabled. Turn on ' +
-    '<em>hardware / graphics acceleration</em> in your browser settings and reload — ' +
-    'or use the <strong>Hashrate</strong> and <strong>Miners</strong> tabs, which work without it.</span>';
-  frame.appendChild(msg);
-}
-
-const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 200);
-camera.position.set(14, 8, 18);
-
-function sizeRenderer() {
-  if (!renderer) return;
-  const r = frame.getBoundingClientRect();
-  if (r.width <= 0 || r.height <= 0) return;
-  renderer.setSize(r.width, r.height, false);
-  camera.aspect = r.width / r.height;
-  camera.updateProjectionMatrix();
-}
-
-const controls = new OrbitControls(camera, canvas);
-controls.enableDamping = true; controls.dampingFactor = 0.06;
-controls.autoRotate = true; controls.autoRotateSpeed = 0.35;
-controls.minDistance = 4; controls.maxDistance = 60;
-
-const SPHERE_R = 8;
-const BASE_SPHERE_COLOR = new THREE.Color(0x3a3f47);
-const BLOCK_COLOR = new THREE.Color('#22c55e');
-const MISS_COLOR  = new THREE.Color('#ef4444');
-
-const sphereWire = new THREE.LineSegments(
-  new THREE.WireframeGeometry(new THREE.SphereGeometry(SPHERE_R, 48, 24)),
-  new THREE.LineBasicMaterial({ color: BASE_SPHERE_COLOR.clone(), transparent: true, opacity: 0.28 })
-);
-scene.add(sphereWire);
-
-function makeDotTexture() {
-  const size = 64;
-  const c = document.createElement('canvas'); c.width = c.height = size;
-  const ctx = c.getContext('2d');
-  const g = ctx.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
-  g.addColorStop(0, 'rgba(255,255,255,1)');
-  g.addColorStop(0.3, 'rgba(255,255,255,0.85)');
-  g.addColorStop(0.7, 'rgba(255,255,255,0.15)');
-  g.addColorStop(1, 'rgba(255,255,255,0)');
-  ctx.fillStyle = g; ctx.fillRect(0, 0, size, size);
-  return new THREE.CanvasTexture(c);
-}
-const dotTex = makeDotTexture();
-
-const coreGeom = new THREE.BufferGeometry();
-coreGeom.setAttribute('position', new THREE.Float32BufferAttribute([0,0,0], 3));
-scene.add(new THREE.Points(coreGeom, new THREE.PointsMaterial({
-  size: 0.28, color: 0xffffff, transparent: true, opacity: 0.9,
-  map: dotTex, blending: THREE.AdditiveBlending, depthWrite: false, sizeAttenuation: true,
-})));
-
-const axLen = SPHERE_R * 1.15;
-const axMat = new THREE.LineBasicMaterial({ color: 0x2a2e35, transparent: true, opacity: 0.35 });
-function axis(a, b) { return new THREE.Line(new THREE.BufferGeometry().setFromPoints([a, b]), axMat); }
-scene.add(axis(new THREE.Vector3(-axLen, 0, 0), new THREE.Vector3(axLen, 0, 0)));
-scene.add(axis(new THREE.Vector3(0, -axLen, 0), new THREE.Vector3(0, axLen, 0)));
-scene.add(axis(new THREE.Vector3(0, 0, -axLen), new THREE.Vector3(0, 0, axLen)));
-
-// Enough particles to hold a full 10-minute round at ~4 TH/s × EMIT_FACTOR.
-// Above that the oldest get cycled out as newer ones arrive.
-const MAX_PARTICLES = 15000;
-const particles = [];
-const positions = new Float32Array(MAX_PARTICLES * 3);
-const colors = new Float32Array(MAX_PARTICLES * 3);
-const geom = new THREE.BufferGeometry();
-geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-scene.add(new THREE.Points(geom, new THREE.PointsMaterial({
-  size: 0.24, vertexColors: true, transparent: true, depthWrite: false,
-  blending: THREE.AdditiveBlending, map: dotTex, sizeAttenuation: true,
-})));
-
-const QUALITY_STOPS = [
-  { t: 0.00, c: new THREE.Color('#254c9e') },
-  { t: 0.20, c: new THREE.Color('#06b6d4') },
-  { t: 0.45, c: new THREE.Color('#22c55e') },
-  { t: 0.70, c: new THREE.Color('#f4d03f') },
-  { t: 0.88, c: new THREE.Color('#f7931a') },
-  { t: 0.97, c: new THREE.Color('#ef4444') },
-  { t: 1.00, c: new THREE.Color('#ffffff') },
-];
-function qualityColor(t) {
-  t = Math.max(0, Math.min(1, t));
-  for (let i = 1; i < QUALITY_STOPS.length; i++) {
-    const a = QUALITY_STOPS[i-1], b = QUALITY_STOPS[i];
-    if (t <= b.t) { return a.c.clone().lerp(b.c, (t - a.t) / (b.t - a.t)); }
-  }
-  return QUALITY_STOPS[QUALITY_STOPS.length-1].c.clone();
-}
-const PARTICLE_SPEED = SPHERE_R * 0.9;
-
-// Deterministic 32-bit hash of a string (FNV-ish). Gives each miner_id
-// a stable scalar so the quasar assigns them a consistent latitude on
-// every render.
-function hashString(s) {
-  let h = 0x811c9dc5 >>> 0;
-  for (let i = 0; i < s.length; i++) {
-    h = (h ^ s.charCodeAt(i)) >>> 0;
-    h = Math.imul(h, 0x01000193) >>> 0;
-  }
-  return h / 0xffffffff;
-}
-
-// Each miner gets a fixed polar angle (latitude) from hash(miner_id),
-// so shares from the same miner always fly along the same meridian.
-// Azimuth is driven by submission time modulo the round length, so a
-// miner's personal-bests trace a latitude circle as the round advances.
-const QUASAR_ROUND_SECS = 600;
-function directionFor(minerIdRedacted, ts) {
-  const polar = (hashString(minerIdRedacted) - 0.5) * Math.PI; // [-π/2, π/2]
-  const azim  = ((ts % QUASAR_ROUND_SECS) / QUASAR_ROUND_SECS) * Math.PI * 2;
-  const cosP = Math.cos(polar);
-  return new THREE.Vector3(cosP * Math.cos(azim), Math.sin(polar), cosP * Math.sin(azim));
-}
-
-// Random direction used by the cold-start fallback (no real share data yet).
-function randomDirection() {
-  let u = 2*Math.random()-1, v = 2*Math.random()-1, s;
-  while ((s = u*u + v*v) >= 1) { u = 2*Math.random()-1; v = 2*Math.random()-1; }
-  const sq = Math.sqrt(1 - s);
-  return new THREE.Vector3(2*u*sq, 2*v*sq, 1 - 2*s);
-}
-
-function emitShare(quality, dir) {
-  if (!dir) dir = randomDirection();
-  const target = Math.min(quality, 1.0) * SPHERE_R;
-  particles.push({
-    pos: new THREE.Vector3(), dir, target, quality,
-    // isBlock/blockClaimed legacy fields retained as no-ops; real block
-    // events arrive via window.__ghostPool.onBlockEvent, not particle state.
-    age: 0, parked: false,
-  });
-  if (particles.length > MAX_PARTICLES) particles.shift();
-}
-
-const EMIT_FACTOR = 5;
-function samplePoolHashrate() {
-  if (window.__ghostPool && typeof window.__ghostPool.getHashrate === 'function') {
-    return window.__ghostPool.getHashrate();
-  }
-  return 0;
-}
-// Fallback random quality — only used when the real-share stream hasn't
-// delivered any shares yet (page just loaded, rate-limit hiccup, etc).
-// Kept strictly below 1.0 so the fallback can't mimic a real block.
-function sampleQuality() {
-  const r = Math.random();
-  if (r < 0.005) return 0.90 + Math.random() * 0.08;
-  let q = -Math.log(1 - Math.random()) * 0.25;
-  if (q > 0.85) q = 0.85;
-  return q;
-}
-
-// ───────── Real-share stream ─────────
-// Polls /api/v1/pool/recent_shares on each VM, pushes arriving shares
-// onto an emission queue. tickEmitter drains the queue (one particle
-// per real share with real quality). If the queue runs dry, it falls
-// back to hashrate-derived emission so the scene never looks frozen
-// during a fetch stall.
-const POOL_VMS = ['vm1', 'vm2', 'vm3', 'vm4', 'vm5', 'vm6', 'vm7', 'vm8'];
-const shareQueue = [];
-const lastTsByVm = {};
-const MAX_QUEUE = 2000;
-
-async function pollShares(vm) {
-  const since = lastTsByVm[vm];
-  const qs = since ? ('?since=' + since) : '';
-  try {
-    const r = await fetch('/api/pool/' + vm + '/api/v1/pool/recent_shares' + qs);
-    if (!r.ok) return;
-    const d = await r.json();
-    if (typeof d.now_ts === 'number') lastTsByVm[vm] = d.now_ts;
-    if (!Array.isArray(d.shares)) return;
-    // First poll on this VM with no `since` returns a short look-back.
-    // Cap how many we enqueue at once so the scene doesn't spike, AND
-    // so we don't immediately saturate every miner's personal-best bar
-    // — the first poll's batch ideally lands the starting positions,
-    // subsequent real-time polls drive rising bests.
-    const cap = since ? d.shares.length : Math.min(d.shares.length, 6);
-    for (let i = 0; i < cap; i++) {
-      shareQueue.push(d.shares[i]);
-    }
-    if (shareQueue.length > MAX_QUEUE) shareQueue.splice(0, shareQueue.length - MAX_QUEUE);
-  } catch (e) { /* transient — next poll will catch up */ }
-}
-function pollAll() { POOL_VMS.forEach(pollShares); }
-// Only drive the share stream when the Quasar can actually render it — no point
-// polling (40 req/min) into a scene that isn't there when WebGL is unavailable.
-if (renderer) {
-  // Defer first quasar poll by ~2s so the page-load burst (stats, records,
-  // leaderboard, payout) drains first. The quasar can sit empty for a
-  // couple of seconds without anyone noticing; the stats tiles can't.
-  setTimeout(pollAll, 2000);
-  // 6s cadence × 8 VMs = 80 req/min for the share stream (this said "4 VMs = 40" until
-  // 2026-08-18 — POOL_VMS was hand-edited to vm1-vm8 on the live host without the comment
-  // following, so the real rate was double what it claimed). Enough to make
-  // the quasar feel live without dominating the rate-limit burst budget
-  // alongside the other pool-page polls.
-  setInterval(pollAll, 6000);
-}
-
-// Personal-best bar for each miner this round. A share only becomes a
-// quasar particle when it beats the miner's previous best — cuts the
-// particle rate by ~100× vs one-per-share while keeping every visible
-// dot meaningful (each one is someone's new record). Cleared at
-// round end so every round the bar starts fresh.
-const bestByMiner = new Map();
-
-let shareEmitAccum = 0;
-function tickEmitter(dt) {
-  // Pause emission during the end-of-round flash; particles cleared when the
-  // flash ends so the next round starts with an empty scene.
-  if (flashState) { shareEmitAccum = 0; return; }
-
-  // Drain the real-share queue, keeping only personal-bests per miner.
-  // Cold-start fallback kicks in only if we've never drained a real
-  // share this session.
-  let drained = 0;
-  while (shareQueue.length && drained < 30) {
-    const s = shareQueue.shift();
-    const mid = s.miner_id_redacted || 'unknown';
-    const prev = bestByMiner.get(mid) || 0;
-    if (s.quality > prev) {
-      bestByMiner.set(mid, s.quality);
-      emitShare(s.quality, directionFor(mid, s.t || 0));
-      drained++;
-    }
-  }
-
-  if (drained > 0 || bestByMiner.size > 0) {
-    // We've seen at least some real shares — no fallback needed.
-    shareEmitAccum = 0;
-    return;
-  }
-  // Cold-start: no real shares received yet. Emit low-rate random
-  // particles so the scene isn't empty during the first fetch.
-  const sharesPerSec = Math.max(0, samplePoolHashrate() * EMIT_FACTOR);
-  shareEmitAccum += sharesPerSec * dt;
-  while (shareEmitAccum >= 1) {
-    emitShare(sampleQuality());
-    shareEmitAccum -= 1;
-  }
-}
-
-const FLASH_SECONDS = 20;
-let lastBlockTs = performance.now() / 1000;
-let flashState = null;
-let flashRemaining = 0;
-
-const banner = document.getElementById('q-banner');
-const bannerText = document.getElementById('q-banner-text');
-const bannerSub  = document.getElementById('q-banner-sub');
-let blocksFound = 0, blocksMissed = 0;
-
-// The block banner clears on a wall-clock timer, NOT on the render loop.
-//
-// It used to be timed only by `tickRound`, which decrements `flashRemaining` by the frame delta
-// and calls `endFlash` at zero. That made the reset depend on the render loop still running, and
-// the loop does not always run:
-//
-//   - `animate()` returns immediately when there is no WebGL context, but `onBlockEvent` sets the
-//     banner regardless. On a browser without WebGL the banner appeared and NOTHING ever cleared
-//     it — `endFlash` was unreachable.
-//   - `requestAnimationFrame(animate)` is the last statement of `animate()`, so any exception
-//     anywhere in that function stopped the loop for good, freezing the banner with it.
-//   - rAF is throttled to a stop in a backgrounded tab, so the "20 seconds" were 20 seconds of
-//     RENDERED time, not elapsed time.
-//
-// The visual fade still runs per-frame — it is a colour lerp, it has to — but the RESET is now
-// guaranteed independently of it.
-var flashTimer = null;
-function armFlashReset() {
-  if (flashTimer) clearTimeout(flashTimer);
-  flashTimer = setTimeout(function () { flashTimer = null; endFlash(); }, FLASH_SECONDS * 1000);
-}
-function triggerBlockFound() {
-  flashState = 'block'; flashRemaining = FLASH_SECONDS;
-  lastBlockTs = performance.now() / 1000; blocksFound++;
-  bannerText.textContent = 'Block found.';
-  bannerSub.textContent = 'ghost pool · we did it';
-  banner.className = 'qbanner block-found show';
-  armFlashReset();
-}
-function triggerNoBlock() {
-  flashState = 'miss'; flashRemaining = FLASH_SECONDS;
-  lastBlockTs = performance.now() / 1000; blocksMissed++;
-  bannerText.textContent = 'Block found elsewhere.';
-  bannerSub.textContent = 'someone else this round · ghost keeps hashing';
-  banner.className = 'qbanner no-block show';
-  armFlashReset();
-}
-function endFlash() {
-  // Idempotent: reachable from the timer AND from `tickRound`, whichever gets there first.
-  if (flashTimer) { clearTimeout(flashTimer); flashTimer = null; }
-  flashState = null; banner.classList.remove('show');
-  sphereWire.material.color.copy(BASE_SPHERE_COLOR); sphereWire.material.opacity = 0.28;
-  // Wipe the scene and start the next round with an empty field.
-  // Personal-best bars reset too so every miner has a fresh shot at
-  // putting their first particle on the board next round.
-  particles.length = 0;
-  bestByMiner.clear();
-}
-// Real block events arrive from refreshPool via window.__ghostPool.onBlockEvent
-window.__ghostPool = window.__ghostPool || {};
-window.__ghostPool.onBlockEvent = function (kind, height) {
-  if (kind === 'ours') triggerBlockFound();
-  else triggerNoBlock();
-};
-// Re-sync "time since last block" from the chain's actual tip timestamp on
-// every refreshPool tick. Previous one-shot `tipTimeSynced` flag meant the
-// clock only ever seeded once on page load, then relied on height-increment
-// detection to reset it when a block landed. If that detection missed (e.g.
-// ghost-mining's template lagged the real tip, or a poll got rate-limited
-// across a transition), the clock drifted forever and eventually showed
-// 30+ minutes even though the chain had moved on.
-//
-// Now: re-seed whenever tipUnixSecs changes. `last_block_time` is the
-// authoritative source for the clock — skip only during the flash animation
-// (when the clock displays '—' anyway).
-let lastSyncedTipUnix = 0;
-function syncFromTipTime(tipUnixSecs) {
-  if (flashState) return;                           // flash is driving the display
-  if (tipUnixSecs === lastSyncedTipUnix) return;    // tip hasn't moved, no work
-  const nowUnix = Date.now() / 1000;
-  const ageSecs = Math.max(0, nowUnix - tipUnixSecs);
-  lastBlockTs = (performance.now() / 1000) - ageSecs;
-  lastSyncedTipUnix = tipUnixSecs;
-}
-window.__ghostPool.onTipTime = syncFromTipTime;
-
-// Own one-shot seed: if refreshPool already completed before this module
-// loaded, onTipTime wasn't defined in time. Fetch status ourselves so the
-// HUD clock is correct on first paint regardless of module-vs-fetch order.
-// Deferred 1.5s so the first-paint burst (stats / leaderboard / payout /
-// records) drains ahead of us — we can tolerate the clock showing 0:00
-// briefly, the tiles can't tolerate missing.
-setTimeout(async () => {
-  for (const vm of POOL_VMS) {
-    try {
-      const r = await fetch('/api/pool/' + vm + '/api/v1/mining/status');
-      if (!r.ok) continue;
-      const d = await r.json();
-      if (typeof d.last_block_time === 'number') {
-        syncFromTipTime(d.last_block_time);
-        return;
-      }
-    } catch (e) { /* try next vm */ }
-  }
-}, 1500);
-function tickRound(dt) {
-  if (flashState) {
-    flashRemaining -= dt;
-    const fade = flashRemaining / FLASH_SECONDS;
-    const target = flashState === 'block' ? BLOCK_COLOR : MISS_COLOR;
-    const pulse = 0.55 + Math.sin(performance.now() * 0.004) * 0.2;
-    sphereWire.material.color.copy(BASE_SPHERE_COLOR).lerp(target, pulse * fade);
-    sphereWire.material.opacity = 0.28 + 0.42 * fade;
-    if (flashRemaining <= 0) endFlash();
-    return;
-  }
-}
-function formatClock(secs) {
-  secs = Math.max(0, Math.floor(secs));
-  const m = Math.floor(secs / 60);
-  const s = secs % 60;
-  return `${m}:${s.toString().padStart(2,'0')}`;
-}
-
-const clock = new THREE.Clock();
-const qHud = {
-  hash:   document.getElementById('q-hash'),
-  miners: document.getElementById('q-miners'),
-  clock:  document.getElementById('q-clock'),
-};
-
-function animate() {
-  if (!renderer) return; // no WebGL context — fallback message is shown instead
-  // `requestAnimationFrame` is re-armed in a `finally`, so an exception in one frame costs that
-  // frame and nothing more. Previously the rAF call was simply the last statement of the function,
-  // which meant any throw ended the animation permanently and silently.
-  try {
-    animateFrame();
-  } catch (e) {
-    console.error('[quasar] frame failed', e);
-  } finally {
-    requestAnimationFrame(animate);
-  }
-}
-
-function animateFrame() {
-  const dt = Math.min(clock.getDelta(), 0.05);
-  tickEmitter(dt);
-  tickRound(dt);
-
-  for (let i = 0; i < particles.length; i++) {
-    const p = particles[i];
-    if (!p.parked) {
-      const distTravelled = p.age * PARTICLE_SPEED;
-      if (distTravelled < p.target) {
-        p.pos.copy(p.dir).multiplyScalar(distTravelled);
-      } else {
-        p.pos.copy(p.dir).multiplyScalar(p.target);
-        p.parked = true;
-        // (Real block events are dispatched from refreshPool via
-        // window.__ghostPool.onBlockEvent — never from particle state.
-        // The legacy isBlock trigger was firing false positives whenever
-        // a real share happened to land at quality >= 1.0 or the random
-        // fallback emitted a fake "rare" particle.)
-      }
-    }
-    p.age += dt;
-  }
-
-  // Global brightness: full during the round, fades with the 20s flash so
-  // the scene dims visibly before being wiped for the next round.
-  const roundAlpha = flashState
-    ? Math.max(0, flashRemaining / FLASH_SECONDS)
-    : 1;
-
-  const posArr = geom.attributes.position.array;
-  const colArr = geom.attributes.color.array;
-  const n = Math.min(particles.length, MAX_PARTICLES);
-  for (let i = 0; i < n; i++) {
-    const p = particles[i];
-    posArr[i*3] = p.pos.x; posArr[i*3+1] = p.pos.y; posArr[i*3+2] = p.pos.z;
-    const c = qualityColor(p.quality);
-    colArr[i*3]   = c.r * roundAlpha;
-    colArr[i*3+1] = c.g * roundAlpha;
-    colArr[i*3+2] = c.b * roundAlpha;
-  }
-  for (let i = n; i < MAX_PARTICLES; i++) {
-    posArr[i*3] = 0; posArr[i*3+1] = 0; posArr[i*3+2] = 0;
-    colArr[i*3] = 0; colArr[i*3+1] = 0; colArr[i*3+2] = 0;
-  }
-  geom.attributes.position.needsUpdate = true;
-  geom.attributes.color.needsUpdate = true;
-
-  controls.update();
-  renderer.render(scene, camera);
-
-  qHud.hash.textContent   = samplePoolHashrate().toFixed(2) + ' TH/s';
-  qHud.miners.textContent = (window.__ghostPool && window.__ghostPool.getMiners ? window.__ghostPool.getMiners() : 0).toString();
-  const sinceSec = (performance.now() / 1000) - lastBlockTs;
-  qHud.clock.textContent  = flashState ? '—' : formatClock(sinceSec);
-}
-
-sizeRenderer();
-const ro = new ResizeObserver(sizeRenderer);
-ro.observe(frame);
-
-// Fullscreen toggle — click the expand button (top-right corner icon) to go
-// full viewport; click it again or press Escape to exit.
-const EXPAND_ICON   = 'M3 9V3h6M21 9V3h-6M3 15v6h6M21 15v6h-6';
-const COLLAPSE_ICON = 'M9 3H3v6M15 3h6v6M9 21H3v-6M15 21h6v-6';
-const expandBtn  = document.getElementById('quasar-expand');
-const expandIcon = document.getElementById('quasar-expand-icon');
-function setFullscreen(on) {
-  frame.classList.toggle('fullscreen', !!on);
-  expandIcon.setAttribute('d', on ? COLLAPSE_ICON : EXPAND_ICON);
-  expandBtn.setAttribute('aria-label', on ? 'Exit fullscreen' : 'Expand to fullscreen');
-  document.body.style.overflow = on ? 'hidden' : '';
-  // One-shot resize to lock in new dimensions before the ResizeObserver fires
-  setTimeout(sizeRenderer, 0);
-}
-expandBtn.addEventListener('click', function () {
-  setFullscreen(!frame.classList.contains('fullscreen'));
-});
-document.addEventListener('keydown', function (e) {
-  if (e.key === 'Escape' && frame.classList.contains('fullscreen')) setFullscreen(false);
-});
-
-animate();
-</script>
+<script src="/node-pool.js"></script>
 
 </body>
 </html>

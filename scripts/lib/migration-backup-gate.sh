@@ -49,7 +49,13 @@ migration_backup_verdict() {
     fi
 
     local live db_kb avail_kb
-    live="$(printf '%s\n' "$probe" | sed -nE 's/^VER ([0-9]+)$/\1/p' | head -1)"
+    # From v65 the schema version is stored NEGATED (`-65`), so binaries from before the node pool
+    # cutover refuse the database at open (crates/ghost-storage/src/migration_v65.rs). Decode it
+    # here: a negative value is a version only at -65 or below.
+    live="$(printf '%s\n' "$probe" | sed -nE 's/^VER (-?[0-9]+)$/\1/p' | head -1)"
+    case "$live" in
+        -*) if [ "${live#-}" -ge 65 ] 2>/dev/null; then live="${live#-}"; else live="x$live"; fi ;;
+    esac
     db_kb="$(printf '%s\n' "$probe" | sed -nE 's/^DBKB ([0-9]+)$/\1/p' | head -1)"
     avail_kb="$(printf '%s\n' "$probe" | sed -nE 's/^AVKB ([0-9]+)$/\1/p' | head -1)"
 

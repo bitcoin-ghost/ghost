@@ -35,7 +35,6 @@ use tracing::{debug, error, warn};
 use crate::{
     error::{self, Action, PoolError, PoolErrorKind, PoolResult},
     io_task::spawn_io_tasks,
-    utils::PayoutMode,
 };
 
 mod common_message_handler;
@@ -56,19 +55,11 @@ pub struct DownstreamData {
     pub standard_channels:
         HashMap<ChannelId, StandardChannel<'static, DefaultJobStore<StandardJob<'static>>>>,
     pub channel_id_factory: AtomicU32,
-    /// SHARE_TIER_BIND: template ids whose jobs were built PER CHANNEL (tiered), and whose group
-    /// job was therefore never broadcast.
-    ///
-    /// Bookkept rather than inferred. It was previously read back off the channels' future jobs at
-    /// activation time, which is wrong whenever no channel still holds that template's future job —
-    /// every channel closed, or the template predates the channel. The inference then said "not
-    /// tiered", the group `SetNewPrevHash` went out naming a job no miner was ever sent, and the
-    /// translator dropped its upstream on `JobIdNotFound`, taking the miner endpoint down with it.
-    pub tiered_template_ids: std::collections::HashSet<u64>,
     /// Extensions that have been successfully negotiated with this client
     pub negotiated_extensions: Vec<u16>,
-    /// Payout mode derived from user_identity (None until channel is opened)
-    pub payout_mode: Option<PayoutMode>,
+    /// The client's `SetupConnection` vendor, hardware_version and firmware, when any is set.
+    /// Read only by the node pool layer, to look a native SV2 miner up in its firmware table.
+    pub setup_device: Option<ghost_common::slot_class_sensing::Sv2Device>,
 }
 
 /// Communication layer for a downstream connection.
@@ -94,7 +85,6 @@ pub struct Downstream {
     downstream_channel: DownstreamChannel,
     pub downstream_id: usize,
     pub requires_standard_jobs: Arc<AtomicBool>,
-    pub requires_custom_work: Arc<AtomicBool>,
     /// Extensions that the pool supports
     pub supported_extensions: Vec<u16>,
     /// Extensions that the pool requires
@@ -158,9 +148,8 @@ impl Downstream {
             standard_channels: HashMap::new(),
             group_channel,
             channel_id_factory,
-            tiered_template_ids: std::collections::HashSet::new(),
             negotiated_extensions: vec![],
-            payout_mode: None,
+            setup_device: None,
         }));
 
         Downstream {
@@ -168,11 +157,44 @@ impl Downstream {
             downstream_data,
             downstream_id,
             requires_standard_jobs: Arc::new(AtomicBool::new(false)),
-            requires_custom_work: Arc::new(AtomicBool::new(false)),
             supported_extensions,
             required_extensions,
             downstream_connection_token,
             peer_addr,
+        }
+    }
+
+    /// A downstream with no connection behind it, for channel manager tests: its channel state
+    /// is real, its I/O is two unbounded channels nobody reads.
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        downstream_id: DownstreamId,
+        group_channel: GroupChannel<'static, DefaultJobStore<ExtendedJob<'static>>>,
+    ) -> Self {
+        let (channel_manager_sender, _) = unbounded();
+        let (_, channel_manager_receiver) = unbounded();
+        let (downstream_sender, downstream_receiver) = unbounded();
+        Downstream {
+            downstream_channel: DownstreamChannel {
+                channel_manager_sender,
+                channel_manager_receiver,
+                downstream_sender,
+                downstream_receiver,
+            },
+            downstream_data: Arc::new(Mutex::new(DownstreamData {
+                extended_channels: HashMap::new(),
+                standard_channels: HashMap::new(),
+                group_channel,
+                channel_id_factory: AtomicU32::new(1),
+                negotiated_extensions: vec![],
+                setup_device: None,
+            })),
+            downstream_id,
+            requires_standard_jobs: Arc::new(AtomicBool::new(false)),
+            supported_extensions: vec![],
+            required_extensions: vec![],
+            downstream_connection_token: CancellationToken::new(),
+            peer_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
         }
     }
 

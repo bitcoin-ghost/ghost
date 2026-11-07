@@ -6,21 +6,11 @@ import { WizardDialog } from '@/components/ui/Wizard';
 import { Input } from '@/components/ui/Input';
 import { Badge } from '@/components/ui/Badge';
 import { useToast } from '@/components/ui/Toast';
-import { isMainnetBech32Address } from '@/lib/bitcoinAddress';
-import {
-  useSetPublicMiningConfig,
-  useSetMiningPayoutAddress,
-  useSetPoolName,
-} from '@/hooks/queries/useConfigQueries';
-import { useSetPrivateMining, useSetPublicMining } from '@/hooks/queries';
-import { useNodeStatus, useMiningStatus } from '@/hooks/queries';
+import { useSetPoolName } from '@/hooks/queries/useConfigQueries';
 
-type MiningMode = 'private_solo' | 'private_pool' | 'pool';
-
+// Every node is a public pool node: there is no mining-mode choice and no
+// node payout address any more, so the wizard only sets the coinbase pool name.
 interface PoolSetupData {
-  mining_mode: MiningMode;
-  public_mining: boolean;
-  payout_address: string;
   pool_name: string;
 }
 
@@ -29,55 +19,11 @@ interface PoolSetupWizardProps {
   onClose: () => void;
 }
 
-// Ghost is Bitcoin MAINNET. This used to accept `tb1` and `bcrt1` too, so a testnet or regtest
-// address could be saved and its rewards silently burned (#588). Shared with the other wizards
-// rather than reimplemented a third time.
-const isValidBech32Address = isMainnetBech32Address;
-
-const MODES: { key: MiningMode; label: string; desc: string }[] = [
-  { key: 'private_solo', label: 'Private Solo', desc: 'Your miners only. Stratum port closed to external connections. All block rewards go to you.' },
-  { key: 'private_pool', label: 'Private Pool', desc: 'Your miners + accept connected miners. You operate a pool and share rewards with connected miners.' },
-  { key: 'pool', label: 'Public Pool', desc: 'Public pool only. Your node acts as a pool server for external miners.' },
-];
-
-function getMiningMode(privateMining?: boolean, publicMining?: boolean): MiningMode {
-  if (privateMining && publicMining) return 'private_pool';
-  if (publicMining) return 'pool';
-  return 'private_solo';
-}
-
 export default function PoolSetupWizard({ isOpen, onClose }: PoolSetupWizardProps) {
-  const { data: nodeStatus } = useNodeStatus();
-  const { data: miningStatus } = useMiningStatus();
-  const setPublicMiningConfig = useSetPublicMiningConfig();
-  const setMiningPayoutAddress = useSetMiningPayoutAddress();
   const setPoolName = useSetPoolName();
-  const setPrivateMining = useSetPrivateMining();
-  const setPublicMining = useSetPublicMining();
   const toast = useToast();
 
-  const currentMode = getMiningMode(miningStatus?.private_mining, miningStatus?.public_mining ?? nodeStatus?.public_mining);
-
   const steps: WizardStep<PoolSetupData>[] = [
-    {
-      id: 'mode',
-      title: 'Mining Mode',
-      description: 'Choose how your node participates in mining',
-    },
-    {
-      id: 'payout',
-      title: 'Payout',
-      description: 'Set your mining payout address',
-      validate: (data) => {
-        if ((data.mining_mode === 'private_pool' || data.mining_mode === 'pool') && !data.payout_address.trim()) {
-          return 'Payout address is required for pool modes';
-        }
-        if (data.payout_address.trim() && !isValidBech32Address(data.payout_address)) {
-          return 'Invalid address. Must be a mainnet bech32 address starting with bc1';
-        }
-        return null;
-      },
-    },
     {
       id: 'info',
       title: 'Pool Info',
@@ -88,27 +34,10 @@ export default function PoolSetupWizard({ isOpen, onClose }: PoolSetupWizardProp
       title: 'Confirm',
       description: 'Review and apply changes',
       onSubmit: async (data) => {
-        const privateMining = data.mining_mode === 'private_solo' || data.mining_mode === 'private_pool';
-        // Only Public Pool claims the +3 Public Mining capability. Private Pool
-        // accepts connected miners but must NOT claim public-mining shares.
-        const publicMining = data.mining_mode === 'pool';
-
-        await Promise.all([
-          setPrivateMining.mutateAsync(privateMining),
-          setPublicMining.mutateAsync(publicMining),
-          setPublicMiningConfig.mutateAsync(publicMining),
-        ]);
-        if (data.payout_address.trim()) {
-          await setMiningPayoutAddress.mutateAsync(data.payout_address.trim());
-        }
         if (data.pool_name.trim()) {
           await setPoolName.mutateAsync(data.pool_name.trim());
         }
-        const modeLabel = MODES.find(m => m.key === data.mining_mode)?.label ?? data.mining_mode;
-        toast.success(
-          'Mining Setup Updated',
-          `Mining mode set to ${modeLabel}`
-        );
+        toast.success('Mining Setup Updated', 'Pool settings applied');
         onClose();
       },
     },
@@ -117,34 +46,19 @@ export default function PoolSetupWizard({ isOpen, onClose }: PoolSetupWizardProp
   const wizard = useWizard<PoolSetupData>({
     steps,
     initialData: {
-      mining_mode: currentMode,
-      public_mining: nodeStatus?.public_mining ?? false,
-      payout_address: '',
       pool_name: '',
     },
   });
 
-  // The wizard captures its initial mining mode at mount, before the node/mining
-  // status queries resolve — so without this it defaults to `private_solo` and
-  // an untouched Finish would switch a public pool back to private solo. Re-seed
-  // the live mode each time the dialog opens. (payout_address / pool_name are
-  // write-only inputs the status endpoints don't return, so they start empty.)
-  const hydratedRef = useRef(false);
+  // pool_name is a write-only input the status endpoints don't return, so the
+  // wizard starts empty each time it opens.
+  const wasOpenRef = useRef(false);
   useEffect(() => {
-    if (!isOpen) {
-      hydratedRef.current = false;
-      return;
+    if (isOpen && !wasOpenRef.current) {
+      wizard.reset({ pool_name: '' });
     }
-    if ((miningStatus || nodeStatus) && !hydratedRef.current) {
-      hydratedRef.current = true;
-      wizard.reset({
-        mining_mode: currentMode,
-        public_mining: nodeStatus?.public_mining ?? false,
-        payout_address: '',
-        pool_name: '',
-      });
-    }
-  }, [isOpen, miningStatus, nodeStatus]); // eslint-disable-line react-hooks/exhaustive-deps
+    wasOpenRef.current = isOpen;
+  }, [isOpen]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <WizardDialog
@@ -156,89 +70,8 @@ export default function PoolSetupWizard({ isOpen, onClose }: PoolSetupWizardProp
     >
       {(data, setData) => (
         <div className="space-y-6">
-          {/* Step 1: Mining Mode Selection */}
+          {/* Step 1: Pool Info */}
           {wizard.currentStep === 0 && (
-            <div className="space-y-4">
-              {MODES.map(({ key, label, desc }) => {
-                const isActive = data.mining_mode === key;
-                return (
-                  <button
-                    key={key}
-                    onClick={() => setData({
-                      mining_mode: key,
-                      public_mining: key === 'pool',
-                    })}
-                    className={`w-full p-4 rounded-lg border text-left transition-all ${
-                      isActive
-                        ? 'bg-[var(--accent)]/20 border-[var(--accent)] ring-1 ring-[var(--accent)]/50'
-                        : 'bg-[var(--surface)]/30 border-[var(--rule-strong)] hover:border-[var(--rule-strong)]'
-                    }`}
-                  >
-                    <div className="flex items-center gap-2 mb-1">
-                      <div className={`w-3 h-3 rounded-full border-2 flex items-center justify-center ${
-                        isActive ? 'border-[var(--accent)]' : 'border-[var(--rule-strong)]'
-                      }`}>
-                        {isActive && <div className="w-1.5 h-1.5 rounded-full bg-[var(--accent)]" />}
-                      </div>
-                      <span className={`font-medium ${isActive ? 'text-[color:var(--accent)]' : 'text-[color:var(--dim)]'}`}>{label}</span>
-                      {isActive && <Badge variant="success">Selected</Badge>}
-                      {key === 'pool' && <Badge variant="info">+3 Shares</Badge>}
-                    </div>
-                    <div className="text-xs text-[color:var(--fainter)] ml-5">{desc}</div>
-                  </button>
-                );
-              })}
-            </div>
-          )}
-
-          {/* Step 2: Payout Address */}
-          {wizard.currentStep === 1 && (
-            <div className="space-y-4">
-              <div className="p-4 rounded-lg bg-[var(--surface)]/50">
-                <Input
-                  label="Mining Payout Address"
-                  value={data.payout_address}
-                  onChange={(e) => setData({ payout_address: e.target.value })}
-                  placeholder="bc1q..."
-                />
-                <p className="text-sm text-[color:var(--dim)] mt-1">
-                  Enter a mainnet bech32 Bitcoin address to receive mining payouts. It must start
-                  with bc1. Use an address you do not also mine to, so node and mining income stay
-                  separately attributable.
-                </p>
-              </div>
-              {data.payout_address.trim() && (
-                <div className="p-4 rounded-lg bg-[var(--surface)]/50">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[color:var(--dim)]">Address Valid</span>
-                    {isValidBech32Address(data.payout_address) ? (
-                      <Badge variant="success">Valid</Badge>
-                    ) : (
-                      <Badge variant="error">Invalid</Badge>
-                    )}
-                  </div>
-                  {isValidBech32Address(data.payout_address) && (
-                    <div className="mt-2">
-                      <span className="text-[color:var(--dim)] text-sm">Network: </span>
-                      {/* Only mainnet validates, so the testnet and regtest branches this
-                          readout used to carry were unreachable once #588 tightened the check. */}
-                      <span className="text-[color:var(--accent)] text-sm">Mainnet</span>
-                    </div>
-                  )}
-                </div>
-              )}
-              {data.mining_mode !== 'private_solo' && !data.payout_address.trim() && (
-                <div className="p-4 rounded-lg bg-[var(--accent)]/20 border border-[var(--accent)]">
-                  <p className="text-sm text-[color:var(--accent)]">
-                    A payout address is required for pool modes (the node receives its own share of pool rewards here).
-                  </p>
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* Step 3: Pool Info */}
-          {wizard.currentStep === 2 && (
             <div className="space-y-4">
               <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <Input
@@ -301,33 +134,16 @@ export default function PoolSetupWizard({ isOpen, onClose }: PoolSetupWizardProp
             </div>
           )}
 
-          {/* Step 4: Confirm */}
-          {wizard.currentStep === 3 && (
+          {/* Step 2: Confirm */}
+          {wizard.currentStep === 1 && (
             <div className="space-y-4">
               <div className="p-4 rounded-lg bg-[var(--surface)]/50">
                 <h4 className="text-[color:var(--fg)] font-medium mb-3">Configuration Summary</h4>
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
-                    <span className="text-[color:var(--dim)]">Mining Mode</span>
-                    <div className="flex items-center gap-2">
-                      <Badge variant="default">
-                        {MODES.find(m => m.key === currentMode)?.label ?? currentMode}
-                      </Badge>
-                      <span className="text-[color:var(--fainter)]">-&gt;</span>
-                      <Badge variant="success">
-                        {MODES.find(m => m.key === data.mining_mode)?.label ?? data.mining_mode}
-                      </Badge>
-                    </div>
+                    <span className="text-[color:var(--dim)]">Mining</span>
+                    <Badge variant="success">Public pool</Badge>
                   </div>
-                  {data.payout_address.trim() && (
-                    <div className="flex items-center justify-between">
-                      <span className="text-[color:var(--dim)]">Payout Address</span>
-                      <span className="text-[color:var(--fg)] font-mono text-sm">
-                        {data.payout_address.trim().slice(0, 12)}...
-                        {data.payout_address.trim().slice(-8)}
-                      </span>
-                    </div>
-                  )}
                   {data.pool_name.trim() && (
                     <div className="flex items-center justify-between">
                       <span className="text-[color:var(--dim)]">Pool Name</span>
@@ -341,9 +157,6 @@ export default function PoolSetupWizard({ isOpen, onClose }: PoolSetupWizardProp
               <div className="p-4 rounded-lg bg-[var(--accent)]/20 border border-[var(--accent)]">
                 <p className="text-sm text-[color:var(--accent)]">
                   Click Finish to apply mining settings. Changes will take effect immediately.
-                  {data.mining_mode !== 'private_solo'
-                    ? ' Miners will be able to connect to your node on port 3333.'
-                    : ''}
                 </p>
               </div>
             </div>

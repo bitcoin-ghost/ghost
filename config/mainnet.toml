@@ -139,43 +139,16 @@ rate_limit_trusted_ips = []
 # Default: 1000
 max_miners = 10000
 
-# Mining mode - determines pool operation style
-# Options:
-#   - "public_pool":   DNS registered, anyone can mine, pool rewards (DEFAULT)
-#   - "private_pool":  Password required, pool rewards, not in DNS
-#   - "private_solo":  Password required, 99% to operator address
-# Default: "public_pool"
-# MUTABLE: Can be changed via dashboard API (triggers graceful restart)
-# NOTE: there is no `public_mining` key. It was removed from the config — `mining_mode`
-# is the single source of truth for whether this node is publicly discoverable.
-# Setting `public_mining` here does nothing: unknown keys are silently ignored.
-mining_mode = "public_pool"
+# Every node is a node pool node: there is no mining mode, and solo and private modes are gone.
+# `mining_mode`, `private_mining_password` and `solo_payout_address` in an older pool.toml are
+# read and ignored.
 
-# Enable public mining (legacy, use mining_mode instead)
-# Options: true | false
-# Default: false
-# DEPRECATED: Set mining_mode = "public_pool" instead
-
-# Signing key for message authentication (REQUIRED for public mining)
+# Signing key for message authentication (optional)
 # Must be 64 hex characters (32 bytes)
 # Generate with: openssl rand -hex 32
-# Options: 64 hex chars or omit for private mining
 # Default: None
-# IMMUTABLE: Cannot be changed via dashboard API (tied to DNS registration)
+# IMMUTABLE: Cannot be changed via dashboard API
 signing_key = "${SIGNING_KEY}"
-
-# Password for private mining modes (REQUIRED when mining_mode != public_pool)
-# Options: Any string (minimum 8 characters recommended)
-# Default: None
-# MUTABLE: Can be changed via dashboard API (triggers graceful restart)
-# private_mining_password = "${PRIVATE_MINING_PASSWORD}"
-
-# Payout address for private_solo mode (REQUIRED when mining_mode = private_solo)
-# Must be valid bech32 address for configured network (bc1... for mainnet)
-# Options: Valid Bitcoin address
-# Default: None
-# MUTABLE: Can be changed via dashboard API (triggers graceful restart)
-# solo_payout_address = "bc1q..."
 
 # Internal API authentication secret (REQUIRED FOR MAINNET)
 # Protects /api/internal/* and /admin/* endpoints with HMAC-SHA256
@@ -187,71 +160,9 @@ signing_key = "${SIGNING_KEY}"
 # IMMUTABLE: Cannot be changed via dashboard API (would compromise own auth)
 internal_api_secret = "${INTERNAL_API_SECRET}"
 
-# Enable Noise Protocol encryption for P2P (REQUIRED FOR MAINNET)
-# Encrypts sensitive P2P messages (shares, blocks, votes, payouts)
-# SECURITY: Node will refuse to start on mainnet with false!
-# Options: true | false
-# Default: true
-noise_enabled = true
-
-# Bootstrap seed nodes for P2P mesh discovery
-# Format: "host:port" using discovery port (8559)
-# Options: Array of peer addresses
-# Default: [] (empty)
-# IMMUTABLE: Cannot be changed via dashboard API (prevents peer poisoning)
-seed_nodes = [
-    # Add mainnet seed nodes here:
-    # "seed1.bitcoinghost.org:8559",
-    # "seed2.bitcoinghost.org:8559",
-    # "seed3.bitcoinghost.org:8559",
-]
-
-# -----------------------------------------------------------------------------
-# [network.p2p] - P2P Consensus Mesh Ports
-# -----------------------------------------------------------------------------
-# Each port serves a specific function in the consensus mesh.
-# All ports should be open in firewall for P2P communication.
-[network.p2p]
-
-# Share propagation - miners submit shares, nodes propagate
-# Options: 1-65535
-# Default: 8555
-share_propagation = 8555
-
-# Block announcements - new blocks found notification
-# Options: 1-65535
-# Default: 8556
-block_announcement = 8556
-
-# Consensus voting - BFT voting messages
-# Options: 1-65535
-# Default: 8557
-consensus_voting = 8557
-
-# Health monitoring - health pings between nodes
-# Options: 1-65535
-# Default: 8558
-health_monitoring = 8558
-
-# Discovery - peer discovery and mesh bootstrap
-# Options: 1-65535
-# Default: 8559
-discovery = 8559
-
-# Elder management - elder list updates and MPC ceremony
-# Options: 1-65535
-# Default: 8560
-elder_management = 8560
-
-# Payout proposal - payout distribution proposals
-# Options: 1-65535
-# Default: 8561
-payout_proposal = 8561
-
-# Payout transaction - signed payout transactions
-# Options: 1-65535
-# Default: 8562
-payout_transaction = 8562
+# The old mesh is gone: miners' ledger agreement is the share-chain relay in pool_sv2
+# (`[node_pool.relay]`). `noise_enabled`, `seed_nodes` and the `[network.p2p]` ports in an older
+# pool.toml are read and ignored.
 
 # =============================================================================
 # [policy] - Transaction Policy (BUDS Classification)
@@ -349,66 +260,11 @@ prune_height = 0
 # =============================================================================
 [pool]
 
-# Treasury address for pool fees
-# SECURITY: Use a secure P2TR (bc1p...) address you control!
-#
-# Options:
-#   - Simple string: "bc1p..." (single-sig)
-#   - Object for multi-sig (see below)
-#
-# For mainnet, use bc1p... (P2TR) or bc1q... (P2WPKH)
-# Default: None (REQUIRED)
-# IMMUTABLE: Cannot be changed via dashboard API (prevents redirect attacks)
-treasury_address = "${TREASURY_ADDRESS}"
-
-# Multi-sig treasury example (uncomment to use):
-# [pool.treasury_address]
-# address = "bc1q..."
-# witness_script = "522102...ae"  # Raw witness script hex
-# required = 2                     # M of N required signatures
-# total = 3                        # Total signers (N)
-
-# Minimum payout threshold in satoshis
-# Balances below this accumulate until threshold is met
-# Options: 547+ (must be above dust limit of 546)
-# Default: 100000 (0.001 BTC)
-min_payout_sats = 100000
-
-# Payout frequency in blocks
-# How often payouts are processed
-# Options: 1+
-# Default: 100
-payout_interval_blocks = 100
-
-# =============================================================================
-# [ghost_pay] - Ghost Pay L2 Instant Payments
-# =============================================================================
-[ghost_pay]
-
-# Enable Ghost Pay L2 layer
-# Provides instant off-chain payments with periodic L1 settlement
-# Options: true | false
-# Default: false
-# MUTABLE: Can be changed via dashboard API (triggers graceful restart)
-enabled = true
-
-# Virtual block time in seconds
-# L2 processes transactions every N seconds
-# Options: 1-3600
-# Default: 10
-virtual_block_secs = 10
-
-# Epoch length in virtual blocks
-# L2 settles to L1 after each epoch
-# Options: 1-100000
-# Default: 2160 (~6 hours at 10s blocks)
-epoch_blocks = 2160
-
-# Enable Wraith Protocol mixing (CoinJoin privacy)
-# Provides transaction unlinkability
-# Options: true | false
-# Default: true
-wraith_enabled = true
+# What a block pays is the node pool's canonical coinbase: the treasury is a compiled-in
+# address and miners are paid from the share-chain ledger, so there is no treasury address,
+# payout threshold or payout interval to configure here. `treasury_address`, `min_payout_sats`,
+# `payout_interval_blocks`, `node_payout_address` and the old `share_shard` flags in an older
+# pool.toml are read and ignored.
 
 # =============================================================================
 # Environment Variables Reference
@@ -417,13 +273,11 @@ wraith_enabled = true
 # Required for mainnet:
 #   BITCOIN_RPC_PASSWORD    - Bitcoin Core RPC password
 #   PUBLIC_ADDRESS          - Public IP/hostname for miners
-#   TREASURY_ADDRESS        - Pool fee destination (bc1p... or bc1q...)
 #   SIGNING_KEY             - 64 hex chars for message signing
 #   INTERNAL_API_SECRET     - 64 hex chars for API authentication
 #
 # Optional:
 #   BITCOIN_RPC_USER        - Bitcoin Core RPC username (default: ghostrpc)
-#   PRIVATE_MINING_PASSWORD - Password for private mining modes
 #
 # Generate secrets:
 #   openssl rand -hex 32    - Generate 64 hex char secret

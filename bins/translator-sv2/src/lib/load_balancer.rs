@@ -144,7 +144,6 @@ pub enum Tier {
 struct PeerInfo {
     public_address: String,
     miner_count: u32,
-    public_mining: bool,
     #[allow(dead_code)]
     last_seen: u64,
     /// Hardware-derived effective max miners. 0 = legacy / pre-update peer
@@ -345,14 +344,13 @@ impl LoadBalancer {
         let my_util_pct =
             ((local_downstream_count as u32).saturating_mul(100)) / my_capacity.max(1);
 
-        // Filter eligible peers: public_mining, with reported capacity,
+        // Filter eligible peers: a known address, reported capacity,
         // not over their own reject threshold.
         let candidates: Vec<&PeerInfo> = cache
             .peers
             .iter()
             .filter(|p| {
-                p.public_mining
-                    && !p.public_address.is_empty()
+                !p.public_address.is_empty()
                     && p.max_capacity > 0
                     && peer_util_pct(p) < self.config.reject_pct
                     // A peer that does not serve this tier is not a candidate for it. For
@@ -391,7 +389,7 @@ impl LoadBalancer {
         // cannot build a template, so the miner must go to a peer whatever the percentages say.
         //
         // Placed AFTER candidate selection so it can only ever divert to a peer that passed the
-        // same eligibility filter — public_mining, capacity reported, under its own reject
+        // same eligibility filter — address known, capacity reported, under its own reject
         // threshold, serving this tier. An unhealthy node with no eligible peer returns `None`
         // above and keeps serving locally: degraded beats unreachable.
         //
@@ -430,8 +428,7 @@ impl LoadBalancer {
             .peers
             .iter()
             .filter(|p| {
-                p.public_mining
-                    && !p.public_address.is_empty()
+                !p.public_address.is_empty()
                     && p.port_for(tier).is_some()
                     // #778: a peer whose own Core is down cannot serve a miner, and this path
                     // picks by LOWEST miner_count — which is precisely what a dying node
@@ -655,7 +652,6 @@ mod tests {
                 .map(|(c, cap, addr)| PeerInfo {
                     public_address: addr.into(),
                     miner_count: c,
-                    public_mining: true,
                     last_seen: 0,
                     max_capacity: cap,
                     core_healthy: None,
@@ -671,7 +667,6 @@ mod tests {
         PeerInfo {
             public_address: addr.into(),
             miner_count: 0,
-            public_mining: true,
             last_seen: 0,
             max_capacity: 100,
             core_healthy: None,
@@ -686,7 +681,6 @@ mod tests {
         PeerInfo {
             public_address: addr.into(),
             miner_count: miners,
-            public_mining: true,
             last_seen: 0,
             max_capacity: 100,
             core_healthy,

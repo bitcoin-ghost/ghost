@@ -1,0 +1,56 @@
+{
+  "address": "bcrt1qminerone000000000000000000000000000",
+  "network": "regtest",
+  "script_hex": "0014aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "known": true,
+  "message": null,
+  "balance": { "units": "27923905065281", "sats": 6501 },
+  "genesis": {
+    "owed": { "units": "2147483648000", "sats": 500 },
+    "export_height": 850,
+    "queue_since": null
+  },
+  "queue_since": 901,
+  "min_payout_sats": 1000,
+  "units_per_sat": 4294967296,
+  "queue": {
+    "next_block_height": 1000,
+    "snapshot_height": 980,
+    "parent_anchor": "abababababababababababababababababababababababababababababababab",
+    "owed": { "units": "27923905065281", "sats": 6501 },
+    "eligible": true,
+    "eligible_count": 3,
+    "is_top": false,
+    "age_rank": 1,
+    "size_rank": 2,
+    "next_block": [
+      { "slot_class": 3, "oldest_slots": 2, "in_oldest": true, "sats": 6501 },
+      { "slot_class": 9, "oldest_slots": 5, "in_oldest": true, "sats": 6501 }
+    ]
+  },
+  "queue_unavailable": null,
+  "recent_shares": [
+    {
+      "share_id": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "anchor": "0101010101010101010101010101010101010101010101010101010101010101",
+      "anchor_btc_height": 900,
+      "job_height": 901,
+      "credited_tier": 10,
+      "credit": { "units": "38654828349", "sats": 9 },
+      "received_at": 1799990000
+    }
+  ],
+  "payouts": [
+    {
+      "height": 960,
+      "block_hash": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+      "sats": 1000,
+      "units": "4294967296000",
+      "status": "provisional",
+      "confirmations": 40,
+      "mature": false,
+      "applied_at": 1799999000
+    }
+  ],
+  "settlement": { "caught_up": true, "synced_height": 999, "bitcoin_tip": 999, "provisional_blocks": 1 }
+}

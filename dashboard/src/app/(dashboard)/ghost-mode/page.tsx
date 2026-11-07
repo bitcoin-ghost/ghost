@@ -63,13 +63,11 @@ export default function GhostModePage() {
 
   const ghostMode = !!status?.ghost_mode;
   const localEgress = !!status?.ghost_mode_local_egress;
-  const publicMining = !!status?.public_mining;
-  // Ghost Mode and Public Mining are mutually exclusive: a Ghost Mode node
-  // builds near-empty blocks and forfeits all transaction-fee income, so it
-  // must not also run as a public miner. Block the enable path while Public
-  // Mining is active (turning Ghost Mode OFF stays allowed). The backend
-  // enforces the same rule and answers a conflicting enable with a 409.
-  const ghostModeBlocked = publicMining && !ghostMode;
+  // Ghost Mode can no longer be enabled on a pool node: a Ghost Mode node
+  // builds near-empty blocks and forfeits all transaction-fee income, and every
+  // node now mines for the public pool. The backend refuses an enable with a
+  // 409; turning Ghost Mode OFF stays allowed.
+  const ghostModeBlocked = !ghostMode;
   const ghostModeToggleDisabled = setGhostMode.isPending || ghostModeBlocked;
   // The sub-toggle only has any effect while Ghost Mode is on; grey it out
   // otherwise so operators can't arm a setting that does nothing.
@@ -143,7 +141,7 @@ export default function GhostModePage() {
             </button>
           </div>
 
-          {/* Mutual-exclusion guard: Public Mining active blocks Ghost Mode */}
+          {/* Ghost Mode cannot be enabled on a pool node */}
           {ghostModeBlocked && (
             <div
               style={{
@@ -156,16 +154,8 @@ export default function GhostModePage() {
               }}
             >
               <p className="t-body" style={{ color: "var(--dim)", lineHeight: "1.6" }}>
-                Public Mining is active. Ghost Mode would make your node build empty blocks and forfeit all fee income, so the
-                two can&apos;t run together — disable Public Mining first on the{" "}
-                <a
-                  href="/settings/capabilities"
-                  className="bare"
-                  style={{ color: "var(--accent)", textDecoration: "underline" }}
-                >
-                  Capabilities page
-                </a>
-                .
+                Ghost Mode can&apos;t be enabled on this node. Every node mines for the public Ghost pool, and Ghost
+                Mode would make it build empty blocks and forfeit all fee income, so the node refuses to turn it on.
               </p>
             </div>
           )}
@@ -306,40 +296,17 @@ export default function GhostModePage() {
         </div>
       </Card>
 
-      {/* Rewards / capability shares */}
+      {/* Pool nodes */}
       <Card>
         <h3 className="t-title" style={{ color: "var(--fg)", marginBottom: "4px" }}>
-          Does this affect my capability shares?
+          Why can&apos;t a pool node enable it?
         </h3>
-        <p className="t-body" style={{ color: "var(--dim)", lineHeight: "1.6", marginBottom: "12px" }}>
-          Not for most of them. Archive, Ghost Pay, Reaper
-          and Elder are each verified by an HTTP challenge–response to your node&apos;s API (block
-          retrieval, L2-block lookup, policy classification, registration order) — none of which rides the
-          P2P transaction-relay path Ghost Mode suppresses, so those +5 / +4 / +2 / +1 shares are
-          untouched. Ghost Mode composes cleanly with an archive /
-          verification node behind Tor: a private, silent node that still earns those shares of the reward
-          pool. The one exception is Public Mining — see below.
+        <p className="t-body" style={{ color: "var(--dim)", lineHeight: "1.6" }}>
+          Ghost Mode rejects transactions from peers, so your mempool never fills with fee-paying
+          transactions and the blocks your node builds are near-empty — coinbase subsidy only. Every node
+          mines for the public Ghost pool, and the pool can&apos;t offer miners empty blocks, so the node
+          refuses to enable Ghost Mode.
         </p>
-        <div
-          style={{
-            padding: "12px 14px",
-            background: "color-mix(in srgb, var(--yellow) 6%, transparent)",
-            border: "1px solid var(--rule)",
-            borderLeft: "3px solid color-mix(in srgb, var(--yellow) 55%, transparent)",
-            borderRadius: "6px",
-          }}
-        >
-          <p className="t-body" style={{ color: "var(--dim)", lineHeight: "1.6" }}>
-            Public Mining is mutually exclusive. Ghost Mode rejects transactions from peers, so your mempool never fills with fee-paying
-            transactions and the blocks your node builds are near-empty — coinbase subsidy only. Since the
-            node operator keeps the transaction fees (miners are paid from the subsidy, less the pool fee),
-            an empty block means zero fee income. So you
-            can&apos;t offer external miners a public pool of empty blocks: the Public Mining +3
-            toggle is blocked while Ghost Mode is on, and
-            vice versa. Private and solo mining are still allowed
-            — it&apos;s your choice to mine your own empty blocks and forfeit your own fee income.
-          </p>
-        </div>
       </Card>
 
       {/* Threat model */}

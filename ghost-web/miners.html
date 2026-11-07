@@ -1,30 +1,31 @@
-<!-- Bitcoin Ghost · Miners -->
+<!-- Bitcoin Ghost — bitcoinghost.org -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Miners · Bitcoin Ghost</title>
-  <meta name="description" content="Point your ASIC at Ghost Pool. 1% fee, ledger-style payouts, no registration, Stratum V1 and V2 supported.">
+  <title>Mine · Bitcoin Ghost</title>
+  <meta name="description" content="Point a miner at the Bitcoin Ghost node pool: connection details, firmware compatibility and the sensing loop.">
   <meta property="og:site_name" content="Bitcoin Ghost">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="Point your hashrate · Bitcoin Ghost">
-  <meta property="og:description" content="Mine to Ghost Pool. Sovereign payouts straight to your address, BFT-voted coinbase, zero custody, 1% pool fee.">
+  <meta property="og:title" content="Mine · Bitcoin Ghost">
+  <meta property="og:description" content="Point a miner at the Bitcoin Ghost node pool: connection details, firmware compatibility and the sensing loop.">
   <meta property="og:url" content="https://bitcoinghost.org/miners.html">
   <meta property="og:image" content="https://bitcoinghost.org/logo.png">
   <meta name="twitter:card" content="summary">
   <meta name="twitter:site" content="@defenwycke">
   <meta name="twitter:creator" content="@defenwycke">
-  <meta name="twitter:title" content="Point your hashrate · Bitcoin Ghost">
-  <meta name="twitter:description" content="Mine to Ghost Pool. Sovereign payouts straight to your address, BFT-voted coinbase, zero custody, 1% pool fee.">
+  <meta name="twitter:title" content="Mine · Bitcoin Ghost">
+  <meta name="twitter:description" content="Point a miner at the Bitcoin Ghost node pool: connection details, firmware compatibility and the sensing loop.">
   <meta name="twitter:image" content="https://bitcoinghost.org/logo.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/style.css?v=20260424b">
+  <link rel="stylesheet" href="/style.css?v=20261102">
   <script>
     (function () {
-      var saved = localStorage.getItem('ghost-theme');
+      var saved = null;
+      try { saved = localStorage.getItem('ghost-theme'); } catch (e) {}
       var system = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
       document.documentElement.setAttribute('data-theme', saved || system);
     })();
@@ -42,17 +43,16 @@
       </svg>
       <span class="wordmark">bitcoinghost</span>
     </a>
+
     <nav class="primary">
       <a href="/">overview</a>
-      <a href="/core.html">core</a>
       <a href="/pool.html">pool</a>
-      <a href="/pay.html">pay</a>
       <a href="/nodes.html">nodes</a>
-      <a href="/hazync.html">hazync</a>
       <a href="/miners.html" class="current">miners</a>
       <a href="/downloads.html">downloads</a>
       <a href="/docs/">docs</a>
     </nav>
+
     <div class="utils">
       <a href="https://github.com/bitcoin-ghost" class="bare icon-btn" aria-label="GitHub">
         <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
@@ -64,583 +64,146 @@
   </div>
 </header>
 
+<!-- NOT READY banner. Remove only after Phases 3 and 4 of docs/NODE_POOL_PLAN.md pass. -->
+<div class="np-banner" role="note">
+  <div class="container">
+    <strong>NOT READY</strong> The node pool is under construction and has not run on signet or mainnet. No block has ever been found and no payout ever made. Do not point hashrate at it. <a href="/docs/#honest-reading">Before you mine →</a>
+  </div>
+</div>
+
 <section class="hero">
   <div class="container">
-    <span class="eyebrow">Miners</span>
-    <h1>Mine on Ghost.</h1>
+    <span class="eyebrow">mine · not ready</span>
+    <h1>Point a miner at the node pool.</h1>
     <p class="lead">
-      Point any SHA-256 ASIC at a Ghost node. 1% pool fee, ledger-style
-      payouts, direct to your address. No registration, no KYC.
+      Use your payout address as your username. You are credited as you mine and paid straight from the coinbase of
+      the blocks the pool finds. Read the warnings first: the pool has never found a block.
     </p>
-    <div style="border:1px solid #c9922c;background:rgba(201,146,44,.08);border-radius:8px;padding:14px 16px;margin:18px 0;font-size:.95rem;line-height:1.55">
-      <strong>⚠ Read this before pointing hashrate here.</strong>
-      This pool runs on Bitcoin <strong>mainnet</strong> with real funds and is under active
-      development. It is small: at its current hashrate the expected time to find a block is
-      measured in <strong>years</strong>, and it <strong>has never found one</strong>. Nothing has
-      been paid out yet, because nothing has been won yet.
-      <br><br>
-      Mining here is a contribution to decentralising pooled mining, not a way to earn predictably.
-      If you need steady income from your hashrate, use an established pool. Expected payout scales
-      with total pool hashrate, so this improves only as more miners and operators join.
-    </div>
     <div class="hero-actions">
-      <a href="#quickstart" class="btn btn-primary">Connect a miner <span class="arrow">→</span></a>
-      <a href="/pool.html#your-miner" class="btn btn-ghost">Your stats</a>
+      <a href="#connect" class="btn btn-primary">Connect <span class="arrow">→</span></a>
+      <a href="/miner.html" class="btn btn-ghost">Your miner stats</a>
     </div>
   </div>
 </section>
 
-<!-- ───────── Why mine at Ghost ───────── -->
-<section class="block miner-why-section">
+<section class="block">
   <div class="container">
-    <div class="section-label">why mine at ghost</div>
-    <h2 class="section-title">A better deal for hashers.</h2>
-    <p class="section-lead">
-      Ghost Pool was built on the idea that miners should keep more of
-      what they earn, get paid directly on-chain, and never hand their
-      credentials to an operator.
-    </p>
-
-    <ul class="feature-list pool-cyan">
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
-        <div>
-          <div class="fl-name">1% fee, you keep 99%</div>
-          <div class="fl-desc">The pool takes 1% of the whole block reward — subsidy and transaction fees — split 50/50 between treasury and the node reward pool. You keep the other 99%, shared proportionally by the work you did. Fees are not paid to whoever finds the block: finding one is luck, and tying your income to it would mean earning nothing for months at a time.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
-        <div>
-          <div class="fl-name">Fees shared, not raffled</div>
-          <div class="fl-desc">Transaction fees are folded into the block reward and shared proportionally by the work you did — not paid to whoever happens to find the block. Your income tracks your contribution instead of your luck, which matters most if you are small: a finder-takes-all rule means earning nothing for months.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
-        <div>
-          <div class="fl-name">Ledger-style payouts</div>
-          <div class="fl-desc">Every share you submit accumulates on your unpaid ledger until you're paid. Shares never evaporate from template rolls — your work carries forward across blocks.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
-        <div>
-          <div class="fl-name">On-chain, non-custodial</div>
-          <div class="fl-desc">Payouts land in the coinbase of every block Ghost finds — direct to your Bitcoin address. The pool never takes custody of your sats.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
-        <div>
-          <div class="fl-name">Stratum V1 and V2</div>
-          <div class="fl-desc">Run what your ASIC already speaks. SV1 on port 3333 for legacy hardware, SV2 on 34255 for encrypted transport and per-miner channels. Miners hash against the node's template — Ghost doesn't run job declaration, so transaction selection stays with the node operator.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
-        <div>
-          <div class="fl-name">Any SHA-256 ASIC</div>
-          <div class="fl-desc">Bitaxe, Whatsminer, Antminer, Avalon — if it hashes double-SHA256 and talks Stratum, it works. No vendor lock-in, no firmware restrictions.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
-        <div>
-          <div class="fl-name">No registration, no KYC</div>
-          <div class="fl-desc">There's no account to create. Your payout address IS your identity. Plug in, authorise with <code>&lt;your-address&gt;.&lt;worker&gt;</code>, and start hashing.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg>
-        <div>
-          <div class="fl-name">Solo or pooled, your call</div>
-          <div class="fl-desc">Run your own node and mine against the templates your node builds — or point at someone else's public-mining node and pool up. Same protocol, same payouts either way.</div>
-        </div>
-      </li>
+    <div class="section-label">read this first</div>
+    <h2 class="section-title">Before you point any hashrate.</h2>
+    <ul class="np-honest">
+      <li><strong>No block has ever been found</strong> by the node pool.</li>
+      <li><strong>No payout has ever been made.</strong></li>
+      <li><strong>Your balance may stay unpaid for a long time.</strong></li>
+      <li><strong>An unaudited node can cheat you.</strong> The tool to audit one, <code>ghost-audit</code>, is built but not released yet.</li>
+      <li><strong>If you need steady income, use an established pool.</strong></li>
     </ul>
-  </div>
-</section>
-
-<!-- ───────── Payout economics ───────── -->
-<section class="block miner-econ-section">
-  <div class="container">
-    <div class="section-label">payout economics</div>
-    <h2 class="section-title">Where every sat of the block reward goes.</h2>
-    <p class="section-lead">
-      Transparent by construction. No "variance" buffer, no mystery
-      withholdings — the full split is on-chain in every coinbase the
-      pool builds.
-    </p>
-
-    <div class="core-tiles">
-      <div class="ct-tile">
-        <div class="k">to miners</div>
-        <div class="v accent">99%</div>
-        <div class="sub">of block subsidy, proportional to unpaid work</div>
-      </div>
-      <div class="ct-tile">
-        <div class="k">to treasury</div>
-        <div class="v">0.5%</div>
-        <div class="sub">of block subsidy, until 21 BTC cap</div>
-      </div>
-      <div class="ct-tile">
-        <div class="k">to node reward pool</div>
-        <div class="v">0.5%</div>
-        <div class="sub">of block subsidy, to node operators</div>
-      </div>
-      <div class="ct-tile">
-        <div class="k">tx fees</div>
-        <div class="v accent">100%</div>
-        <div class="sub">to whichever node finds the block</div>
-      </div>
-    </div>
-    <div class="pending-note">
-      Ledger model: your share is <strong>unpaid work / total unpaid work</strong>
-      across every active miner. Top 200 unpaid positions are paid per
-      block; miners below that threshold carry forward until they clear
-      the dust line. See the <a href="/pool.html">Pool</a> page's "In
-      line to get paid" for the live queue.
-      <br><br>
-      <strong>The dust line is a per-node setting, not a protocol rule.</strong> Each operator
-      sets <code>min_payout_sats</code>, so it differs between nodes — ask the one you mine on.
-      On this pool it is currently <strong>10,000 sats</strong> (0.0001 BTC). The protocol floor
-      underneath it is Bitcoin's own 546-sat dust limit, which no operator can go below. Work
-      under the line is never lost: it carries forward until it clears.
+    <div class="hero-actions">
+      <a href="/docs/#honest-reading" class="btn btn-ghost">How long waits are <span class="arrow">→</span></a>
     </div>
   </div>
 </section>
 
-<!-- ───────── Quickstart ───────── -->
-<section class="block miner-quickstart-section" id="quickstart">
+<section class="block" id="connect">
   <div class="container">
-    <div class="section-label">quickstart</div>
-    <h2 class="section-title">Connect a miner in seconds.</h2>
-    <p class="section-lead">
-      No account. No sign-up. No KYC. Your payout address <em>is</em> your
-      identity — paste it in, pick your Stratum version, and copy the exact
-      settings for your miner.
-    </p>
+    <div class="section-label">connect</div>
+    <h2 class="section-title">Any node. Your address as username.</h2>
 
-    <style>
-      .qsgen { display: grid; grid-template-columns: 1fr 1.1fr; gap: 22px; margin-top: 28px; align-items: start; }
-      @media (max-width: 760px) { .qsgen { grid-template-columns: 1fr; } }
-      .qsgen-form { background: var(--surface); border: 1px solid var(--rule); border-radius: 12px; padding: 22px; display: flex; flex-direction: column; gap: 18px; }
-      .qsgen-field { display: flex; flex-direction: column; gap: 7px; }
-      .qsgen-label { font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--dim); }
-      .qsgen-form input { font-family: var(--font-mono); font-size: 14px; color: var(--fg); background: var(--bg); border: 1px solid var(--rule-strong); border-radius: 8px; padding: 11px 13px; outline: none; transition: border-color 120ms; }
-      .qsgen-form input:focus { border-color: var(--accent); }
-      .qsgen-form input::placeholder { color: var(--fainter); }
-      .qsgen-toggle { display: flex; gap: 8px; }
-      .qsgen-toggle button { flex: 1; font-family: var(--font-sans); font-size: 13px; font-weight: 600; color: var(--dim); background: var(--bg); border: 1px solid var(--rule-strong); border-radius: 8px; padding: 10px 8px; cursor: pointer; transition: all 120ms; }
-      .qsgen-toggle button:hover { color: var(--fg); }
-      .qsgen-toggle button.active { color: #000; background: var(--accent); border-color: var(--accent); }
-      :root[data-theme="dark"] .qsgen-toggle button.active { color: #000; }
-      .qsgen-out { background: var(--surface); border: 1px solid var(--rule); border-radius: 12px; padding: 22px; display: flex; flex-direction: column; gap: 13px; }
-      .qsg-row { display: flex; flex-direction: column; gap: 5px; }
-      .qsg-row .k { font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--dim); }
-      .qsg-val { display: flex; align-items: center; gap: 8px; }
-      .qsg-val code { flex: 1; font-family: var(--font-mono); font-size: 13px; color: var(--fg); background: var(--bg); border: 1px solid var(--rule); border-radius: 7px; padding: 9px 11px; overflow-x: auto; white-space: nowrap; }
-      .qsg-copy { flex: none; font-family: var(--font-sans); font-size: 12px; font-weight: 600; color: var(--dim); background: var(--bg); border: 1px solid var(--rule-strong); border-radius: 7px; padding: 9px 12px; cursor: pointer; transition: all 120ms; }
-      .qsg-copy:hover { color: var(--fg); border-color: var(--fg); }
-      .qsg-copy.done { color: var(--green); border-color: var(--green); }
-      .qsg-select { flex: 1; font-family: var(--font-mono); font-size: 13px; color: var(--fg); background: var(--bg); border: 1px solid var(--rule-strong); border-radius: 7px; padding: 9px 11px; outline: none; cursor: pointer; }
-      .qsg-select:focus { border-color: var(--accent); }
-      .qsg-foot { font-size: 12.5px; color: var(--dim); line-height: 1.55; margin-top: 4px; }
-      .qsg-foot code { font-family: var(--font-mono); font-size: 12px; color: var(--fg); }
-      .qsg-noacct { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 600; color: var(--green); margin-bottom: 14px; }
-      .qsg-noacct::before { content: "✓"; }
-    </style>
+    <div class="hw-table-wrap">
+      <table class="hw-table">
+        <thead><tr><th>Protocol</th><th>URL</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td>Stratum V1</td><td><code>stratum+tcp://&lt;node&gt;:3333</code></td><td>Hobby tier, through the node's SV1 translator</td></tr>
+          <tr><td>Stratum V1</td><td><code>stratum+tcp://&lt;node&gt;:4444</code></td><td>Farm tier, higher starting difficulty</td></tr>
+          <tr><td>Stratum V2</td><td><code>&lt;node&gt;:34255</code></td><td>Standard channels always get the full 500-slot class</td></tr>
+        </tbody>
+      </table>
+    </div>
 
-    <div class="qsgen">
-      <div class="qsgen-form">
-        <label class="qsgen-field">
-          <span class="qsgen-label">Your payout address</span>
-          <input id="qsg-addr" type="text" spellcheck="false" autocomplete="off" placeholder="bc1q… your Bitcoin address" />
-        </label>
-        <label class="qsgen-field">
-          <span class="qsgen-label">Worker name</span>
-          <input id="qsg-worker" type="text" spellcheck="false" autocomplete="off" value="worker1" placeholder="worker1" />
-        </label>
-        <div class="qsgen-field">
-          <span class="qsgen-label">Stratum version</span>
-          <div class="qsgen-toggle" id="qsg-proto">
-            <button type="button" data-proto="sv1" class="active">SV1 · any ASIC</button>
-            <button type="button" data-proto="sv2">SV2 · native firmware</button>
-          </div>
+    <div class="feature-group">
+      <div class="features">
+        <div class="feature">
+          <div class="name">Username</div>
+          <div class="desc"><code>&lt;payout address&gt;.&lt;worker&gt;</code>. The address is where you are paid.</div>
+        </div>
+        <div class="feature">
+          <div class="name">Address types</div>
+          <div class="desc">P2SH (<code>3…</code>), P2WPKH or P2WSH (<code>bc1q…</code>), P2TR (<code>bc1p…</code>). P2PKH (<code>1…</code>) is refused.</div>
+        </div>
+        <div class="feature">
+          <div class="name">Which node</div>
+          <div class="desc">Any on the <a href="/endpoints.html">node list</a>, or your own. That node builds your jobs and takes the fees of any block you find.</div>
         </div>
       </div>
-
-      <div class="qsgen-out" id="qsg-out"></div>
     </div>
-
-    <p class="qsg-foot" style="margin-top:18px">
-      One address can back as many workers as you like — give each ASIC its own
-      worker name. Shares land on your unpaid ledger within seconds. Track them
-      any time by pasting your address into the
-      <a href="/pool.html#your-miner">lookup on the pool page</a> — no login.
-    </p>
-
-    <p class="qsg-foot" style="margin-top:12px">
-      The settings above point at the <strong>public pool</strong> — open to
-      anyone, no permission needed. Some operators instead run a
-      <strong>private pool</strong> you join with a password they give you, or
-      mine <strong>solo</strong> on their own node. Those are choices the
-      <em>node operator</em> makes — see the three
-      <a href="/nodes.html#mining-modes">mining modes</a> if you want to run
-      your own node and decide how its hashpower is used.
-    </p>
-
-    <script>
-      (function () {
-        var POOL = 'pool.bitcoinghost.org';
-        var SV1_PORT = '3333';
-        var SV2_PORT = '34255';
-        var proto = 'sv1';
-
-        // SV2 pins the pool's Noise AUTHORITY key. That key is per-POOL, not per-node:
-        // each node generates its own short-lived STATIC key at startup and certifies it
-        // with the shared authority key, which is exactly what lets one pinned key work
-        // behind a load-balanced name. So the SV2 panel points at the pool, same as SV1.
-        //
-        // The key is read live from the nodes, never hardcoded here. A stale hardcoded key
-        // is not merely broken: it tells miners to trust a key we no longer hold, and
-        // whoever does hold it can then present as this pool (#516).
-        //
-        // If the nodes ever DISAGREE about the authority key — a half-finished rotation —
-        // the panel degrades to a per-node picker rather than publishing one node's key as
-        // though it spoke for the pool.
-        var sv2Nodes = [];      // [{host, key, sv2Port}] — one entry per node that answered
-        var sv2Choice = 0;
-        function sv2Agreed() {
-          if (!sv2Nodes.length) return null;
-          for (var i = 1; i < sv2Nodes.length; i++) {
-            if (sv2Nodes[i].key !== sv2Nodes[0].key) return null;
-          }
-          return sv2Nodes[0];
-        }
-
-        var addrEl = document.getElementById('qsg-addr');
-        var workerEl = document.getElementById('qsg-worker');
-        var outEl = document.getElementById('qsg-out');
-        var toggle = document.getElementById('qsg-proto');
-
-        function esc(s) {
-          return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
-            return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-          });
-        }
-        function username() {
-          var a = (addrEl.value || '').trim() || '<your-address>';
-          var w = (workerEl.value || '').trim() || 'worker1';
-          return a + '.' + w;
-        }
-        function row(k, v) {
-          return '<div class="qsg-row"><span class="k">' + k + '</span>' +
-            '<div class="qsg-val"><code>' + esc(v) + '</code>' +
-            '<button type="button" class="qsg-copy" data-copy="' + esc(v) + '">Copy</button></div></div>';
-        }
-        function render() {
-          var user = username();
-          var html = '<div class="qsg-noacct">No account needed — no KYC</div>';
-          if (proto === 'sv1') {
-            html += row('Stratum URL', 'stratum+tcp://' + POOL + ':' + SV1_PORT);
-            html += row('Username', user);
-            html += row('Password', 'x');
-            html += '<p class="qsg-foot">Works on any ASIC — set the pool/URL, username and password fields in your miner’s web UI. The password is ignored; <code>x</code> is fine.</p>';
-          } else {
-            var agreed = sv2Agreed();
-            if (!sv2Nodes.length) {
-              html += '<p class="qsg-foot">Loading… the SV2 settings are read from the nodes themselves, so they are never stale.</p>';
-            } else if (agreed) {
-              html += row('Host', POOL);
-              html += row('Port', String(agreed.sv2Port));
-              html += row('Username', user);
-              html += row('Protocol', 'Stratum V2');
-              html += row('Channel type', 'Extended');
-              html += row('Authority public key', agreed.key);
-              html += '<p class="qsg-foot">For miners with native SV2 firmware (e.g. a Bitaxe on AxeOS). SV2 authenticates the pool by pinning its <strong>authority key</strong> — one key for the whole pool, so this works against any node and you can keep using <code>' + POOL + '</code>. Each node proves itself with its own short-lived key signed by that authority key, which is why one pin covers them all. Username is the same <code>address.worker</code> as SV1; the password is ignored.</p>';
-            } else {
-              var n = sv2Nodes[Math.min(sv2Choice, sv2Nodes.length - 1)];
-              var opts = '';
-              for (var i = 0; i < sv2Nodes.length; i++) {
-                opts += '<option value="' + i + '"' + (i === sv2Choice ? ' selected' : '') + '>' +
-                  esc(sv2Nodes[i].host) + '</option>';
-              }
-              html += '<div class="qsg-row"><span class="k">Node</span>' +
-                '<div class="qsg-val"><select id="qsg-node" class="qsg-select">' + opts + '</select></div></div>';
-              html += row('Host', n.host);
-              html += row('Port', String(n.sv2Port));
-              html += row('Username', user);
-              html += row('Protocol', 'Stratum V2');
-              html += row('Channel type', 'Extended');
-              html += row('Authority public key', n.key);
-              html += '<p class="qsg-foot"><strong>The nodes currently disagree about the pool\u2019s authority key</strong>, which usually means a key rotation is still in progress. Until they agree, pin a specific node: use the host and key shown together above, not <code>' + POOL + '</code>, because the balanced name could send you to a node with a different key. Username is the same <code>address.worker</code> as SV1; the password is ignored.</p>';
-            }
-          }
-          outEl.innerHTML = html;
-        }
-
-        toggle.addEventListener('click', function (e) {
-          var b = e.target.closest('button[data-proto]');
-          if (!b) return;
-          proto = b.getAttribute('data-proto');
-          Array.prototype.forEach.call(toggle.children, function (c) { c.classList.toggle('active', c === b); });
-          render();
-        });
-        addrEl.addEventListener('input', render);
-        workerEl.addEventListener('input', render);
-        outEl.addEventListener('change', function (e) {
-          if (e.target && e.target.id === 'qsg-node') {
-            sv2Choice = parseInt(e.target.value, 10) || 0;
-            render();
-          }
-        });
-        outEl.addEventListener('click', function (e) {
-          var b = e.target.closest('.qsg-copy');
-          if (!b) return;
-          var val = b.getAttribute('data-copy');
-          var done = function () { b.textContent = 'Copied'; b.classList.add('done'); setTimeout(function () { b.textContent = 'Copy'; b.classList.remove('done'); }, 1400); };
-          if (navigator.clipboard && navigator.clipboard.writeText) {
-            navigator.clipboard.writeText(val).then(done, done);
-          } else {
-            var ta = document.createElement('textarea'); ta.value = val; document.body.appendChild(ta); ta.select();
-            try { document.execCommand('copy'); } catch (e2) {} document.body.removeChild(ta); done();
-          }
-        });
-
-        render();
-
-        // Read each seed's OWN authority key from its own status endpoint, and its public
-        // host from the `is_self` entry of its own mesh-node list. Pairing the two is what
-        // makes the key trustworthy-by-construction: it comes from the same node it
-        // authenticates, not from a constant in this file.
-        //
-        // Seeds are the four load-balancer proxies. Nodes beyond them have no per-node
-        // proxy yet, so their keys cannot be read from a browser; they still appear in the
-        // public node list below, and an operator can read their key from that node's own
-        // /api/v1/mining/status.
-        var QS_SEEDS = ['vm1', 'vm2', 'vm3', 'vm4'];
-        (function loadSv2Nodes() {
-          var pending = QS_SEEDS.length;
-          QS_SEEDS.forEach(function (vm) {
-            var base = '/api/pool/' + vm + '/api/v1/';
-            Promise.all([
-              fetch(base + 'mining/status').then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; }),
-              fetch(base + 'pool/mesh-nodes').then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; })
-            ]).then(function (res) {
-              var st = res[0], mesh = res[1];
-              if (st && mesh && st.authority_public_key && st.public_mining) {
-                var self = (mesh.nodes || []).filter(function (n) { return n && n.is_self; })[0];
-                var host = self ? String(self.address || '').replace(/:\d+$/, '') : '';
-                if (host && !sv2Nodes.some(function (n) { return n.host === host; })) {
-                  sv2Nodes.push({ host: host, key: st.authority_public_key, sv2Port: st.stratum_v2_port || 34255 });
-                }
-              }
-            }).catch(function () { /* a dead seed just contributes nothing */ })
-              .then(function () {
-                if (--pending === 0) {
-                  sv2Nodes.sort(function (a, b) { return a.host < b.host ? -1 : 1; });
-                  if (proto === 'sv2') render();
-                }
-              });
-          });
-        })();
-      })();
-    </script>
   </div>
 </section>
 
-<!-- ───────── Public mining nodes ───────── -->
-<section class="block" id="nodes">
+<section class="block" id="firmware">
   <div class="container">
-    <div class="section-label">the mesh</div>
-    <h2 class="section-title">Every public node, live.</h2>
+    <div class="section-label">firmware compatibility</div>
+    <h2 class="section-title">Most hardware can't carry 500 payouts.</h2>
     <p class="section-lead">
-      <code>pool.bitcoinghost.org</code> is a convenience, not the pool — it
-      balances you across nodes. The pool is the mesh below, and you can point a
-      miner at any node in it directly. Nothing here is a hardcoded list: the
-      page asks a node, and the node reports itself and every peer it is
-      connected to, so a node that joins tonight appears here on its own.
+      A block pays miners from its coinbase, and a 500-output coinbase is about 22 KB. Most firmware cannot safely take that,
+      and on Bitmain and Avalon firmware an oversized coinbase can corrupt memory or be silently skipped rather than refused.
+      So each job carries a <strong>slot class</strong> sized to the miner's firmware. Your credit doesn't depend on it; how many
+      balances a block you find can pay does.
     </p>
 
-    <style>
-      .nodes-wrap { margin-top: 26px; overflow-x: auto; }
-      .nodes-tbl { width: 100%; border-collapse: collapse; font-size: 13.5px; min-width: 620px; }
-      .nodes-tbl th { text-align: left; font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--dim); padding: 0 14px 9px 0; border-bottom: 1px solid var(--rule); white-space: nowrap; }
-      .nodes-tbl td { padding: 11px 14px 11px 0; border-bottom: 1px solid var(--rule); vertical-align: top; }
-      .nodes-tbl td.mono { font-family: var(--font-mono); font-size: 12.5px; white-space: nowrap; }
-      .nodes-tbl tr:last-child td { border-bottom: none; }
-      .node-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 7px; vertical-align: middle; }
-      .node-dot.up { background: var(--green); }
-      .node-dot.down { background: var(--dim); }
-      .nodes-note { font-size: 12.5px; color: var(--dim); line-height: 1.6; margin-top: 16px; }
-      .nodes-note code { font-family: var(--font-mono); font-size: 12px; color: var(--fg); }
-      .nodes-empty { font-size: 13.5px; color: var(--dim); padding: 18px 0; }
-    </style>
-
-    <div class="nodes-wrap">
-      <table class="nodes-tbl" id="nodes-tbl" hidden>
-        <thead>
-          <tr>
-            <th>Node</th>
-            <th>Stratum V1</th>
-            <th>Stratum V2</th>
-            <th>Miners</th>
-            <th>Hashrate</th>
-          </tr>
-        </thead>
-        <tbody id="nodes-body"></tbody>
+    <div class="hw-table-wrap">
+      <table class="hw-table">
+        <thead><tr><th>Hardware</th><th>Safe coinbase ceiling</th><th>About this many miner outputs</th><th>Evidence</th></tr></thead>
+        <tbody>
+          <tr><td>Stock Antminer S19 (Amlogic board, the common one)</td><td>about 730 B</td><td><strong>9</strong></td><td>OCEAN's code and talk only; image encrypted</td></tr>
+          <tr><td>Antminer S19 XP (CVITEK board)</td><td>2,048 B</td><td><strong>40</strong></td><td>Disassembly of Bitmain's official image; stack overflow beyond</td></tr>
+          <tr><td>Antminer S21</td><td>about 2,250 B</td><td><strong>44</strong></td><td>OCEAN's code and talk; image encrypted</td></tr>
+          <tr><td>Antminer S9, S11, S17, T17, S19 XP Zynq</td><td>about 7,650 B</td><td><strong>170</strong></td><td>Bitmain source; memory overwrite beyond</td></tr>
+          <tr><td>Avalon (2014-2025, incl. A15, Nano 3s)</td><td>6,144 B</td><td><strong>135</strong></td><td>Canaan source; oversize jobs silently skipped</td></tr>
+          <tr><td>Whatsminer</td><td>about 6,500 B</td><td><strong>143</strong></td><td>OCEAN's code ("tested")</td></tr>
+          <tr><td>Bitaxe ESP-Miner up to v2.15</td><td>large (first part at most 1,024 B)</td><td><strong>500</strong></td><td>ESP-Miner source</td></tr>
+          <tr><td>Bitaxe ESP-Miner main, NerdQAxe</td><td>about 7,600 B</td><td><strong>170</strong></td><td>Source: 16 KB <code>mining.notify</code> line limit</td></tr>
+          <tr><td>ePIC, Braiins OS</td><td>16 KB or more</td><td><strong>364-500</strong></td><td>OCEAN's code; Braiins "not extensively tested"</td></tr>
+          <tr><td>NiceHash</td><td>about 500 B</td><td><strong>3</strong></td><td>OCEAN's code</td></tr>
+        </tbody>
       </table>
-      <div class="nodes-empty" id="nodes-empty">Asking the mesh…</div>
     </div>
-
-    <p class="nodes-note">
-      <strong>SV1</strong> works against any node on the list, and against
-      <code>pool.bitcoinghost.org</code> — it authenticates nothing, so the
-      address you point at does not have to be a specific machine.
-      <strong>SV2</strong> is different: it pins the node's authority key, every
-      node has its own, and so an SV2 miner has to name one node. The
-      <a href="#quickstart">quickstart</a> above will give you a node's host and
-      its matching key together.
-    </p>
-    <p class="nodes-note">
-      Picking a node yourself is the point, not a workaround — it is what keeps
-      the pool from depending on one name resolving. Your payouts are identical
-      wherever you connect: shares are pooled across the whole mesh and paid
-      against your address, not against the node that happened to take them.
-    </p>
-
-    <script>
-      (function () {
-        // Same bootstrap seeds as the rest of the site: enter through one of the four
-        // proxied nodes, then let that node's mesh-node list describe the WHOLE mesh —
-        // including nodes that have no proxy of their own.
-        var SEEDS = ['vm1', 'vm2', 'vm3', 'vm4'];
-        var SV1 = 3333, SV2 = 34255;
-        var tbl = document.getElementById('nodes-tbl');
-        var body = document.getElementById('nodes-body');
-        var empty = document.getElementById('nodes-empty');
-
-        function esc(s) {
-          return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
-            return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-          });
-        }
-        function hashrate(th) {
-          if (!isFinite(th) || th <= 0) return '—';
-          if (th < 1) return (th * 1000).toFixed(1) + ' GH/s';
-          if (th < 1000) return th.toFixed(2) + ' TH/s';
-          return (th / 1000).toFixed(2) + ' PH/s';
-        }
-        // The mesh reports an API address (host:8080 / host:8559); the mining ports are
-        // fleet-wide, so the host is the only part we need from it.
-        function hostOf(addr) { return String(addr || '').replace(/:\d+$/, ''); }
-
-        // Ask EVERY seed, not just the first that answers.
-        //
-        // The gossiped `public_mining` bit flaps: at any moment an observer has a peer or
-        // two reading false that are demonstrably public, and which peers those are keeps
-        // changing (#518). Trusting one node's view would make real nodes blink out of the
-        // list, and a node that blinks out as someone loads the page is simply not offered.
-        // Four independent views, OR-ed together, make that vanishingly unlikely — and not
-        // depending on any single node's account of the mesh is the right shape anyway.
-        async function fetchMesh() {
-          var views = await Promise.all(SEEDS.map(function (vm) {
-            var ctl = new AbortController();
-            var t = setTimeout(function () { ctl.abort(); }, 6000);
-            return fetch('/api/pool/' + vm + '/api/v1/pool/mesh-nodes', { signal: ctl.signal })
-              .then(function (r) { clearTimeout(t); return r.ok ? r.json() : null; })
-              .catch(function () { clearTimeout(t); return null; });
-          }));
-          var merged = {}, any = false;
-          views.forEach(function (d) {
-            if (!d || !Array.isArray(d.nodes)) return;
-            any = true;
-            d.nodes.forEach(function (n) {
-              var h = hostOf(n && n.address);
-              if (!h) return;
-              var prev = merged[h];
-              if (!prev) { merged[h] = JSON.parse(JSON.stringify(n)); return; }
-              // OR the capability and health bits; take the highest reported
-              // hashrate and miner count, since a stale view under-reports.
-              var pm = (prev.capabilities && prev.capabilities.public_mining) ||
-                       (n.capabilities && n.capabilities.public_mining);
-              if (prev.capabilities) prev.capabilities.public_mining = !!pm;
-              prev.healthy = prev.healthy !== false || n.healthy !== false;
-              if ((n.hashrate_th || 0) > (prev.hashrate_th || 0)) prev.hashrate_th = n.hashrate_th;
-              var nc = (n.deduped_miner_count != null ? n.deduped_miner_count : n.miner_count) || 0;
-              var pc = (prev.deduped_miner_count != null ? prev.deduped_miner_count : prev.miner_count) || 0;
-              if (nc > pc) { prev.deduped_miner_count = n.deduped_miner_count; prev.miner_count = n.miner_count; }
-            });
-          });
-          if (!any) return null;
-          return Object.keys(merged).map(function (h) { return merged[h]; });
-        }
-
-        function render(nodes) {
-          // Only nodes that actually accept outside hashpower belong on a miner's list —
-          // a node mining solo or running a private pool is not an endpoint you can use.
-          var pub = nodes.filter(function (n) {
-            return n && n.capabilities && n.capabilities.public_mining && hostOf(n.address);
-          });
-          // One row per HOST: a restarting node briefly reports stale same-IP duplicates.
-          var seen = {}, rows = [];
-          pub.forEach(function (n) {
-            var h = hostOf(n.address);
-            if (seen[h]) return;
-            seen[h] = 1;
-            rows.push(n);
-          });
-          rows.sort(function (a, b) { return (b.hashrate_th || 0) - (a.hashrate_th || 0); });
-
-          if (!rows.length) {
-            empty.textContent = 'No public mining nodes are reporting right now.';
-            empty.hidden = false; tbl.hidden = true;
-            return;
-          }
-          body.innerHTML = rows.map(function (n) {
-            var h = hostOf(n.address);
-            var up = n.healthy !== false;
-            var miners = (n.deduped_miner_count != null ? n.deduped_miner_count : n.miner_count) || 0;
-            return '<tr>' +
-              '<td class="mono"><span class="node-dot ' + (up ? 'up' : 'down') + '"></span>' + esc(h) + '</td>' +
-              '<td class="mono">' + esc(h + ':' + SV1) + '</td>' +
-              '<td class="mono">' + esc(h + ':' + SV2) + '</td>' +
-              '<td>' + miners + '</td>' +
-              '<td>' + hashrate(n.hashrate_th) + '</td>' +
-              '</tr>';
-          }).join('');
-          empty.hidden = true; tbl.hidden = false;
-        }
-
-        async function refresh() {
-          var nodes = await fetchMesh();
-          if (!nodes) {
-            // Keep whatever is already on screen; only say something if we never had data.
-            if (tbl.hidden) { empty.textContent = 'Could not reach the mesh just now — retrying.'; }
-            return;
-          }
-          render(nodes);
-        }
-        refresh();
-        setInterval(refresh, 60000);
-      })();
-    </script>
+    <div class="np-prose">
+      <p>From published source, official firmware images and OCEAN's public blocks. <strong>None of it was measured on our own
+      hardware</strong>; ceilings are raised only by tests. Outputs assume P2TR payees. A miner only gets a class whose whole coinbase
+      fits under its ceiling: the classes are 3, 9, 44, 143, 364 and 500 outputs (500 B, 730 B, 2.25 KB, 6.5 KB, 16 KB and 22 KB),
+      so an S21 fits the 44 class and a stock S19 the 9 class.</p>
+      <p><strong>Stratum V2 avoids the limit.</strong> On a standard SV2 channel the miner receives only a header, so it always gets
+      the full 500-slot class. Only SV2 firmware such as Braiins OS can use it; stock Antminers speak SV1 only.</p>
+      <p><strong>Known low-limit firmware is warned, not refused.</strong> The node tells you at connect and on the miner page, naming
+      the model and what the limit is expected to cost. Blocks it finds pay fewer balances and send more to the treasury as change.</p>
+    </div>
   </div>
 </section>
 
-<!-- ───────── Final CTA ───────── -->
-<section class="block connect-cta" style="border-bottom:none">
+<section class="block">
   <div class="container">
-    <div class="section-label">ready?</div>
-    <h2 class="section-title">Start hashing.</h2>
-    <p class="section-lead">
-      Every share, every block, direct to your address. No middleman.
-    </p>
-    <div class="hero-actions" style="margin-top: 24px">
-      <a href="#quickstart" class="btn btn-primary">Quickstart <span class="arrow">→</span></a>
-      <a href="/pool.html#your-miner" class="btn btn-ghost">Look up your miner</a>
+    <div class="section-label">the sensing loop</div>
+    <h2 class="section-title">The node feels its way up.</h2>
+    <p class="section-lead">A valid share proves your firmware built that coinbase. Nothing proves what it can't carry. So each connection is sensed:</p>
+    <ol class="quickstart-steps">
+      <li><div class="qs-n">1</div><div><div class="qs-title">Identify</div><div class="qs-desc">The node looks your model up by its user agent (SV1) or the vendor and firmware fields of the connection (SV2). An unknown miner gets the smallest class only.</div></div></li>
+      <li><div class="qs-n">2</div><div><div class="qs-title">Start small</div><div class="qs-desc">Every miner starts at the smallest class, 3 outputs.</div></div></li>
+      <li><div class="qs-n">3</div><div><div class="qs-title">Step up</div><div class="qs-desc">After 20 valid shares at a class, the node tries the next class up.</div></div></li>
+      <li><div class="qs-n">4</div><div><div class="qs-title">Never past the ceiling</div><div class="qs-desc">It never tries a class above your model's known-safe ceiling in the table, however well the miner is doing.</div></div></li>
+      <li><div class="qs-n">5</div><div><div class="qs-title">Drop back on failure</div><div class="qs-desc">If the miner disconnects or stops returning valid shares while a larger class is being tried, the node drops back to the last class that worked and stays there. Once settled, a dropped connection resumes at the settled class.</div></div></li>
+    </ol>
+  </div>
+</section>
+
+<section class="block" style="border-bottom: none;">
+  <div class="container">
+    <div class="section-label">getting paid</div>
+    <h2 class="section-title">Credited now, paid when a block lands.</h2>
+    <div class="np-prose">
+      <p>Each share adds to your balance at once. Each block found pays balances of at least 1,000 sats from the table as it
+      stood 20 blocks earlier: half its slots to the balances waiting longest, half to the largest, exactly what is owed and never
+      more. <a href="/docs/#payouts">The payout rule →</a></p>
+      <p>Check your balance on the <a href="/miner.html">miner page</a>. Checking that your node pays you honestly needs
+      <code>ghost-audit</code>, which is <a href="/docs/#ghost-audit">built but not released yet</a>.</p>
     </div>
   </div>
 </section>
@@ -650,18 +213,47 @@
     <div class="colophon">
       <div class="brand">
         <svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="width:22px;height:22px;">
-          <path d="M9 10h.01"/>
-          <path d="M15 10h.01"/>
-          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
+        <path d="M9 10h.01"/>
+        <path d="M15 10h.01"/>
+        <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
         </svg>
         <span class="wordmark">bitcoinghost</span>
       </div>
       <div class="meta">Open source under the MIT license. No ICO, no foundation, no venture money.</div>
     </div>
-    <div><h4>Core</h4><ul></ul></div>
-    <div><h4>Pool</h4><ul></ul></div>
-    <div><h4>Pay</h4><ul></ul></div>
-    <div><h4>Products</h4><ul></ul></div>
+    <div>
+      <h4>Node pool</h4>
+      <ul>
+        <li><a href="/">How it works</a></li>
+        <li><a href="/pool.html">Pool status</a></li>
+        <li><a href="/endpoints.html">Node list</a></li>
+        <li><a href="/miner.html">Miner stats</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Mine</h4>
+      <ul>
+        <li><a href="/miners.html">Point a miner</a></li>
+        <li><a href="/miners.html#firmware">Firmware</a></li>
+        <li><a href="/docs/#payouts">Payout rule</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Run a node</h4>
+      <ul>
+        <li><a href="/nodes.html">Run a node</a></li>
+        <li><a href="/downloads.html">Downloads</a></li>
+        <li><a href="/docs/#deployment">Deployment</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Read first</h4>
+      <ul>
+        <li><a href="/docs/#honest-reading">Before you mine</a></li>
+        <li><a href="/docs/#ghost-audit">Auditing a node</a></li>
+        <li><a href="/security.html">Security</a></li>
+      </ul>
+    </div>
     <div>
       <h4>Project</h4>
       <ul>
@@ -685,7 +277,7 @@
     btn.addEventListener('click', function () {
       var next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
       html.setAttribute('data-theme', next);
-      localStorage.setItem('ghost-theme', next);
+      try { localStorage.setItem('ghost-theme', next); } catch (e) {}
       render();
     });
   })();

@@ -198,6 +198,7 @@ nav.primary a.current::after {
 }
 .metric {
   padding: 28px 0;
+  min-width: 0;
 }
 .metric .label {
   font-family: var(--font-mono);
@@ -214,6 +215,7 @@ nav.primary a.current::after {
   margin-top: 6px;
   color: var(--fg);
   letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
 }
 .metric .unit, .metric .value .unit { color: var(--dim); font-size: 0.55em; margin-left: 6px; font-weight: 400; letter-spacing: 0.02em; }
 
@@ -1378,7 +1380,7 @@ h2.section-title {
 .lb-table-wrap {
   border: 1px solid var(--rule);
   border-radius: 6px;
-  overflow: hidden;
+  overflow-x: auto;
 }
 .lb-table {
   width: 100%; border-collapse: collapse;
@@ -1583,3 +1585,156 @@ pre.diagram .dim { color: var(--dim); }
   .roadmap .cell { padding: 16px 0; }
   .site-footer .container { grid-template-columns: 1fr 1fr; }
 }
+
+/* ---- Node pool --------------------------------------------------------
+   NOT READY banner: on every page until Phases 3 and 4 of the node pool
+   plan pass. Remove it then, and only then. */
+.np-banner {
+  border-bottom: 1px solid var(--rule);
+  background: var(--accent-weak);
+  font-family: var(--font-mono); font-size: 12.5px; line-height: 1.55;
+  color: var(--fg);
+}
+.np-banner .container { padding-top: 10px; padding-bottom: 10px; }
+.np-banner strong { color: var(--accent); font-weight: 600; letter-spacing: 0.06em; margin-right: 6px; }
+.np-banner a { color: var(--fg); }
+
+/* The required launch wording: plain list, accent rule on the left. */
+.np-honest {
+  margin-top: 32px; padding: 20px 24px;
+  border: 1px solid var(--rule-strong); border-left: 3px solid var(--accent);
+  border-radius: 6px; background: var(--surface);
+  list-style: none; display: grid; gap: 10px;
+  font-size: 16px; max-width: 70ch;
+}
+.np-honest li strong { font-weight: 600; }
+
+/* Prose block for explainer pages */
+.np-prose { max-width: 68ch; margin-top: 24px; color: var(--dim); font-size: 16px; line-height: 1.65; }
+.np-prose p + p { margin-top: 14px; }
+.np-prose strong { color: var(--fg); font-weight: 600; }
+.np-prose code, .hw-table code, .feature code { font-family: var(--font-mono); font-size: 0.9em; background: var(--surface); padding: 1px 5px; border-radius: 3px; color: var(--fg); }
+
+/* Live status: tile value "unavailable" is dimmed, never an error colour. */
+.metric .value.np-na { color: var(--dim); font-size: 18px; }
+.np-status-note { font-family: var(--font-mono); font-size: 12px; color: var(--dim); margin-top: 14px; }
+.np-raw { margin-top: 24px; }
+.np-raw summary { cursor: pointer; font-family: var(--font-mono); font-size: 12px; color: var(--dim); }
+.np-raw pre {
+  margin-top: 10px; padding: 16px; overflow-x: auto;
+  background: var(--surface); border: 1px solid var(--rule); border-radius: 6px;
+  font-family: var(--font-mono); font-size: 12px; color: var(--fg);
+}
+.np-placeholder {
+  margin-top: 24px; padding: 14px 18px;
+  border: 1px dashed var(--rule-strong); border-radius: 6px;
+  font-family: var(--font-mono); font-size: 13px; color: var(--dim);
+}
+.np-lookup-input {
+  flex: 1 1 320px; min-width: 0; max-width: 560px;
+  padding: 10px 14px; border-radius: 6px;
+  border: 1px solid var(--rule-strong); background: var(--bg); color: var(--fg);
+  font-family: var(--font-mono); font-size: 14px; outline: none;
+}
+.np-lookup-input:focus { border-color: var(--accent); }
+
+/* ───── Miner page (miner.html, miner.js) ─────
+   Chart colours: categorical slots blue / orange / violet, checked for colour-blind and
+   normal-vision separation against both page backgrounds; dark mode has its own steps. */
+:root {
+  --viz-1: #2a78d6;
+  --viz-2: #eb6834;
+  --viz-3: #6250d6;
+  --viz-grid: #e7e4dc;
+  --viz-unknown: rgba(107, 107, 104, 0.08);
+}
+:root[data-theme="dark"] {
+  --viz-1: #3987e5;
+  --viz-2: #d95926;
+  --viz-3: #9085e9;
+  --viz-grid: #222528;
+  --viz-unknown: rgba(139, 138, 132, 0.10);
+}
+[hidden] { display: none !important; }
+.mp2-hero { border-bottom: none; }
+.mp2-section { padding: 56px 0; }
+.mp2-nodeinfo { font-family: var(--font-mono); font-size: 12px; color: var(--dim); }
+.mp2-worker { color: var(--dim); font-weight: 500; }
+.mp2-tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 16px; }
+.mp-tile .v { overflow-wrap: anywhere; }
+.mp-tile .v.mp-na { color: var(--dim); font-size: 18px; }
+.mp2-updated { font-family: var(--font-mono); font-size: 11px; color: var(--fainter); margin-top: 10px; min-height: 1em; }
+.mp2-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; flex-wrap: wrap; margin-bottom: 8px; }
+.mp2-head .section-title { margin-bottom: 0; }
+.mp2-chart { margin-top: 28px; }
+.mp2-h3 { font-family: var(--font-mono); font-size: 12px; font-weight: 500; color: var(--dim); text-transform: uppercase; letter-spacing: 0.14em; margin: 0 0 8px; }
+.mp2-plot { width: 100%; min-height: 60px; }
+.mpc-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.mpc-chip {
+  font-family: var(--font-mono); font-size: 12px; padding: 6px 12px; min-height: 32px;
+  border: 1px solid var(--rule-strong); border-radius: 16px; background: transparent; color: var(--dim); cursor: pointer;
+}
+.mpc-chip:hover { color: var(--fg); }
+.mpc-chip.on { background: var(--fg); color: var(--bg); border-color: var(--fg); }
+.mpc-title { font-family: var(--font-mono); font-size: 12px; color: var(--fg); margin: 4px 0; }
+.mpc-svg { display: block; max-width: 100%; height: auto; overflow: visible; touch-action: pan-y; }
+.mpc-grid { stroke: var(--viz-grid); stroke-width: 1; }
+.mpc-ylab, .mpc-xlab, .mpc-unknown-lab { font-family: var(--font-mono); font-size: 11px; fill: var(--dim); }
+.mpc-unknown { fill: var(--viz-unknown); }
+.mpc-line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.mpc-line.s1 { stroke: var(--viz-1); }
+.mpc-bar.s1 { fill: var(--viz-1); }
+.mpc-bar.s2 { fill: var(--viz-2); }
+.mpc-bar.s3 { fill: var(--viz-3); }
+.mpc-marker { fill: var(--viz-2); stroke: var(--bg); stroke-width: 2; }
+.mpc-cross { stroke: var(--dim); stroke-width: 1; stroke-dasharray: 3 3; }
+.mpc-hit { fill: transparent; cursor: crosshair; }
+.mpc-legend { display: flex; gap: 16px; flex-wrap: wrap; font-family: var(--font-mono); font-size: 12px; color: var(--dim); margin-bottom: 6px; }
+.mpc-key { display: inline-flex; align-items: center; gap: 6px; }
+.mpc-swatch { display: inline-block; width: 12px; height: 12px; border-radius: 2px; }
+.mpc-swatch.dot { border-radius: 50%; }
+.mpc-swatch.s1 { background: var(--viz-1); }
+.mpc-swatch.s2 { background: var(--viz-2); }
+.mpc-swatch.s3 { background: var(--viz-3); }
+.mpc-empty {
+  padding: 20px; border: 1px dashed var(--rule-strong); border-radius: 6px;
+  font-family: var(--font-mono); font-size: 13px; color: var(--dim);
+}
+.mp-tip {
+  position: absolute; z-index: 50; pointer-events: none; max-width: 240px;
+  padding: 8px 10px; border-radius: 6px; background: var(--fg); color: var(--bg);
+  font-family: var(--font-mono); font-size: 12px; line-height: 1.5;
+}
+.mpt-time { opacity: 0.7; font-size: 11px; }
+.mpw-wrap { overflow-x: auto; }
+.mpw-table th, .mpq-table th, .payout-table th {
+  text-align: left; padding: 10px 14px; font-family: var(--font-mono); font-size: 11px; font-weight: 500;
+  color: var(--dim); text-transform: uppercase; letter-spacing: 0.1em; border-bottom: 1px solid var(--rule);
+}
+.mpw-table td { padding: 12px 14px; font-size: 13px; }
+.mpw-num { text-align: right; white-space: nowrap; }
+.mpw-table th.mpw-num, .payout-table th.mpw-num { text-align: right; }
+.mpw-name a { color: var(--fg); font-weight: 500; }
+.mpw-selected td { background: var(--surface); }
+.mpw-status { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; padding: 2px 8px; border-radius: 3px; }
+.mpw-status.online { background: rgba(34,197,94,0.15); color: #16a34a; }
+.mpw-status.idle { background: var(--accent-weak); color: var(--fg); }
+.mpw-status.offline { border: 1px solid var(--rule-strong); color: var(--dim); }
+.mpw-status.online::before { content: "\25CF  "; }
+.mpw-status.idle::before { content: "\25D0  "; }
+.mpw-status.offline::before { content: "\25CB  "; }
+.mpw-warn td { font-size: 12px; color: var(--fg); background: var(--accent-weak); padding: 8px 14px; }
+.mpq-words { margin-top: 8px; margin-bottom: 20px; }
+.mpq-assume { margin: 8px 0 0 20px; }
+@media (max-width: 900px) {
+  .mp2-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .mp2-section { padding: 40px 0; }
+  .mpw-table td, .mpw-table th { padding: 10px 8px; font-size: 12px; }
+}
+@media (max-width: 420px) {
+  .mp2-tiles .v { font-size: 22px; }
+}
+
+/* Long inline code (a key fingerprint, a command line) wraps rather than widening the page on
+   a phone. Code blocks (pre) scroll inside themselves instead. */
+:not(pre) > code { overflow-wrap: anywhere; }

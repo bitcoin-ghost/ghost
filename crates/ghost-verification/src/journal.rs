@@ -2,7 +2,7 @@
 //!
 //! The dashboard Logs console reads ghost-mining's own output from the in-process
 //! ring buffer (`crate::log_buffer`). This module extends that console to the
-//! *other* node binaries — ghostd, ghost-pay, the dashboard and the SV2 stack —
+//! *other* node binaries — ghostd, the dashboard and the SV2 stack —
 //! whose logs live in the systemd journal rather than in ghost-mining's address
 //! space.
 //!
@@ -56,13 +56,6 @@ pub const ALLOWLIST: &[LogUnit] = &[
         unit: "ghostd.service",
         label: "Ghost Core",
         description: "ghostd — Bitcoin Ghost Core daemon",
-        ring_buffer: false,
-    },
-    LogUnit {
-        key: "ghost-pay",
-        unit: "ghost-pay.service",
-        label: "Ghost Pay",
-        description: "L2 instant-payment service",
         ring_buffer: false,
     },
     LogUnit {
@@ -187,7 +180,7 @@ fn priority_to_level(priority: Option<&str>) -> &'static str {
 
 /// Strip ANSI/VT escape sequences (colour, cursor moves) from a log message.
 ///
-/// ghost-pay and some other binaries colour their `tracing` output, and journald
+/// Some binaries colour their `tracing` output, and journald
 /// stores those raw bytes. We render plain text, so drop every CSI/OSC/escape
 /// sequence. Implemented as a tiny state machine (no regex dependency).
 pub fn strip_ansi(input: &str) -> String {
@@ -409,7 +402,7 @@ mod tests {
 
     #[test]
     fn strip_ansi_removes_colour_and_keeps_text() {
-        // SGR colour codes (ghost-pay style) are removed, text preserved.
+        // SGR colour codes are removed, text preserved.
         assert_eq!(
             strip_ansi("\u{1b}[32mINFO\u{1b}[0m started"),
             "INFO started"
@@ -459,10 +452,10 @@ mod tests {
     fn parses_journal_json_array_message_and_strips_ansi() {
         // MESSAGE as a byte array carrying an ANSI colour sequence: bytes for
         // ESC [ 3 2 m O K ESC [ 0 m
-        let line = r#"{"__REALTIME_TIMESTAMP":"1700000000000000","PRIORITY":"4","_SYSTEMD_UNIT":"ghost-pay.service","MESSAGE":[27,91,51,50,109,79,75,27,91,48,109]}"#;
+        let line = r#"{"__REALTIME_TIMESTAMP":"1700000000000000","PRIORITY":"4","_SYSTEMD_UNIT":"sri-pool.service","MESSAGE":[27,91,51,50,109,79,75,27,91,48,109]}"#;
         let v = parse_journal_line(line).unwrap();
         assert_eq!(v["level"], "warn");
-        assert_eq!(v["target"], "ghost-pay.service"); // fell back to unit
+        assert_eq!(v["target"], "sri-pool.service"); // fell back to unit
         assert_eq!(v["message"], "OK"); // ANSI stripped from the byte array
     }
 

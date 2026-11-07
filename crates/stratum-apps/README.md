@@ -50,8 +50,6 @@ use stratum_apps::rpc::{BlockHash, MiniRpcClient};
 
 ### Role-Specific Bundles
 - `pool` - Everything needed for pool applications
-- `jd_client` - Everything needed for JD client applications
-- `jd_server` - Everything needed for JD server applications (includes RPC)
 - `translator` - Everything needed for translator applications (includes SV1 + translation)
 - `mining_device` - Everything needed for mining device applications
 
@@ -74,19 +72,3 @@ let connection = network_helpers::Connection::new(stream, HandshakeRole::Respond
 let config: PoolConfig = config_helpers::parse_config("pool.toml")?;
 ```
 
-### JD Server Application
-
-```toml
-[dependencies]
-stratum-apps = { version = "1.0", features = ["jd_server"] }
-```
-
-```rust
-use stratum_apps::{network_helpers, config_helpers, rpc};
-
-// RPC functionality with custom types
-use stratum_apps::rpc::{BlockHash, MiniRpcClient};
-
-// All networking and configuration utilities available
-// Plus RPC server utilities with proper serialization
-```

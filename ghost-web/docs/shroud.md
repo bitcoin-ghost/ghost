@@ -82,14 +82,14 @@ Set in `ghost.conf`:
 shroud=0
 ```
 
-**ghost-mining (P2P mesh forwarding):**
+**ghost-mining (dashboard setting):**
 
 ```toml
 [network]
 shroud_enabled = false   # default — opt-in
 ```
 
-Independent of the ghost-core flag — the pool's mesh has its own forwarding path, so the toggle exists separately. Most operators leave both on.
+This records the choice the dashboard shows; it is ghost-core's `-shroud` flag that delays relay, so a change takes effect when ghost-core restarts with it.
 
 :::info Why is it on by default?
 The cost of Shroud is at most 5 seconds of additional latency before peers learn about your transaction. The benefit is meaningful protection against the most common form of de-anonymisation. The asymmetry makes the default obvious.
@@ -109,22 +109,21 @@ The cost of Shroud is at most 5 seconds of additional latency before peers learn
 It's a network-layer privacy primitive, not a transaction-layer one. Specifically:
 
 - **It doesn't hide participation.** Your node relays transactions; an observer can tell you're online and active. Shroud only obscures *which* transactions originated with you.
-- **It doesn't encrypt anything.** Transaction contents (amounts, addresses, scripts) are still cleartext on the wire. Use Ghost Keys for address privacy and Wraith for transaction-graph privacy.
+- **It doesn't encrypt anything.** Transaction contents (amounts, addresses, scripts) are still cleartext on the wire.
 - **It doesn't help if your mempool is queryable.** Several services let you query "is transaction X in your mempool?" — Shroud can't help with that. **Ghost Mode** is the answer: it stops the node from accepting or advertising transactions to peers at all. The two are independent toggles and stack cleanly; Shroud handles relay timing, Ghost Mode handles whether the mempool is exposed in the first place.
 - **It doesn't change confirmation time.** A 5-second delay before peers see a transaction is well below the time it takes for a miner to actually include it in a block.
 
 ## Where it sits
 
-Shroud is one layer in Ghost's defence-in-depth privacy architecture. Each operates independently:
+Shroud is one of the node's network privacy layers. Each operates independently:
 
 | Layer | Feature | Protects |
 |---|---|---|
 | Network | **Shroud** | Transaction origin timing |
-| Address | Ghost Keys (BIP-352 v2) | Recipient address linkability |
-| Transaction | Wraith | Input-output graph linkability |
-| Payment | Ghost Pay L2 | On-chain transaction visibility |
+| Relay | Ghost Mode | Whether you relay transactions at all |
+| IP | Tor | Your node's IP address |
 
-You don't have to opt into all four. Enable what's appropriate for your threat model. Shroud is the cheapest of the four — it costs nothing and runs by default.
+You don't have to opt into all of them. Enable what's appropriate for your threat model. Shroud is the cheapest — it costs nothing and runs by default.
 
 ## Source
 

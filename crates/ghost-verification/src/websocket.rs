@@ -123,7 +123,8 @@ pub enum WsEvent {
         block_height: u64,
         round_id: u64,
         miner_count: u32,
-        peer_count: u32,
+        /// Share-chain relay peers, `null` until pool_sv2 has reported them.
+        peer_count: Option<u32>,
         uptime_secs: u64,
     },
     /// Error event
@@ -942,7 +943,7 @@ mod tests {
             block_height: 1,
             round_id: 1,
             miner_count: 1,
-            peer_count: 1,
+            peer_count: Some(1),
             uptime_secs: 1,
         }
         .is_public());

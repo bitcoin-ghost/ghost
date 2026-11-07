@@ -10,7 +10,6 @@
 #   ./scripts/test-dashboard-endpoints.sh --host 10.0.0.5     # Test specific host
 #   ./scripts/test-dashboard-endpoints.sh --all-vms           # Test all 4 VMs
 #   ./scripts/test-dashboard-endpoints.sh --pool-port 9090    # Custom pool port
-#   ./scripts/test-dashboard-endpoints.sh --ghost-pay-port 9900  # Custom Ghost Pay port
 #
 
 set -uo pipefail
@@ -31,7 +30,6 @@ VM_NAMES=("signet-1" "signet-2" "signet-3" "signet-4")
 # Defaults
 HOST="$VM1_IP"
 POOL_PORT=8080
-GHOST_PAY_PORT=8800
 ALL_VMS=false
 
 # Colors
@@ -54,7 +52,6 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --host)           HOST="$2"; shift 2 ;;
         --pool-port)      POOL_PORT="$2"; shift 2 ;;
-        --ghost-pay-port) GHOST_PAY_PORT="$2"; shift 2 ;;
         --all-vms)        ALL_VMS=true; shift ;;
         -h|--help)
             echo "Usage: $0 [OPTIONS]"
@@ -62,7 +59,6 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --host <ip>             Target host IP (default: $VM1_IP)"
             echo "  --pool-port <port>      Ghost pool API port (default: 8080)"
-            echo "  --ghost-pay-port <port> Ghost Pay API port (default: 8800)"
             echo "  --all-vms               Test all 4 production VMs sequentially"
             echo "  -h, --help              Show this help"
             exit 0
@@ -195,16 +191,14 @@ run_all_tests() {
     local host="$1"
     local pool="http://$host:$POOL_PORT"
 
-    # ── Group 1: Overview (6 endpoints) ──────────────────────────────
+    # ── Group 1: Overview (4 endpoints) ──────────────────────────────
 
-    group_header 1 "Overview" 6
+    group_header 1 "Overview" 4
 
     test_endpoint "1.1" "/api/v1/node/status"              "$pool/api/v1/node/status"
     test_endpoint "1.2" "/api/v1/mining/status"             "$pool/api/v1/mining/status"
     test_endpoint "1.3" "/api/v1/rewards/current"           "$pool/api/v1/rewards/current"
     test_endpoint "1.4" "/api/v1/mesh/status"               "$pool/api/v1/mesh/status"
-    test_endpoint "1.5" "/api/v1/ghostpay/status"           "$pool/api/v1/ghostpay/status"
-    test_endpoint_gated "1.6" "/api/v1/ghostpay/payout-history"   "$pool/api/v1/ghostpay/payout-history"
 
     # ── Group 2: Mining (7 endpoints) ────────────────────────────────
 
@@ -229,9 +223,9 @@ run_all_tests() {
     test_endpoint "3.5" "/api/v1/network/treasury"          "$pool/api/v1/network/treasury"
     test_endpoint_gated "3.6" "/api/v1/network/payout-history"    "$pool/api/v1/network/payout-history"
 
-    # ── Group 4: Settings/Config (13 endpoints) ──────────────────────
+    # ── Group 4: Settings/Config (12 endpoints) ──────────────────────
 
-    group_header 4 "Settings/Config" 13
+    group_header 4 "Settings/Config" 12
 
     test_endpoint_gated "4.01" "/api/v1/config/full"              "$pool/api/v1/config/full"
     test_endpoint "4.02" "/api/v1/config/archive_mode"      "$pool/api/v1/config/archive_mode"
@@ -240,20 +234,17 @@ run_all_tests() {
     test_endpoint "4.05" "/api/v1/config/template_profile"  "$pool/api/v1/config/template_profile"
     test_endpoint "4.06" "/api/v1/config/public_mining"     "$pool/api/v1/config/public_mining"
     test_endpoint "4.07" "/api/v1/config/reaper"            "$pool/api/v1/config/reaper"
-    test_endpoint "4.08" "/api/v1/config/ghost_pay"         "$pool/api/v1/config/ghost_pay"
-    test_endpoint "4.09" "/api/v1/config/elder"             "$pool/api/v1/config/elder"
-    test_endpoint "4.10" "/api/v1/config/prune_profile"     "$pool/api/v1/config/prune_profile"
-    test_endpoint "4.11" "/api/v1/config/operator_window"   "$pool/api/v1/config/operator_window"
-    test_endpoint "4.12" "/api/v1/config/profiles/mempool"  "$pool/api/v1/config/profiles/mempool"
-    test_endpoint "4.13" "/api/v1/config/profiles/template" "$pool/api/v1/config/profiles/template"
+    test_endpoint "4.08" "/api/v1/config/elder"             "$pool/api/v1/config/elder"
+    test_endpoint "4.09" "/api/v1/config/prune_profile"     "$pool/api/v1/config/prune_profile"
+    test_endpoint "4.10" "/api/v1/config/operator_window"   "$pool/api/v1/config/operator_window"
+    test_endpoint "4.11" "/api/v1/config/profiles/mempool"  "$pool/api/v1/config/profiles/mempool"
+    test_endpoint "4.12" "/api/v1/config/profiles/template" "$pool/api/v1/config/profiles/template"
 
-    # ── Group 5: Elders/MPC (3 endpoints) ────────────────────────────
+    # ── Group 5: Elders (1 endpoint) ─────────────────────────────────
 
-    group_header 5 "Elders/MPC" 3
+    group_header 5 "Elders" 1
 
     test_endpoint "5.1" "/api/v1/network/elder"             "$pool/api/v1/network/elder"
-    test_endpoint "5.2" "/api/v1/mpc/status"                "$pool/api/v1/mpc/status"
-    test_endpoint "5.3" "/api/v1/mpc/contributors"          "$pool/api/v1/mpc/contributors"
 
     # ── Group 6: System (4 endpoints) ────────────────────────────────
 
@@ -272,13 +263,12 @@ run_all_tests() {
     test_endpoint "7.2" "/api/v1/rewards/full"              "$pool/api/v1/rewards/full"
     test_endpoint "7.3" "/api/v1/rewards/node-history"      "$pool/api/v1/rewards/node-history"
 
-    # ── Group 8: Privacy - Wraith/Shroud/Haze (3 endpoints) ─────────
+    # ── Group 8: Privacy - Shroud/Haze (2 endpoints) ────────────────
 
-    group_header 8 "Privacy (Wraith/Shroud/Haze)" 3
+    group_header 8 "Privacy (Shroud/Haze)" 2
 
-    test_endpoint "8.1" "/api/v1/wraith/sessions"           "$pool/api/v1/wraith/sessions"
-    test_endpoint "8.2" "/api/v1/shroud/status"             "$pool/api/v1/shroud/status"
-    test_endpoint "8.3" "/api/v1/haze/status"               "$pool/api/v1/haze/status"
+    test_endpoint "8.1" "/api/v1/shroud/status"             "$pool/api/v1/shroud/status"
+    test_endpoint "8.2" "/api/v1/haze/status"               "$pool/api/v1/haze/status"
 
     # ── Group 9: Reaper/Buds (2 endpoints) ───────────────────────────
 
@@ -287,12 +277,11 @@ run_all_tests() {
     test_endpoint "9.1" "/api/v1/buds/capabilities"         "$pool/api/v1/buds/capabilities"
     test_endpoint "9.2" "/api/v1/buds/mempool"              "$pool/api/v1/buds/mempool"
 
-    # ── Group 10: Locks/Payments (2 endpoints) ───────────────────────
+    # ── Group 10: Payments (1 endpoint) ──────────────────────────────
 
-    group_header 10 "Locks/Payments" 2
+    group_header 10 "Payments" 1
 
-    test_endpoint "10.1" "/api/v1/locks"                    "$pool/api/v1/locks"
-    test_endpoint_gated "10.2" "/api/v1/payments"                 "$pool/api/v1/payments"
+    test_endpoint_gated "10.1" "/api/v1/payments"                 "$pool/api/v1/payments"
 
     # ── Group 11: Swarm (2 endpoints) ────────────────────────────────
 
@@ -313,13 +302,12 @@ run_all_tests() {
 
     test_endpoint "13.1" "/api/v1/backup/history"           "$pool/api/v1/backup/history"
 
-    # ── Group 14: Additional (3 endpoints) ───────────────────────────
+    # ── Group 14: Additional (2 endpoints) ───────────────────────────
 
-    group_header 14 "Additional" 3
+    group_header 14 "Additional" 2
 
-    test_endpoint     "14.1" "/api/v1/settlement/status"    "$pool/api/v1/settlement/status"
-    test_endpoint_raw "14.2" "/health"                      "$pool/health"
-    test_endpoint_raw "14.3" "/metrics"                     "$pool/metrics"
+    test_endpoint_raw "14.1" "/health"                      "$pool/health"
+    test_endpoint_raw "14.2" "/metrics"                     "$pool/metrics"
 }
 
 # ── Main ─────────────────────────────────────────────────────────────
@@ -331,7 +319,6 @@ echo "  $(date '+%Y-%m-%d %H:%M:%S')"
 echo "════════════════════════════════════════════════════════════════"
 echo ""
 echo "  Pool port:      $POOL_PORT"
-echo "  Ghost Pay port: $GHOST_PAY_PORT"
 
 START_TIME=$(date +%s)
 

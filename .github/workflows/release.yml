@@ -16,8 +16,36 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The old network's channel releases only what main carries. A `v*` tag pushed by hand on any
+  # other history (the node pool branch, above all) would otherwise build and publish an
+  # old-channel release that GitHub makes latest, and every old-network node would update to
+  # it. The tagged commit must be on main's history.
+  guard:
+    name: Tag on main
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: The tagged commit is on main's history
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" != tag ]; then
+            echo "not a tag ($GITHUB_REF_NAME): dry run, nothing to check"
+            exit 0
+          fi
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::tag $GITHUB_REF_NAME is on $GITHUB_SHA, which is not on main's history: the old channel releases only from main (node pool releases are np-v* tags, release-node-pool.yml)"
+            exit 1
+          fi
+          echo "$GITHUB_REF_NAME ($GITHUB_SHA) is on main's history"
+
   build:
     name: Build (${{ matrix.target }})
+    needs: guard
     runs-on: ${{ matrix.os }}
     # There was no timeout here at all, so the v1.11.23 apt hang was heading for the
     # 6-hour default. Generous enough for a cold cross-target release build, bounded
@@ -144,17 +172,10 @@ jobs:
       # release artifacts here.
       - name: Build
         run: |
-          # CRITICAL: ghost-mining must be built with its zk-production feature so
-          # the released binary can run on mainnet. Without it,
-          # is_production_mode() is false and the binary aborts at startup
-          # ("MAINNET SECURITY: ZK consensus on mainnet requires trusted setup
-          # parameters"), so every curl|bash install crash-loops. zk-production
-          # is a compile-time flag with no build-time artefacts (params load at
-          # runtime), so this is safe.
           cargo build --release --target ${{ matrix.target }} \
-            --features ghost-mining/zk-production \
-            -p ghost-mining -p ghost-cli -p ghost-miner-proxy \
-            -p translator_sv2 -p pool_sv2 -p jd_client_sv2 -p jd_server_sv2
+            -p ghost-mining -p ghost-cli \
+            -p translator_sv2 -p pool_sv2 \
+            -p ghost-audit
 
       # Build ghostd (the C++ Bitcoin Core daemon) so the node binaries ship in
       # ONE signed release at ONE version and can never drift apart. Linux only — the pool/elder fleet is
@@ -214,7 +235,9 @@ jobs:
           mkdir -p dist
 
           # Copy binaries (check actual names from target directory)
-          for bin in ghost-mining ghost-admin ghost-miner-proxy translator_sv2 pool_sv2 jd_client_sv2 ghost-light-wallet ghost-light-wallet-tui; do
+          # ghost-audit is the miner's tool (W2.9): it ships in the archive for miners to run and
+          # is never rolled onto a node (scripts/release.sh FLEET_BINARIES).
+          for bin in ghost-mining ghost-admin translator_sv2 pool_sv2 ghost-audit; do
             if [ -f "target/${{ matrix.target }}/release/${bin}${{ matrix.suffix }}" ]; then
               cp "target/${{ matrix.target }}/release/${bin}${{ matrix.suffix }}" dist/
             fi
@@ -284,15 +307,6 @@ jobs:
             done
             cmp "$check/ghost-mining" "$check/ghost-pool" || { echo "::error::ghost-pool is not the same build as ghost-mining"; exit 1; }
             echo "archive extracts ghost-mining and ghost-pool, identical"
-            # #402: the miner-side discovery shim ships with every node release, asked by name.
-            [ -x "$check/ghost-miner-proxy" ] || { echo "::error::the archive does not carry ghost-miner-proxy"; exit 1; }
-            # Run only where the runner can execute the target: a cross-built macOS x86_64 binary
-            # on an arm64 runner is not this check's business.
-            if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
-              proxy_says="$("$check/ghost-miner-proxy" --help 2>&1 || true)"
-              case "$proxy_says" in *"Decentralised mining discovery"*) ;; *) echo "::error::ghost-miner-proxy in the archive is not the discovery shim: ${proxy_says%%$'\n'*}"; exit 1 ;; esac
-            fi
-            echo "archive carries the ghost-miner-proxy discovery shim"
             # Where ghostd ships, so does its RPC client — and under that name it must BE the
             # RPC client. Asked of the extracted binary, not inferred from how it was built.
             if [ -f "$check/ghostd" ]; then

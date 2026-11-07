@@ -1,6 +1,6 @@
 // Config API endpoints
 import { fetchApi } from './client';
-import type { NodeConfig, FullNodeConfig, L2PruningConfig } from '@/types/api';
+import type { NodeConfig, FullNodeConfig } from '@/types/api';
 
 /// Live peer-connection state (#499).
 ///
@@ -44,11 +44,6 @@ export async function setOperatorWindow(blocks: number): Promise<{ success: bool
     method: 'POST',
     body: JSON.stringify({ blocks }),
   });
-}
-
-// L2 Pruning status (from ghost-pay-node)
-export async function getL2PruningStatus(): Promise<L2PruningConfig> {
-  return fetchApi<L2PruningConfig>('/api/v1/ghost-pay/pruning');
 }
 
 export async function setGhostMode(enabled: boolean): Promise<NodeConfig> {
@@ -151,13 +146,6 @@ export interface ArchiveModeResponse {
 
 export async function setArchiveMode(enabled: boolean): Promise<ArchiveModeResponse> {
   return fetchApi<ArchiveModeResponse>('/api/v1/config/archive_mode', {
-    method: 'POST',
-    body: JSON.stringify({ enabled }),
-  });
-}
-
-export async function setPublicMiningConfig(enabled: boolean): Promise<NodeConfig> {
-  return fetchApi<NodeConfig>('/api/v1/config/public_mining', {
     method: 'POST',
     body: JSON.stringify({ enabled }),
   });
@@ -382,14 +370,6 @@ export async function setPolicyCustom(config: PolicyCustomConfig): Promise<Polic
   });
 }
 
-// Payout Address Settings
-export async function setGhostPayPayoutAddress(address: string | null): Promise<{ address: string | null }> {
-  return fetchApi<{ address: string | null }>('/api/v1/settings/ghostpay_payout_address', {
-    method: 'POST',
-    body: JSON.stringify({ address }),
-  });
-}
-
 // Haze configuration (wizard endpoint)
 export async function configureHaze(mode: 'standard' | 'hazed' | 'full_archive'): Promise<{ success: boolean; mode: string; message: string }> {
   return fetchApi('/api/v1/haze/configure', {
@@ -412,33 +392,6 @@ export async function configureShroud(config: {
 export async function restartNode(): Promise<{ success: boolean; message: string }> {
   return fetchApi('/api/v1/node/restart', {
     method: 'POST',
-  });
-}
-
-// Ghost Pay mode toggle
-export async function setGhostPay(enabled: boolean): Promise<NodeConfig> {
-  return fetchApi<NodeConfig>('/api/v1/config/ghost_pay', {
-    method: 'POST',
-    body: JSON.stringify({ enabled }),
-  });
-}
-
-// Wraith mixing toggle — persists `[ghost_pay] wraith_enabled` to the node
-// config. A ghost-mining restart applies the change on a live node.
-export async function setWraith(
-  enabled: boolean,
-): Promise<{ success: boolean; enabled: boolean; persisted: boolean; restart_required: boolean; message: string }> {
-  return fetchApi('/api/v1/config/wraith', {
-    method: 'POST',
-    body: JSON.stringify({ enabled }),
-  });
-}
-
-// Mining payout address
-export async function setMiningPayoutAddress(address: string): Promise<{ success: boolean; message: string }> {
-  return fetchApi('/api/v1/mining/payout_address', {
-    method: 'POST',
-    body: JSON.stringify({ address }),
   });
 }
 

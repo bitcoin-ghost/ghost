@@ -24,13 +24,6 @@ scrape_configs:
     metrics_path: '/api/v1/metrics'
     scrape_interval: 10s
 
-  # Ghost Pay metrics (if enabled)
-  - job_name: 'ghost-pay'
-    static_configs:
-      - targets: ['ghost-pay:8081']
-    metrics_path: '/api/v1/metrics'
-    scrape_interval: 10s
-
   # Ghost Coordinator metrics (if enabled)
   - job_name: 'ghost-coordinator'
     static_configs:

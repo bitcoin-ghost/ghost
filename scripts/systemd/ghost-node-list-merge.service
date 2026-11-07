@@ -1,0 +1,33 @@
+[Unit]
+Description=Bitcoin Ghost merged node list (ghost-audit merge)
+Documentation=https://bitcoinghost.org/docs.html#node-pool
+# For the WEBSITE host, not a node: collects every configured lister's node-list.json, lists a
+# node only when a strict majority of them list it, writes /var/lib/ghost-merge/node-list.json
+# (served as https://bitcoinghost.org/node-list.json) and pool.zone, and runs the DNS hook when the
+# records change. Run by ghost-node-list-merge.timer. Exit 2 = no quorum (nothing written),
+# 4 = written but the DNS push failed (retried next run): both mark the unit failed.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ghost-merge
+Group=ghost-merge
+# GHOST_MERGE_ARGS: --network, one --lister per lister, --dns-name, --dns-hook. Not secret; the
+# DNS hook reads its credentials from its own root-only env file (/etc/ghost/namecheap.env).
+EnvironmentFile=/etc/ghost/node-list-merge.env
+ExecStart=/opt/ghost/bin/ghost-audit merge --out-json /var/lib/ghost-merge/node-list.json --out-dns /var/lib/ghost-merge/pool.zone $GHOST_MERGE_ARGS
+StateDirectory=ghost-merge
+StateDirectoryMode=0755
+UMask=0022
+TimeoutStartSec=300
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes

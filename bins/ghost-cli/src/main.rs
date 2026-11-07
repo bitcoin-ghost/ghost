@@ -23,39 +23,33 @@
 //! Ghost CLI - Administration tool for Bitcoin Ghost
 //!
 //! Provides commands for:
-//! - Viewing pool status
-//! - Managing miners
-//! - Monitoring consensus
-//! - Querying payouts
+//! - The node pool's health (relay tip, peers, settlement, connected miners)
+//! - The node's own health and metrics
 //! - Key management
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use colored::*;
 use serde::{Deserialize, Serialize};
-use std::io::{self, Write};
 use std::path::PathBuf;
-use tabled::{Table, Tabled};
-
-fn confirm(prompt: &str) -> bool {
-    print!("{} (y/n): ", prompt);
-    io::stdout().flush().unwrap();
-    let mut input = String::new();
-    io::stdin().read_line(&mut input).unwrap();
-    input.trim().eq_ignore_ascii_case("y")
-}
 
 /// Ghost CLI - Bitcoin Ghost Administration Tool
 #[derive(Parser)]
 #[command(name = "ghost-admin")]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// Pool API URL (required, or set GHOST_POOL_URL env var)
+    /// The node's API URL (or set GHOST_POOL_URL). Default: this machine's ghost-mining API.
     ///
-    /// Made optional at the clap level to sidestep a quirk where a required
-    /// `global = true` String arg ends up being required at both the top level
-    /// and every subcommand level. Presence is validated in main().
-    #[arg(short, long, env = "GHOST_POOL_URL", global = true)]
+    /// An Option at the clap level to sidestep a quirk where a required `global = true` String
+    /// arg ends up being required at both the top level and every subcommand level. An empty
+    /// value is refused in main().
+    #[arg(
+        short,
+        long,
+        env = "GHOST_POOL_URL",
+        global = true,
+        default_value = "http://127.0.0.1:8080"
+    )]
     url: Option<String>,
 
     /// Output format (text, json)
@@ -65,10 +59,6 @@ struct Cli {
     /// Retry HTTP requests on transient failures (network errors, timeouts, 5xx)
     #[arg(long, default_value = "3", global = true)]
     retries: u32,
-
-    /// Dry-run mode: print what mutating commands would do without calling the API
-    #[arg(long, global = true)]
-    dry_run: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -94,25 +84,6 @@ impl std::str::FromStr for OutputFormat {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Show pool status
-    Status,
-
-    /// Miner management
-    #[command(subcommand)]
-    Miner(MinerCommands),
-
-    /// Round information
-    #[command(subcommand)]
-    Round(RoundCommands),
-
-    /// Payout information
-    #[command(subcommand)]
-    Payout(PayoutCommands),
-
-    /// Consensus operations
-    #[command(subcommand)]
-    Consensus(ConsensusCommands),
-
     /// Key management
     #[command(subcommand)]
     Key(KeyCommands),
@@ -121,110 +92,8 @@ enum Commands {
     #[command(subcommand)]
     Node(NodeCommands),
 
-    /// Show metrics
+    /// Show metrics (Prometheus text)
     Metrics,
-}
-
-#[derive(Subcommand)]
-enum MinerCommands {
-    /// List connected miners
-    List {
-        /// Show only active miners
-        #[arg(short, long)]
-        active: bool,
-        /// Limit results
-        #[arg(short, long, default_value = "100")]
-        limit: usize,
-    },
-    /// Show miner details
-    Info {
-        /// Miner ID
-        miner_id: String,
-    },
-    /// Kick a miner
-    Kick {
-        /// Miner ID
-        miner_id: String,
-        /// Reason for kick
-        #[arg(short, long)]
-        reason: Option<String>,
-    },
-    /// Ban a miner
-    Ban {
-        /// Miner address or ID
-        target: String,
-        /// Duration in hours (0 = permanent)
-        #[arg(short, long, default_value = "24")]
-        duration: u64,
-        /// Reason for ban
-        #[arg(short, long)]
-        reason: Option<String>,
-    },
-    /// Unban a miner
-    Unban {
-        /// Miner address or ID
-        target: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum RoundCommands {
-    /// Show current round
-    Current,
-    /// Show round history
-    History {
-        /// Number of rounds
-        #[arg(short, long, default_value = "10")]
-        count: usize,
-    },
-    /// Show specific round
-    Info {
-        /// Round ID
-        round_id: u64,
-    },
-}
-
-#[derive(Subcommand)]
-enum PayoutCommands {
-    /// List pending payouts
-    Pending {
-        /// Limit results
-        #[arg(short, long, default_value = "50")]
-        limit: usize,
-    },
-    /// Show payout history
-    History {
-        /// Number of payouts
-        #[arg(short, long, default_value = "20")]
-        count: usize,
-    },
-    /// Show payout details
-    Info {
-        /// Payout ID or transaction ID
-        id: String,
-    },
-    /// Force payout processing
-    Process {
-        /// Dry run (don't actually process)
-        #[arg(long)]
-        dry_run: bool,
-    },
-}
-
-#[derive(Subcommand)]
-enum ConsensusCommands {
-    /// Show consensus status
-    Status,
-    /// List peers in mesh
-    Peers,
-    /// Show recent votes
-    Votes {
-        /// Number of votes
-        #[arg(short, long, default_value = "20")]
-        count: usize,
-    },
-    /// Show elder nodes
-    Elders,
 }
 
 #[derive(Subcommand)]
@@ -246,96 +115,12 @@ enum KeyCommands {
 
 #[derive(Subcommand)]
 enum NodeCommands {
+    /// Node pool health: relay tip, peers, settlement, fee address, connected miners' slot classes
+    Status,
     /// Show node info
     Info,
-    /// Check health
+    /// Check health (`/health`)
     Health,
-    /// Drain node (stop accepting new work)
-    Drain,
-    /// Resume node (accept new work)
-    Resume,
-    /// Show configuration
-    Config,
-}
-
-// =============================================================================
-// API Response Types
-// =============================================================================
-
-#[derive(Debug, Serialize, Deserialize)]
-struct StatusResponse {
-    status: String,
-    version: String,
-    node_id: String,
-    uptime_secs: u64,
-    bitcoin_connected: bool,
-    block_height: u64,
-    miners_connected: u64,
-    miners_active: u64,
-    current_round: u64,
-    shares_this_round: u64,
-    hashrate_estimate: f64,
-    blocks_found_total: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize, Tabled)]
-struct MinerInfo {
-    #[tabled(rename = "ID")]
-    id: String,
-    #[tabled(rename = "Address")]
-    address: String,
-    #[tabled(rename = "Hashrate")]
-    hashrate: String,
-    #[tabled(rename = "Shares")]
-    shares: u64,
-    #[tabled(rename = "Last Seen")]
-    last_seen: String,
-    #[tabled(rename = "Status")]
-    status: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Tabled)]
-struct RoundInfo {
-    #[tabled(rename = "ID")]
-    id: u64,
-    #[tabled(rename = "Height")]
-    height: u64,
-    #[tabled(rename = "Shares")]
-    shares: u64,
-    #[tabled(rename = "Work")]
-    work: String,
-    #[tabled(rename = "Duration")]
-    duration: String,
-    #[tabled(rename = "Status")]
-    status: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Tabled)]
-struct PayoutInfo {
-    #[tabled(rename = "ID")]
-    id: String,
-    #[tabled(rename = "Address")]
-    address: String,
-    #[tabled(rename = "Amount (sats)")]
-    amount_sats: u64,
-    #[tabled(rename = "Round")]
-    round_id: u64,
-    #[tabled(rename = "Status")]
-    status: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Tabled)]
-struct PeerInfo {
-    #[tabled(rename = "Node ID")]
-    node_id: String,
-    #[tabled(rename = "Address")]
-    address: String,
-    #[tabled(rename = "Tenure")]
-    tenure: String,
-    #[tabled(rename = "Elder")]
-    is_elder: String,
-    #[tabled(rename = "Uptime")]
-    uptime: String,
 }
 
 // =============================================================================
@@ -398,8 +183,14 @@ impl ApiClient {
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("request failed")))
     }
 
+    /// GET a JSON route under `/api/v1`.
     async fn get<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
-        let url = format!("{}/api/v1{}", self.base_url, path);
+        self.get_json_at(&format!("/api/v1{path}")).await
+    }
+
+    /// GET a JSON route at `path` from the server root.
+    async fn get_json_at<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
+        let url = format!("{}{}", self.base_url, path);
         self.with_retries(|| async {
             let resp = match self.client.get(&url).send().await {
                 Ok(r) => r,
@@ -426,41 +217,9 @@ impl ApiClient {
         .await
     }
 
-    async fn post<T: for<'de> Deserialize<'de>>(
-        &self,
-        path: &str,
-        body: &impl Serialize,
-    ) -> Result<T> {
-        let url = format!("{}/api/v1{}", self.base_url, path);
-        let body_json = serde_json::to_value(body).context("Failed to serialize request body")?;
-        self.with_retries(|| async {
-            let resp = match self.client.post(&url).json(&body_json).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    return AttemptResult::Retry(
-                        anyhow::Error::from(e).context("Failed to connect to pool"),
-                    );
-                }
-            };
-            let status = resp.status();
-            if status.is_server_error() {
-                return AttemptResult::Retry(anyhow::anyhow!("API error: {}", status));
-            }
-            if !status.is_success() {
-                return AttemptResult::Fatal(anyhow::anyhow!("API error: {}", status));
-            }
-            match resp.json::<T>().await {
-                Ok(v) => AttemptResult::Ok(v),
-                Err(e) => AttemptResult::Fatal(
-                    anyhow::Error::from(e).context("Failed to parse API response"),
-                ),
-            }
-        })
-        .await
-    }
-
-    async fn get_text(&self, path: &str) -> Result<String> {
-        let url = format!("{}/api/v1{}", self.base_url, path);
+    /// GET a text route at `path` from the server root.
+    async fn get_text_at(&self, path: &str) -> Result<String> {
+        let url = format!("{}{}", self.base_url, path);
         self.with_retries(|| async {
             let resp = match self.client.get(&url).send().await {
                 Ok(r) => r,
@@ -492,215 +251,8 @@ impl ApiClient {
 // Command Handlers
 // =============================================================================
 
-async fn cmd_status(client: &ApiClient, format: OutputFormat) -> Result<()> {
-    let status: StatusResponse = client.get("/status").await?;
-
-    match format {
-        OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&status)?);
-        }
-        OutputFormat::Text => {
-            println!("{}", "=== Ghost Pool Status ===".green().bold());
-            println!();
-            println!("  {} {}", "Version:".cyan(), status.version);
-            println!("  {} {}", "Node ID:".cyan(), &status.node_id[..16]);
-            println!(
-                "  {} {}",
-                "Status:".cyan(),
-                if status.status == "healthy" {
-                    status.status.green()
-                } else {
-                    status.status.red()
-                }
-            );
-            println!(
-                "  {} {}s",
-                "Uptime:".cyan(),
-                format_duration(status.uptime_secs)
-            );
-            println!();
-            println!("{}", "--- Bitcoin ---".yellow());
-            println!(
-                "  {} {}",
-                "Connected:".cyan(),
-                if status.bitcoin_connected {
-                    "Yes".green()
-                } else {
-                    "No".red()
-                }
-            );
-            println!("  {} {}", "Block Height:".cyan(), status.block_height);
-            println!();
-            println!("{}", "--- Mining ---".yellow());
-            println!(
-                "  {} {}",
-                "Miners Connected:".cyan(),
-                status.miners_connected
-            );
-            println!("  {} {}", "Miners Active:".cyan(), status.miners_active);
-            println!("  {} {}", "Current Round:".cyan(), status.current_round);
-            println!(
-                "  {} {}",
-                "Shares (this round):".cyan(),
-                status.shares_this_round
-            );
-            println!(
-                "  {} {:.2} TH/s",
-                "Hashrate:".cyan(),
-                status.hashrate_estimate / 1e12
-            );
-            println!("  {} {}", "Blocks Found:".cyan(), status.blocks_found_total);
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_miner_list(
-    client: &ApiClient,
-    format: OutputFormat,
-    active: bool,
-    limit: usize,
-) -> Result<()> {
-    let path = if active {
-        format!("/miners?active=true&limit={}", limit)
-    } else {
-        format!("/miners?limit={}", limit)
-    };
-
-    let miners: Vec<MinerInfo> = client.get(&path).await?;
-
-    match format {
-        OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&miners)?);
-        }
-        OutputFormat::Text => {
-            if miners.is_empty() {
-                println!("{}", "No miners connected".yellow());
-            } else {
-                println!(
-                    "{}",
-                    format!("=== {} Miners ===", miners.len()).green().bold()
-                );
-                let table = Table::new(&miners).to_string();
-                println!("{}", table);
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_round_current(client: &ApiClient, format: OutputFormat) -> Result<()> {
-    let round: RoundInfo = client.get("/rounds/current").await?;
-
-    match format {
-        OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&round)?);
-        }
-        OutputFormat::Text => {
-            println!("{}", "=== Current Round ===".green().bold());
-            println!();
-            println!("  {} {}", "Round ID:".cyan(), round.id);
-            println!("  {} {}", "Block Height:".cyan(), round.height);
-            println!("  {} {}", "Shares:".cyan(), round.shares);
-            println!("  {} {}", "Total Work:".cyan(), round.work);
-            println!("  {} {}", "Duration:".cyan(), round.duration);
-            println!("  {} {}", "Status:".cyan(), round.status);
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_payout_pending(client: &ApiClient, format: OutputFormat, limit: usize) -> Result<()> {
-    let payouts: Vec<PayoutInfo> = client
-        .get(&format!("/payouts/pending?limit={}", limit))
-        .await?;
-
-    match format {
-        OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&payouts)?);
-        }
-        OutputFormat::Text => {
-            if payouts.is_empty() {
-                println!("{}", "No pending payouts".yellow());
-            } else {
-                println!(
-                    "{}",
-                    format!("=== {} Pending Payouts ===", payouts.len())
-                        .green()
-                        .bold()
-                );
-                let table = Table::new(&payouts).to_string();
-                println!("{}", table);
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_consensus_status(client: &ApiClient, format: OutputFormat) -> Result<()> {
-    #[derive(Debug, Serialize, Deserialize)]
-    struct ConsensusStatus {
-        connected_peers: u64,
-        elder_count: u64,
-        participation_percent: f64,
-        last_vote_time: String,
-        pending_proposals: u64,
-    }
-
-    let status: ConsensusStatus = client.get("/consensus/status").await?;
-
-    match format {
-        OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&status)?);
-        }
-        OutputFormat::Text => {
-            println!("{}", "=== Consensus Status ===".green().bold());
-            println!();
-            println!("  {} {}", "Connected Peers:".cyan(), status.connected_peers);
-            println!("  {} {}", "Elder Nodes:".cyan(), status.elder_count);
-            println!(
-                "  {} {:.1}%",
-                "Participation:".cyan(),
-                status.participation_percent
-            );
-            println!("  {} {}", "Last Vote:".cyan(), status.last_vote_time);
-            println!(
-                "  {} {}",
-                "Pending Proposals:".cyan(),
-                status.pending_proposals
-            );
-        }
-    }
-    Ok(())
-}
-
-async fn cmd_consensus_peers(client: &ApiClient, format: OutputFormat) -> Result<()> {
-    let peers: Vec<PeerInfo> = client.get("/consensus/peers").await?;
-
-    match format {
-        OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&peers)?);
-        }
-        OutputFormat::Text => {
-            if peers.is_empty() {
-                println!("{}", "No peers connected".yellow());
-            } else {
-                println!(
-                    "{}",
-                    format!("=== {} Connected Peers ===", peers.len())
-                        .green()
-                        .bold()
-                );
-                let table = Table::new(&peers).to_string();
-                println!("{}", table);
-            }
-        }
-    }
-    Ok(())
-}
-
 async fn cmd_metrics(client: &ApiClient) -> Result<()> {
-    let metrics = client.get_text("/metrics").await?;
+    let metrics = client.get_text_at("/metrics").await?;
     println!("{}", metrics);
     Ok(())
 }
@@ -765,268 +317,226 @@ async fn cmd_key_verify(path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_node_health(client: &ApiClient, format: OutputFormat) -> Result<()> {
-    #[derive(Debug, Serialize, Deserialize)]
-    struct HealthResponse {
-        status: String,
-        checks: std::collections::HashMap<String, bool>,
-    }
-
-    let health: HealthResponse = client.get("/health").await?;
-
+/// `node status`: the node pool's health, from `GET /api/v1/node-pool/status` (served by pool_sv2,
+/// forwarded by ghost-mining).
+async fn cmd_node_pool_status(client: &ApiClient, format: OutputFormat) -> Result<()> {
+    let status: serde_json::Value = client.get("/node-pool/status").await?;
     match format {
-        OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&health)?);
-        }
-        OutputFormat::Text => {
-            let status_color = if health.status == "healthy" {
-                health.status.green()
-            } else {
-                health.status.red()
-            };
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&status)?),
+        OutputFormat::Text => print!("{}", render_node_pool_status(&status)),
+    }
+    Ok(())
+}
 
+/// The node pool status as plain lines. Missing fields print as `?`, never as a healthy default.
+fn render_node_pool_status(v: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
+    fn f(v: &serde_json::Value) -> String {
+        match v {
+            serde_json::Value::Null => "?".to_string(),
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        }
+    }
+    let short = |v: &serde_json::Value| {
+        let s = f(v);
+        if s.len() > 16 {
+            format!("{}…", &s[..16])
+        } else {
+            s
+        }
+    };
+    let mut o = String::new();
+    let chain = &v["share_chain"];
+    let st = &v["settlement"];
+    let _ = writeln!(o, "=== Node pool ({}) ===", f(&v["network"]));
+    let _ = writeln!(
+        o,
+        "  relay tip:     {} (anchor height {}, Bitcoin height {}, T_net {})",
+        short(&chain["tip"]),
+        f(&chain["anchor_height"]),
+        f(&chain["btc_height"]),
+        f(&chain["t_net"])
+    );
+    let _ = writeln!(
+        o,
+        "  genesis:       {} at height {} ({})",
+        short(&v["start"]["genesis_anchor"]),
+        f(&v["start"]["genesis_btc_height"]),
+        f(&v["start"]["source"])
+    );
+    let _ = writeln!(o, "  peers:         {}", f(&v["peers"]));
+    let caught_up = match st["caught_up"].as_bool() {
+        Some(true) => "yes".to_string(),
+        Some(false) => "NO".to_string(),
+        None => "?".to_string(),
+    };
+    let provisional = st["provisional"].as_array().map_or(0, Vec::len);
+    let _ = writeln!(
+        o,
+        "  settlement:    caught up {caught_up} (synced {} of Bitcoin tip {}), {provisional} provisional",
+        f(&st["synced_height"]),
+        f(&st["bitcoin_tip"])
+    );
+    let _ = writeln!(
+        o,
+        "  pool hashrate: {}",
+        pool_hashrate_line(&v["pool_hashrate"])
+    );
+    let _ = writeln!(o, "  total owed:    {}", total_owed_line(&v["total_owed"]));
+    let _ = writeln!(o, "  fee address:   {}", f(&v["fee_address"]));
+    let _ = writeln!(o, "  ledger rows:   {}", f(&v["ledger_rows"]));
+    let miners = v["miners"].as_array().cloned().unwrap_or_default();
+    let _ = writeln!(o, "  miners:        {}", miners.len());
+    for m in &miners {
+        let _ = writeln!(
+            o,
+            "    {} {} class {}{}",
+            f(&m["address"]),
+            f(&m["kind"]),
+            f(&m["slot_class"]),
+            m["sensing"]["model"]
+                .as_str()
+                .map(|x| format!(" ({x})"))
+                .unwrap_or_default()
+        );
+        if let Some(w) = m["firmware_warning"].as_str() {
+            let _ = writeln!(o, "      warning: {w}");
+        }
+    }
+    o
+}
+
+/// `pool_hashrate` as one line: the rate and the window it was measured over, or why it could not
+/// be measured. `?` when the node does not report it (a pool_sv2 older than the field).
+fn pool_hashrate_line(h: &serde_json::Value) -> String {
+    if !h.is_object() {
+        return "?".to_string();
+    }
+    let n = |k: &str| {
+        h[k].as_u64()
+            .map_or_else(|| "?".to_string(), |x| x.to_string())
+    };
+    match h["hashes_per_sec"].as_f64() {
+        Some(hs) => format!(
+            "{} over {} Bitcoin blocks (job heights {} to {}, {} credited shares)",
+            fmt_hashrate(hs),
+            n("window_blocks"),
+            n("from_job_height"),
+            n("to_job_height"),
+            n("credited_shares")
+        ),
+        None => format!(
+            "not measured: {}",
+            h["unavailable"].as_str().unwrap_or("no reason given")
+        ),
+    }
+}
+
+fn fmt_hashrate(hs: f64) -> String {
+    const UNITS: [(f64, &str); 6] = [
+        (1e18, "EH/s"),
+        (1e15, "PH/s"),
+        (1e12, "TH/s"),
+        (1e9, "GH/s"),
+        (1e6, "MH/s"),
+        (1e3, "kH/s"),
+    ];
+    for (f, u) in UNITS {
+        if hs >= f {
+            return format!("{:.2} {u}", hs / f);
+        }
+    }
+    format!("{hs:.0} H/s")
+}
+
+/// Units of `2^-32` sat per whole sat.
+const UNITS_PER_SAT: i128 = 1 << 32;
+
+/// `total_owed` in whole sats rounded down, from the exact `units` (a decimal string), as the
+/// dashboard and the website show it. `sats` is an i64 that saturates on a large enough ledger,
+/// so it is used only when `units` is missing or not an integer. `?` when neither is there.
+fn total_owed_line(a: &serde_json::Value) -> String {
+    if let Some(units) = a["units"].as_str().and_then(|u| u.parse::<i128>().ok()) {
+        return format!(
+            "{} sats ({units} units of 2^-32 sat)",
+            group_digits(units.div_euclid(UNITS_PER_SAT))
+        );
+    }
+    match a["sats"].as_i64() {
+        Some(sats) => format!("{} sats", group_digits(i128::from(sats))),
+        None => "?".to_string(),
+    }
+}
+
+/// `1234567` -> `1,234,567`.
+fn group_digits(n: i128) -> String {
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    if n < 0 {
+        out.push('-');
+    }
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `node health`: the node's own `/health` document. `healthy` is false until it can show it
+/// reaches its Bitcoin node; unknown fields print as `?`.
+async fn cmd_node_health(client: &ApiClient, format: OutputFormat) -> Result<()> {
+    let health: serde_json::Value = client.get_json_at("/health").await?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&health)?),
+        OutputFormat::Text => {
+            let f = |k: &str| match &health[k] {
+                serde_json::Value::Null => "?".to_string(),
+                v => v.to_string(),
+            };
+            let healthy = health["healthy"].as_bool() == Some(true);
             println!("{}", "=== Health Check ===".green().bold());
             println!();
-            println!("  {} {}", "Overall:".cyan(), status_color);
-            println!();
-            for (check, passed) in &health.checks {
-                let status = if *passed { "OK".green() } else { "FAIL".red() };
-                println!("  {} {}", format!("{}:", check).cyan(), status);
+            println!(
+                "  {} {}",
+                "Overall:".cyan(),
+                if healthy {
+                    "healthy".green()
+                } else {
+                    "UNHEALTHY".red()
+                }
+            );
+            for k in [
+                "core_reachable",
+                "block_height",
+                "miner_count",
+                "version",
+                "uptime_secs",
+            ] {
+                println!("  {} {}", format!("{k}:").cyan(), f(k));
             }
         }
     }
     Ok(())
-}
-
-async fn cmd_node_drain(client: &ApiClient) -> Result<()> {
-    #[derive(Debug, Serialize, Deserialize)]
-    struct DrainResponse {
-        status: String,
-        message: String,
-    }
-
-    let response: DrainResponse = client.post("/admin/drain", &()).await?;
-
-    println!("{}", "=== Node Drain ===".yellow().bold());
-    println!();
-    println!("  {} {}", "Status:".cyan(), response.status);
-    println!("  {} {}", "Message:".cyan(), response.message);
-
-    Ok(())
-}
-
-async fn cmd_node_resume(client: &ApiClient) -> Result<()> {
-    #[derive(Debug, Serialize, Deserialize)]
-    struct ResumeResponse {
-        status: String,
-        message: String,
-    }
-
-    let response: ResumeResponse = client.post("/admin/resume", &()).await?;
-
-    println!("{}", "=== Node Resume ===".green().bold());
-    println!();
-    println!("  {} {}", "Status:".cyan(), response.status);
-    println!("  {} {}", "Message:".cyan(), response.message);
-
-    Ok(())
-}
-
-// =============================================================================
-// Helpers
-// =============================================================================
-
-fn format_duration(secs: u64) -> String {
-    let days = secs / 86400;
-    let hours = (secs % 86400) / 3600;
-    let mins = (secs % 3600) / 60;
-
-    if days > 0 {
-        format!("{}d {}h {}m", days, hours, mins)
-    } else if hours > 0 {
-        format!("{}h {}m", hours, mins)
-    } else {
-        format!("{}m", mins)
-    }
 }
 
 // =============================================================================
 // Main
 // =============================================================================
 
-/// Print a dry-run summary for a mutating request and return true so the caller can skip it.
-fn dry_run_notice(method: &str, path: &str, body: Option<&serde_json::Value>) -> bool {
-    println!("{}", "[dry-run] would send:".yellow().bold());
-    println!("  {} {}", method.cyan(), path);
-    if let Some(b) = body {
-        if !b.is_null() {
-            println!("  body: {}", serde_json::to_string(b).unwrap_or_default());
-        }
-    }
-    println!("{}", "[dry-run] no request sent.".yellow());
-    true
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let url = cli.url.as_deref().filter(|s| !s.is_empty()).ok_or_else(|| {
         anyhow::anyhow!(
-            "pool API URL is required — pass --url <URL> or set GHOST_POOL_URL (currently unset or empty)"
+            "the node API URL is empty — pass --url <URL> or unset GHOST_POOL_URL to use http://127.0.0.1:8080"
         )
     })?;
     let client = ApiClient::new(url, cli.retries);
-    let dry_run = cli.dry_run;
 
     match cli.command {
-        Commands::Status => cmd_status(&client, cli.format).await?,
-
-        Commands::Miner(cmd) => match cmd {
-            MinerCommands::List { active, limit } => {
-                cmd_miner_list(&client, cli.format, active, limit).await?
-            }
-            MinerCommands::Info { miner_id } => {
-                let miner: MinerInfo = client.get(&format!("/miners/{}", miner_id)).await?;
-                match cli.format {
-                    OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&miner)?),
-                    OutputFormat::Text => {
-                        let table = Table::new(&[miner]).to_string();
-                        println!("{}", table);
-                    }
-                }
-            }
-            MinerCommands::Kick { miner_id, reason } => {
-                let path = format!("/admin/miners/{}/kick", miner_id);
-                let body = serde_json::json!({ "reason": reason });
-                if dry_run {
-                    dry_run_notice("POST", &path, Some(&body));
-                    return Ok(());
-                }
-                if !confirm(&format!("Kick miner {}?", miner_id)) {
-                    println!("Cancelled.");
-                    return Ok(());
-                }
-                let _: serde_json::Value = client.post(&path, &body).await?;
-                println!("{}", format!("Miner {} kicked", miner_id).yellow());
-            }
-            MinerCommands::Ban {
-                target,
-                duration,
-                reason,
-            } => {
-                let path = format!("/admin/ban/{}", target);
-                let body = serde_json::json!({ "duration_hours": duration, "reason": reason });
-                if dry_run {
-                    dry_run_notice("POST", &path, Some(&body));
-                    return Ok(());
-                }
-                if !confirm(&format!("Ban {} for {} hours?", target, duration)) {
-                    println!("Cancelled.");
-                    return Ok(());
-                }
-                let _: serde_json::Value = client.post(&path, &body).await?;
-                println!(
-                    "{}",
-                    format!("Banned {} for {} hours", target, duration).red()
-                );
-            }
-            MinerCommands::Unban { target } => {
-                let path = format!("/admin/unban/{}", target);
-                if dry_run {
-                    dry_run_notice("POST", &path, None);
-                    return Ok(());
-                }
-                let _: serde_json::Value = client.post(&path, &()).await?;
-                println!("{}", format!("Unbanned {}", target).green());
-            }
-        },
-
-        Commands::Round(cmd) => match cmd {
-            RoundCommands::Current => cmd_round_current(&client, cli.format).await?,
-            RoundCommands::History { count } => {
-                let rounds: Vec<RoundInfo> =
-                    client.get(&format!("/rounds?limit={}", count)).await?;
-                match cli.format {
-                    OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&rounds)?),
-                    OutputFormat::Text => {
-                        let table = Table::new(&rounds).to_string();
-                        println!("{}", table);
-                    }
-                }
-            }
-            RoundCommands::Info { round_id } => {
-                let round: RoundInfo = client.get(&format!("/rounds/{}", round_id)).await?;
-                match cli.format {
-                    OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&round)?),
-                    OutputFormat::Text => {
-                        let table = Table::new(&[round]).to_string();
-                        println!("{}", table);
-                    }
-                }
-            }
-        },
-
-        Commands::Payout(cmd) => match cmd {
-            PayoutCommands::Pending { limit } => {
-                cmd_payout_pending(&client, cli.format, limit).await?
-            }
-            PayoutCommands::History { count } => {
-                let payouts: Vec<PayoutInfo> =
-                    client.get(&format!("/payouts?limit={}", count)).await?;
-                match cli.format {
-                    OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&payouts)?),
-                    OutputFormat::Text => {
-                        let table = Table::new(&payouts).to_string();
-                        println!("{}", table);
-                    }
-                }
-            }
-            PayoutCommands::Info { id } => {
-                let payout: PayoutInfo = client.get(&format!("/payouts/{}", id)).await?;
-                match cli.format {
-                    OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&payout)?),
-                    OutputFormat::Text => {
-                        let table = Table::new(&[payout]).to_string();
-                        println!("{}", table);
-                    }
-                }
-            }
-            PayoutCommands::Process { dry_run: local_dry } => {
-                // Two dry-runs in play: --dry-run skips the call entirely; the local
-                // --dry-run on payout process keeps the call but asks the backend to
-                // simulate. Global wins when set.
-                let body = serde_json::json!({ "dry_run": local_dry || dry_run });
-                if dry_run {
-                    dry_run_notice("POST", "/admin/payouts/process", Some(&body));
-                    return Ok(());
-                }
-                let result: serde_json::Value =
-                    client.post("/admin/payouts/process", &body).await?;
-                println!("{}", serde_json::to_string_pretty(&result)?);
-            }
-        },
-
-        Commands::Consensus(cmd) => match cmd {
-            ConsensusCommands::Status => cmd_consensus_status(&client, cli.format).await?,
-            ConsensusCommands::Peers => cmd_consensus_peers(&client, cli.format).await?,
-            ConsensusCommands::Votes { count } => {
-                let votes: serde_json::Value = client
-                    .get(&format!("/consensus/votes?limit={}", count))
-                    .await?;
-                println!("{}", serde_json::to_string_pretty(&votes)?);
-            }
-            ConsensusCommands::Elders => {
-                let elders: Vec<PeerInfo> = client.get("/consensus/elders").await?;
-                match cli.format {
-                    OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&elders)?),
-                    OutputFormat::Text => {
-                        let table = Table::new(&elders).to_string();
-                        println!("{}", table);
-                    }
-                }
-            }
-        },
-
         Commands::Key(cmd) => match cmd {
             KeyCommands::Generate { output } => cmd_key_generate(output).await?,
             KeyCommands::Show => cmd_key_show(&client, cli.format).await?,
@@ -1034,33 +544,101 @@ async fn main() -> Result<()> {
         },
 
         Commands::Node(cmd) => match cmd {
+            NodeCommands::Status => cmd_node_pool_status(&client, cli.format).await?,
             NodeCommands::Info => {
                 let info: serde_json::Value = client.get("/node/info").await?;
                 println!("{}", serde_json::to_string_pretty(&info)?);
             }
             NodeCommands::Health => cmd_node_health(&client, cli.format).await?,
-            NodeCommands::Drain => {
-                if dry_run {
-                    dry_run_notice("POST", "/admin/drain", None);
-                } else {
-                    cmd_node_drain(&client).await?
-                }
-            }
-            NodeCommands::Resume => {
-                if dry_run {
-                    dry_run_notice("POST", "/admin/resume", None);
-                } else {
-                    cmd_node_resume(&client).await?
-                }
-            }
-            NodeCommands::Config => {
-                let config: serde_json::Value = client.get("/node/config").await?;
-                println!("{}", serde_json::to_string_pretty(&config)?);
-            }
         },
 
         Commands::Metrics => cmd_metrics(&client).await?,
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_pool_status_renders_every_health_line() {
+        let v = serde_json::json!({
+            "network": "regtest",
+            "start": {"genesis_anchor": "8d8cd561340ff83e99410e115619d64a", "genesis_btc_height": 0,
+                      "source": "default"},
+            "share_chain": {"tip": "abababababababababab", "anchor_height": 7, "btc_height": 998,
+                            "t_net": 10},
+            "peers": 2,
+            "settlement": {"caught_up": false, "synced_height": 990, "bitcoin_tip": 999,
+                           "provisional": [{"height": 960, "block_hash": "00"}]},
+            "fee_address": "bcrt1qfee",
+            "ledger_rows": 3,
+            "pool_hashrate": {"hashes_per_sec": 101808185.67, "from_job_height": 856,
+                              "to_job_height": 999, "window_blocks": 144, "credited_shares": 2,
+                              "unavailable": null},
+            "total_owed": {"units": "130996625984789", "sats": 30500},
+            "miners": [{"address": "bcrt1qminer", "kind": "extended", "slot_class": 9,
+                        "sensing": {"model": "Stock Antminer"},
+                        "firmware_warning": "Stock Antminer firmware is limited to slot class 9"}]
+        });
+        let out = render_node_pool_status(&v);
+        for want in [
+            "Node pool (regtest)",
+            "relay tip:     abababababababab… (anchor height 7, Bitcoin height 998, T_net 10)",
+            "peers:         2",
+            "caught up NO (synced 990 of Bitcoin tip 999), 1 provisional",
+            "fee address:   bcrt1qfee",
+            "pool hashrate: 101.81 MH/s over 144 Bitcoin blocks (job heights 856 to 999, 2 credited shares)",
+            "total owed:    30,500 sats (130996625984789 units of 2^-32 sat)",
+            "bcrt1qminer extended class 9 (Stock Antminer)",
+            "warning: Stock Antminer firmware is limited to slot class 9",
+        ] {
+            assert!(out.contains(want), "{want:?} missing from:\n{out}");
+        }
+        let empty = render_node_pool_status(&serde_json::json!({}));
+        assert!(
+            empty.contains("caught up ?"),
+            "unknown is not healthy: {empty}"
+        );
+        assert!(empty.contains("pool hashrate: ?\n"), "{empty}");
+        assert!(empty.contains("total owed:    ?\n"), "{empty}");
+    }
+
+    #[test]
+    fn node_pool_status_says_why_the_hashrate_is_not_measured() {
+        let v = serde_json::json!({"pool_hashrate": {
+            "hashes_per_sec": null, "from_job_height": null, "to_job_height": null,
+            "window_blocks": 0, "credited_shares": 0,
+            "unavailable": "settlement has not seen a Bitcoin tip yet"}});
+        let out = render_node_pool_status(&v);
+        assert!(
+            out.contains(
+                "pool hashrate: not measured: settlement has not seen a Bitcoin tip yet\n"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn total_owed_comes_from_the_exact_units_not_the_saturating_sats() {
+        // 2^96 units = 2^64 sats, past i64::MAX, where pool_sv2's `sats` saturates.
+        let out = total_owed_line(&serde_json::json!({
+            "units": "79228162514264337593543950336", "sats": i64::MAX}));
+        assert!(
+            out.starts_with("18,446,744,073,709,551,616 sats ("),
+            "{out}"
+        );
+        // Rounded down, below zero too.
+        let out = total_owed_line(&serde_json::json!({"units": "-1", "sats": -1}));
+        assert!(out.starts_with("-1 sats ("), "{out}");
+        let out = total_owed_line(&serde_json::json!({"units": "131000000000000", "sats": 0}));
+        assert!(out.starts_with("30,500 sats ("), "{out}");
+        // No usable units: the API's sats.
+        let out = total_owed_line(&serde_json::json!({"units": "x", "sats": 12}));
+        assert_eq!(out, "12 sats");
+        assert_eq!(group_digits(999), "999");
+        assert_eq!(group_digits(-1_000), "-1,000");
+    }
 }

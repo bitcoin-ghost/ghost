@@ -49,6 +49,12 @@ expect "already migrated"              60 "$(printf 'VER 60\nDBKB 2596528\nAVKB 
 expect "ahead of this binary"          60 "$(printf 'VER 61\nDBKB 2596528\nAVKB 24751328\n')" "NOMIGRATE 61" 0
 expect "fresh node, no database"       60 "NODB" "NODB" 0
 
+# From v65 user_version is stored negated (-65): decoded, never mistaken for a parse failure.
+expect "v65 stored negated, v66 wanted" 66 "$(printf 'VER -65\nDBKB 100\nAVKB 400\n')" "BACKUP 65 200 400" 0
+expect "v65 stored negated, at target"  65 "$(printf 'VER -65\nDBKB 100\nAVKB 400\n')" "NOMIGRATE 65" 0
+expect "v64 -> v65 takes a backup"      65 "$(printf 'VER 64\nDBKB 100\nAVKB 400\n')" "BACKUP 64 200 400" 0
+expect "negative but not a version"     65 "$(printf 'VER -3\nDBKB 100\nAVKB 400\n')" "REFUSE_PARSE live_schema x-3" 1
+
 # Refusals. Each one is a way the probe can fail to answer while looking like it did.
 expect "not enough room for a copy"    60 "$(printf 'VER 59\nDBKB 2596528\nAVKB 1000000\n')" "REFUSE_SPACE 5193056 1000000" 1
 expect "exactly one byte short"        60 "$(printf 'VER 59\nDBKB 100\nAVKB 199\n')" "REFUSE_SPACE 200 199" 1

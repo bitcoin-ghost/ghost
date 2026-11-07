@@ -1,18 +1,16 @@
-use std::sync::atomic::Ordering;
-
 use stratum_apps::stratum_core::{
     bitcoin::{Amount, TxOut},
-    channels_sv2::outputs::deserialize_outputs,
     handlers_sv2::HandleTemplateDistributionMessagesFromServerAsync,
     mining_sv2::{SetNewPrevHash as SetNewPrevHashMp, SetTarget},
     parsers_sv2::{Mining, Tlv},
     template_distribution_sv2::*,
 };
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::{
     channel_manager::{ChannelManager, RouteMessageTo},
     error::{self, PoolError, PoolErrorKind},
+    node_pool::ChannelKind,
 };
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -33,250 +31,238 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
+        let np = self.node_pool.clone();
 
-        // SHARE_TIER_BIND: is this template at/above the configured activation height? Decided
-        // per TEMPLATE from the BIP34 height ghost-mining stamps into `coinbase_prefix`, so this
-        // binary flips at the same block as ghost-mining's height gate rather than at a restart.
-        // `None` (unconfigured — the only shipped state) keeps the group-broadcast path below,
-        // byte-identical to today.
-        let tiering = self
-            .tier_binding
-            .clone()
-            .filter(|tb| tb.template_is_tiered(&msg));
-        // The tiered template: the plain node tag stripped out of the prefix, making room (the
-        // exact same 25 bytes) for the per-tier tag each channel's factory stamps back in.
-        let tiered_template = tiering
-            .as_ref()
-            .map(|_| crate::tier_binding::strip_plain_node_tag(&msg.clone().into_static()));
+        // The template provider hands over the whole coinbase value and the witness commitment
+        // as its only output; anything else cannot carry a canonical coinbase. That is a
+        // misconfigured template provider, not a bad block: refuse to mine on it.
+        if let Err(e) = np.template_parts(&msg) {
+            error!(
+                template_id = msg.template_id,
+                "NODE_POOL: the template cannot carry a canonical coinbase: {e}"
+            );
+            return Err(PoolError::shutdown(PoolErrorKind::Custom(format!(
+                "template {} cannot carry a canonical coinbase: {e}",
+                msg.template_id
+            ))));
+        }
 
-        let messages = self.channel_manager_data.super_safe_lock(|channel_manager_data| {
-            if msg.future_template {
-                channel_manager_data.last_future_template = Some(msg.clone().into_static());
-            }
+        np.on_new_template(&msg);
+        // While a tip is held, a future template is kept for the replay after it is served
+        // (`node_pool_serve_held_tip`): serving the held tip drops every other future job.
+        np.note_future_template(&msg);
+        // The table this template's jobs pay, fetched before the channel locks are taken, and
+        // the anchor they build on. No table in time: the template is not served (see
+        // `NodePool::prepare_job_basis`), and miners keep their current job.
+        let served = np.prepare_job_basis(&msg).await;
+        if let Some(h) = crate::node_pool::NodePool::template_height(&msg) {
+            np.note_job_height(h);
+        }
+        if served {
+            np.mark_served(msg.template_id);
+        } else {
+            np.mark_unserved(msg.template_id);
+        }
+        // A template on the current tip while that tip is held for its table: its jobs would
+        // build on a prev hash the channels were never given. The held tip is served from the
+        // active template once the table arrives (`node_pool_serve_held_tip`).
+        let held = !msg.future_template && np.pending_tip().is_some();
+        let serve = served && !held;
+        // The template's Ghost tags taken out of the prefix, making room, byte for byte, for
+        // what each channel's factory stamps back in.
+        let prepared = np.prepare_template(&msg.clone().into_static());
+        let template_id = msg.template_id;
 
-            let mut messages: Vec<RouteMessageTo> = Vec::new();
-
-            // External-TP / ghost-mining mode: when the Template Provider sets
-            // `coinbase_tx_value_remaining == 0`, it is declaring that it has
-            // already allocated the entire subsidy + fees into the outputs it
-            // supplied in `template.coinbase_tx_outputs`. In that case we must
-            // pass an empty `additional_coinbase_outputs` vector to
-            // `on_new_template` so that the channels_sv2 sum check passes
-            // (`sum([]) == 0 == value_remaining`) and the final coinbase
-            // consists solely of the TP-provided outputs, which
-            // `JobFactory::coinbase()` appends automatically after the (empty)
-            // additional list.
-            //
-            // When `value_remaining > 0` we stay on the classic path: build a
-            // single reward output whose value matches `value_remaining`, or
-            // let the per-downstream `PayoutMode` split it as usual.
-            let tp_owns_coinbase = msg.coinbase_tx_value_remaining == 0;
-            if tp_owns_coinbase {
-                tracing::debug!(
-                    "Template: TP owns coinbase (value_remaining=0, template_outputs_count={})",
-                    msg.coinbase_tx_outputs_count
-                );
-            }
-
-            let coinbase_output: Vec<TxOut> = if tp_owns_coinbase {
-                Vec::new()
-            } else {
-                let mut out = deserialize_outputs(channel_manager_data.coinbase_outputs.clone())
-                    .expect("deserialization failed");
-                out[0].value = Amount::from_sat(msg.coinbase_tx_value_remaining);
-                out
-            };
-
-            for (downstream_id, downstream) in channel_manager_data.downstream.iter_mut() {
-                // If REQUIRES_CUSTOM_WORK is set, skip template handling entirely (see https://github.com/stratum-mining/sv2-apps/issues/55)
-                let requires_custom_work = downstream.requires_custom_work.load(Ordering::SeqCst);
-                if requires_custom_work {
-                    continue;
+        // No channel error on this path shuts the pool down: a channel that cannot take this
+        // template is logged and skipped, and keeps its current job (#898's rule, on the
+        // template side). Only a template no coinbase can be built from (above) is fatal.
+        let messages = self
+            .channel_manager_data
+            .super_safe_lock(|channel_manager_data| {
+                if msg.future_template {
+                    channel_manager_data.last_future_template = Some(msg.clone().into_static());
                 }
 
-                let messages_: Vec<RouteMessageTo<'_>> = downstream.downstream_data.super_safe_lock(|data| {
-                    let downstream_coinbase_outputs = if tp_owns_coinbase {
-                        Vec::new()
-                    } else if let Some(ref payout_mode) = data.payout_mode {
-                        payout_mode.coinbase_outputs(msg.coinbase_tx_value_remaining, &self.coinbase_reward_script)
-                    } else {
-                        coinbase_output.clone()
-                    };
+                let mut messages: Vec<RouteMessageTo> = Vec::new();
+                let mut skipped = 0usize;
+                let mut failed = 0usize;
 
-                    data.group_channel.on_new_template(msg.clone().into_static(), downstream_coinbase_outputs.clone()).map_err(|e| {
-                        tracing::error!("Error while adding template to group channel");
-                        PoolError::shutdown(e)
-                    })?;
+                // The group channel tracks every template so its state stays coherent, but its job
+                // is never sent: one coinbase cannot carry every channel's share tag and slot class.
+                let group_outputs = vec![TxOut {
+                    value: Amount::from_sat(msg.coinbase_tx_value_remaining),
+                    script_pubkey: self.coinbase_reward_script.script_pubkey(),
+                }];
 
-                    // SHARE_TIER_BIND (at/above the gate): PER-CHANNEL jobs instead of one
-                    // group broadcast. One coinbase cannot commit to every channel's difficulty
-                    // tier, so each channel's own factory builds its job — target quantised to
-                    // its tier, tier commitment stamped as the factory's extra push (the plain
-                    // node tag was stripped from `tiered_template`, so the length is unchanged),
-                    // and the tier captured on the job at build. The group channel above still
-                    // tracks the template so its state stays coherent, but its job is never
-                    // broadcast while tiering is active. Below the gate this branch vanishes and
-                    // the group path below runs untouched — byte-identical to today.
-                    if let (Some(tb), Some(tiered_template)) = (tiering.as_ref(), tiered_template.as_ref()) {
-                        let mut messages: Vec<RouteMessageTo> = vec![];
+                for (downstream_id, downstream) in channel_manager_data.downstream.iter_mut() {
+                    downstream.downstream_data.super_safe_lock(|data| {
+                        if let Err(e) = data
+                            .group_channel
+                            .on_new_template(msg.clone().into_static(), group_outputs.clone())
+                        {
+                            error!(
+                                downstream_id = *downstream_id,
+                                template_id,
+                                error = ?e,
+                                "NODE_POOL_TEMPLATE_MISMATCH: the group channel did not take this \
+                                 template; skipped (its job is never sent)"
+                            );
+                        }
 
-                        // Record that THIS template was built tiered, so activation knows the group
-                        // job was never broadcast without having to infer it from channels that may
-                        // by then be gone. Recorded even when no channel is open yet: a channel can
-                        // open between the template and its activation.
-                        data.tiered_template_ids.insert(msg.template_id);
+                        // Per-channel jobs: each channel's own factory builds its job, target
+                        // quantised to its tier, share tag stamped as the factory's extra push, the
+                        // canonical outputs of its slot class.
+                        if !serve {
+                            skipped += data.standard_channels.len() + data.extended_channels.len();
+                            return;
+                        }
 
                         for (channel_id, standard_channel) in data.standard_channels.iter_mut() {
-                            let q = tb.quantise_target(
+                            let q = np.quantise_target(
                                 standard_channel.get_target(),
                                 standard_channel.get_requested_max_target(),
                             );
                             if &q != standard_channel.get_target() {
                                 standard_channel.set_target(q);
-                                messages.push((*downstream_id, Mining::SetTarget(SetTarget {
-                                    channel_id: *channel_id,
-                                    maximum_target: q.to_le_bytes().into(),
-                                })).into());
+                                messages.push(
+                                    (
+                                        *downstream_id,
+                                        Mining::SetTarget(SetTarget {
+                                            channel_id: *channel_id,
+                                            maximum_target: q.to_le_bytes().into(),
+                                        }),
+                                    )
+                                        .into(),
+                                );
                             }
-                            standard_channel.set_tier_commitment(Some(
-                                tb.stamp_for_target(standard_channel.get_target()),
-                            ));
-                            standard_channel.on_new_template(tiered_template.clone(), downstream_coinbase_outputs.clone()).map_err(|e| {
-                                tracing::error!("Error while adding tiered template to standard channel with id: {channel_id:?}");
-                                PoolError::shutdown(e)
-                            })?;
-                            let job_message = match msg.future_template {
-                                true => {
-                                    let job_id = standard_channel
-                                        .get_future_job_id_from_template_id(msg.template_id)
-                                        .ok_or(PoolError::shutdown(PoolErrorKind::JobNotFound))?;
-                                    standard_channel
-                                        .get_future_job(job_id)
-                                        .ok_or(PoolError::shutdown(PoolErrorKind::JobNotFound))?
-                                        .get_job_message()
-                                        .clone()
+                            let key = (*downstream_id, *channel_id);
+                            standard_channel.set_tier_commitment(Some(np.stamp(
+                                key,
+                                ChannelKind::Standard,
+                                standard_channel.get_user_identity(),
+                                standard_channel.get_target(),
+                            )));
+                            let built = np.job_outputs(key, &msg).and_then(|outputs| {
+                                standard_channel
+                                    .on_new_template(prepared.clone(), outputs)
+                                    .map_err(|e| format!("{e:?}"))?;
+                                let job = match msg.future_template {
+                                    true => standard_channel
+                                        .get_future_job_id_from_template_id(template_id)
+                                        .and_then(|id| standard_channel.get_future_job(id)),
+                                    false => standard_channel.get_active_job(),
+                                };
+                                job.map(|j| j.get_job_message().clone()).ok_or_else(|| {
+                                    "the job just built is not in the channel".into()
+                                })
+                            });
+                            match built {
+                                Ok(job_message) => {
+                                    np.bind_job(key, job_message.job_id);
+                                    messages.push(
+                                        (
+                                            *downstream_id,
+                                            Mining::NewMiningJob(job_message.into_static()),
+                                        )
+                                            .into(),
+                                    );
                                 }
-                                false => standard_channel
-                                    .get_active_job()
-                                    .ok_or(PoolError::shutdown(PoolErrorKind::JobNotFound))?
-                                    .get_job_message()
-                                    .clone(),
-                            };
-                            messages.push((*downstream_id, Mining::NewMiningJob(job_message.into_static())).into());
+                                Err(e) => {
+                                    failed += 1;
+                                    error!(
+                                    ?key,
+                                    template_id,
+                                    "NODE_POOL_TEMPLATE_MISMATCH: no job on this template for a \
+                                     standard channel; it keeps its current job: {e}"
+                                );
+                                }
+                            }
                         }
 
                         for (channel_id, extended_channel) in data.extended_channels.iter_mut() {
-                            let q = tb.quantise_target(
+                            // A provisional channel gets its first job when its payee is bound.
+                            if np.awaits_payee((*downstream_id, *channel_id)) {
+                                continue;
+                            }
+                            let q = np.quantise_target(
                                 extended_channel.get_target(),
                                 extended_channel.get_requested_max_target(),
                             );
                             if &q != extended_channel.get_target() {
                                 extended_channel.set_target(q);
-                                messages.push((*downstream_id, Mining::SetTarget(SetTarget {
-                                    channel_id: *channel_id,
-                                    maximum_target: q.to_le_bytes().into(),
-                                })).into());
+                                messages.push(
+                                    (
+                                        *downstream_id,
+                                        Mining::SetTarget(SetTarget {
+                                            channel_id: *channel_id,
+                                            maximum_target: q.to_le_bytes().into(),
+                                        }),
+                                    )
+                                        .into(),
+                                );
                             }
-                            extended_channel.set_tier_commitment(Some(
-                                tb.stamp_for_target(extended_channel.get_target()),
-                            ));
-                            extended_channel.on_new_template(tiered_template.clone(), downstream_coinbase_outputs.clone()).map_err(|e| {
-                                tracing::error!("Error while adding tiered template to extended channel with id: {channel_id:?}");
-                                PoolError::shutdown(e)
-                            })?;
-                            let job_message = match msg.future_template {
-                                true => {
-                                    let job_id = extended_channel
-                                        .get_future_job_id_from_template_id(msg.template_id)
-                                        .ok_or(PoolError::shutdown(PoolErrorKind::JobNotFound))?;
-                                    extended_channel
-                                        .get_future_job(job_id)
-                                        .ok_or(PoolError::shutdown(PoolErrorKind::JobNotFound))?
-                                        .get_job_message()
-                                        .clone()
+                            let key = (*downstream_id, *channel_id);
+                            extended_channel.set_tier_commitment(Some(np.stamp(
+                                key,
+                                ChannelKind::Extended,
+                                extended_channel.get_user_identity(),
+                                extended_channel.get_target(),
+                            )));
+                            let built = np.job_outputs(key, &msg).and_then(|outputs| {
+                                extended_channel
+                                    .on_new_template(prepared.clone(), outputs)
+                                    .map_err(|e| format!("{e:?}"))?;
+                                let job = match msg.future_template {
+                                    true => extended_channel
+                                        .get_future_job_id_from_template_id(template_id)
+                                        .and_then(|id| extended_channel.get_future_job(id)),
+                                    false => extended_channel.get_active_job(),
+                                };
+                                job.map(|j| j.get_job_message().clone()).ok_or_else(|| {
+                                    "the job just built is not in the channel".into()
+                                })
+                            });
+                            match built {
+                                Ok(job_message) => {
+                                    np.bind_job(key, job_message.job_id);
+                                    messages.push(
+                                        (
+                                            *downstream_id,
+                                            Mining::NewExtendedMiningJob(job_message.into_static()),
+                                        )
+                                            .into(),
+                                    );
                                 }
-                                false => extended_channel
-                                    .get_active_job()
-                                    .ok_or(PoolError::shutdown(PoolErrorKind::JobNotFound))?
-                                    .get_job_message()
-                                    .clone(),
-                            };
-                            messages.push((*downstream_id, Mining::NewExtendedMiningJob(job_message.into_static())).into());
-                        }
-
-                        return Ok::<Vec<RouteMessageTo<'_>>, Self::Error>(messages);
-                    }
-
-                    let group_channel_job = match msg.future_template {
-                        true => {
-                            let future_job_id = data.group_channel.get_future_job_id_from_template_id(msg.template_id).ok_or(
-                                PoolError::shutdown(PoolErrorKind::JobNotFound)
-                            )?;
-                            data.group_channel.get_future_job(future_job_id).ok_or(
-                                PoolError::shutdown(PoolErrorKind::JobNotFound)
-                            )?
-                        },
-                        false => {
-                            data.group_channel.get_active_job().ok_or(
-                                PoolError::shutdown(PoolErrorKind::JobNotFound)
-                            )?
-                        },
-                    };
-
-                    let mut messages: Vec<RouteMessageTo> = vec![];
-
-                    // if REQUIRES_STANDARD_JOBS is not set and the group channel is not empty
-                    // we need to send the NewExtendedMiningJob message to the group channel
-                    let requires_standard_jobs = downstream.requires_standard_jobs.load(Ordering::SeqCst);
-                    let empty_group_channel = data.group_channel.get_channel_ids().is_empty();
-                    if !requires_standard_jobs && !empty_group_channel {
-                        messages.push((*downstream_id, Mining::NewExtendedMiningJob(group_channel_job.get_job_message().clone())).into());
-                    }
-
-                    // loop over every standard channel
-                    // if REQUIRES_STANDARD_JOBS is not set, we need to call on_group_channel_job on each standard channel
-                    // if REQUIRES_STANDARD_JOBS is set, we need to call on_new_template, and send individual NewMiningJob messages for each standard channel
-                    for (channel_id, standard_channel) in data.standard_channels.iter_mut() {
-                        if !requires_standard_jobs {
-                            standard_channel.on_group_channel_job(group_channel_job.clone()).map_err(|e| {
-                                tracing::error!("Error while adding group channel job to standard channel with id: {channel_id:?}");
-                                PoolError::shutdown(e)
-                            })?;
-                        } else {
-                            standard_channel.on_new_template(msg.clone().into_static(), downstream_coinbase_outputs.clone()).map_err(|e| {
-                                tracing::error!("Error while adding template to standard channel");
-                                PoolError::shutdown(e)
-                            })?;
-
-                            match msg.future_template {
-                                true => {
-                                    let standard_job_id = standard_channel.get_future_job_id_from_template_id(msg.template_id).expect("future job id must exist");
-                                    let standard_job = standard_channel.get_future_job(standard_job_id).expect("future job must exist");
-                                    messages.push((*downstream_id, Mining::NewMiningJob(standard_job.get_job_message().clone())).into());
-                                },
-                                false => {
-                                    let standard_job = standard_channel.get_active_job().expect("active job must exist");
-                                    messages.push((*downstream_id, Mining::NewMiningJob(standard_job.get_job_message().clone())).into());
-                                },
+                                Err(e) => {
+                                    failed += 1;
+                                    error!(
+                                    ?key,
+                                    template_id,
+                                    "NODE_POOL_TEMPLATE_MISMATCH: no job on this template for an \
+                                     extended channel; it keeps its current job: {e}"
+                                );
+                                }
                             }
                         }
-                    }
-
-                    // loop over every extended channel, and call on_group_channel_job on each extended channel
-                    for (channel_id, extended_channel) in data.extended_channels.iter_mut() {
-                        extended_channel.on_group_channel_job(group_channel_job.clone()).map_err(|e| {
-                            tracing::error!("Error while adding group channel job to extended channel with id: {channel_id:?}");
-                            PoolError::shutdown(e)
-                        })?;
-                    }
-
-                    Ok::<Vec<RouteMessageTo<'_>>, Self::Error>(messages)
-                })?;
-
-                messages.extend(messages_);
-            }
-            Ok::<Vec<RouteMessageTo<'_>>, Self::Error>(messages)
-        })?;
+                    });
+                }
+                if skipped > 0 {
+                    warn!(
+                        template_id,
+                        channels = skipped,
+                        served,
+                        "NODE_POOL: no job sent on this template; miners keep their current job"
+                    );
+                }
+                if failed > 0 {
+                    error!(
+                        template_id,
+                        channels = failed,
+                        "NODE_POOL_TEMPLATE_MISMATCH: channels left on their current job"
+                    );
+                }
+                messages
+            });
 
         for message in messages {
             // A send can only fail if the receiver side of the channel is closed.
@@ -318,119 +304,185 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
 
+        // A held tip is served (`node_pool_serve_held_tip`) by replaying the active template as
+        // a future one and activating it, which drops every future template the template
+        // provider sent for that same tip meanwhile. The provider's own SetNewPrevHash for one of
+        // those then names a template no channel holds, and the group channel's
+        // TemplateIdNotFound was a shutdown: seen 2026-11-03, a 24 h soak's node0 pool_sv2 shut
+        // itself down at 5 h 59 m this way. The tip is already active and every channel has its
+        // job on it, so there is nothing to do. (Serving the held tip now gives such templates
+        // back to the channels, so this is the backstop; a dropped template on a NEW tip is
+        // repaired below instead.)
+        let replayed = self.channel_manager_data.super_safe_lock(|data| {
+            same_tip_unknown_template(
+                data.last_new_prev_hash.as_ref(),
+                &msg,
+                data.downstream.values().any(|d| {
+                    d.downstream_data.super_safe_lock(|dd| {
+                        dd.group_channel
+                            .get_future_job_id_from_template_id(msg.template_id)
+                            .is_none()
+                    })
+                }),
+            )
+        });
+        if replayed {
+            warn!(
+                template_id = msg.template_id,
+                "NODE_POOL: SetNewPrevHash for a template dropped when the held tip was served; \
+                 the tip is already active, ignored"
+            );
+            return Ok(());
+        }
+
+        let np = self.node_pool.clone();
+        np.on_set_new_prev_hash(msg.template_id);
+        let template_id = msg.template_id;
+
+        // The new tip's template was not served (no snapshot table in time): no channel has a
+        // job on it, so nothing is activated or sent. The tip is held and served, with its jobs,
+        // as soon as the table arrives (`node_pool_serve_held_tip`); until then miners keep
+        // their current job.
+        if np.is_unserved(template_id) {
+            error!(
+                template_id,
+                "NODE_POOL_NO_TABLE: the new Bitcoin tip is held: its jobs wait for their \
+                 snapshot table"
+            );
+            np.hold_tip(msg.clone().into_static());
+            self.channel_manager_data.super_safe_lock(|data| {
+                data.last_new_prev_hash = Some(msg.clone().into_static());
+                for (downstream_id, downstream) in data.downstream.iter_mut() {
+                    downstream.downstream_data.super_safe_lock(|d| {
+                        if let Err(e) = d
+                            .group_channel
+                            .on_set_new_prev_hash(msg.clone().into_static())
+                        {
+                            error!(
+                                downstream_id = *downstream_id,
+                                template_id,
+                                error = ?e,
+                                "NODE_POOL_TIP_MISMATCH: the group channel does not hold the \
+                                 held tip's template; skipped (the held tip's replay rebuilds it)"
+                            );
+                        }
+                    });
+                }
+            });
+            return Ok(());
+        }
+        np.clear_pending_tip();
+
+        // ⛔ No channel error here shuts the pool down (#898's rule, on the template side). A
+        // channel that does not hold the template this prev hash names is NOT activated: its
+        // job store would mark every job stale, or activate a job on another height, and it
+        // keeps its current job instead. The tip is then held for repair, so the next tick
+        // rebuilds it for every channel from the active template.
+        let mut mismatched = 0usize;
         let messages = self.channel_manager_data.super_safe_lock(|data| {
             data.last_new_prev_hash = Some(msg.clone().into_static());
 
             let mut messages: Vec<RouteMessageTo> = vec![];
 
             for (downstream_id, downstream) in data.downstream.iter_mut() {
-                // If downstream requires custom work, skip template handling entirely (see https://github.com/stratum-mining/sv2-apps/issues/55)
-                let requires_custom_work = downstream.requires_custom_work.load(Ordering::SeqCst);
-                if requires_custom_work {
-                    continue;
-                }
-
-                let downstream_messages = downstream.downstream_data.super_safe_lock(|data| {
-                    let mut messages: Vec<RouteMessageTo> = vec![];
-
-                    // SHARE_TIER_BIND: were this template's jobs built PER CHANNEL (tiered)?
-                    // When tiered, the group job was never broadcast, so the group SetNewPrevHash
-                    // must not be sent (it would name a job id no miner holds) — each channel gets
-                    // its own instead.
-                    //
-                    // Read from what the tiered build RECORDED, not inferred from the channels'
-                    // future jobs. The inference was wrong whenever no channel still held this
-                    // template's future job — every channel closed, or the template predates the
-                    // channel — because it then answered "not tiered" and the group SetNewPrevHash
-                    // went out naming an unbroadcast job. Observed live: the translator dropped its
-                    // upstream on `JobIdNotFound` and the miner endpoint died with it, on a loop.
-                    //
-                    // Consumed here so the set cannot grow without bound.
-                    let tiered_activation = data.tiered_template_ids.remove(&msg.template_id);
-
-                    // call on_set_new_prev_hash on the group channel to update the channel state
-                    data.group_channel.on_set_new_prev_hash(msg.clone().into_static()).map_err(|e| {
-                        tracing::error!("Error while adding new prev hash to group channel");
-                        PoolError::shutdown(e)
-                    })?;
-
-                    // did SetupConnection have the REQUIRES_STANDARD_JOBS flag set?
-                    // if no, and the group channel is not empty, we need to send the SetNewPrevHashMp to the group channel
-                    let requires_custom_work = downstream.requires_custom_work.load(Ordering::SeqCst);
-                    let empty_group_channel = data.group_channel.get_channel_ids().is_empty();
-                    if !tiered_activation && !requires_custom_work && !empty_group_channel {
-                        let group_channel_id = data.group_channel.get_group_channel_id();
-                        let activated_group_job_id = data.group_channel.get_active_job().expect("active job must exist").get_job_id();
-                        let group_set_new_prev_hash_message = SetNewPrevHashMp {
-                            channel_id: group_channel_id,
-                            job_id: activated_group_job_id,
-                            prev_hash: msg.prev_hash.clone(),
-                            min_ntime: msg.header_timestamp,
-                            nbits: msg.n_bits,
-                        };
-
-                        // send the SetNewPrevHash message to the group channel
-                        messages.push((*downstream_id, Mining::SetNewPrevHash(group_set_new_prev_hash_message)).into());
+                downstream.downstream_data.super_safe_lock(|data| {
+                    // call on_set_new_prev_hash on the group channel to update the channel state;
+                    // its job was never sent, so neither is its SetNewPrevHash: every channel mines
+                    // its own job and gets its own below.
+                    if let Err(e) = data.group_channel.on_set_new_prev_hash(msg.clone().into_static()) {
+                        mismatched += 1;
+                        error!(
+                            downstream_id = *downstream_id,
+                            template_id,
+                            error = ?e,
+                            "NODE_POOL_TIP_MISMATCH: the group channel does not hold this tip's \
+                             template; skipped"
+                        );
                     }
 
-                    // loop over every extended channel, and call on_set_new_prev_hash on each extended channel to update the channel state
                     for (channel_id, extended_channel) in data.extended_channels.iter_mut() {
-                        extended_channel.on_set_new_prev_hash(msg.clone().into_static()).map_err(|e| {
-                            tracing::error!("Error while adding new prev hash to extended channel: {channel_id:?} {e:?}");
-                            PoolError::shutdown(e)
-                        })?;
-
-                        // SHARE_TIER_BIND (tiered): this channel mines its OWN job, so it gets
-                        // its own SetNewPrevHash naming that job.
-                        if tiered_activation {
-                            let activated_job_id = extended_channel.get_active_job().ok_or(
-                                PoolError::shutdown(PoolErrorKind::JobNotFound)
-                            )?.get_job_id();
-                            messages.push((*downstream_id, Mining::SetNewPrevHash(SetNewPrevHashMp {
+                        let key = (*downstream_id, *channel_id);
+                        // A provisional channel has no job yet: the new tip is recorded, nothing
+                        // is sent.
+                        if np.awaits_payee(key) {
+                            if let Err(e) = extended_channel.on_set_new_prev_hash(msg.clone().into_static()) {
+                                error!(?key, template_id, error = ?e, "NODE_POOL_TIP_MISMATCH: a provisional channel did not take the new tip");
+                            }
+                            continue;
+                        }
+                        let activated = match extended_channel.get_future_job_id_from_template_id(template_id) {
+                            None => Err("the channel holds no job on this template".to_string()),
+                            Some(_) => extended_channel
+                                .on_set_new_prev_hash(msg.clone().into_static())
+                                .map_err(|e| format!("{e:?}"))
+                                .and_then(|()| {
+                                    extended_channel
+                                        .get_active_job()
+                                        .map(|j| j.get_job_id())
+                                        .ok_or_else(|| "no active job after activation".to_string())
+                                }),
+                        };
+                        match activated {
+                            // This channel mines its OWN job, so it gets its own SetNewPrevHash
+                            // naming that job.
+                            Ok(job_id) => messages.push((*downstream_id, Mining::SetNewPrevHash(SetNewPrevHashMp {
                                 channel_id: *channel_id,
-                                job_id: activated_job_id,
+                                job_id,
                                 prev_hash: msg.prev_hash.clone(),
                                 min_ntime: msg.header_timestamp,
                                 nbits: msg.n_bits,
-                            })).into());
+                            })).into()),
+                            Err(e) => {
+                                mismatched += 1;
+                                error!(
+                                    ?key,
+                                    template_id,
+                                    "NODE_POOL_TIP_MISMATCH: an extended channel was not moved to \
+                                     the new tip; it keeps its current job: {e}"
+                                );
+                            }
                         }
                     }
 
-                    // loop over every standard channel, and call on_set_new_prev_hash on each standard channel to update the channel state
                     for (channel_id, standard_channel) in data.standard_channels.iter_mut() {
-                        // call on_set_new_prev_hash on the standard channel to update the channel state
-                        standard_channel.on_set_new_prev_hash(msg.clone().into_static()).map_err(|e| {
-                            tracing::error!("Error while adding new prev hash to standard channel: {channel_id:?} {e:?}");
-                            PoolError::shutdown(e)
-                        })?;
-
-                        // did SetupConnection have the REQUIRES_STANDARD_JOBS flag set?
-                        // if yes, we need to send the SetNewPrevHashMp to each standard channel
-                        // (and likewise under SHARE_TIER_BIND, where every channel mines its
-                        // own tier-stamped job rather than the group broadcast)
-                        if tiered_activation || downstream.requires_standard_jobs.load(Ordering::SeqCst) {
-                            let activated_standard_job_id = standard_channel.get_active_job().ok_or(
-                                PoolError::shutdown(PoolErrorKind::JobNotFound)
-                            )?.get_job_id();
-                            let standard_set_new_prev_hash_message = SetNewPrevHashMp {
+                        let key = (*downstream_id, *channel_id);
+                        let activated = match standard_channel.get_future_job_id_from_template_id(template_id) {
+                            None => Err("the channel holds no job on this template".to_string()),
+                            Some(_) => standard_channel
+                                .on_set_new_prev_hash(msg.clone().into_static())
+                                .map_err(|e| format!("{e:?}"))
+                                .and_then(|()| {
+                                    standard_channel
+                                        .get_active_job()
+                                        .map(|j| j.get_job_id())
+                                        .ok_or_else(|| "no active job after activation".to_string())
+                                }),
+                        };
+                        match activated {
+                            // Every channel mines its own job, so each gets its own SetNewPrevHash.
+                            Ok(job_id) => messages.push((*downstream_id, Mining::SetNewPrevHash(SetNewPrevHashMp {
                                 channel_id: *channel_id,
-                                job_id: activated_standard_job_id,
+                                job_id,
                                 prev_hash: msg.prev_hash.clone(),
                                 min_ntime: msg.header_timestamp,
                                 nbits: msg.n_bits,
-                            };
-                            messages.push((*downstream_id, Mining::SetNewPrevHash(standard_set_new_prev_hash_message)).into());
+                            })).into()),
+                            Err(e) => {
+                                mismatched += 1;
+                                error!(
+                                    ?key,
+                                    template_id,
+                                    "NODE_POOL_TIP_MISMATCH: a standard channel was not moved to \
+                                     the new tip; it keeps its current job: {e}"
+                                );
+                            }
                         }
                     }
-
-                    Ok::<Vec<RouteMessageTo<'_>>, Self::Error>(messages)
-                })?;
-
-                messages.extend(downstream_messages);
+                });
             }
 
-            Ok::<Vec<RouteMessageTo<'_>>, Self::Error>(messages)
-        })?;
+            messages
+        });
 
         for message in messages {
             // A send can only fail if the receiver side of the channel is closed.
@@ -441,6 +493,75 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
             }
         }
 
+        if mismatched > 0 {
+            if np.hold_tip_for_repair(msg.clone().into_static()) {
+                error!(
+                    template_id,
+                    channels = mismatched,
+                    "NODE_POOL_TIP_MISMATCH: channels did not hold this tip's template; the tip is \
+                     held and rebuilt for every channel from the active template on the next tick"
+                );
+            } else {
+                error!(
+                    template_id,
+                    channels = mismatched,
+                    "NODE_POOL_TIP_MISMATCH: channels did not hold this tip's template and it \
+                     cannot be rebuilt; they keep their current job until the next template"
+                );
+            }
+        }
+
         Ok(())
+    }
+}
+
+/// Whether `msg` re-announces the tip already active (`last`) for a template the channels do not
+/// hold (`channels_lack_it`): a template dropped when a held tip was served. Such a
+/// SetNewPrevHash changes nothing and is ignored rather than failing the channels.
+fn same_tip_unknown_template(
+    last: Option<&SetNewPrevHash<'static>>,
+    msg: &SetNewPrevHash<'_>,
+    channels_lack_it: bool,
+) -> bool {
+    channels_lack_it && last.is_some_and(|p| p.prev_hash == msg.prev_hash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snph(template_id: u64, tip: u8) -> SetNewPrevHash<'static> {
+        SetNewPrevHash {
+            template_id,
+            prev_hash: [tip; 32].into(),
+            header_timestamp: 1,
+            n_bits: 0x1e0377ae,
+            target: [0xff; 32].into(),
+        }
+    }
+
+    /// The soak's sequence: tip held on 6775, 6776 sent for the same tip, the held tip served
+    /// from 6775 (dropping 6776), then the provider's SetNewPrevHash for 6776.
+    #[test]
+    fn a_dropped_template_on_the_active_tip_is_ignored_and_nothing_else_is() {
+        let active = snph(6775, 0xAA);
+        assert!(same_tip_unknown_template(
+            Some(&active),
+            &snph(6776, 0xAA),
+            true
+        ));
+        // The ordinary second template on a tip: the channels hold it.
+        assert!(!same_tip_unknown_template(
+            Some(&active),
+            &snph(6776, 0xAA),
+            false
+        ));
+        // A new tip is never skipped, known template or not.
+        assert!(!same_tip_unknown_template(
+            Some(&active),
+            &snph(6777, 0xBB),
+            true
+        ));
+        assert!(!same_tip_unknown_template(None, &snph(1, 0xAA), true));
     }
 }

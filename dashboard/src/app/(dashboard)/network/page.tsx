@@ -11,6 +11,7 @@ import { CopyButton } from "@/components/ui/CopyButton";
 import { SkeletonCard } from "@/components/ui/Skeleton";
 import { SectionErrorBoundary } from "@/components/ui/SectionErrorBoundary";
 import { useNodeStatus } from "@/hooks/queries/useNodeQueries";
+import { useNodePoolStatus } from "@/hooks/queries/useNodePoolQueries";
 import { useSetTor } from "@/hooks/queries/useConfigQueries";
 import { useToast } from "@/components/ui/Toast";
 
@@ -28,6 +29,8 @@ import { useToast } from "@/components/ui/Toast";
 
 export default function NetworkPage() {
   const { data: status, isLoading, error: statusError } = useNodeStatus();
+  // Peers are the share-chain relay's, from pool_sv2's node pool status (the old mesh is gone).
+  const pool = useNodePoolStatus();
   const setTor = useSetTor();
   const { success, error } = useToast();
 
@@ -66,7 +69,7 @@ export default function NetworkPage() {
 
   const torActive = !!status?.tor_mode;
   const onion = status?.onion_address;
-  const peerCount = status?.peer_count ?? 0;
+  const relayPeers = pool.error ? null : pool.data?.peers;
   const exposure = torActive ? (onion ? "tor" : "tor (no onion)") : "clearnet";
 
   return (
@@ -90,9 +93,16 @@ export default function NetworkPage() {
             tooltip="Whether your node's outbound P2P connections run over clearnet or Tor."
           />
           <StatCard
-            label="Connected peers"
-            value={peerCount.toLocaleString()}
-            tooltip="Mesh peers currently connected to your node."
+            label="Relay peers"
+            value={
+              relayPeers === null
+                ? "unavailable"
+                : relayPeers === undefined
+                  ? "—"
+                  : relayPeers.toLocaleString()
+            }
+            loading={pool.isLoading}
+            tooltip="Share-chain relay peers connected to this node, from the node pool status. Unavailable when the pool service does not answer."
           />
           <StatCard
             label="Onion address"

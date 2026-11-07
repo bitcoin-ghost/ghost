@@ -103,8 +103,9 @@ is "a node not yet renamed: the old unit name is started" \
    "start ghost-pool,start sri-pool,start sri-translator," "$STARTS"
 
 run_gate "ghost-mining ghost-pay sri-pool sri-translator" STUB_IBD_TRUE_FOR=0
-is "ghost-pay, where installed, is started after the node" \
-   "start ghost-mining,start ghost-pay,start sri-pool,start sri-translator," "$STARTS"
+is "a retired ghost-pay unit is left alone: not started" \
+   "start ghost-mining,start sri-pool,start sri-translator," "$STARTS"
+is "and it is not stopped either" 0 "$($G -c ' ghost-pay' "$CALLS" || true)"
 
 run_gate "ghost-mining sri-pool sri-translator" STUB_IBD_TRUE_FOR=0 STUB_FAIL_START=ghost-mining
 is "the node fails to start: the stratum stack is not started against nothing" "start ghost-mining," "$STARTS"
@@ -114,11 +115,6 @@ run_gate "ghost-mining sri-pool sri-translator" STUB_IBD_TRUE_FOR=0 STUB_FAIL_ST
 is "the pool fails to start: the translator is still attempted" \
    "start ghost-mining,start sri-pool,start sri-translator," "$STARTS"
 is "and the gate reports failure" 1 "$RC"
-
-run_gate "ghost-mining ghost-pay sri-pool sri-translator" STUB_IBD_TRUE_FOR=0 STUB_FAIL_START=ghost-pay
-is "ghost-pay failing (it is masked on vm1) does not stop the stratum stack" \
-   "start ghost-mining,start ghost-pay,start sri-pool,start sri-translator," "$STARTS"
-is "nor fail the gate" 0 "$RC"
 
 echo "2. nothing pulls the node in"
 
@@ -140,6 +136,9 @@ echo "3. the installer starts nothing behind the gate"
 gated='(ghost-mining|ghost-pool|sri-pool|sri-translator|ghost-pay)'
 acts="$($G -nE "systemctl +(enable|start|restart|reenable)( +--[a-z-]+)* +${gated}(\.service)?( |$)" "$INSTALLER" || true)"
 is "the installer does not start or enable the node or the stratum stack" "" "$(printf '%s' "$acts" | tr '\n' ' ')"
+# Ghost Pay is retired: a re-run on a host that still has its unit leaves it alone, and says so.
+is "the installer says it leaves a retired ghost-pay unit alone" 1 \
+   "$($G -c 'ghost-pay.service found — Ghost Pay is retired; the unit is left as it is' "$INSTALLER" || true)"
 is "the installer does enable and start the gate" 1 \
    "$($G -cE '^systemctl enable --now ghost-mining-gate( |$)' "$INSTALLER" || true)"
 # Positive control: the pattern above must be able to see such a line, or its silence means nothing.

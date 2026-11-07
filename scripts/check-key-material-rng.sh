@@ -39,9 +39,6 @@ cd "$REPO_ROOT"
 PATHS=(
     "crates/stratum-apps/src/key_utils"
     "crates/ghost-common/src/signer.rs"
-    "crates/ghost-keys/src"
-    "crates/ghost-lock/src"
-    "apps/wraith-wallet/core/src/keystore.rs"
 )
 
 BANNED='thread_rng\(|SmallRng|StdRng::seed_from_u64|rand::random\('

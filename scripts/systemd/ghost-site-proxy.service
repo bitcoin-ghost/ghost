@@ -1,0 +1,34 @@
+[Unit]
+Description=Bitcoin Ghost website API proxy (listed nodes, read routes only)
+Documentation=https://bitcoinghost.org/docs/#node-pool
+# For the WEBSITE host, not a node, beside ghost-node-list-merge.timer: nginx hands it
+# /api/pool/<host>/... and /api/v1/node-pool/status (scripts/website-proxy/nginx-site-proxy.conf).
+# It forwards GETs of the pages' read routes only, only to hosts in the merged node-list.json
+# (re-read whenever it changes), on a fixed API port. Install the script as
+# /opt/ghost/bin/ghost-site-proxy (from scripts/website-proxy/ghost-site-proxy.py).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+ExecStart=/usr/bin/python3 -I /opt/ghost/bin/ghost-site-proxy --listen 127.0.0.1:8791 --node-list /var/lib/ghost-merge/node-list.json --api-port 8080
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

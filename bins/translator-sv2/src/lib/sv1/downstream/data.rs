@@ -79,6 +79,10 @@ pub struct DownstreamData {
     // `<addr>.<addr>.<worker>`, because the pool spliced a full identity onto a channel that
     // already carried the address.
     pub channel_opened_provisionally: bool,
+    // A provisionally opened channel's payee was sent to the pool (an `UpdateChannel` carrying
+    // the Ghost payee TLV) once the miner authorised: the node pool binds the payee then, since
+    // a job credits its payee and none can be built before it is known.
+    pub payee_bound: bool,
     // Whether the client opted in to `subscribe-extranonce` via `mining.configure`.
     //
     // `mining.set_extranonce` is opt-in. Sending it to a client that never asked is a
@@ -87,6 +91,9 @@ pub struct DownstreamData {
     // reconnects in 24 h on one node). Miners that send no `mining.configure` at all
     // leave this false.
     pub extranonce_subscribe_negotiated: bool,
+    /// The agent the miner named in `mining.subscribe`, cut to 255 bytes. Forwarded to the pool
+    /// in the Ghost agent TLV when the upstream negotiated it (node pool slot-class sensing).
+    pub user_agent: Option<String>,
     // Set when a miner-declared difficulty (`d=` in the authorize password, or
     // `mining.suggest_difficulty`) arrives AFTER the channel is already open, so the
     // channel-open path can no longer size itself from it.
@@ -144,9 +151,11 @@ impl DownstreamData {
             pending_hashrate: None,
             queued_sv1_handshake_messages: Vec::new(),
             extranonce_subscribe_negotiated: false,
+            user_agent: None,
             declared_difficulty_needs_push: false,
             channel_open_requested: false,
             channel_opened_provisionally: false,
+            payee_bound: false,
             pending_share: None,
             upstream_target: None,
             last_job_received_time: None,

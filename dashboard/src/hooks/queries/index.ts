@@ -1,23 +1,17 @@
 // Node queries
 export * from './useNodeQueries';
 
-// Network queries
-export * from './useNetworkQueries';
-
 // Mining queries
 export * from './useMiningQueries';
+
+// Node pool queries
+export * from './useNodePoolQueries';
 
 // Config queries
 export * from './useConfigQueries';
 
 // Alerts queries
 export * from './useAlertsQueries';
-
-// Ghost Pay queries
-export * from './useGhostPayQueries';
-
-// Rewards queries
-export * from './useRewardsQueries';
 
 // Swarm queries
 export * from './useSwarmQueries';
@@ -46,9 +40,6 @@ export * from './useSystemQueries';
 // Resource queries
 export * from './useResourceQueries';
 
-// Mesh queries
-export * from './useMeshQueries';
-
 // Haze queries
 export * from './useHazeQueries';
 
@@ -60,9 +51,3 @@ export * from './useReaperQueries';
 
 // Filtering-activity queries
 export * from './useFilteringQueries';
-
-// Capability self-check queries
-export * from './useSelfCheckQueries';
-
-// Geo (offline GeoIP database) queries
-export * from './useGeoQueries';

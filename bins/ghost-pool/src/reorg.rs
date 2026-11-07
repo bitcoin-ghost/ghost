@@ -22,18 +22,15 @@
 
 //! Reorg detection and handling
 //!
-//! Monitors ZMQ sequence topic for block disconnect events (reorgs) and
-//! invalidates affected rounds and payout proposals.
+//! Monitors ZMQ sequence topic for block disconnect events (reorgs), marks the
+//! affected rounds orphaned, alerts the operator and records the event for the
+//! Sync page. What a reorg does to balances is the node pool relay's concern.
 //!
 //! # Reorg Handling Strategy
 //!
 //! When a block is disconnected (orphaned):
 //! 1. Mark affected rounds as `Orphaned` status
-//! 2. Cancel any pending payout proposals for those rounds
-//! 3. Log the event for monitoring
-//!
-//! The shares from orphaned rounds are NOT lost - they can be carried forward
-//! to the next round if desired (configurable).
+//! 2. Log the event for monitoring
 
 use parking_lot::RwLock;
 use std::collections::VecDeque;
@@ -43,8 +40,6 @@ use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 use ghost_common::zmq::BlockEvent;
-use ghost_consensus::vote_handler::VoteHandler;
-use ghost_storage::models::PayoutStatus;
 use ghost_storage::Database;
 use ghost_verification::alerts::{AlertDispatcher, AlertEvent};
 use ghost_verification::chain_health::ChainHealth;
@@ -120,7 +115,6 @@ impl ReorgConfig {
 /// Handles blockchain reorgs by invalidating affected rounds
 pub struct ReorgHandler {
     db: Arc<Database>,
-    vote_handler: Option<Arc<VoteHandler>>,
     /// Operator-alert dispatcher. When set, a `ReorgDetected` alert fires (once
     /// per debounce window, and only if the operator has the event enabled) at
     /// the existing reorg-detection point.
@@ -147,7 +141,6 @@ pub struct ReorgHandler {
 struct ReorgStatsInner {
     total_reorgs: AtomicU64,
     rounds_orphaned: AtomicU64,
-    proposals_cancelled: AtomicU64,
     max_depth_seen: AtomicU32,
 }
 
@@ -155,7 +148,6 @@ impl ReorgHandler {
     pub fn new(db: Arc<Database>, config: ReorgConfig) -> Self {
         Self {
             db,
-            vote_handler: None,
             alerts: None,
             chain_health: None,
             get_height: None,
@@ -163,19 +155,12 @@ impl ReorgHandler {
             stats: ReorgStatsInner {
                 total_reorgs: AtomicU64::new(0),
                 rounds_orphaned: AtomicU64::new(0),
-                proposals_cancelled: AtomicU64::new(0),
                 max_depth_seen: AtomicU32::new(0),
             },
             orphaned_blocks: RwLock::new(VecDeque::with_capacity(config.reorg_history_size)),
             in_reorg: AtomicU32::new(0),
             config,
         }
-    }
-
-    /// Set the vote handler for cancelling pending proposals
-    pub fn with_vote_handler(mut self, vh: Arc<VoteHandler>) -> Self {
-        self.vote_handler = Some(vh);
-        self
     }
 
     /// Wire the operator-alert dispatcher so reorgs page the operator.
@@ -223,7 +208,6 @@ impl ReorgHandler {
         ReorgStats {
             total_reorgs: self.stats.total_reorgs.load(Ordering::Relaxed),
             rounds_orphaned: self.stats.rounds_orphaned.load(Ordering::Relaxed),
-            proposals_cancelled: self.stats.proposals_cancelled.load(Ordering::Relaxed),
             max_depth_seen: self.stats.max_depth_seen.load(Ordering::Relaxed),
         }
     }
@@ -393,55 +377,11 @@ impl ReorgHandler {
             }
         }
 
-        // 2. Cancel pending payout proposals for this block
-        let mut cancelled = 0u64;
-        if let Some(ref vote_handler) = self.vote_handler {
-            // Get rounds for this block hash to cancel their proposals
-            match self.db.get_rounds_by_block_hash(block_hash) {
-                Ok(rounds) => {
-                    for round in rounds {
-                        if round.payout_status == PayoutStatus::Pending
-                            || round.payout_status == PayoutStatus::Approved
-                        {
-                            // Cancel any pending votes for this round
-                            if let Err(e) = vote_handler.cancel_proposal_for_round(round.round_id) {
-                                warn!(
-                                    round_id = round.round_id,
-                                    error = %e,
-                                    "Failed to cancel proposal (may already be processed)"
-                                );
-                            } else {
-                                cancelled += 1;
-                                info!(
-                                    round_id = round.round_id,
-                                    reorg_depth, "Cancelled payout proposal due to reorg"
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        block_hash = %hash_display,
-                        error = %e,
-                        "Failed to get rounds for orphaned block"
-                    );
-                }
-            }
-        }
-
-        if cancelled > 0 {
-            self.stats
-                .proposals_cancelled
-                .fetch_add(cancelled, Ordering::Relaxed);
-        }
-
-        // 3. Log reorg summary for monitoring
+        // 2. Log reorg summary for monitoring
         let stats = self.stats();
         info!(
             total_reorgs = stats.total_reorgs,
             total_rounds_orphaned = stats.rounds_orphaned,
-            total_proposals_cancelled = stats.proposals_cancelled,
             max_depth_seen = stats.max_depth_seen,
             current_depth = reorg_depth,
             pause_active = self.config.pause_on_reorg && self.is_in_reorg(),
@@ -462,8 +402,6 @@ pub struct ReorgStats {
     pub total_reorgs: u64,
     /// Total rounds orphaned
     pub rounds_orphaned: u64,
-    /// Total proposals cancelled
-    pub proposals_cancelled: u64,
     /// Maximum reorg depth seen
     pub max_depth_seen: u32,
 }

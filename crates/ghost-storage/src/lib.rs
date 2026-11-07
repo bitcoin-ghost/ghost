@@ -39,23 +39,16 @@ pub mod address_key;
 pub mod audit_log;
 pub mod database;
 pub mod encryption;
+mod migration_v65;
 pub mod migrations;
 pub mod models;
-pub mod mpc_lineage;
+pub mod node_pool_genesis;
+pub mod node_pool_store;
+pub mod node_pool_views;
 pub mod queries;
-pub mod shard_store;
-pub mod snapshot;
 
 pub use audit_log::*;
 pub use database::*;
 pub use encryption::*;
 pub use models::*;
-pub use queries::GlyphRecord;
-pub use queries::L2StateInfo;
-pub use queries::MeshNodeListCheckpointRecord;
-pub use queries::MpcContributionRecord;
-pub use queries::PayoutLedgerCheckpointRecord;
-pub use queries::{ConfidentialNoteRecord, ConfidentialTransferRecord};
-pub use queries::{L2CheckpointRecord, L2EpochRecord, L2NoteRecord, L2ValidRootRecord};
-pub use snapshot::*;
 // Note: queries module adds methods to Database via impl blocks

@@ -94,6 +94,15 @@ impl IsServer<'static> for Sv1Server {
         info!("Received mining.subscribe from Sv1 downstream");
         debug!("Down: Handling mining.subscribe: {}", request);
 
+        // Keep the agent for the node pool's slot-class sensing. It only leaves this process
+        // when the upstream negotiated the Ghost agent extension; see `ghost_agent_tlv`.
+        if let Some(downstream) = self.downstreams.get(&downstream_id) {
+            let agent = super::clamp_agent(&request.agent_signature).to_string();
+            downstream
+                .downstream_data
+                .super_safe_lock(|data| data.user_agent = Some(agent));
+        }
+
         let set_difficulty_sub = (
             "mining.set_difficulty".to_string(),
             downstream_id.to_string(),
@@ -128,7 +137,9 @@ impl IsServer<'static> for Sv1Server {
         // enforces.
         // A trailing `.d=<difficulty>` is stripped here so the rest of the checks — and the
         // payout address / worker attribution downstream — see the plain `<address>.<worker>`.
-        let (name, username_difficulty) = super::split_username_difficulty(request.name.as_str());
+        // A bare payout address is accepted as `<address>.default` (the worker is optional).
+        let (name, username_difficulty) = super::normalize_username(request.name.as_str());
+        let name = name.as_ref();
         if let Err(rejection) = super::check_username_attributable(name) {
             warn!(
                 "Down: Rejecting mining.authorize from downstream {} — username '{}' has a missing or empty {} half; expected `<bitcoin_address>.<worker_name>`. Shares from this username could not be attributed and would earn nothing (#479).",
@@ -406,11 +417,11 @@ impl IsServer<'static> for Sv1Server {
             );
             return false;
         };
-        // Compare against the stored name, which has any `.d=` directive stripped.
-        let (name, _) = super::split_username_difficulty(name);
+        // Compare against the stored name: `.d=` stripped, a bare address given its worker.
+        let (name, _) = super::normalize_username(name);
         downstream
             .downstream_data
-            .super_safe_lock(|data| data.authorized_worker_name == *name)
+            .super_safe_lock(|data| data.authorized_worker_name == name.as_ref())
     }
 
     /// Authorizes a Downstream role.
@@ -436,8 +447,10 @@ impl IsServer<'static> for Sv1Server {
         // Store the username WITHOUT any trailing `.d=<difficulty>` directive: this string
         // becomes the channel `user_identity`, from which the pool derives the miner's payout
         // address and worker name. Leaving the directive on would corrupt attribution.
-        let (name, _) = super::split_username_difficulty(name);
+        let (name, _) = super::normalize_username(name);
+        let name = name.as_ref();
         let is_authorized = self.is_authorized(client_id, name);
+        let bind_after = !is_authorized;
         downstream.downstream_data.super_safe_lock(|data| {
             if !is_authorized {
                 data.authorized_worker_name = name.to_string();
@@ -474,6 +487,11 @@ impl IsServer<'static> for Sv1Server {
                 data.user_identity, downstream_id
             );
         });
+        // A channel already opened on subscribe gets its payee now (a serialising miner
+        // authorises only after its subscribe was answered).
+        if bind_after {
+            self.bind_provisional_payee(downstream_id);
+        }
     }
 
     /// Sets the `extranonce1` field sent in the SV1 `mining.notify` message to the value specified
@@ -704,5 +722,181 @@ mod vanished_downstream_tests {
         assert_eq!(s.extranonce2_size(None), 0);
         s.authorize(None, "x");
         s.set_version_rolling_min_bit(None, None);
+    }
+}
+
+/// Phase 3 harness finding C: the pool refusing one SV1 miner's channel dropped every miner on
+/// the translator, and a serialising miner's channel opened on subscribe under the provisional
+/// identity, which the node pool cannot credit. Now one refusal drops one miner, and the
+/// provisional channel is bound to the miner's payee when it authorises.
+#[cfg(test)]
+mod one_miner_channel_tests {
+    use super::*;
+    use crate::sv1::downstream::downstream::Downstream;
+    use async_channel::{unbounded, Receiver};
+    use std::{net::SocketAddr, str::FromStr};
+    use stratum_apps::stratum_core::{
+        bitcoin::Target,
+        mining_sv2::OpenMiningChannelError,
+        parsers_sv2::{Mining, Tlv},
+    };
+    use tokio_util::sync::CancellationToken;
+
+    const ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+
+    /// What the SV1 server sends the channel manager.
+    type ToChannelManager = Receiver<(Mining<'static>, Option<Vec<Tlv>>)>;
+
+    /// A server, and what it sends the channel manager.
+    fn server() -> (Sv1Server, ToChannelManager) {
+        use crate::config::{DownstreamDifficultyConfig, TranslatorConfig, Upstream};
+        use stratum_apps::key_utils::Secp256k1PublicKey;
+        let pubkey =
+            Secp256k1PublicKey::from_str("9bDuixKmZqAJnrmP746n8zU1wyAQRrus7th9dxnkPg6RzQvCnan")
+                .unwrap();
+        let config = TranslatorConfig::new(
+            vec![Upstream::new("127.0.0.1".to_string(), 4444, pubkey)],
+            "0.0.0.0".to_string(),
+            3333,
+            DownstreamDifficultyConfig::new(100.0, 5.0, true, 60),
+            2,
+            1,
+            4,
+            "test_user".to_string(),
+            false,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        let (_tx_a, rx) = unbounded();
+        let (tx, to_cm) = unbounded();
+        let s = Sv1Server::new(SocketAddr::from_str("127.0.0.1:0").unwrap(), rx, tx, config);
+        (s, to_cm)
+    }
+
+    /// A connected downstream `id`, registered as the server registers one.
+    fn connect(s: &Sv1Server, id: usize) {
+        let (to_miner, _from_server) = unbounded();
+        let (_to_server, from_miner) = unbounded();
+        let (srv_tx, srv_rx) = unbounded();
+        let (d_tx, _d_rx) = unbounded();
+        s.sv1_server_channel_state
+            .sv1_server_to_downstream_sender
+            .super_safe_lock(|m| m.insert(id, srv_tx));
+        let d = Downstream::new(
+            id,
+            SocketAddr::from_str("127.0.0.1:1").unwrap(),
+            to_miner,
+            from_miner,
+            d_tx,
+            srv_rx,
+            Target::from_le_bytes([0xff; 32]),
+            Some(1.0e12),
+            8,
+            CancellationToken::new(),
+        );
+        s.downstreams.insert(id, d);
+    }
+
+    #[test]
+    fn a_provisional_channel_is_bound_to_its_miner_on_authorize() {
+        let (mut s, to_cm) = server();
+        connect(&s, 7);
+        s.downstreams
+            .get(&7)
+            .unwrap()
+            .downstream_data
+            .super_safe_lock(|d| {
+                d.channel_opened_provisionally = true;
+                d.channel_id = Some(3);
+            });
+        // A bare payout address (finding G): bound as `<address>.default`.
+        s.authorize(Some(7), ADDR);
+        let (msg, tlvs) = to_cm.try_recv().expect("an UpdateChannel to the pool");
+        let Mining::UpdateChannel(u) = msg else {
+            panic!("not an UpdateChannel: {msg:?}")
+        };
+        assert_eq!(u.channel_id, 3);
+        let tlvs = tlvs.expect("the payee TLV");
+        assert_eq!(tlvs.len(), 1);
+        assert_eq!(tlvs[0].r#type.extension_type, 0x4748);
+        assert_eq!(tlvs[0].r#type.field_type, 0x02);
+        assert_eq!(tlvs[0].value, format!("{ADDR}.default").into_bytes());
+        s.downstreams
+            .get(&7)
+            .unwrap()
+            .downstream_data
+            .super_safe_lock(|d| {
+                assert!(d.payee_bound && !d.channel_opened_provisionally);
+                assert_eq!(
+                    d.user_identity, "default",
+                    "the share TLV is the worker now"
+                );
+            });
+        // Once only.
+        s.bind_provisional_payee(7);
+        assert!(to_cm.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_channel_opened_on_authorize_sends_no_payee() {
+        let (mut s, to_cm) = server();
+        connect(&s, 8);
+        s.downstreams
+            .get(&8)
+            .unwrap()
+            .downstream_data
+            .super_safe_lock(|d| d.channel_id = Some(4));
+        s.authorize(Some(8), &format!("{ADDR}.rig1"));
+        assert!(to_cm.try_recv().is_err());
+    }
+
+    /// Authorised while the open was in flight: bound when the channel id arrives.
+    #[test]
+    fn a_provisional_channel_opened_after_authorize_is_bound_then() {
+        let (mut s, to_cm) = server();
+        connect(&s, 9);
+        s.downstreams
+            .get(&9)
+            .unwrap()
+            .downstream_data
+            .super_safe_lock(|d| d.channel_opened_provisionally = true);
+        s.authorize(Some(9), &format!("{ADDR}.rig2"));
+        assert!(to_cm.try_recv().is_err(), "no channel yet");
+        s.downstreams
+            .get(&9)
+            .unwrap()
+            .downstream_data
+            .super_safe_lock(|d| d.channel_id = Some(5));
+        s.bind_provisional_payee(9);
+        let (msg, tlvs) = to_cm.try_recv().unwrap();
+        assert!(matches!(msg, Mining::UpdateChannel(ref u) if u.channel_id == 5));
+        assert_eq!(tlvs.unwrap()[0].value, format!("{ADDR}.rig2").into_bytes());
+    }
+
+    #[tokio::test]
+    async fn a_refused_channel_drops_that_miner_only() {
+        let (s, _to_cm) = server();
+        connect(&s, 1);
+        connect(&s, 2);
+        s.request_id_to_downstream_id.insert(1, 1);
+        s.request_id_to_downstream_id.insert(2, 2);
+        let refusal = Mining::OpenMiningChannelError(OpenMiningChannelError {
+            request_id: 1,
+            error_code: "node-pool-no-payee".to_string().try_into().unwrap(),
+        });
+        s.process_upstream_message(Target::from_le_bytes([0xff; 32]), refusal, None)
+            .await
+            .expect("not an error for the translator");
+        assert!(
+            s.downstreams.get(&1).is_none(),
+            "the refused miner is dropped"
+        );
+        assert!(s.downstreams.get(&2).is_some(), "the other miner stays");
+        assert!(s
+            .sv1_server_channel_state
+            .sv1_server_to_downstream_sender
+            .super_safe_lock(|m| !m.contains_key(&1) && m.contains_key(&2)));
     }
 }

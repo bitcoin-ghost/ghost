@@ -661,6 +661,10 @@ async fn handle_template_distribution_message(
                 "Received CoinbaseOutputConstraints from client {}",
                 client_id
             );
+            template_processor.note_coinbase_output_constraints(
+                constraints.coinbase_output_max_additional_size,
+                constraints.coinbase_output_max_additional_sigops,
+            );
             // Store constraints for this client
             if let Some(client) = clients.write().get_mut(&client_id) {
                 client.coinbase_constraints = Some(constraints);
@@ -945,20 +949,8 @@ async fn handle_submit_solution(
         .submit_block_with_coinbase(coinbase_tx, &coinbase_non_witness, &header, &work_state)
         .await?;
 
-    // Notify the payout task that this block has been submitted to Bitcoin Core.
-    // block_hash from double_sha256 is in internal byte order; reverse to display order.
-    let mut block_hash_display = block_hash;
-    block_hash_display.reverse();
-    template_processor.notify_block_submitted(crate::template::BlockSubmittedInfo {
-        block_hash: block_hash_display,
-        height: work_state.height,
-        // The payout this block's coinbase actually pays — the snapshot the template was built
-        // against, not whatever happens to be approved by the time the notification lands.
-        payout_snapshot: work_state.payout_snapshot,
-        // #601: the coinbase as mined, so settlement credits the fee-adjusted amounts the chain
-        // actually paid rather than the ratified proposal's.
-        coinbase: coinbase_non_witness,
-    });
+    // Settlement is the node pool relay's: it sees the block enter the best chain and retires
+    // what its coinbase paid (`ghost_np_relay::settlement`).
 
     info!(
         "Block at height {} submitted successfully!",
@@ -1296,36 +1288,24 @@ fn create_new_template(
         return Err(anyhow::anyhow!("Coinbase1 too short"));
     }
 
-    // BIP34 encodes the block height as a 1-byte push opcode + N little-endian
-    // bytes, where N depends on the height's magnitude. This matches the exact
-    // encoding produced by `TemplateProcessor::encode_height`.
+    // The BIP34 height push, as `TemplateProcessor::encode_height` wrote it: `OP_0` or
+    // `OP_1`..`OP_16` (one byte) at heights 0 to 16, else a minimal script-number push.
     let height = work_state.height;
-    let height_push_len: usize = if height <= 0x7f {
-        2 // OP_PUSH1 + 1 byte
-    } else if height <= 0x7fff {
-        3 // OP_PUSH2 + 2 bytes
-    } else if height <= 0x7fffff {
-        4 // OP_PUSH3 + 3 bytes
-    } else {
-        5 // OP_PUSH4 + 4 bytes
-    };
-
     let scriptsig_full = &work_state.coinbase1[SCRIPTSIG_START..];
-    if scriptsig_full.len() < height_push_len {
-        return Err(anyhow::anyhow!(
-            "Coinbase1 scriptSig shorter than expected BIP34 height push"
-        ));
-    }
-    // Carry the payout tag through into the prefix.
-    //
-    // SRI appends its pool tag and the extranonce AFTER `coinbase_prefix`, so anything left out
-    // here never reaches the mined coinbase. The pool tag is deliberately excluded (SRI stamps its
-    // own, and including it too is the double-stamp described above), but the payout commitment
-    // must survive — it is how a node later recognises a won block as one it can settle.
-    //
-    // Detected rather than assumed: the tag is one push immediately after the height, so its
-    // presence is checkable. A treasury-only coinbase carries none, and then the prefix is
-    // height-only exactly as before.
+    let height_push_len = match ghost_common::coinbase_tags::bip34_height_from(scriptsig_full) {
+        Some((h, len)) if h == height => len,
+        _ => {
+            return Err(anyhow::anyhow!(
+                "Coinbase1 scriptSig does not start with the BIP34 push of height {height}"
+            ))
+        }
+    };
+    // Carry the two Ghost tag slots through into the prefix: the `GHPP` slot, which pool_sv2
+    // fills per job with `parent_anchor[..16]` (how settlement later finds a block's anchor), and
+    // the `GHNT` slot its share tag replaces. SRI appends its pool tag and the extranonce AFTER
+    // `coinbase_prefix`, so anything left out here never reaches the mined coinbase; the pool tag
+    // is deliberately excluded (SRI stamps its own, and including it too is the double-stamp
+    // described above). Detected rather than assumed: each tag is one push after the height.
     /// A tag is one push: `[len][magic][payload]`. Present or absent, never partial.
     fn tag_len_at(bytes: &[u8], magic: &[u8; 4], payload_len: usize) -> usize {
         let total = 1 + 4 + payload_len;
@@ -1376,8 +1356,9 @@ fn create_new_template(
 
     let merkle_path_seq: Seq0255<'static, U256<'static>> = merkle_path.into();
 
-    // Use Ghost's pre-built coinbase outputs instead of letting SRI Pool add its own
-    // This gives Ghost full control over payouts (BFT consensus, treasury, etc.)
+    // The node pool's template: the witness commitment is the only output, and the whole
+    // coinbase value (subsidy + the kept transactions' fees) is left to pool_sv2, which builds
+    // each job's canonical outputs for its slot class (`ghost_common::canonical_payout`).
     let coinbase_outputs: B064K<'static> = work_state
         .coinbase_outputs_serialized
         .clone()
@@ -1397,11 +1378,9 @@ fn create_new_template(
         coinbase_tx_version: 2, // Standard coinbase version
         coinbase_prefix,
         coinbase_tx_input_sequence: 0xffffffff,
-        // Ghost-pool provides ALL coinbase outputs (payouts, treasury, OP_RETURN).
-        // Set value_remaining to 0 so SRI does not add its own payout outputs.
-        coinbase_tx_value_remaining: 0,
+        coinbase_tx_value_remaining: work_state.subsidy + work_state.total_fees,
         coinbase_tx_outputs_count: work_state.coinbase_outputs_count,
-        coinbase_tx_outputs: coinbase_outputs, // Ghost's outputs (BFT payouts, treasury)
+        coinbase_tx_outputs: coinbase_outputs, // the witness commitment
         coinbase_tx_locktime: 0,
         merkle_path: merkle_path_seq,
     })

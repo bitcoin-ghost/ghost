@@ -1437,49 +1437,6 @@ impl BitcoinRpc {
         self.call("getsilentpaymentstats", vec![]).await
     }
 
-    /// Create a Wraith Phase 1 (Split) transaction
-    pub async fn create_wraith_tx(
-        &self,
-        inputs: Vec<WraithInputRpc>,
-        intermediate_addresses: Vec<Vec<String>>,
-        session_id: &str,
-        denomination: &str,
-    ) -> GhostResult<WraithTxResult> {
-        self.call(
-            "createwraithtx",
-            vec![
-                json!(inputs),
-                json!(intermediate_addresses),
-                json!(session_id),
-                json!(denomination),
-            ],
-        )
-        .await
-    }
-
-    /// Create a Wraith Phase 2 (Merge) transaction
-    pub async fn create_wraith_final_tx(
-        &self,
-        intermediate_inputs: Vec<WraithInputRpc>,
-        final_addresses: Vec<String>,
-        session_id: &str,
-    ) -> GhostResult<WraithTxResult> {
-        self.call(
-            "createwraithfinaltx",
-            vec![
-                json!(intermediate_inputs),
-                json!(final_addresses),
-                json!(session_id),
-            ],
-        )
-        .await
-    }
-
-    /// Parse Wraith transaction metadata
-    pub async fn parse_wraith_tx(&self, txid: &str) -> GhostResult<WraithTxInfo> {
-        self.call("parsewraithtx", vec![json!(txid)]).await
-    }
-
     /// Shuffle transaction outputs deterministically
     pub async fn shuffle_outputs(&self, tx_hex: &str, seed: &str) -> GhostResult<String> {
         self.call("shuffleoutputs", vec![json!(tx_hex), json!(seed)])
@@ -2081,35 +2038,6 @@ pub struct SilentPaymentStats {
     pub total_balance: u64,
     pub earliest_block: Option<u64>,
     pub latest_block: Option<u64>,
-}
-
-/// Input for Wraith RPC calls
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WraithInputRpc {
-    pub txid: String,
-    pub vout: u32,
-    pub amount: u64,
-    pub script_pubkey: Option<String>,
-}
-
-/// Result of Wraith transaction creation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WraithTxResult {
-    pub hex: String,
-    pub txid: String,
-    pub complete: bool,
-    pub fee: u64,
-    pub input_count: u32,
-    pub output_count: u32,
-}
-
-/// Wraith transaction info from parsing
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WraithTxInfo {
-    pub session_id: String,
-    pub phase: u8,
-    pub participant_count: u16,
-    pub valid: bool,
 }
 
 /// Input for Reconciliation RPC calls

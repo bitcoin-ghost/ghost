@@ -1,18 +1,20 @@
 // Integration test for translator extension negotiation with extension 0x0002
-// (EXTENSION_TYPE_WORKER_HASHRATE_TRACKING) and user_identity TLV validation.
+// (EXTENSION_TYPE_WORKER_HASHRATE_TRACKING) and the Ghost agent extension (0x4748), and for the
+// miner's identity reaching the node pool.
 //
 // This test validates:
-// 1. Pool and translator negotiate extension 0x0002 during SetupConnection
-// 2. SV1 miner submits shares through the translator
-// 3. Translator forwards SubmitSharesExtended with TLV containing user_identity
-// 4. Pool receives and processes the TLV user_identity correctly
+// 1. Pool and translator negotiate 0x0002 and 0x4748 during SetupConnection
+// 2. The channel opens on subscribe under the provisional identity
+// 3. When the SV1 miner authorises, the translator binds the channel with an UpdateChannel
+//    carrying the miner's full identity in the payee TLV
+// 4. The pool then serves the channel its first job
 
 use integration_tests_sv2::{interceptor::MessageDirection, template_provider::DifficultyLevel, *};
 use stratum_apps::stratum_core::{
     binary_sv2::Seq064K,
     common_messages_sv2::*,
+    extensions_sv2::EXTENSION_TYPE_WORKER_HASHRATE_TRACKING,
     extensions_sv2::PROVISIONAL_CHANNEL_IDENTITY,
-    extensions_sv2::{EXTENSION_TYPE_WORKER_HASHRATE_TRACKING, TLV_FIELD_TYPE_USER_IDENTITY},
     mining_sv2::*,
     parsers_sv2::{AnyMessage, Extensions, ExtensionsNegotiation, Mining},
 };
@@ -28,19 +30,26 @@ use tracing::info;
 /// than a bad fixture. The address is the harness's own signet coinbase address.
 const MINER_USERNAME: &str = "tb1qa0sm0hxzj0x25rh8gw5xlzwlsfvvyz8u96w3p8.SRI-miner";
 
-/// Tests that the translator successfully negotiates extension 0x0002 with the pool
-/// and sends user_identity TLV in SubmitSharesExtended messages.
+/// Tests that the translator negotiates extensions 0x0002 and 0x4748 with the pool, and binds
+/// the miner's identity to its channel with the payee TLV.
 #[tokio::test]
-async fn test_extension_negotiation_with_tlv_in_submit_shares() {
+async fn test_extension_negotiation_and_payee_binding() {
     start_tracing();
     // Extension 0x0002 for worker hashrate tracking
     let supported_extensions = vec![EXTENSION_TYPE_WORKER_HASHRATE_TRACKING];
-    let required_extensions = vec![EXTENSION_TYPE_WORKER_HASHRATE_TRACKING];
+    // The translator requires the Ghost agent extension as well, as every node's does: the node
+    // pool accepts a channel opened on subscribe only over it (see `start_sv2_translator`). The
+    // pool supports it whatever its config lists, so both are negotiated.
+    let required_extensions = vec![
+        EXTENSION_TYPE_WORKER_HASHRATE_TRACKING,
+        AGENT_TLV_EXTENSION_TYPE,
+    ];
 
-    let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
+    let (tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
     // Start pool with extension 0x0002 support
     let (pool, pool_addr, _) = start_pool(
         sv2_tp_config(tp_addr),
+        tp.bitcoin_core(),
         supported_extensions.clone(),
         vec![],
         false,
@@ -54,7 +63,7 @@ async fn test_extension_negotiation_with_tlv_in_submit_shares() {
         &[pool_translator_sniffer_addr],
         false, // aggregate_channels = false
         supported_extensions.clone(),
-        required_extensions,
+        required_extensions.clone(),
         None,
         false,
     )
@@ -97,7 +106,7 @@ async fn test_extension_negotiation_with_tlv_in_submit_shares() {
     };
     assert_eq!(
         request_extensions_msg.requested_extensions,
-        Seq064K::new(supported_extensions.clone()).unwrap()
+        Seq064K::new(required_extensions.clone()).unwrap()
     );
 
     // Verify RequestExtensionsSuccess acknowledges the extension
@@ -111,7 +120,7 @@ async fn test_extension_negotiation_with_tlv_in_submit_shares() {
         )) => {
             assert_eq!(
                 msg.supported_extensions,
-                Seq064K::new(supported_extensions).unwrap()
+                Seq064K::new(required_extensions).unwrap()
             );
         }
         _ => panic!("Expected RequestExtensionsSuccess message"),
@@ -129,8 +138,8 @@ async fn test_extension_negotiation_with_tlv_in_submit_shares() {
     //
     // A serialising SV1 client waits for the subscribe response before it authorises, so the
     // channel has to open at subscribe, before any user_identity is known. It therefore opens
-    // under `PROVISIONAL_CHANNEL_IDENTITY` and the real payout identity travels PER SHARE in the
-    // worker TLV, asserted below — which is what this test is actually named for.
+    // under `PROVISIONAL_CHANNEL_IDENTITY`, and the real payout identity follows in the payee TLV
+    // of the binding `UpdateChannel`, asserted below.
     //
     // ⚠ Asserting the miner's username here instead would pass only with the flag OFF, i.e. only
     // in the configuration where the miner is handed a placeholder extranonce and every share it
@@ -155,88 +164,49 @@ async fn test_extension_negotiation_with_tlv_in_submit_shares() {
         )
         .await;
 
+    // The miner's identity reaches the node pool when it authorises: the translator binds the
+    // provisional channel with an `UpdateChannel` carrying the Ghost payee TLV (extension 0x4748),
+    // and only then does the pool build the channel a job, since a job credits its payee.
+    //
+    // ⚠ This used to assert the 0x0002 user_identity TLV on a `SubmitSharesExtended`. The node
+    // pool floors every channel at difficulty 2^10 (about 2^42 hashes a share), so minerd, a CPU
+    // miner taking its SV1 difficulty from the channel, never submits a share in the life of the
+    // test, and the translator forwards none. The per-share TLV is covered by the translator's
+    // unit tests (`channel_manager.rs`); what a CPU miner CAN show end to end is the binding.
+    pool_translator_sniffer
+        .wait_for_message_type(MessageDirection::ToUpstream, MESSAGE_TYPE_UPDATE_CHANNEL)
+        .await;
+    let payee = loop {
+        match pool_translator_sniffer.next_message_from_downstream_with_tlvs() {
+            Some((_, AnyMessage::Mining(Mining::UpdateChannel(msg)), tlv_fields)) => {
+                info!("UpdateChannel received - channel_id: {}", msg.channel_id);
+                let tlvs = tlv_fields.expect("the binding UpdateChannel carries TLV fields");
+                let payee = tlvs
+                    .iter()
+                    .find(|tlv| {
+                        tlv.r#type.extension_type == AGENT_TLV_EXTENSION_TYPE
+                            && tlv.r#type.field_type == PAYEE_TLV_FIELD_TYPE
+                    })
+                    .expect("the payee TLV (0x4748) is present");
+                break String::from_utf8(payee.value.clone()).expect("the payee is UTF-8");
+            }
+            Some(_) => continue,
+            None => panic!("UpdateChannel was seen going upstream, then not found"),
+        }
+    };
+    // The FULL `<address>.<worker>` identity, not just the worker half: under
+    // `open_channel_on_subscribe` the channel opened on the provisional sentinel, so this is where
+    // the payout address travels.
+    assert_eq!(
+        payee, MINER_USERNAME,
+        "the payee TLV carries the full identity"
+    );
+
+    // Bound, the channel gets its first job.
     pool_translator_sniffer
         .wait_for_message_type(
             MessageDirection::ToDownstream,
             MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
-        )
-        .await;
-
-    pool_translator_sniffer
-        .wait_for_message_type(
-            MessageDirection::ToUpstream,
-            MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
-        )
-        .await;
-    // Verify SubmitSharesExtended contains TLV with user_identity
-    let submit_shares_msg = pool_translator_sniffer.next_message_from_downstream_with_tlvs();
-    match submit_shares_msg {
-        Some((_, AnyMessage::Mining(Mining::SubmitSharesExtended(msg)), tlv_fields)) => {
-            info!(
-                "SubmitSharesExtended received - channel_id: {}, sequence_number: {}, job_id: {}",
-                msg.channel_id, msg.sequence_number, msg.job_id
-            );
-            let tlvs = tlv_fields.unwrap();
-            // Find user_identity TLV
-            let user_identity_tlv = tlvs.iter().find(|tlv| {
-                tlv.r#type.extension_type == EXTENSION_TYPE_WORKER_HASHRATE_TRACKING
-                    && tlv.r#type.field_type == TLV_FIELD_TYPE_USER_IDENTITY
-            });
-            assert!(
-                user_identity_tlv.is_some(),
-                "user_identity TLV should be present with extension 0x0002"
-            );
-
-            // Extract and validate user_identity value
-            if let Some(tlv) = user_identity_tlv {
-                // Validate TLV structure
-                assert_eq!(
-                    tlv.r#type.extension_type, EXTENSION_TYPE_WORKER_HASHRATE_TRACKING,
-                    "TLV extension_type should be 0x0002"
-                );
-                assert_eq!(
-                    tlv.r#type.field_type, TLV_FIELD_TYPE_USER_IDENTITY,
-                    "TLV field_type should be user_identity"
-                );
-                // The TLV carries the FULL `<address>.<worker>` identity, not just the worker
-                // half. Under `open_channel_on_subscribe` the channel opens on the provisional
-                // sentinel, so the payout address has nowhere else to travel — it rides per
-                // share, here. Derived from the constant rather than hard-coded, so changing the
-                // fixture username cannot leave a stale byte count behind.
-                let payload_len = tlv.value.len();
-                assert_eq!(
-                    payload_len,
-                    MINER_USERNAME.len(),
-                    "user_identity TLV payload should be the full identity ({} bytes)",
-                    MINER_USERNAME.len()
-                );
-                // Try to convert value to string for logging
-                if let Ok(user_identity_str) = std::str::from_utf8(&tlv.value) {
-                    // Verify user_identity format (should be "SRI-miner")
-                    assert_eq!(
-                        user_identity_str, MINER_USERNAME,
-                        "user_identity TLV should carry the full identity, got: {}",
-                        user_identity_str
-                    );
-                } else {
-                    // If not UTF-8, just log hex representation
-                    let hex_str = tlv
-                        .value
-                        .iter()
-                        .map(|b| format!("{:02x}", b))
-                        .collect::<String>();
-                    info!("✅ user_identity TLV payload (hex): {}", hex_str);
-                }
-            }
-        }
-        _ => panic!("Expected SubmitSharesExtended message with TLV fields"),
-    }
-
-    // Wait for SubmitSharesSuccess response from pool
-    pool_translator_sniffer
-        .wait_for_message_type(
-            MessageDirection::ToDownstream,
-            MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
         )
         .await;
     shutdown_all!(translator, pool);

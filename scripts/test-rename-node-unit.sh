@@ -156,7 +156,7 @@ is  "stopped exactly once, started exactly once" "1 1" "$($G -c '^stop ghost-poo
 is  "the gate is renamed" yes "$([ -f "$U/ghost-mining-gate.service" ] && [ ! -e "$U/ghost-pool-gate.service" ] && echo yes)"
 is  "the renamed gate is enabled" yes "$([ -L "$U/multi-user.target.wants/ghost-mining-gate.service" ] && echo yes)"
 is  "the old gate's enablement link is gone" no "$([ -e "$U/multi-user.target.wants/ghost-pool-gate.service" ] || [ -L "$U/multi-user.target.wants/ghost-pool-gate.service" ] && echo yes || echo no)"
-is  "the gate was NOT started (it would start ghost-pay)" 0 "$($G -c '^start ghost-mining-gate' "$R/stub/calls" || true)"
+is  "the gate was NOT started (its job is the next boot)" 0 "$($G -c '^start ghost-mining-gate' "$R/stub/calls" || true)"
 is  "sri-pool orders on and wants the new name" "After=network.target ghost-mining.service|Wants=ghost-mining.service" "$($G -E '^(After|Wants)=' "$U/sri-pool.service" | paste -sd'|')"
 is  "sri-pool's comment is left alone" 1 "$($G -c '^# ghostd, ghost-pool and$' "$U/sri-pool.service")"
 is  "the watchdog unit orders on the new name" "After=network-online.target ghostd.service ghost-mining.service" "$($G '^After=' "$U/ghost-restart-watch.service")"

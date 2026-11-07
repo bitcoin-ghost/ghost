@@ -129,6 +129,7 @@ pub struct MonitoringServer {
     bind_address: SocketAddr,
     state: ServerState,
     refresh_interval: Duration,
+    extra_routes: Option<Router>,
 }
 
 impl MonitoringServer {
@@ -181,7 +182,18 @@ impl MonitoringServer {
                 start_time,
                 metrics,
             },
+            extra_routes: None,
         })
+    }
+
+    /// Serve `routes` beside the built-in ones, on the same listener (e.g. an application's own
+    /// JSON endpoints). Their paths must not collide with the built-ins.
+    pub fn with_routes(mut self, routes: Router) -> Self {
+        self.extra_routes = Some(match self.extra_routes.take() {
+            Some(r) => r.merge(routes),
+            None => routes,
+        });
+        self
     }
 
     /// Add Sv1 clients monitoring (optional, for Translator Proxy only)
@@ -259,6 +271,10 @@ impl MonitoringServer {
             .nest("/api/v1", api_v1)
             .route("/metrics", get(handle_prometheus_metrics))
             .with_state(self.state);
+        let app = match self.extra_routes {
+            Some(extra) => app.merge(extra),
+            None => app,
+        };
 
         let listener = TcpListener::bind(self.bind_address).await?;
 
@@ -960,6 +976,8 @@ mod tests {
             last_batch_work_sum: 30.0,
             share_batch_size: 10,
             blocks_found: 0,
+            slot_class: None,
+            slot_class_warning: None,
         }
     }
 

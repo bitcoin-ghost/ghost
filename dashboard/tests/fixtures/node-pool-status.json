@@ -1,0 +1,125 @@
+{
+  "network": "regtest",
+  "node_id": "7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a",
+  "start": {
+    "genesis_anchor": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "genesis_btc_height": 0,
+    "source": "default",
+    "genesis_tier": 10,
+    "genesis_table_digest": "4242424242424242424242424242424242424242424242424242424242424242",
+    "pinned_genesis_table_digest": null
+  },
+  "share_chain": {
+    "tip": "abababababababababababababababababababababababababababababababab",
+    "anchor_height": 7,
+    "btc_height": 998,
+    "t_net": 10,
+    "work": "0000000000000000000000000000000000000000000000000000000000100000",
+    "loose_shares": 3,
+    "unseen_anchors": 1
+  },
+  "peers": 2,
+  "relay_stats": {
+    "shares_accepted": 40,
+    "shares_stale": 2,
+    "shares_invalid": 1,
+    "anchors_valid": 7,
+    "anchors_invalid": 0,
+    "reorgs": 1
+  },
+  "retention": {
+    "checkpoint_depth": 288,
+    "prune": true,
+    "checkpoints": [
+      {
+        "anchor": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+        "anchor_height": 3,
+        "btc_height": 700,
+        "digest": "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1",
+        "created_at": 1799990000
+      }
+    ]
+  },
+  "settlement": {
+    "caught_up": true,
+    "synced_height": 999,
+    "bitcoin_tip": 999,
+    "provisional": [
+      { "height": 960, "block_hash": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2" }
+    ],
+    "matched": 1,
+    "confirmed": 0,
+    "mismatched": 0,
+    "disconnected": 0
+  },
+  "fee_address": "bcrt1qfeeaddressexample0000000000000000000",
+  "ledger_rows": 3,
+  "pool_blocks_found": 41,
+  "pool_expected_block_interval_secs": 52000,
+  "total_owed": { "units": "130996625984789", "sats": 30500 },
+  "pool_hashrate": {
+    "hashes_per_sec": 101808185.67,
+    "from_job_height": 856,
+    "to_job_height": 999,
+    "window_blocks": 144,
+    "credited_shares": 2,
+    "unavailable": null
+  },
+  "recent_blocks": [
+    {
+      "height": 960,
+      "block_hash": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+      "status": "provisional",
+      "subsidy_sats": 312500000,
+      "treasury_base_sats": 1562500,
+      "miners_paid_sats": 1000,
+      "treasury_change_sats": 310936500,
+      "finder_surplus_sats": 0,
+      "treasury_sats": 312499000,
+      "payouts": [{ "address": "bcrt1qminerone000000000000000000000000000", "sats": 1000 }],
+      "applied_at": 1799999000
+    },
+    {
+      "height": 950,
+      "block_hash": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+      "status": "settled",
+      "subsidy_sats": 312500000,
+      "treasury_base_sats": 1562500,
+      "miners_paid_sats": 1500,
+      "treasury_change_sats": 310936000,
+      "finder_surplus_sats": 0,
+      "treasury_sats": 312498500,
+      "payouts": [{ "address": "bcrt1qminerone000000000000000000000000000", "sats": 1500 }],
+      "applied_at": 1799998000
+    }
+  ],
+  "miners": [
+    {
+      "downstream_id": 4,
+      "channel_id": 1,
+      "kind": "extended",
+      "address": "bcrt1qminerone000000000000000000000000000",
+      "worker": "rig1",
+      "slot_class": 9,
+      "sensing": {
+        "model": "Stock Antminer",
+        "firmware": "2.0.0",
+        "agent": "bmminer/2.0.0",
+        "ceiling_class": 9,
+        "settled": true,
+        "highest_passed": 9
+      },
+      "firmware_warning": "Stock Antminer firmware carries at most 9 miner outputs (about 730 B)"
+    },
+    {
+      "downstream_id": 5,
+      "channel_id": 2,
+      "kind": "standard",
+      "address": "bcrt1qminertwo000000000000000000000000000",
+      "worker": "bitaxe",
+      "slot_class": 500,
+      "sensing": null,
+      "firmware_warning": null
+    }
+  ]
+}

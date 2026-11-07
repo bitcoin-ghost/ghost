@@ -1,0 +1,11 @@
+{
+  "schema": "ghost-audit/node-list/v1",
+  "generated_at": null,
+  "generated_at_unix": null,
+  "network": null,
+  "genesis_anchor": null,
+  "policy": null,
+  "candidates": 0,
+  "listed": 0,
+  "nodes": []
+}

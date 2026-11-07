@@ -1,21 +1,15 @@
 # Node Dashboard
 
-*Monitor your node, track rewards, and manage settings through a web-based dashboard.*
+*Monitor your node and manage its settings through a web-based dashboard.*
 
 ## Overview
 
-Every Ghost node includes a local web dashboard for monitoring and configuration. The dashboard is:
+The installer sets the dashboard up with every node pool node, from the same signed release as the node (see [Deployment](#deployment), *Node dashboard*). It runs as `ghost-dashboard.service` on `127.0.0.1:3000`, and its password is in `/etc/ghost/dashboard.env` on the node (`sudo grep DASHBOARD_PASSWORD /etc/ghost/dashboard.env`). The dashboard is:
 
 - **Local-only by default** — No public internet exposure
 - **Real-time** — Live updates via WebSocket
 - **Responsive** — Works on desktop and mobile
 - **Secure** — JWT authentication, no external dependencies
-
-- **Status**: ● Online (99.8% uptime)
-- **Sync**: 870,234 / 870,234 (100%)
-- **Mining**: 1.2 PH/s (12 miners)
-- **Shares**: ⭐⭐⭐⭐ (14/15)
-- **This Round**: ~0.0234 BTC
 
 :::warning Security First
 The dashboard binds only to localhost (127.0.0.1). It's never exposed to the public internet. You access it through SSH tunnel or VPN.
@@ -36,22 +30,6 @@ Three ways to access your dashboard remotely:
 ### SSH Port Forwarding
 
 Forward your local port through an encrypted SSH connection. No additional software needed.
-
-### Quick Connect
-
-```bash
-# Install ghost CLI (one time)
-$ npm install -g @ghost-pool/cli
-
-# Connect to your node
-$ ghost connect your-server.com
-
-# Output:
-→ Establishing SSH tunnel...
-→ Dashboard available at http://localhost:3000
-→ Opening browser...
-✓ Connected to ghost-usa-west-42
-```
 
 ### Manual SSH
 
@@ -111,12 +89,13 @@ http://100.64.0.42:3000
 
 ### Configuration
 
-During Ghost install, if you chose Tailscale, the dashboard binds to your Tailscale IP:
+The installer binds the dashboard to `127.0.0.1`. To reach it over Tailscale instead of a tunnel, bind it to the node's Tailscale IP with a drop-in (the password still applies, and no firewall rule is needed on a Tailscale address):
 
 ```bash
-# /etc/ghost/node.conf
-dashboard:
-  bind: "100.64.0.42:3000"  # Tailscale IP
+sudo systemctl edit ghost-dashboard
+# [Service]
+# Environment=HOSTNAME=100.64.0.42
+sudo systemctl restart ghost-dashboard
 ```
 
 :::info Why Tailscale?
@@ -125,53 +104,34 @@ Tailscale uses WireGuard under the hood for encrypted connections. It handles NA
 
 ## Dashboard Features
 
-### Overview Page
+The dashboard is built for the node pool. Its node pool pages:
 
-- Node status and uptime percentage
-- Blockchain sync progress
-- Mining hashrate and connected miners
-- Current share count (0-15)
-- Estimated rewards this round
-- Network statistics
+| Page | Shows |
+| --- | --- |
+| **Overview** (`/`) | Node pool health: the pool service answering, relay peers, settlement caught up, provisional and mismatched blocks, anchors waiting for their batch. The Bitcoin node's sync, the share-chain tip and anchor height, the fee address, and where the share chain starts (genesis anchor and height, genesis tier, table digest, pinned digest). |
+| **Miners** (`/miners`) | Every open channel with its payout address, worker, slot class (how many miner outputs its jobs carry), sensed firmware model, sensing state and any firmware warning. Per payout address: hashrate, shares in the last 24 hours, ledger balance, queue position and expected wait. Each address links to its own page. |
+| **Miner** (`/miners/{address}`) | Workers on this node, the ledger balance, its rank in the oldest and largest queues, what the next block would pay it at each slot class, its payouts (settled or provisional, confirmations, spendable) and its recent credited shares. |
+| **Pool Blocks** (`/blocks`) | Recent pool blocks: subsidy, what each paid to miners and to whom, the treasury base (`S/200`), the change sent to the treasury, and whether settlement matched the block or retired it provisionally. Settlement counters since start. |
+| **Share Chain** (`/share-chain`) | The tip, cumulative work and `T_net`, loose shares and anchors waiting for their batch, the relay's counters since start, the checkpoint depth, pruning on or off, and the stored checkpoints. |
+| **Connect Miners** (`/mining`) | This node's stratum ports, the SV2 authority key and the username rule (`<payout-address>.<worker>`; P2SH, P2WPKH, P2WSH and P2TR only). |
 
-### Mining Page
+**Settings** shows the fee address read-only. It is a money destination, so the dashboard never
+writes it: re-run the installer with `--fee-address`, or edit `fee_address` under `[node_pool]` in
+`/etc/ghost/pool-config.toml` and restart pool_sv2. Alerts (including the webhook) are set under
+Settings, Alerts.
 
-- List of connected miners with hashrate
-- Share statistics per worker
-- Template profile selector
-- Stratum endpoint display
-- Historical hashrate graph
+The Bitcoin node, privacy, transaction filtering, storage and system pages are unchanged. Pages
+for elders, capabilities, checkpoints, votes, node rewards, Wraith, Ghost Pay, Tap and L2 are
+gone, as are the old mesh's pool, geo, capacity and peers pages, and the Connect Wallet page
+(GhostTap and light-wallet pairing): Ghost Pay and Ghost Tap are obsolete.
 
-### Rewards Page
-
-- Share breakdown (which shares you're earning)
-- Payout history with transaction links
-- Earnings chart over time
-- Payout address configuration
-
-### Network Page
-
-- Pool-wide statistics
-- Connected peers list
-- Elder registry and your status
-- Treasury progress and decay status
-
-### Settings Page
-
-- Ghost Mode toggle
-- Archive Mode toggle
-- Public Mining toggle
-- Mempool and template profiles
-- Pruning configuration
-- Security settings (rotate `DASHBOARD_PASSWORD` via systemd override)
-
-### Logs Page
-
-- Live log streaming
-- Filter by level (info, warn, error)
-- Filter by source (core, pool, node)
-- Search functionality
-- Download logs
+:::info Honest readings
+Where the node does not report a value, the dashboard says **unknown**; where a call fails, it says
+**unavailable** with the reason. It never fills a gap with zero or with a healthy state. Hashrate,
+shares and worker status are this node's own (only the node a miner is connected to sees its
+shares); balances, queue positions and payouts are the share chain's and are the same on every
+node.
+:::
 
 ## API Access
 
@@ -186,18 +146,19 @@ in their own right, not because of any localhost exemption.
 ```bash
 # Against the node backend on :8080 (not the dashboard):
 
-# Example: Get node status
-$ curl http://localhost:8080/api/v1/node/status
+# The node pool's status: share chain, peers, settlement, blocks, miners
+$ curl http://localhost:8080/api/v1/node-pool/status
 
-# Example: Get mining stats
-$ curl http://localhost:8080/api/v1/mining/status
+# One miner's ledger: balance, queue position, shares, payouts
+$ curl http://localhost:8080/api/v1/ledger/<address>
 
-# Example: Toggle Ghost Mode
-$ curl -X PATCH \
-     -H "Content-Type: application/json" \
-     -d '{"ghost_mode": true}' \
-     http://localhost:8080/api/v1/config
+# One miner's workers on this node and its expected wait
+$ curl http://localhost:8080/api/v1/miner/<address>
 ```
+
+These three are forwarded to pool_sv2, which builds them on its loopback monitoring listener; if
+pool_sv2 does not answer, the backend says so with a `503`. Routes of removed features answer
+`410 Gone` with the feature's name.
 
 The dashboard's own API (port `3000`, including the `/api/v1/*` proxy) is a
 different matter: it requires a session on **every** request, including from
@@ -237,10 +198,10 @@ so the target, the action and the parameters cannot be changed after signing.
 they are refused (`400 unsigned_fields`).
 
 **Settable keys** — nothing else: `alerts.enabled`, every
-`alerts.events.<event>` toggle (`node_offline`, `capability_drift`, `low_disk`,
-`restart_needed`, `peer_count_drop`, `block_found`, `reorg_detected`,
-`behind_tip`, `update_available`, `mempool_congestion`, `fee_spike`,
-`failed_login`, `service_restart_loop`), `network.max_miners` (1 to 4294967295)
+`alerts.events.<event>` toggle (`low_disk`, `restart_needed`,
+`peer_count_drop` (share-chain relay peers dropped, or none), `block_found`,
+`reorg_detected`, `behind_tip`, `update_available`, `mempool_congestion`,
+`fee_spike`, `failed_login`, `service_restart_loop`), `network.max_miners` (1 to 4294967295)
 and `identity.display_name` (1-64 printable characters, no quotes).
 
 Anything else is `403 refused_by_design`, with a `category` saying why:
@@ -255,15 +216,14 @@ spending a restart on it. The edit keeps every comment and every other line,
 is checked against the node's real config loader before it is written, and
 replaces the file atomically with its original owner and mode.
 
-Full API documentation: [docs.ghostpool.io/api](https://docs.ghostpool.io/api)
-
 ## Security
 
 ### Authentication
 
-- **Password-gated** — Set `DASHBOARD_PASSWORD` in the dashboard's systemd
-  override (`/etc/systemd/system/ghost-dashboard.service.d/override.conf`,
-  root-readable only). Each operator picks their own value.
+- **Password-gated** — `DASHBOARD_PASSWORD`, generated by the installer on the
+  node into `/etc/ghost/dashboard.env` (root-only, mode 600) and read by the unit
+  with `EnvironmentFile=`. Never an `Environment=` line: systemd shows those to
+  every local user. The installer never prints it.
 - **JWT session cookie** — On successful login at `/login`, the dashboard
   issues a signed cookie named `ghost-session`. Middleware
   (`dashboard/src/middleware.ts`) verifies the JWT on every request.
@@ -293,15 +253,13 @@ Full API documentation: [docs.ghostpool.io/api](https://docs.ghostpool.io/api)
 If the dashboard password is compromised:
 
 ```bash
-# Generate a strong replacement
-$ openssl rand -base64 32
-
-# Edit the override file (root only) and replace DASHBOARD_PASSWORD,
-# then reload + restart
-$ sudo systemctl edit ghost-dashboard
-$ sudo systemctl daemon-reload
+# Replace DASHBOARD_PASSWORD in the root-only file, then restart
+$ sudo sed -i "s/^DASHBOARD_PASSWORD=.*/DASHBOARD_PASSWORD=$(openssl rand -hex 16)/" /etc/ghost/dashboard.env
 $ sudo systemctl restart ghost-dashboard
+$ sudo grep DASHBOARD_PASSWORD /etc/ghost/dashboard.env
 ```
+
+A re-run of the installer keeps the password you set.
 
 Existing `ghost-session` cookies remain valid until they expire — restart
 forces a fresh login because the JWT secret is process-scoped.
@@ -312,18 +270,14 @@ Because the dashboard binds loopback and auth is a single `DASHBOARD_PASSWORD`,
 a *forgotten* password would lock the operator out — and there is deliberately
 no web-based reset (that would be an authentication bypass). Recovery instead
 relies on **node access**, which reaching the dashboard already implies. On the
-node, as root, run the bundled helper:
+node, read it:
 
 ```bash
-$ sudo scripts/agathion-reset-password.sh
+$ sudo grep DASHBOARD_PASSWORD /etc/ghost/dashboard.env
 ```
 
-It generates (or accepts, via `--password`) a strong password, writes it to the
-`override.conf` drop-in above while preserving other `Environment=` entries,
-drops any explicit `DASHBOARD_JWT_SECRET` so old sessions die, runs
-`daemon-reload` + `restart`, and prints the new password. The login page's
-"Forgot password?" link points operators to this command. See the dashboard
-README ("Password recovery") for details.
+The login page's "Forgot password?" link says the same. To set a new one, see
+*Rotate the password*, above.
 
 ### Best Practices
 

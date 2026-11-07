@@ -31,8 +31,12 @@
 
 #![deny(unreachable_pub)]
 
+/// Node pool anchor chain: fork choice, ancestry and retarget, in memory.
+pub mod anchor_chain;
 pub mod atomic_file;
-pub mod batch_two_phase;
+
+/// Node pool: the canonical payout rule, a port of `docs/node-pool-reference/refimpl_v3.py`.
+pub mod canonical_payout;
 pub mod circuit_breaker;
 pub mod clock;
 pub mod coinbase_tags;
@@ -42,28 +46,36 @@ pub mod constants;
 pub mod error;
 pub mod identity;
 pub mod identity_rotation;
-pub mod instant;
 pub mod internal_auth;
-pub mod key_rotation;
 pub mod metrics;
-pub mod mpc;
+
+/// Node pool protocol constants (new names only; nothing live reads them).
+pub mod node_pool_constants;
+
+/// The cutover's ledger export, read and checked as a share-chain genesis table (Phase 4).
+pub mod node_pool_genesis_export;
+
+/// Where each network's node pool share chain starts (W2.8).
+pub mod node_pool_network;
+
+/// Node pool 256-bit arithmetic.
+pub mod node_pool_u256;
 pub mod rpc;
 
 pub mod sanitize;
 pub mod serde_hex;
 pub mod setup;
 
-/// Proving a share was mined to the node that claims it.
-pub mod share_binding;
+/// Node pool share tag and the pure share checks.
+pub mod share_commit;
 
-/// Share shard: the network shard's deterministic core (two grow-only quantities, max-merge,
-/// signed epoch summaries, table root).
-pub mod share_shard;
+/// Node pool slot-class sensing: the firmware ceiling table and the per-miner stepping loop.
+pub mod slot_class_sensing;
+
 pub mod signer;
 pub mod template_verifier;
 pub mod tls;
 pub mod types;
-pub mod work_fold;
 /// Bitcoin Core ZMQ subscriber. Gated behind the default `zmq` feature: it
 /// depends on the UNIX-only `tmq` crate, so wallet builds targeting Windows
 /// disable it via `default-features = false`.
@@ -75,8 +87,6 @@ pub use constants::*;
 pub use error::*;
 pub use identity::*;
 pub use identity_rotation::*;
-pub use instant::*;
-pub use key_rotation::*;
 pub use sanitize::{sanitize_for_log, sanitize_for_log_with_len};
 pub use signer::*;
 pub use types::*;

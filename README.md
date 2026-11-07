@@ -10,11 +10,9 @@
 [![Version](https://img.shields.io/github/v/release/bitcoin-ghost/ghost?label=version)](https://github.com/bitcoin-ghost/ghost/releases/latest)
 
 Bitcoin Ghost is a Bitcoin mainnet project built around a Bitcoin Core fork
-(`ghostd`) and a decentralised mining pool (`ghost-mining`). Nodes form a
-peer-to-peer mesh, reach BFT consensus on payouts, and are rewarded for the
-infrastructure they actually provide — full-node storage, mining, and mempool
-filtering — through a verified-capability share system. It also includes a
-self-custody wallet with Ghost Locks and a CoinJoin privacy protocol (Wraith).
+(`ghostd`) and a node pool: a mining pool with no operator. Anyone can run a
+node; miners' balances are decided by a light share chain, and every block's
+coinbase pays them directly (see [`docs/NODE_POOL_SPEC.md`](docs/NODE_POOL_SPEC.md)).
 No separate token, no altcoin — it settles in Bitcoin.
 
 - **Website:** <https://bitcoinghost.org>
@@ -26,43 +24,19 @@ No separate token, no altcoin — it settles in Bitcoin.
 | Component | Path | Description |
 |-----------|------|-------------|
 | `ghostd` (Ghost Core) | `ghost-core/` | A fork of Bitcoin Core v30 running on Bitcoin mainnet, with Reaper mempool filtering and Ghost Haze block stripping. Separate C++/CMake build. |
-| `ghost-mining` | `bins/ghost-pool/` | Decentralised mining pool node. Runs the P2P consensus mesh, tracks shares, and computes coinbase payouts. |
-| Ghost Lock | `crates/ghost-lock/` | Four-lane Taproot accounts with escape, inheritance and quorum co-signing. |
-| Wraith wallet | `apps/wraith-wallet/` | Self-custody wallet — daemon, CLI and desktop app — talking to your own node. |
-| Wraith | `crates/wraith-protocol/` | Blind-signature CoinJoin mixing. |
-| Light wallet | `bins/ghost-cli/`, `crates/ghost-light-wallet/` | CLI/TUI wallet with BIP-352 Silent Payments. |
-| SV2 mining apps | `bins/translator-sv2/`, `bins/pool-sv2/` | Stratum V2 translator and pool, amalgamated in-tree. |
+| `ghost-mining` | `bins/ghost-pool/` | Pool node: block templates for pool_sv2, round statistics and the operator API. |
+| SV2 mining apps | `bins/translator-sv2/`, `bins/pool-sv2/` | Stratum V2 translator and pool, amalgamated in-tree. pool_sv2 builds every job's canonical coinbase and runs the node pool share-chain relay. |
 
 The workspace contains over 40 crates and binaries under `crates/` and `bins/`.
 See [`docs/protocols/ARCHITECTURE.md`](https://bitcoinghost.org/docs/) on the
 website for the full crate map, or browse the source directly.
 
-## Node reward shares (5-4-3-2-1)
-
-Nodes earn shares in the node reward pool by proving — not self-reporting — that
-they run real infrastructure. Every capability is verified through
-challenge-response probes issued by random peers every five minutes.
-
-| Capability | Shares | Verification |
-|------------|:------:|--------------|
-| Archive node | +5 | Peers request arbitrary historical blocks. |
-| Ghost Pay | +4 | Random L2 state-lookup challenges. **Being retired** — the service is no longer built or installed, so new nodes cannot claim it. Removing it from the weighting is a consensus change and lands with its own height gate. |
-| Public mining | +3 | Peers probe the Stratum port for accessibility. |
-| Reaper | +2 | Mempool policy classification challenges. |
-| Elder | +1 | Contributed to the MPC ceremony (first 101 nodes; permanent). |
-
-Maximum 15 shares. Before any shares count, a node must maintain 95% uptime over
-a trailing seven-day window. The MPC trusted-setup ceremony admits elders in
-order from position 1 up to 101; once the 101st node has contributed, no further
-elder positions are created.
-
 ## Architecture
 
 ```
                        ┌────────────────────────────────┐
-                       │       P2P MESH NETWORK          │
-                       │  consensus · shares · payouts   │
-                       │  blocks · health · discovery    │
+                       │  NODE POOL SHARE-CHAIN RELAY   │
+                       │  shares · anchors · sync (8566)│
                        └────────────────────────────────┘
                         ▲              ▲              ▲
                   ┌─────┴─────┐  ┌─────┴─────┐  ┌─────┴─────┐
@@ -70,42 +44,43 @@ elder positions are created.
                   └─────┬─────┘  └─────┬─────┘  └─────┬─────┘
                      ghostd         ghostd         ghostd
                         │              │              │
-                   Your miners    Their miners    Light wallets
-                  (Stratum V1)   (Stratum V1)    (CLI / TUI)
+                   Your miners    Their miners    Their miners
+                  (Stratum V1)   (Stratum V1)    (Stratum V1)
 ```
 
-Every node is a peer. Miners connect to whichever node they choose. Nodes reach
-consensus through BFT voting on a Noise-encrypted ZeroMQ mesh, and each node
-selects its own transactions according to its configured mempool policy.
+Every node is a peer. Miners connect to whichever node they choose. Nodes agree
+who is owed what through the node pool share chain (most-work fork choice, no
+votes), and each node selects its own transactions according to its configured
+mempool policy.
 
 ### Network ports
 
 | Port | Purpose |
 |------|---------|
 | 3333 | Stratum V1 — hobby tier, ~2,328 starting difficulty |
-| 4444 | Stratum V1 — farm/rental tier, ~232,827 starting difficulty (public mining nodes) |
+| 4444 | Stratum V1 — farm/rental tier, ~232,827 starting difficulty |
 | 34255 | Stratum V2 — via SRI pool |
+| 8566 | Node pool share-chain relay |
 | 8080 | REST API |
-| 8555–8562 | P2P consensus mesh (shares, blocks, voting, health, discovery, elders, payouts) |
-| 8800 | Ghost Pay L2 API |
-| 8900 | GSP WebSocket (light-wallet backend) |
 
 ## Running a node
 
-The install script provisions `ghostd` and `ghost-mining`, writes a config, and
-sets up the systemd services. Supply the Bitcoin address your node rewards
-should be paid to:
+The install script provisions `ghostd`, `ghost-mining` and the SV2 stratum stack
+as a node pool node, writes the configs, and sets up the systemd services. It
+runs a preflight first and changes nothing if a check fails. Supply the address
+that takes the transaction fees of blocks your node's miners find (P2SH, P2WPKH,
+P2WSH or P2TR):
 
 ```sh
-curl -sSL https://get.bitcoinghost.org | sudo bash -s -- --payout-address bc1q...
+curl -sSL https://get.bitcoinghost.org | sudo bash -s -- --fee-address bc1q... --alert-webhook https://ntfy.sh
 ```
 
-Run `sudo bash -s -- --help` to see options such as `--archive`, `--wraith`,
-`--mining-mode`, and `--sync`. Full setup guidance is at
-<https://bitcoinghost.org/docs/>.
+Run `sudo bash -s -- --help` to see options such as `--network`, `--relay-peer`,
+`--archive` and `--sync`. Full setup guidance is in
+[`ghost-web/docs/deployment.md`](ghost-web/docs/deployment.md).
 
 Point a miner at your node with `stratum+tcp://<your-ip>:3333` and a worker name
-of `<btc_address>.worker1`.
+of `<your payout address>.worker1`; the address must be P2SH, P2WPKH, P2WSH or P2TR.
 
 ### Verifying releases
 
@@ -133,7 +108,7 @@ Requirements:
 ```sh
 git clone https://github.com/bitcoin-ghost/ghost.git
 cd ghost
-cargo build --release            # builds the Rust workspace (ghost-mining, wallets, ...)
+cargo build --release            # builds the Rust workspace (ghost-mining, pool_sv2, ...)
 ```
 
 `ghost-core` has its own build; see [`ghost-core/INSTALL.md`](ghost-core/INSTALL.md).
@@ -141,26 +116,18 @@ cargo build --release            # builds the Rust workspace (ghost-mining, wall
 Common development commands:
 
 ```sh
-# The Tauri desktop crates need a built JS frontend before `tauri::generate_context!`
-# will compile, so the pure-Rust commands exclude them — exactly as CI does.
-EXCLUDES="--workspace --exclude wraith-wallet-gui --exclude ghost-tap-desktop"
+EXCLUDES="--workspace"
 
 cargo test $EXCLUDES --lib --bins             # test suite, as CI runs it
-cargo test -p ghost-consensus                 # a single crate
+cargo test -p ghost-np-relay                  # a single crate
 cargo clippy $EXCLUDES --all-targets --all-features -- -D warnings
 cargo fmt --all                               # format
 cargo audit                                   # dependency advisory check
 ```
 
-`ghost-mpc`'s lifecycle test needs its small-cap harness feature and is run on its own:
-
-```sh
-cargo test -p ghost-mpc --test mpc_lifecycle --features mpc-test-cap
-```
-
 Before opening a PR, `scripts/record-tests.sh` runs the full gate exactly as CI does
 — formatting, clippy with CI's own argument list, docs under `-D warnings`, the fuzz
-targets, and the feature-gated suites — and is the quickest way to find out whether
+targets — and is the quickest way to find out whether
 CI will be happy.
 
 ## Privacy features
@@ -170,9 +137,7 @@ own:
 
 | Feature | What it does |
 |---------|--------------|
-| Wraith Protocol | Single-round, coordinator-blinded atomic CoinJoin mixing at L2 entry using blind Schnorr signatures. |
 | Ghost Keys (BIP-352) | Silent Payments — a fresh on-chain address per payment from one static identifier. |
-| Ghost Pay L2 | Off-chain transfers proven with zero-knowledge proofs. |
 | Ghost Mode | Incognito node mode — the node stops accepting and advertising transactions to peers, so its mempool is never exposed to surveillance. Pairs with Tor. |
 | Ghost Shroud | Randomised relay delay on transactions to resist timing analysis. |
 | Ghost Haze | Strips witness padding, scriptSig stuffing, and OP_RETURN payloads from blocks before they are written to disk, retaining the full economic graph. |
@@ -180,9 +145,8 @@ own:
 ## Documentation
 
 Protocol and operator documentation is published at
-<https://bitcoinghost.org/docs/>, covering the consensus protocol, the
-node-capability system, economics, Ghost Keys, Ghost Pay, the Wraith Protocol,
-Ghost Haze, the Reaper, and deployment.
+<https://bitcoinghost.org/docs/>, covering Ghost Keys, Ghost Haze, the Reaper,
+and deployment. The node pool is specified in `docs/NODE_POOL_SPEC.md`.
 
 ## Contributing
 

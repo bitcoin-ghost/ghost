@@ -77,7 +77,7 @@ export default function ZeroSyncPage() {
     { label: "Full blocks", on: mode !== "hazed" && !pruned, note: "Complete historical blocks to any peer" },
     { label: "Stripped blocks", on: mode === "hazed", note: "Structural blocks to hazed peers" },
     { label: "Signed UTXO snapshot", on: hasSnapshot && (ckpt?.signed ?? false), note: "Fast bootstrap for new nodes" },
-    { label: "Light-client filters", on: false, note: "BIP158 + merkle proofs — planned (GSP serving layer)" },
+    { label: "Light-client filters", on: false, note: "BIP158 + merkle proofs — not served" },
   ];
 
   return (

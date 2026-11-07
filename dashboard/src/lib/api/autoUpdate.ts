@@ -12,10 +12,16 @@ export interface AutoUpdateStatus {
   message?: string;
   installed_version?: string;
   latest_version?: string;
+  channel?: string;
 }
+
+// Which releases the updater follows: the node pool's np- releases, the old network's latest
+// release (no channel marker), or a marker the updater refuses.
+export type ReleaseChannel = "node-pool" | "old-network" | "invalid";
 
 export interface AutoUpdateState {
   enabled: boolean;
+  channel: ReleaseChannel;
   installed_version: string | null;
   latest_version: string | null;
   last_status: AutoUpdateStatus | null;

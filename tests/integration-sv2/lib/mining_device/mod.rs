@@ -611,7 +611,16 @@ impl Device {
 #[derive(Debug, Clone)]
 struct Miner {
     header: Option<Header>,
+    /// What a hash must meet to be submitted: the easier of `share_target` and
+    /// `network_target`.
     target: Option<U256>,
+    /// The channel's share target, from the pool.
+    share_target: Option<U256>,
+    /// The current block's target, from the job's `nbits`. A hash meeting it is a block, and a
+    /// miner submits a block whatever its share target: dropping it would throw the block away.
+    /// On regtest this is what lets a CPU miner submit at all against the node pool, whose
+    /// channel floor (difficulty 2^10, about 2^42 hashes) is out of a CPU's reach.
+    network_target: Option<U256>,
     job_id: Option<u32>,
     version: Option<u32>,
     handicap: u32,
@@ -623,6 +632,8 @@ impl Miner {
     fn new(handicap: u32) -> Self {
         Self {
             target: None,
+            share_target: None,
+            network_target: None,
             header: None,
             job_id: None,
             version: None,
@@ -638,12 +649,22 @@ impl Miner {
             .fold("".to_string(), |acc, b| acc + format!("{b:02x}").as_str());
         info!("Set target to {}", hex_string);
         // Store the target as U256 in little-endian format
-        self.target = Some(U256::from_little_endian(target.as_slice()));
+        self.share_target = Some(U256::from_little_endian(target.as_slice()));
+        self.update_target();
     }
 
     // Same as new_target but without logging (useful for internal probes)
     fn new_target_silent(&mut self, target: Vec<u8>) {
-        self.target = Some(U256::from_little_endian(target.as_slice()));
+        self.share_target = Some(U256::from_little_endian(target.as_slice()));
+        self.update_target();
+    }
+
+    /// The submit target: the share target, or the block target where that is easier.
+    fn update_target(&mut self) {
+        self.target = match (self.share_target, self.network_target) {
+            (Some(s), Some(n)) => Some(s.max(n)),
+            (s, n) => s.or(n),
+        };
     }
 
     fn new_header(&mut self, set_new_prev_hash: &SetNewPrevHash, new_job: &NewMiningJob) {
@@ -669,6 +690,11 @@ impl Miner {
             nonce: 0,
         };
         self.header = Some(header);
+        let network_target = stratum_apps::stratum_core::bitcoin::Target::from_compact(
+            CompactTarget::from_consensus(set_new_prev_hash.nbits),
+        );
+        self.network_target = Some(U256::from_little_endian(&network_target.to_le_bytes()));
+        self.update_target();
         // Build a fast hasher with midstate prepared for the static parts of the header
         if let Some(h) = &self.header {
             self.fast_hasher = Some(FastSha256d::from_header_static(h));
