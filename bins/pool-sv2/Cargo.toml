@@ -36,4 +36,7 @@ hotpath = "0.14.0"
 default = ["monitoring"]
 monitoring = ["stratum-apps/monitoring"]
 hotpath = ["hotpath/hotpath"]
+# The end-to-end harness's hostile build (scripts/regtest-solo/): GHOST_SOLO_FAULT=skim-treasury
+# pays every job's treasury output to the operator. Never enabled in a release.
+solo-fault-injection = []
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]

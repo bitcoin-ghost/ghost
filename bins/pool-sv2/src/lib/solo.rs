@@ -336,7 +336,10 @@ impl Solo {
             });
         }
         let slot = st.channels.get_mut(&key).expect("registered above");
-        let pay = solo_outputs(height, self.network.halving(), fees, &slot.payee_script);
+        #[allow(unused_mut)]
+        let mut pay = solo_outputs(height, self.network.halving(), fees, &slot.payee_script);
+        #[cfg(feature = "solo-fault-injection")]
+        fault::apply(&mut pay, self.network);
         let reward: Vec<TxOut> = pay
             .iter()
             .map(|(v, s)| TxOut {
@@ -746,6 +749,31 @@ pub fn assemble_block(header80: &[u8], coinbase: &[u8], transactions: &[Vec<u8>]
         raw.extend_from_slice(t);
     }
     raw
+}
+
+/// A hostile build for the end-to-end harness (`scripts/regtest-solo/`): with the feature
+/// `solo-fault-injection` and `GHOST_SOLO_FAULT=skim-treasury`, every job's treasury output pays
+/// the operator instead (a script of its own), the cheat `ghost-audit check` must refuse. Never in a
+/// release: the feature is off by default, and refused outside regtest.
+#[cfg(feature = "solo-fault-injection")]
+mod fault {
+    use ghost_common::solo::{CoinbaseOutput, SoloNetwork};
+
+    /// The script a skimming operator pays itself: P2WPKH of twenty 0x5c bytes.
+    pub const SKIM_SCRIPT: [u8; 22] = {
+        let mut s = [0x5c_u8; 22];
+        s[0] = 0x00;
+        s[1] = 0x14;
+        s
+    };
+
+    pub fn apply(pay: &mut [CoinbaseOutput; 2], network: SoloNetwork) {
+        if network == SoloNetwork::Regtest
+            && std::env::var("GHOST_SOLO_FAULT").as_deref() == Ok("skim-treasury")
+        {
+            pay[0].1 = SKIM_SCRIPT.to_vec();
+        }
+    }
 }
 
 #[cfg(test)]

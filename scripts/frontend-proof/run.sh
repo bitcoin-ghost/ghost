@@ -25,6 +25,15 @@
 # ghost-mining, pool_sv2, translator_sv2, ghost-audit, built from this tree) and ghostd (see
 # scripts/regtest-node-pool/run.sh --fetch-ghostd). Not run by CI.
 set -euo pipefail
+
+# PENDING: this proof drove the node pool's regtest harness (scripts/regtest-node-pool/, the share
+# chain, the open-listing lister and merge, and the old website pages), all removed for Ghost
+# Pool's solo design (they are kept on the feat/node-pool branch). It needs porting to
+# scripts/regtest-solo/ and the new pages before it can run again; until then it refuses to.
+if [[ "${FRONTEND_PROOF_FORCE:-}" != "1" ]]; then
+  echo "frontend-proof: pending a port to scripts/regtest-solo/ (see docs/SOLO_PROGRESS.md)" >&2
+  exit 2
+fi
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
 PLAYWRIGHT_VERSION=1.56.1
