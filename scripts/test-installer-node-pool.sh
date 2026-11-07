@@ -551,6 +551,13 @@ has "... and the note says so" "your own" "$note"
 is "the dashboard is restarted on a re-run" 1 "$($G -c '^  systemctl restart ghost-dashboard ' "$INSTALLER" || true)"
 is "nothing prints the dashboard password" 0 "$($G -cE 'echo.*\$\(?(sed|grep|cat)[^|]*dashboard\.env|cat .*dashboard\.env' "$INSTALLER" || true)"
 
+
+echo "11. the translator assigns tier difficulties"
+tcfg="$(sed -n '/^cat > \/etc\/ghost\/translator-config.toml <<EOF$/,/^EOF$/p' "$INSTALLER")"
+is "the translator config is found" yes "$([ -n "$tcfg" ] && echo yes)"
+is "quantise_to_tiers is on, once" 1 "$(printf '%s\n' "$tcfg" | $G -cx 'quantise_to_tiers = true' || true)"
+is "inside [downstream_difficulty_config]" "[downstream_difficulty_config]" \
+   "$(printf '%s\n' "$tcfg" | sed -n '1,/^quantise_to_tiers = true$/p' | $G -E '^\[' | tail -1)"
 echo
 echo "test-installer-node-pool: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

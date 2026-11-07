@@ -1886,6 +1886,10 @@ monitoring_address = "0.0.0.0:9092"
 min_individual_miner_hashrate = 1_000_000_000_000.0
 shares_per_minute = 6.0
 enable_vardiff = true
+# Every difficulty the translator assigns is a power-of-two tier (2^n, floor 2^10). The node pool
+# validates and credits a share at its tier, so an untiered difficulty would credit miners BELOW
+# what they mine at (pool_sv2 logs "not tier-shaped" for every such channel).
+quantise_to_tiers = true
 # ⛔ REMOVED: \`idle_timeout_secs\`. It was set here and by install-node.sh, documented as
 # "disconnect miners with no shares" — and NO Rust struct reads it. \`TranslatorConfig\` carries no
 # \`deny_unknown_fields\`, so it parsed, was discarded, and produced no warning, while reading to
