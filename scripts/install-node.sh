@@ -1,25 +1,45 @@
 #!/usr/bin/env bash
 #
-# Bitcoin Ghost — one-command node installer.
+# Bitcoin Ghost — one-command Ghost Solo node installer.
 #
-#   curl -sSL https://get.bitcoinghost.org | sudo bash -s -- --fee-address bc1q...
+#   curl -sSL https://get.bitcoinghost.org | sudo bash -s -- --alert-webhook https://ntfy.sh
 #
-# Stands up a full Ghost node (ghostd + ghost-mining + the SV2 stratum stack) on Ubuntu as a node
-# pool node and joins the share chain. The node pool is the only mode: there are no mining modes,
-# treasury prompts or capability flags. Mirrors the proven production setup; every
-# per-node secret is generated fresh on this machine and never leaves it.
+# Stands up a Ghost Solo node on Ubuntu: ghostd + ghost-mining + the SV2 stratum stack (pool_sv2
+# and the SV1 translator). Ghost Solo is a solo mining pool: no accounts, no sign-up. A miner's
+# username is its own Bitcoin address, and a block it finds pays it directly in the coinbase: the
+# subsidy and every fee, less 0.5% of the subsidy to the treasury (compiled into pool_sv2). There is
+# no share chain, relay, ledger, fee address or lister. Every per-node secret is generated fresh on
+# this machine and never leaves it.
+#
+# Two nodes (A and B) back each other up: each sends every block its miners find to the other as
+# well as to its own ghostd, and each keeps a direct Bitcoin connection to the other so a block
+# reaches the network from both at once. On each node, once both are installed:
+#
+#   sudo bash install-node.sh --peer-node <the other node's IP> --submit-auth <its user:password>
+#
+# --peer-node sets `addnode=<ip>:8333` (the Bitcoin P2P link) and the found-block target
+# `http://<ip>:8332` ([solo] submit_rpc in /etc/ghost/pool-config.toml), and lets that IP reach
+# this node's Bitcoin RPC (rpcallowip, plus a ufw rule for that address only). The other node's RPC
+# credentials are its /etc/bitcoin/bitcoin.conf `rpcuser`/`rpcpassword`.
+#
+# Found-block credentials file (what pool_sv2 reads, `[solo] submit_rpc_auth_file`):
+#   /etc/ghost/solo-submit-rpc.auth, root:root 0600. One entry a line, `#` comments allowed:
+#     http://10.0.0.2:8332 user:password    # for that node only
+#     user:password                          # for every node without its own line
+#   --submit-auth <user:password> writes the second form; a re-run without it keeps the file.
+#   (Also GHOST_SUBMIT_AUTH=<user:password> in the environment, so it stays out of `ps`.)
 #
 # Derived from the verified provisioning of mainnet-5.
 set -euo pipefail
 
 # ─────────────────────────── network constants ───────────────────────────────
-# ⛔ GHOST_VERSION names a NODE POOL release: `np-latest` (the newest published np-vX.Y.Z) or an
-# exact `np-v…` tag. Node pool releases have their own channel in the same GitHub repository: tags
-# `np-v*`, published as pre-releases, so they are never the repository's `latest`. `latest` is the
-# old network's (`main`, still running beside the node pool), and its tags (v1.11.x) are refused
-# here: they carry no node pool. There is no default; the installer refuses without one (checked
-# after the preflight, so --help and --preflight-only work). The tarball is GPG-verified below
-# regardless. RELEASE_BASE and POOL_TARBALL are set once the tag is resolved.
+# ⛔ GHOST_VERSION names a release of this channel: `np-latest` (the newest published np-vX.Y.Z)
+# or an exact `np-v…` tag. These releases have their own channel in the same GitHub repository:
+# tags `np-v*`, published as pre-releases, so they are never the repository's `latest`. `latest`
+# is the old network's (`main`), and its tags (v1.11.x) are refused here. There is no default; the
+# installer refuses without one (checked after the preflight, so --help and --preflight-only
+# work). The tarball is GPG-verified below regardless. RELEASE_BASE and POOL_TARBALL are set once
+# the tag is resolved.
 GHOST_VERSION="${GHOST_VERSION:-}"
 # Signed release artefacts (GPG: defenwycke release key).
 GPG_KEY_FP="777FE81F8CC077FD3D08055E852C2B3190F5B928"
@@ -34,47 +54,46 @@ RELEASE_KEY_URL="https://get.bitcoinghost.org/ghost-release-key.asc"
 # Release assets live at <this>/<tag>/<asset>.
 RELEASE_DOWNLOAD_URL="https://github.com/bitcoin-ghost/ghost/releases/download"
 # ⛔ TEST ONLY: a local release mirror signed with a throwaway key, for rehearsing an install
-# end to end before any node pool release exists (see test_release_mirror below). Both must be
-# set; refused on mainnet. Never set either for a real node.
+# end to end (see test_release_mirror below). Both must be set; refused on mainnet. Never set
+# either for a real node.
 TEST_RELEASE_MIRROR="${GHOST_TEST_RELEASE_MIRROR:-}"
 TEST_RELEASE_KEY_FP="${GHOST_TEST_RELEASE_KEY_FP:-}"
-# ⛔ No old-network peers. The old network's eight nodes keep running `main` beside node pool
-# nodes, and the two must never talk: a seed list here used to name the old fleet, so every install
-# dialled its mesh. A node pool node agrees on its ledger over the share-chain relay
-# (`[node_pool.relay]`, `--relay-peer`); ghost-mining no longer runs the old mesh at all, and the
-# old mesh ports stay closed (below).
+# ⛔ No old-network peers. The old network's eight nodes keep running `main`, and the two must never
+# talk: a seed list here used to name the old fleet, so every install dialled its mesh. ghost-mining
+# no longer runs the old mesh at all, and the old mesh ports stay closed (below).
 # assumevalid checkpoint (speeds signature validation; does NOT skip download).
 ASSUMEVALID="000000000000000000010538edbfd2d5b809a33dd83f284aeea41c6d0d96968a"
 
 # ─────────────────────────────── defaults ────────────────────────────────────
-# Where every transaction fee of a block this node's miners find is paid (`[node_pool]
-# fee_address`). Required. Miners themselves are paid from the subsidy by the share-chain ledger.
-FEE_ADDRESS=""
 NETWORK="mainnet"          # mainnet | signet | regtest
-# The share-chain relay (`[node_pool.relay]`): the port peers dial, peers to dial first, and the
-# share chain's genesis. Empty genesis = the network's published one (np_network_defaults). Mainnet's
-# is published; signet's is not, so a signet node is written with an UNSET placeholder and pool_sv2
-# refuses to start until it is set.
-RELAY_PORT="8566"
-RELAY_PEERS=""
-# A custom signet (`signetchallenge`, hex) and Bitcoin peers to dial (`addnode`, host:port). The
-# node pool's own signet is a custom one, and a node on it finds the chain only through peers that
-# carry it; without a challenge `--network signet` is the public signet.
+# A custom signet (`signetchallenge`, hex) and Bitcoin peers to dial (`addnode`, host:port). On a
+# two-node setup the other node is one of these (--peer-node adds it); without a challenge
+# `--network signet` is the public signet.
 SIGNET_CHALLENGE=""
 BITCOIN_PEERS=""
-GENESIS_ANCHOR=""
-GENESIS_HEIGHT=""
+# Other nodes every found block is also sent to (`[solo] submit_rpc`), space-separated
+# http(s)://host:port URLs; --submit-node host:port and --peer-node add to it.
+SUBMIT_NODES=""
+# Addresses allowed to reach this node's Bitcoin RPC besides 127.0.0.1 (the other node, so it can
+# submit the blocks its miners find here). --peer-node adds its host's address.
+RPC_ALLOW=""
+# The other nodes' RPC credentials (`user:password`), for /etc/ghost/solo-submit-rpc.auth.
+SUBMIT_AUTH="${GHOST_SUBMIT_AUTH:-}"
 PREFLIGHT_ONLY="false"
 ALERT_WEBHOOK=""
 ALERT_TOPIC="ghost-node"
 NICKNAME="ghost-node"
 SYNC_MODE="ibd"            # ibd (trustless, default) | haze (IRREVERSIBLE)
-# Every node is a public node pool node: there are no mining modes any more.
 # Optional custom pool name. Empty = fall back to the default coinbase tag
 # "GHOST PublicPool" (nothing written to pool.toml). When set it becomes the block coinbase
 # scriptsig tag "- G H O S T - <name>", visible on explorers. ASCII, <=30 chars.
 POOL_NAME=""
-REAPER="true"
+# ⛔ The Reaper is OFF by default on a solo node. A block propagates fastest when every peer can
+# rebuild it from its own mempool (compact blocks): a template built from Bitcoin Core's standard
+# policy is one they can, and a filtered mempool is not what they hold. ghostd's Reaper defaults to
+# ON when no flag says otherwise, so the unit says `-ghostreaper=disabled` explicitly. --reaper
+# turns it on (spam filtering, at the cost of templates peers have to fetch more of).
+REAPER="false"
 ARCHIVE="false"
 # Tor. OFF by default — a plain clearnet install is completely unchanged.
 #   hybrid   (--tor)      reach outbound peers via Tor AND stay reachable on
@@ -89,45 +108,42 @@ TOR_MODE="hybrid"
 # updater verifies the GPG release signature before applying anything.
 AUTO_UPDATE="false"
 BACKUPS="true"
-# Open listing (W2.10): run `ghost-audit list` on this node as ghost-lister.service. OFF unless
-# --lister is passed; empty means "as the last install left it" (a re-run keeps an enabled lister),
-# --no-lister turns it off. The genesis table pins it needs off regtest:
-LISTER=""
-LISTER_TABLE_DIGEST=""
-LISTER_GENESIS_EXPORT=""
-LISTER_EXPORT_DIGEST=""
-# The node pool block reserve is always written: blockreservedweight=90000 in bitcoin.conf, so
-# getblocktemplate leaves room for the node pool's coinbase (up to 22 KB). ghostd's default
-# 8,000 WU lost a block at a 2.25 KB coinbase on a full template. `--node-pool` used to switch it
-# on; the node pool is now the only mode, so the flag is accepted and does nothing.
 
 usage() {
   cat <<EOF
-Bitcoin Ghost node installer
+Bitcoin Ghost — Ghost Solo node installer
 
-Required:
-  --fee-address <address>     Where every transaction fee of a block this node's miners
-                                find is paid. P2SH, P2WPKH, P2WSH or P2TR, of --network.
-                                Miners are paid from the subsidy by the pool ledger, not here.
+A solo mining pool: miners connect with their Bitcoin address as the username, and a block a
+miner finds pays it the subsidy and every fee, less 0.5% of the subsidy to the treasury.
+Nothing is required: run it with no flags on a terminal for a guided setup.
 
-Node pool:
+Network:
   --network <name>            mainnet | signet | regtest           (default: mainnet)
-  --relay-port <port>         Share-chain relay port peers dial     (default: 8566)
-  --relay-peer <host:port>    A relay peer to dial; repeat for more. More are learned.
-  --genesis-anchor <hex>      Share-chain genesis anchor (64 hex) and its Bitcoin height.
-  --genesis-height <n>          Default: the network's published genesis. None is published
-                                for mainnet or signet yet: without these the node is
-                                installed with an UNSET placeholder and pool_sv2 refuses to
-                                start until it is set.
   --signet-challenge <hex>    signet only: a custom signet's challenge script (signetchallenge).
                                 Default: the public signet.
-  --bitcoin-peer <host:port>  A Bitcoin peer for ghostd to dial (addnode); repeat for more.
   --preflight-only            Run the preflight checks and exit; change nothing.
+
+Two nodes (the other node backs this one up; run the same on it, pointing back here):
+  --peer-node <host>          The other node: addnode=<host>:8333 (a direct Bitcoin link, so a
+                                block found on either reaches the network from both), found
+                                blocks also sent to http://<host>:8332, and that host allowed
+                                to reach this node's Bitcoin RPC (rpcallowip + a ufw rule for
+                                it alone). Repeat for more. Keep that link private (a VPN or a
+                                private network): the RPC password crosses it.
+  --submit-auth <user:pass>   The other node's Bitcoin RPC credentials (its bitcoin.conf
+                                rpcuser/rpcpassword), written root-only to
+                                /etc/ghost/solo-submit-rpc.auth. Or GHOST_SUBMIT_AUTH=... in
+                                the environment. A re-run without it keeps the file.
+  --bitcoin-peer <host:port>  A Bitcoin peer for ghostd to dial (addnode); repeat for more.
+                                --peer-node adds the other node here.
+  --submit-node <host:port>   Another Bitcoin node's RPC that every found block is also sent
+                                to (submitblock), without the addnode or rpcallowip that
+                                --peer-node adds; repeat for more. http(s):// URLs work too.
 
 Strongly recommended:
   --alert-webhook <url>       Push endpoint for node alerts (e.g. https://ntfy.sh). Without
-                                this, alerts are DISABLED and all fourteen detectors — low disk,
-                                node offline, behind tip, restart loop … — fire into nothing.
+                                this, alerts are DISABLED and every detector — low disk,
+                                node offline, behind tip, restart loop … — fires into nothing.
   --alert-topic <name>        Push topic                        (default: ghost-node)
 
 Options:
@@ -141,15 +157,17 @@ Options:
                                 haze — strips block data, ~195GB, FAST but
                                        IRREVERSIBLE. You can never serve raw
                                        blocks or go archive without a full resync.
-  --no-reaper                 Don't run the mempool reaper
+  --reaper                    Run the mempool reaper (spam filter). Off by default: blocks
+                                built from the standard policy propagate fastest.
+  --no-reaper                 Don't run the mempool reaper    (default)
   --archive                   Full archive node (~720GB)
   --tor                       Route over Tor (hybrid): outbound peers via Tor +
                                 publish an onion, still reachable on clearnet 8333
   --tor-only                  Route over Tor ONLY: no clearnet (onlynet=onion),
                                 close 8333 (implies --tor)
   --no-tor                    Never use Tor                   (default)
-  --auto-update               Automatically apply newer SIGNED node pool releases (off by
-                                default). Follows the np- channel only, never the old
+  --auto-update               Automatically apply newer SIGNED releases of this channel (off
+                                by default). Follows the np- channel only, never the old
                                 network's releases. Verifies the GPG signature and the
                                 tarball checksum before swapping any binary; health-checks
                                 and rolls back on failure. Checked every 6h.
@@ -158,44 +176,40 @@ Options:
                                 kept 7 days in /var/backups/ghost/db   (default)
   --no-backups                No nightly backups. They can be switched on later:
                                 sudo systemctl enable --now ghost-backup.timer
-  --lister                    Also run an open-listing lister on this node (off by default):
-                                ghost-audit list probes every node it finds in relay gossip
-                                every 10 minutes (it submits no shares) and its node-list.json is
-                                served read-only at http://<node>:8080/api/v1/node-pool/node-list
-                                for the website's merge. Off regtest it needs the three below.
-  --lister-table-digest <hex> The network's pinned genesis table digest (table_root, 64 hex).
-  --genesis-export <dir>      The network's published ledger export (ledger-export.bin and
-                                .json): imported as this node's genesis table before the pool
-                                first starts, and given to the lister. Also --lister-genesis-export.
-  --lister-genesis-export <dir>  The ledger export directory (ledger-export.bin and .json)
-  --lister-export-digest <hex>     and its published sha256; copied for the lister's first run.
-  --no-lister                 Stop and disable the lister (a re-run otherwise keeps it as it was).
-  --payout-address <address>  Old name of --fee-address, still accepted.
-  --node-pool                 Accepted and ignored: the node pool is the only mode.
+  --fee-address, --payout-address <address>
+                              Accepted and ignored: fees go to the miner who finds the block.
+  --node-pool                 Accepted and ignored.
   --non-interactive           Never prompt; use flags/defaults only (for scripts)
   -h, --help                  This help.
 
 Removing the node:
   --uninstall                 Stop and remove the node's services, timers, binaries, dashboard,
                                 firewall rules (22/tcp stays), sudoers files and release channel.
-                                KEEPS its data: the chain, node-pool.db, node.key, the configs and
-                                the backups; installing again reuses them. Asks for confirmation.
+                                KEEPS its data: the chain, node.key, miner statistics, the
+                                configs and the backups; installing again reuses them. Asks for
+                                confirmation. Also removes what an older (node pool) install left:
+                                the lister and its user, and the relay's firewall rule.
   --purge                     With --uninstall: delete that data too. Cannot be undone.
   --yes                       With --uninstall: do not ask (for scripts).
 
 Environment:
-  GHOST_VERSION=<release>     Required. np-latest (the newest node pool release) or an exact
-                                np-v<x.y.z> tag. Old-network tags (v1.11.x) are refused.
+  GHOST_VERSION=<release>     Required. np-latest (the newest release of this channel) or an
+                                exact np-v<x.y.z> tag. Old-network tags (v1.11.x) are refused.
 
-With no config flags on an interactive terminal, a guided setup wizard runs.
-Every install runs a preflight first (fee address, RAM, disk, ports, Bitcoin node,
-relay); a failed check stops it before anything is changed.
+Miners connect to:
+  stratum+tcp://<this node>:3333   SV1, small miners (Bitaxe, NerdAxe)
+  stratum+tcp://<this node>:4444   SV1, the farm tier (S19/S21-class, rented hashrate)
+  <this node>:34255                SV2 (Noise; the authority key is printed at the end)
+  Username: <your Bitcoin address>[.<worker>] (P2SH, P2WPKH, P2WSH or P2TR). Password: anything.
+
+Every install runs a preflight first (RAM, disk, ports, Bitcoin node, peers); a failed check
+stops it before anything is changed.
 
 The node dashboard is installed with the node and listens on 127.0.0.1:3000 only (reach it
 through an SSH tunnel). Its password is in /etc/ghost/dashboard.env (root-only).
 
-Re-running the installer on a node keeps its identity, keys, settings and ledger, and
-restarts the node (and the dashboard) on what it wrote.
+Re-running the installer on a node keeps its identity, keys and settings (peers, found-block
+targets and their credentials), and restarts the node (and the dashboard) on what it wrote.
 EOF
 }
 
@@ -211,24 +225,22 @@ PURGE="false"
 ASSUME_YES="false"
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --fee-address)    FEE_ADDRESS="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
-    # The old name. It set the SV2 coinbase_reward_script and the translator's default identity;
-    # the address an operator gave there is the one they mean to be paid at.
-    --payout-address) FEE_ADDRESS="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1))
-                      echo "NOTE: --payout-address is now --fee-address." >&2;;
+    # Fees go to the miner who finds the block now. Kept so an old command line still runs.
+    --fee-address|--payout-address) shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1))
+                      echo "NOTE: --fee-address/--payout-address is ignored: every fee goes to the miner who finds the block." >&2;;
     --network)        NETWORK="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
-    --relay-port)     RELAY_PORT="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
-    --relay-peer)     RELAY_PEERS="${RELAY_PEERS:+$RELAY_PEERS }$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
-    --genesis-anchor) GENESIS_ANCHOR="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
-    --genesis-height) GENESIS_HEIGHT="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --signet-challenge) SIGNET_CHALLENGE="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --bitcoin-peer)   BITCOIN_PEERS="${BITCOIN_PEERS:+$BITCOIN_PEERS }$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --peer-node)      PEER_NODES="${PEER_NODES:+$PEER_NODES }$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --submit-node)    SUBMIT_FLAGS="${SUBMIT_FLAGS:+$SUBMIT_FLAGS }$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --submit-auth)    SUBMIT_AUTH="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --preflight-only) PREFLIGHT_ONLY="true"; shift;;
     --alert-webhook)  ALERT_WEBHOOK="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --alert-topic)    ALERT_TOPIC="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --nickname)       NICKNAME="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --pool-name)      POOL_NAME="${2:-}"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --sync)           SYNC_MODE="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --reaper)         REAPER="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --no-reaper)      REAPER="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --archive)        ARCHIVE="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --tor)            TOR="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
@@ -238,12 +250,7 @@ while [[ $# -gt 0 ]]; do
     --no-auto-update) AUTO_UPDATE="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --backups)        BACKUPS="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --no-backups)     BACKUPS="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
-    --lister)         LISTER="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
-    --no-lister)      LISTER="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
-    --lister-table-digest) LISTER_TABLE_DIGEST="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
-    --lister-genesis-export|--genesis-export) LISTER_GENESIS_EXPORT="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
-    --lister-export-digest) LISTER_EXPORT_DIGEST="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
-    --node-pool)      shift;;   # the only mode now; kept so old command lines still run
+    --node-pool)      shift;;   # kept so old command lines still run
     --non-interactive) NON_INTERACTIVE="true"; shift;;
     --uninstall)      UNINSTALL="true"; shift;;
     --purge)          PURGE="true"; shift;;
@@ -252,17 +259,19 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown option: $1" >&2; usage; exit 1;;
   esac
 done
+PEER_NODES="${PEER_NODES:-}"
+SUBMIT_FLAGS="${SUBMIT_FLAGS:-}"
 
 err() { echo "ERROR: $*" >&2; exit 1; }
 log() { echo -e "\033[36m==>\033[0m $*"; }
 
 # >>> NODE_POOL_FUNCTIONS
-# The node pool pieces of this installer: fee address validation, per-network defaults, the
-# pool_sv2 config and the preflight. Kept between these two markers and free of side effects
-# (they only print), because two tests run them straight out of this file:
+# The Ghost Solo pieces of this installer: the payout address check, per-network defaults, the
+# pool_sv2 config and the preflight. Kept between these two markers (whose name is older than
+# Ghost Solo) and free of side effects (they only print), because two tests run them straight out
+# of this file:
 #   scripts/test-installer-node-pool.sh       the shell-level checks, preflight lines included
-#   bins/pool-sv2/tests/installer_config.rs   pool_sv2 parses the rendered config, accepts it
-#                                             (NodePool::resolve, relay start), and agrees with
+#   bins/pool-sv2/tests/installer_config.rs   pool_sv2 parses the rendered config, and agrees with
 #                                             np_fee_address_check on every address class
 # Edit them here; both tests read this file, not a copy.
 
@@ -301,9 +310,9 @@ np_sha256d_hex() {
 
 # np_fee_address_check ADDRESS NETWORK
 # Succeeds, printing the class (p2sh, p2wpkh, p2wsh, p2tr), when ADDRESS is a valid address of
-# NETWORK in one of the four payee classes pool_sv2 accepts for `[node_pool] fee_address`
-# (NodePool::fee_script). Otherwise fails, printing why. Checksums are verified: a typo in a fee
-# address sends every fee this node earns to a script nobody holds.
+# NETWORK in one of the four payee classes pool_sv2 accepts as a miner's username
+# (Solo::payee_for_identity). Otherwise fails, printing why. Checksums are verified. The name is
+# older than Ghost Solo (there is no fee address any more); installer_config.rs calls it by it.
 np_fee_address_check() {
   local a="$1" net="$2" hrp
   hrp="$(np_hrp "$net")" || { echo "unknown network '$net'"; return 1; }
@@ -386,36 +395,15 @@ np_fee_address_check() {
 
 # Per-network defaults. Sets:
 #   NP_P2P_PORT              ghostd's P2P port (the network's own default)
-#   NP_TIER_BASE             [node_pool.relay] tier_base, empty for the difficulty-1 default
-#   NP_GENESIS_ANCHOR        the network's published share-chain genesis, or UNSET
-#   NP_GENESIS_HEIGHT        its btc_height (0 when UNSET)
-#   NP_TABLE_DIGEST          its genesis table digest (table_root), or empty
-#   NP_EXPORT_DIGEST         the sha256 of its published ledger export, or empty
 #   NP_MIN_RAM_MB / NP_WARN_RAM_MB, NP_MIN_DISK_GB   the preflight's floors
 #
-# Mainnet's start is published (flag day 2026-11-07) and compiled into pool_sv2
-# (`node_pool_network::MAINNET_START`): these values are the same, and pool_sv2 refuses any other
-# configured mainnet genesis. No genesis is published for signet: it gets UNSET, which pool_sv2
-# refuses at startup by name (`NodePoolRelayConfig::genesis_hash`); guessing one would start a
-# private share chain that no other node joins. Regtest is a local test chain, so it gets
-# a fixed genesis every regtest node shares: sha256("GhostNodePool/genesis/regtest"), height 0, and
-# regtest's own proof-of-work limit as tier 0 so CPU-mined shares reach T_net.
+# Mainnet floors, measured on vm8 (2026-11-07, pruned): the whole stack used 1.46 GB, and ghostd's
+# RSS reached 2.2 GB with dbcache=1024; under 4 GB of RAM ghostd is given dbcache=450
+# (np_dbcache). Disk: the pruned chain state is about 12 GB; 25 GB counts a chain already there.
 np_network_defaults() {
   local net="$1" sync="${2:-ibd}" archive="${3:-false}"
-  NP_TIER_BASE=""
-  NP_GENESIS_ANCHOR="UNSET"
-  NP_GENESIS_HEIGHT=0
-  NP_TABLE_DIGEST=""
-  NP_EXPORT_DIGEST=""
   case "$net" in
     mainnet)
-      # The flag-day start (NODE_POOL_PLAN.md, FLAG_DAY_RUNBOOK.md): freeze 974,875.
-      NP_GENESIS_ANCHOR="a512f0c9378c31fe34160ee6388b62289596e46110d45079eec8eafe8c4c4526"
-      NP_GENESIS_HEIGHT=974875
-      NP_TABLE_DIGEST="43e8165e7ac1ba4b67b328ab0a2ecb8aa20cb2fb2a780b3e3527e59e71410d2d"
-      NP_EXPORT_DIGEST="cfb6202057a3f3b7cb3287cd404849b469880ed3584eb9a587ad6ca644dcb74e"
-      # Pruned (prune=550): the chain state is about 12 GB (measured on the old fleet, 2026-11-07),
-      # and the old stack runs in 3 GB of RAM; the node pool adds about 0.5 GB (soak, 2026-11-06).
       NP_P2P_PORT=8333; NP_MIN_RAM_MB=2800; NP_WARN_RAM_MB=3800
       if [[ "$archive" == "true" ]]; then NP_MIN_DISK_GB=800
       elif [[ "$sync" == "haze" ]]; then NP_MIN_DISK_GB=250
@@ -423,32 +411,46 @@ np_network_defaults() {
     signet)
       NP_P2P_PORT=38333; NP_MIN_RAM_MB=3500; NP_WARN_RAM_MB=7000; NP_MIN_DISK_GB=30;;
     regtest)
-      NP_P2P_PORT=18444; NP_MIN_RAM_MB=1500; NP_WARN_RAM_MB=3500; NP_MIN_DISK_GB=5
-      NP_TIER_BASE="7fffff0000000000000000000000000000000000000000000000000000000000"
-      NP_GENESIS_ANCHOR="8d8cd561340ff83e99410e115619d64ad94516264d3e5cd6a991109c69f1229c"
-      NP_GENESIS_HEIGHT=0;;
+      NP_P2P_PORT=18444; NP_MIN_RAM_MB=1500; NP_WARN_RAM_MB=3500; NP_MIN_DISK_GB=5;;
     *) return 1;;
   esac
 }
 
-# np_render_pool_config: the whole pool_sv2 config, on stdout. Reads
-#   SV2_AUTH_PUB SV2_AUTH_SEC TDP_PUBKEY APISECRET FEE_ADDRESS NETWORK RPC_USER RPCPW
-#   RELAY_PORT RELAY_PEERS (space-separated host:port) GENESIS_ANCHOR GENESIS_HEIGHT
-#   NP_TIER_BASE
-np_render_pool_config() {
-  local peers="" p tier_line genesis_note=""
-  for p in $RELAY_PEERS; do peers+="${peers:+, }\"${p}\""; done
-  tier_line="# tier_base: the difficulty-1 target (mainnet and signet)."
-  [[ -n "$NP_TIER_BASE" ]] && tier_line="tier_base = \"${NP_TIER_BASE}\""
-  if [[ "$GENESIS_ANCHOR" == "UNSET" ]]; then
-    genesis_note="# ⛔ PLACEHOLDER. No share-chain genesis is published for ${NETWORK} yet, so pool_sv2
-# REFUSES TO START until genesis_anchor and genesis_btc_height are set to the published values.
-# Set them here, or re-run the installer with --genesis-anchor <hex> --genesis-height <n>."
+# np_dbcache MEM_MB: ghostd's dbcache for a machine with MEM_MB of RAM. 1024 from 4 GB up; 450
+# (Bitcoin Core's default) below, or when the RAM could not be read: ghostd's RSS reached 2.2 GB
+# at 1024 on vm8, which leaves too little of a 3 GB machine for the rest of the stack.
+np_dbcache() {
+  if [[ "${1:-}" =~ ^[0-9]+$ ]] && (( $1 >= 4096 )); then echo 1024; else echo 450; fi
+}
+
+# np_submit_url ENTRY: a found-block target as the URL pool_sv2 takes (`[solo] submit_rpc`).
+# host:port becomes http://host:port; an http(s)://host:port URL is kept. Fails on anything else
+# (a path, credentials in the URL, no port).
+np_submit_url() {
+  local e="${1%/}"
+  if [[ "$e" =~ ^(https?://)?[A-Za-z0-9._-]+:([0-9]{1,5})$ ]] \
+     && (( BASH_REMATCH[2] > 0 && BASH_REMATCH[2] < 65536 )); then
+    [[ -n "${BASH_REMATCH[1]}" ]] || e="http://${e}"
+    echo "$e"; return 0
   fi
+  return 1
+}
+
+# np_render_pool_config: the whole pool_sv2 config, on stdout. Reads
+#   SV2_AUTH_PUB SV2_AUTH_SEC TDP_PUBKEY APISECRET NETWORK
+#   SUBMIT_NODES (space-separated http(s):// URLs; may be unset)
+#   SUBMIT_AUTH_READY (true when /etc/ghost/solo-submit-rpc.auth exists; may be unset). The file
+#     is named only then: pool_sv2 refuses to start on a credentials file it cannot read.
+np_render_pool_config() {
+  local submit="" u auth_line
+  for u in ${SUBMIT_NODES:-}; do submit+="${submit:+, }\"${u}\""; done
+  auth_line="# submit_rpc_auth_file = \"/etc/ghost/solo-submit-rpc.auth\""
+  [[ -n "$submit" && "${SUBMIT_AUTH_READY:-false}" == true ]] \
+    && auth_line="submit_rpc_auth_file = \"/etc/ghost/solo-submit-rpc.auth\""
   cat <<EOF
-# Bitcoin Ghost — SRI Pool (SV2). Generated by install-node.sh.
+# Bitcoin Ghost — Ghost Solo pool (SV2). Generated by install-node.sh.
 #
-# ghost-mining (TDP :8442) -> pool_sv2 (SV2 :34255) -> translator (SV1 :3333) -> BitAxe
+# ghost-mining (TDP :8442) -> pool_sv2 (SV2 :34255) -> translator (SV1 :3333, :4444) -> miners
 
 # Per-node SV2 authority keypair (Ed25519/secp256k1, generated fresh at install).
 authority_public_key = "${SV2_AUTH_PUB}"
@@ -458,9 +460,10 @@ cert_validity_sec = 3600
 # Listen for SV2 miners/translators.
 listen_address = "0.0.0.0:34255"
 
-# Required by the SV2 config, but not what blocks pay: every job carries the node pool's canonical
-# coinbase ([node_pool] below). Set to the fee address.
-coinbase_reward_script = "addr(${FEE_ADDRESS})"
+# Required by the SV2 config, but not what blocks pay: every miner's job pays the treasury and
+# that miner ([solo] below). This script is only the group channel's, whose job is never sent. It
+# is the treasury's (bc1qgxg5ywk835c9fp6arz6d6x50xpk6y0ualt900k), the same on every network.
+coinbase_reward_script = "raw(00144191423ac78d3054875d18b4dd1a8f306da23f9d)"
 
 # Pool identification. pool_signature is kept in step with ghost-mining's coinbase
 # tag by update-pool-signature.sh (sri-pool ExecStartPre); this is the fallback
@@ -472,9 +475,10 @@ pool_signature = "- G H O S T -"
 shares_per_minute = 6.0
 share_batch_size = 1
 
-# Protocol extensions — support the Ghost per-miner TLV extension (0x0002) and the Ghost agent
-# extension (0x4748) the translator requires for slot-class sensing. (pool_sv2 also adds 0x4748
-# by itself; it is listed so the pairing is visible and checked.)
+# Protocol extensions — the Ghost per-miner TLV extension (0x0002) and the Ghost agent extension
+# (0x4748), which binds a channel the translator opened on subscribe to the miner's address once
+# it authorises. (pool_sv2 also adds 0x4748 by itself; it is listed so the pairing is visible and
+# checked.)
 supported_extensions = [0x0002, 0x4748]
 required_extensions = []
 
@@ -502,34 +506,22 @@ max_retries = 3
 # max_downstream_connections = 512
 # max_connections_per_ip = 64
 
-# The node pool: the only mode. pool_sv2 refuses to start without this section and its relay.
-# node_id is deliberately not set: pool_sv2 reads it from the co-located ghost-mining's /health.
-[node_pool]
-# Every transaction fee of a block this node's miners find is paid here (P2SH, P2WPKH, P2WSH or
-# P2TR). Miners are paid from the subsidy, by the share-chain ledger, never through this address.
-fee_address = "${FEE_ADDRESS}"
-
-# The share-chain relay and settlement (${NETWORK}). Peers dial the listen port, so it is opened
-# on the firewall. More peers are learned from the ones listed.
-[node_pool.relay]
-# The network decides where the share chain may start: mainnet runs only on the start compiled
-# into pool_sv2; signet and regtest take the genesis below.
+# GHOST SOLO. Every job pays, in its coinbase: the treasury exactly subsidy / 200, the miner whose
+# username (its Bitcoin address) opened the channel the rest (subsidy - subsidy / 200 + every fee),
+# and the witness commitment. Nothing else.
+[solo]
+# mainnet, signet or regtest: the subsidy schedule and which addresses miners may use.
 network = "${NETWORK}"
-listen = "0.0.0.0:${RELAY_PORT}"
-# The stratum ports told to anyone who asks the relay port (open listing reads them, probes them,
-# and lists this node only if the probe passes). SV1 is the translator's; SV2 defaults to
-# pool_sv2's own listen port and authority key.
-advertise_sv1_port = 3333
-peers = [${peers}]
-db_path = "/var/lib/ghost/node-pool.db"
-${genesis_note}
-genesis_anchor = "${GENESIS_ANCHOR}"
-genesis_btc_height = ${GENESIS_HEIGHT}
-${tier_line}
-rpc_host = "127.0.0.1"
-rpc_port = 8332
-rpc_user = "${RPC_USER}"
-rpc_password = "${RPCPW}"
+# Where miner-stats.json and blocks-found.json are kept across restarts.
+state_dir = "/var/lib/ghost/solo"
+# Other Bitcoin nodes every found block is also sent to (submitblock), in parallel, after the
+# local node: the other node of a two-node setup (install-node.sh --peer-node / --submit-node).
+submit_rpc = [${submit}]
+# Their credentials, root-only: one \`user:password\` (every node) or \`http://host:port
+# user:password\` (that node) a line. Never in this file, never logged.
+${auth_line}
+# The translator's SV1 ports, shown by /api/v1/pool/status (3333 small miners, 4444 farm tier).
+sv1_ports = [3333, 4444]
 
 # Template provider — this node's own ghost-mining TDP server. public_key is the
 # TDP authority key derived from node.key.
@@ -574,29 +566,31 @@ pf_bitcoin_chain() {
     http://127.0.0.1:8332/ 2>/dev/null | grep -oE '"chain":[[:space:]]*"[a-z0-9]+"' | grep -oE '"[a-z0-9]+"$' | tr -d '"' || true
 }
 pf_resolves() { getent hosts "$1" >/dev/null 2>&1; }
+# The address a host resolves to (itself when it is one), or nothing. IPv4 first.
+pf_resolve_ip() {
+  if [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then echo "$1"; return 0; fi
+  getent ahostsv4 "$1" 2>/dev/null | awk 'NR == 1 {print $1}' || true
+}
+# The host of a found-block target (host:port or http(s)://host:port).
+np_url_host() { local h="${1#*://}"; echo "${h%:*}"; }
 pf_dashboard_active() { systemctl is-active --quiet ghost-dashboard 2>/dev/null; }
 # The chain name bitcoind reports for a network.
 np_core_chain() { case "$1" in mainnet) echo main;; signet) echo signet;; regtest) echo regtest;; esac; }
 
-# np_preflight: every check, then a verdict. Reads NETWORK SYNC_MODE ARCHIVE FEE_ADDRESS RELAY_PORT
-# RELAY_PEERS GENESIS_ANCHOR ALERT_WEBHOOK. Returns non-zero when any check FAILed.
+# np_preflight: every check, then a verdict. Reads NETWORK SYNC_MODE ARCHIVE SIGNET_CHALLENGE
+# BITCOIN_PEERS SUBMIT_NODES RPC_ALLOW SUBMIT_AUTH SUBMIT_AUTH_PRESENT ALERT_WEBHOOK. Returns
+# non-zero when any check FAILed.
 np_preflight() {
   PF_FAILS=0
   np_network_defaults "$NETWORK" "$SYNC_MODE" "$ARCHIVE" || { pf_line FAIL "network '$NETWORK' is not mainnet, signet or regtest"; return 1; }
-  local why kind mem disk p owner chain
+  local mem disk p owner chain
   echo "Preflight (${NETWORK}):"
-
-  if kind="$(np_fee_address_check "$FEE_ADDRESS" "$NETWORK")"; then
-    pf_line PASS "fee address is a valid ${NETWORK} ${kind^^} address"
-  else
-    why="$kind"; pf_line FAIL "fee address '${FEE_ADDRESS}': ${why}"
-  fi
 
   mem="$(pf_mem_mb)"
   if [[ -z "$mem" ]]; then pf_line WARN "RAM: could not be read"
   elif (( mem < NP_MIN_RAM_MB )); then pf_line FAIL "RAM: ${mem} MB, a ${NETWORK} node needs at least ${NP_MIN_RAM_MB} MB"
-  elif (( mem < NP_WARN_RAM_MB )); then pf_line WARN "RAM: ${mem} MB, ${NP_WARN_RAM_MB} MB or more recommended"
-  else pf_line PASS "RAM: ${mem} MB"; fi
+  elif (( mem < NP_WARN_RAM_MB )); then pf_line WARN "RAM: ${mem} MB, ${NP_WARN_RAM_MB} MB or more recommended (ghostd gets dbcache=$(np_dbcache "$mem"))"
+  else pf_line PASS "RAM: ${mem} MB (ghostd dbcache=$(np_dbcache "$mem"))"; fi
 
   disk="$(pf_disk_free_gb)"
   if [[ -z "$disk" ]]; then pf_line WARN "disk: free space on /var/lib could not be read"
@@ -604,7 +598,7 @@ np_preflight() {
   else pf_line PASS "disk: ${disk} GB available on /var/lib (needs ${NP_MIN_DISK_GB} GB)"; fi
 
   # Ports this node listens on. Held by one of the node's own processes is a re-run, not a clash.
-  for p in "$NP_P2P_PORT" 8332 8080 8442 3333 4444 34255 9090 "$RELAY_PORT"; do
+  for p in "$NP_P2P_PORT" 8332 8080 8442 3333 4444 34255 9090; do
     owner="$(pf_port_owner "$p")"
     case "$owner" in
       "") pf_line PASS "port ${p} is free";;
@@ -633,21 +627,6 @@ np_preflight() {
     pf_line PASS "no Bitcoin node yet: ghostd is installed and checked again once started"
   fi
 
-  # The relay. The port is opened on this firewall by the installer; reachability from outside
-  # cannot be tested before anything listens on it, and nothing probes it from outside yet.
-  pf_line PASS "relay port ${RELAY_PORT}/tcp will be opened on ufw (open it on any firewall in front of this machine too)"
-  if [[ -z "$RELAY_PEERS" ]]; then
-    pf_line WARN "no relay peers given (--relay-peer): the node waits for peers to dial it"
-  else
-    for p in $RELAY_PEERS; do
-      if [[ "$p" =~ ^(.+):([0-9]{1,5})$ ]] && (( BASH_REMATCH[2] > 0 && BASH_REMATCH[2] < 65536 )); then
-        if pf_resolves "${BASH_REMATCH[1]}"; then pf_line PASS "relay peer ${p} resolves"
-        else pf_line WARN "relay peer ${p} does not resolve now"; fi
-      else
-        pf_line FAIL "relay peer '${p}' is not host:port"
-      fi
-    done
-  fi
   # ghostd's chain: a custom signet's challenge, and Bitcoin peers to dial.
   if [[ -n "${SIGNET_CHALLENGE:-}" ]]; then
     if [[ "$NETWORK" != signet ]]; then
@@ -667,16 +646,38 @@ np_preflight() {
       pf_line FAIL "Bitcoin peer '${p}' is not host:port"
     fi
   done
-  if [[ "$GENESIS_ANCHOR" == UNSET ]]; then
-    pf_line WARN "no share-chain genesis is published for ${NETWORK}: pool_sv2 will refuse to start until one is set (--genesis-anchor/--genesis-height)"
-  elif [[ "$NETWORK" == mainnet && "$GENESIS_ANCHOR" =~ ^[0-9a-fA-F]{64}$ && ! "$GENESIS_ANCHOR" =~ ^0{64}$
-          && "$GENESIS_ANCHOR" != "${NP_GENESIS_ANCHOR:-UNSET}" ]]; then
-    pf_line WARN "share-chain genesis ${GENESIS_ANCHOR:0:16}… is configured on mainnet: pool_sv2 runs mainnet only on the start compiled into it and refuses any other"
-  elif [[ "$GENESIS_ANCHOR" =~ ^[0-9a-fA-F]{64}$ && ! "$GENESIS_ANCHOR" =~ ^0{64}$ ]]; then
-    pf_line PASS "share-chain genesis ${GENESIS_ANCHOR:0:16}… at height ${GENESIS_HEIGHT}"
+
+  # The other node: where found blocks are also sent, and who may reach this node's RPC.
+  if [[ -z "${SUBMIT_NODES:-}" ]]; then
+    pf_line WARN "no other node (--peer-node): found blocks are submitted to this node's ghostd only"
   else
-    pf_line FAIL "genesis anchor '${GENESIS_ANCHOR}' is not 64 hex characters"
+    for p in $SUBMIT_NODES; do
+      if np_submit_url "$p" >/dev/null; then
+        if pf_resolves "$(np_url_host "$p")"; then pf_line PASS "found blocks also go to ${p}"
+        else pf_line WARN "found-block target ${p} does not resolve now"; fi
+      else
+        pf_line FAIL "found-block target '${p}' is not host:port or an http(s)://host:port URL"
+      fi
+    done
+    if [[ -n "${SUBMIT_AUTH:-}" ]]; then
+      if [[ "$SUBMIT_AUTH" =~ ^[^[:space:]:#]+:[^[:space:]#]+$ ]]; then
+        pf_line PASS "found-block credentials given (written root-only to /etc/ghost/solo-submit-rpc.auth)"
+      else
+        pf_line FAIL "--submit-auth must be user:password (no spaces or #)"
+      fi
+    elif [[ "${SUBMIT_AUTH_PRESENT:-false}" == true ]]; then
+      pf_line PASS "found-block credentials kept from /etc/ghost/solo-submit-rpc.auth"
+    else
+      pf_line WARN "no --submit-auth: the other node refuses found blocks until /etc/ghost/solo-submit-rpc.auth holds its RPC user:password"
+    fi
   fi
+  for p in ${RPC_ALLOW:-}; do
+    if [[ "$p" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+      pf_line PASS "the other node ${p} may reach this node's Bitcoin RPC (8332, that address only)"
+    else
+      pf_line FAIL "'${p}' is not an IPv4 address: --peer-node needs a host that resolves to one"
+    fi
+  done
 
   if [[ -z "$ALERT_WEBHOOK" ]]; then
     pf_line WARN "no alert webhook (--alert-webhook): alerts are written disabled"
@@ -772,67 +773,6 @@ np_resolve_release() {
   esac
 }
 
-# >>> NP_LISTER
-# Open listing (W2.10), opt-in with --lister: `ghost-audit list` as ghost-lister.service, user
-# ghost-audit, state in /var/lib/ghost-audit. Its node-list.json there is what ghost-mining serves
-# read-only at GET /api/v1/node-pool/node-list (port 8080, already open), so `ghost-audit merge`
-# can collect it with no new port or process.
-NP_LISTER_ENV=/etc/ghost/lister.env
-NP_LISTER_DIR=/var/lib/ghost-audit
-NP_LISTER_EXPORT_DIR=/var/lib/ghost-audit/genesis-export
-NP_AUDIT_BIN=/opt/ghost/bin/ghost-audit
-
-# A value from an env file: np_lister_old KEY FILE.
-np_lister_old() { [[ -r "$2" ]] && sed -nE "s/^${1}=(.*)$/\1/p" "$2" | tail -1 || true; }
-
-# Why the lister cannot run with this configuration, or nothing when it can. Reads NETWORK
-# GENESIS_ANCHOR LISTER_TABLE_DIGEST LISTER_EXPORT_DIGEST and LISTER_EXPORT_PRESENT (true when the
-# ledger export is in NP_LISTER_EXPORT_DIR). Off regtest the lister judges jobs against the
-# network's genesis table, so it needs the pinned digest and, for its first run, the export.
-np_lister_blocker() {
-  if [[ ! "$GENESIS_ANCHOR" =~ ^[0-9a-fA-F]{64}$ ]]; then
-    echo "no share-chain genesis is set"; return
-  fi
-  [[ "$NETWORK" == regtest ]] && return
-  if [[ ! "$LISTER_TABLE_DIGEST" =~ ^[0-9a-fA-F]{64}$ ]]; then
-    echo "no genesis table digest: pass --lister-table-digest <the table_root pool_sv2's genesis import printed>"; return
-  fi
-  if [[ "${LISTER_EXPORT_PRESENT:-false}" != true || ! "$LISTER_EXPORT_DIGEST" =~ ^[0-9a-fA-F]{64}$ ]]; then
-    echo "no ledger export: pass --lister-genesis-export <dir> --lister-export-digest <sha256>"; return
-  fi
-}
-
-# The lister's env file. Reads RPC_USER RPCPW NETWORK GENESIS_ANCHOR GENESIS_HEIGHT RELAY_PORT
-# RELAY_PEERS FEE_ADDRESS LISTER_TABLE_DIGEST LISTER_EXPORT_DIGEST LISTER_EXPORT_PRESENT. It syncs
-# its share chain from this node's relay and the configured peers, starts discovery there, and
-# logs its probes in with the fee address (a probe submits nothing).
-np_lister_env_render() {
-  local args p
-  args="--network ${NETWORK} --genesis-anchor ${GENESIS_ANCHOR} --genesis-height ${GENESIS_HEIGHT}"
-  args+=" --relay-peer 127.0.0.1:${RELAY_PORT}"
-  for p in $RELAY_PEERS; do args+=" --relay-peer ${p}"; done
-  args+=" --address ${FEE_ADDRESS}"
-  cat <<EOF
-# ghost-audit list (open listing), written by install-node.sh. Root-only: it holds the RPC password.
-# Edit, then: sudo systemctl restart ghost-lister
-GHOST_AUDIT_RPC_USER=${RPC_USER}
-GHOST_AUDIT_RPC_PASSWORD=${RPCPW}
-GHOST_LISTER_ARGS=${args}
-EOF
-  if [[ "$LISTER_TABLE_DIGEST" =~ ^[0-9a-fA-F]{64}$ ]]; then
-    echo "GHOST_AUDIT_GENESIS_TABLE_DIGEST=${LISTER_TABLE_DIGEST}"
-  else
-    echo "# GHOST_AUDIT_GENESIS_TABLE_DIGEST=<64 hex: the network's pinned genesis table digest>"
-  fi
-  if [[ "${LISTER_EXPORT_PRESENT:-false}" == true && "$LISTER_EXPORT_DIGEST" =~ ^[0-9a-fA-F]{64}$ ]]; then
-    echo "GHOST_AUDIT_GENESIS_EXPORT=${NP_LISTER_EXPORT_DIR}"
-    echo "GHOST_AUDIT_EXPORT_DIGEST=${LISTER_EXPORT_DIGEST}"
-  else
-    echo "# GHOST_AUDIT_GENESIS_EXPORT=${NP_LISTER_EXPORT_DIR}"
-    echo "# GHOST_AUDIT_EXPORT_DIGEST=<64 hex: the published sha256 of ledger-export.bin>"
-  fi
-}
-# <<< NP_LISTER
 # <<< NODE_POOL_FUNCTIONS
 
 # is_core_rpc_client PATH — true only if PATH is the Ghost Core RPC client (#1028).
@@ -883,14 +823,15 @@ prompt_yes_no() {
 }
 
 # Interactive first-run wizard. Collects the SAME variables the flag interface
-# sets (FEE_ADDRESS, NETWORK, RELAY_PEERS, ALERT_WEBHOOK, SYNC_MODE, POOL_NAME, REAPER,
+# sets (NETWORK, PEER_NODES, SUBMIT_AUTH, ALERT_WEBHOOK, SYNC_MODE, POOL_NAME, REAPER,
 # ARCHIVE, NICKNAME); the rest of the installer is unchanged. Only ever runs with no
 # config flags, on a TTY, without --non-interactive.
 run_wizard() {
   echo
-  log "Bitcoin Ghost — guided node setup"
-  echo "This installs a full Ghost node (ghostd + ghost-mining + the SV2 stratum stack) as a"
-  echo "node pool node and joins the share chain. Press Enter to accept each [default]."
+  log "Bitcoin Ghost — guided Ghost Solo node setup"
+  echo "This installs a Ghost Solo node (ghostd + ghost-mining + the SV2 stratum stack): a solo"
+  echo "mining pool whose miners use their Bitcoin address as the username and are paid the whole"
+  echo "block they find (less 0.5% of the subsidy). Press Enter to accept each [default]."
   echo
 
   # Network.
@@ -899,27 +840,21 @@ run_wizard() {
   nw="$(_trim "${nw:-mainnet}")"
   case "$nw" in mainnet|signet|regtest) NETWORK="$nw";; *) echo "  Unrecognised — using mainnet."; NETWORK="mainnet";; esac
 
-  # Fee address — REQUIRED, no default, re-prompt until valid for the network.
-  local addr why
+  # The other node (optional).
   echo
-  echo "Fee address: every transaction fee of a block this node's miners find is paid here."
-  echo "Miners are paid from the subsidy by the pool ledger, not through this address."
-  while :; do
-    read -rp "Fee address (${NETWORK}; P2SH, P2WPKH, P2WSH or P2TR): " addr || err "Input ended before a fee address was given."
-    addr="$(_trim "$addr")"
-    if why="$(np_fee_address_check "$addr" "$NETWORK")"; then
-      FEE_ADDRESS="$addr"; break
-    fi
-    echo "  ✗ ${why}. Try again."
-  done
-
-  # Relay peers (optional).
-  echo
-  echo "Share-chain relay peers to dial first, host:port separated by spaces (optional; more"
-  echo "are learned from them, and peers can dial this node on port ${RELAY_PORT})."
-  local rp
-  read -rp "Relay peers [none]: " rp || true
-  RELAY_PEERS="$(_trim "$rp")"
+  echo "The other node (optional): a second Ghost Solo node this one backs up and is backed up by."
+  echo "Found blocks go to both nodes, and the two keep a direct Bitcoin connection. Install both,"
+  echo "then give each the other's address. Keep the link between them private (VPN or LAN)."
+  local pn_host
+  read -rp "Other node's IP or hostname [none]: " pn_host || true
+  PEER_NODES="$(_trim "$pn_host")"
+  if [[ -n "$PEER_NODES" ]]; then
+    echo "  Its Bitcoin RPC credentials: on that node, sudo grep -E '^rpc(user|password)=' /etc/bitcoin/bitcoin.conf"
+    local su
+    read -rsp "  Its rpcuser:rpcpassword [leave blank to add later]: " su || true
+    echo
+    SUBMIT_AUTH="$(_trim "$su")"
+  fi
 
   # Alert webhook (optional, but without it every detector fires into nothing).
   echo
@@ -982,7 +917,7 @@ run_wizard() {
   # ghostd options.
   echo
   echo "Node options:"
-  REAPER="$(prompt_yes_no "  Run the mempool reaper — filters spam/inscriptions?" Y)"
+  REAPER="$(prompt_yes_no "  Run the mempool reaper — filters spam/inscriptions (blocks then propagate slower)?" N)"
   ARCHIVE="$(prompt_yes_no "  Run as a full archive node — ~720GB disk?" N)"
 
   # Tor. Off by default. Hybrid keeps clearnet reachability AND adds an onion;
@@ -1015,8 +950,7 @@ run_wizard() {
   echo
   log "Summary of your choices"
   echo "  Network        : $NETWORK"
-  echo "  Fee address    : $FEE_ADDRESS"
-  echo "  Relay peers    : ${RELAY_PEERS:-none}"
+  echo "  Other node     : ${PEER_NODES:-none}$([[ -n "$PEER_NODES" && -z "$SUBMIT_AUTH" ]] && echo "  (no RPC credentials yet)")"
   echo "  Alert webhook  : ${ALERT_WEBHOOK:-none (alerts disabled)}"
   echo "  Sync mode      : $SYNC_MODE"
   [[ -n "$POOL_NAME" ]] && echo "  Pool name      : $POOL_NAME  (coinbase: - G H O S T - $POOL_NAME)"
@@ -1041,12 +975,15 @@ run_wizard() {
 # Removed: every unit, timer and drop-in this installer writes, /opt/ghost (binaries, helper
 # scripts, the dashboard and its Node.js runtime), the firewall rules it opened (22/tcp stays, so
 # ssh keeps working, and ufw stays enabled), its sudoers files, the release channel marker, the
-# installed-version file, the auto-update opt-in and the journald drop-in.
-# Kept unless --purge: the chain (/var/lib/bitcoin), the share-chain relay's store and the node's
-# other state (/var/lib/ghost), node.key and ghost-mining's database (/home/ghost/.ghost), the
+# installed-version file, the auto-update opt-in and the journald drop-in. What an older (node
+# pool) install left goes too: the lister's unit (ghost-lister.service), and with --purge its
+# user (ghost-audit), its state (/var/lib/ghost-audit) and the relay's store
+# (/var/lib/ghost/node-pool.db), as well as its relay port's firewall rule.
+# Kept unless --purge: the chain (/var/lib/bitcoin), the node's state (/var/lib/ghost: miner
+# statistics and found blocks), node.key and ghost-mining's database (/home/ghost/.ghost), the
 # configs that carry the node's keys and settings (/etc/ghost, /etc/bitcoin), the nightly backups
 # (/var/backups/ghost, /var/lib/ghost-backup) and the ghost user. Installing again over what was
-# kept reuses the node's identity, keys, fee address, peers and ledger, as a re-run does.
+# kept reuses the node's identity, keys and peers, as a re-run does.
 # Kept between these markers so scripts/test-installer-uninstall.sh can run it against a throwaway
 # root (UNINSTALL_ROOT) with systemctl, ufw and userdel stood in for.
 UNINSTALL_ROOT="${UNINSTALL_ROOT:-}"
@@ -1061,15 +998,23 @@ NP_REMOVED_FILES=(/etc/sudoers.d/ghost-autoupdate /etc/sudoers.d/ghost-backup-of
   /etc/ghost/release-channel /etc/ghost/version /etc/ghost/auto-update.conf
   /etc/systemd/journald.conf.d/10-ghost.conf)
 
-# The TCP ports this installer opens: the Bitcoin P2P port and the relay port as configured
-# (all three networks' P2P defaults when the config is gone), the API, the stratum ports, and 8442,
-# which installs before the TDP server moved to loopback opened. Never 22.
+# The TCP ports this installer opens: the Bitcoin P2P port as configured (all three networks' P2P
+# defaults when the config is gone), the API and the stratum ports; and those an older install
+# opened: the node pool relay's (as its config named it, 8566 by default) and 8442, opened before
+# the TDP server moved to loopback. Never 22.
 np_opened_ports() {
   local r="$UNINSTALL_ROOT" p2p relay
   p2p="$(sed -nE 's/^port=([0-9]+)$/\1/p' "$r/etc/bitcoin/bitcoin.conf" 2>/dev/null | head -1)"
   relay="$(sed -nE 's/^listen = "[^"]*:([0-9]+)"$/\1/p' "$r/etc/ghost/pool-config.toml" 2>/dev/null | head -1)"
   if [[ -n "$p2p" ]]; then echo "$p2p"; else printf '%s\n' 8333 38333 18444; fi
   printf '%s\n' "${relay:-8566}" 8080 3333 34255 4444 8442
+}
+
+# The other nodes allowed to reach this node's Bitcoin RPC (bitcoin.conf rpcallowip, loopback
+# aside): each has a ufw rule for 8332 from that address alone (--peer-node).
+np_rpc_allowed() {
+  sed -nE 's/^rpcallowip=([^[:space:]]+)$/\1/p' "$UNINSTALL_ROOT/etc/bitcoin/bitcoin.conf" 2>/dev/null \
+    | { /usr/bin/grep -vxE '127\.0\.0\.1(/32)?|::1' || true; }
 }
 
 np_uninstall() {
@@ -1080,9 +1025,9 @@ np_uninstall() {
   if [[ "$PURGE" == true ]]; then
     echo "--purge: it ALSO DELETES the node's data, which cannot be undone:"
     for d in "${NP_DATA[@]}"; do echo "    $d"; done
-    echo "  node.key (the node's identity) and the share-chain ledger are in there. Back them up first."
+    echo "  node.key (the node's identity) and the found-block record are in there. Back them up first."
   else
-    echo "The node's data is kept: the chain, node-pool.db, node.key, the configs and the backups."
+    echo "The node's data is kept: the chain, node.key, the miner statistics, the configs and the backups."
   fi
   if [[ "$ASSUME_YES" != true ]]; then
     # Never `read` stdin: under `curl … | sudo bash` stdin is this script (see --sync haze).
@@ -1106,6 +1051,9 @@ np_uninstall() {
   log "Removing the firewall rules the installer opened (22/tcp is left open)"
   for p in $(np_opened_ports | sort -un); do
     ufw delete allow "${p}/tcp" >/dev/null 2>&1 || true
+  done
+  for p in $(np_rpc_allowed); do
+    ufw delete allow proto tcp from "$p" to any port 8332 >/dev/null 2>&1 || true
   done
 
   log "Removing sudoers files, the release channel, the version and auto-update files"
@@ -1134,13 +1082,13 @@ np_uninstall() {
 np_kept_what() {
   case "$1" in
     /var/lib/bitcoin)      echo "the chain (ghostd's data directory)";;
-    /var/lib/ghost)        echo "node-pool.db (share chain and ledger), miner stats";;
+    /var/lib/ghost)        echo "solo/ (miner statistics, found blocks); node-pool.db if an older install left one";;
     /home/ghost)           echo ".ghost/node.key (node identity), ghost-mining's database";;
-    /etc/ghost)            echo "pool.toml, pool-config.toml (SV2 key, fee address), dashboard.env, dashboard-internal-auth.env, lister.env";;
+    /etc/ghost)            echo "pool.toml, pool-config.toml (SV2 key, found-block targets), solo-submit-rpc.auth, dashboard.env, dashboard-internal-auth.env";;
     /etc/bitcoin)          echo "bitcoin.conf (RPC password, signet challenge, peers)";;
     /var/backups/ghost)    echo "nightly database backups";;
     /var/lib/ghost-backup) echo "off-node backup key and status";;
-    /var/lib/ghost-audit)  echo "the lister's share chain, probe history and node-list.json";;
+    /var/lib/ghost-audit)  echo "an older install's lister state";;
   esac
 }
 # <<< NP_UNINSTALL
@@ -1159,69 +1107,54 @@ if [[ "$CONFIG_FLAGS" -eq 0 && "$NON_INTERACTIVE" != "true" && -t 0 ]]; then
 fi
 
 np_hrp "$NETWORK" >/dev/null || err "--network must be mainnet, signet or regtest."
-# A re-run keeps what the last install wrote when a flag does not say otherwise: the fee address,
-# the relay peers and the share-chain genesis live only in pool_sv2's config.
+np_network_defaults "$NETWORK" "$SYNC_MODE" "$ARCHIVE"
+# A re-run keeps what the last install wrote when no flag says otherwise: the found-block targets
+# live only in pool_sv2's config, their credentials in their own file, and a custom signet's
+# challenge, the Bitcoin peers and the RPC allow-list in bitcoin.conf, which is rewritten on every
+# run. Losing the challenge would move the node to the public signet, a different chain.
 OLD_POOL_CONFIG=/etc/ghost/pool-config.toml
-old_key() { [[ -r "$OLD_POOL_CONFIG" ]] && sed -nE "s/^${1}[[:space:]]*=[[:space:]]*(.*)$/\1/p" "$OLD_POOL_CONFIG" | head -1 || true; }
-if [[ -z "$FEE_ADDRESS" ]]; then
-  FEE_ADDRESS="$(old_key fee_address | tr -d '"')"
-  [[ -n "$FEE_ADDRESS" ]] && log "Keeping the fee address from ${OLD_POOL_CONFIG}: ${FEE_ADDRESS}"
-fi
-if [[ -z "$FEE_ADDRESS" ]]; then
-  # An install from before the node pool has no fee_address; its payout address was written as
-  # the SV2 coinbase_reward_script. Use it rather than refuse an upgrade, and say so.
-  FEE_ADDRESS="$(old_key coinbase_reward_script | sed -nE 's/^"addr\(([^)]+)\)".*/\1/p')"
-  [[ -n "$FEE_ADDRESS" ]] && log "Using the old payout address from ${OLD_POOL_CONFIG} as the fee address: ${FEE_ADDRESS}"
-fi
-[[ -n "$FEE_ADDRESS" ]] || { usage; err "--fee-address is required."; }
-FEE_ADDRESS="$(_trim "$FEE_ADDRESS")"
-if [[ -z "$RELAY_PEERS" ]]; then
-  RELAY_PEERS="$(old_key peers | tr -d '[]",')"
-  RELAY_PEERS="$(_trim "$RELAY_PEERS")"
-fi
-# bitcoin.conf is rewritten on every run, so a custom signet's challenge and the Bitcoin peers are
-# read back from it when the flags do not say otherwise. Losing the challenge would move the node
-# to the public signet, a different chain.
 OLD_BITCOIN_CONF=/etc/bitcoin/bitcoin.conf
+SUBMIT_AUTH_FILE=/etc/ghost/solo-submit-rpc.auth
+old_key() { [[ -r "$OLD_POOL_CONFIG" ]] && sed -nE "s/^${1}[[:space:]]*=[[:space:]]*(.*)$/\1/p" "$OLD_POOL_CONFIG" | head -1 || true; }
+# Words of a list, each once, in order.
+np_uniq() { local w out="" seen=" "; for w in $1; do [[ "$seen" == *" $w "* ]] && continue; seen+="$w "; out+="${out:+ }$w"; done; echo "$out"; }
+# The relay port an older (node pool) install opened, closed on the firewall below.
+OLD_RELAY_PORT="$(sed -nE 's/^listen = "[^"]*:([0-9]+)"$/\1/p' "$OLD_POOL_CONFIG" 2>/dev/null | head -1 || true)"
 if [[ -z "$SIGNET_CHALLENGE" && "$NETWORK" == signet && -r "$OLD_BITCOIN_CONF" ]]; then
   SIGNET_CHALLENGE="$(sed -nE 's/^signetchallenge=([0-9a-fA-F]+)$/\1/p' "$OLD_BITCOIN_CONF" | head -1)"
   [[ -n "$SIGNET_CHALLENGE" ]] && log "Keeping the custom signet challenge from ${OLD_BITCOIN_CONF}"
 fi
-if [[ -z "$BITCOIN_PEERS" && -r "$OLD_BITCOIN_CONF" ]]; then
+if [[ -z "$BITCOIN_PEERS" && -z "$PEER_NODES" && -r "$OLD_BITCOIN_CONF" ]]; then
   BITCOIN_PEERS="$(sed -nE 's/^addnode=(.+)$/\1/p' "$OLD_BITCOIN_CONF" | paste -sd' ' -)"
 fi
-np_network_defaults "$NETWORK" "$SYNC_MODE" "$ARCHIVE"
-if [[ -n "$GENESIS_ANCHOR" && -z "$GENESIS_HEIGHT" ]]; then
-  err "--genesis-anchor needs --genesis-height: the anchor's Bitcoin height is part of the genesis."
+if [[ -z "$SUBMIT_FLAGS" && -z "$PEER_NODES" ]]; then
+  SUBMIT_FLAGS="$(_trim "$(old_key submit_rpc | tr -d '[]",')")"
+  [[ -n "$SUBMIT_FLAGS" ]] && log "Keeping the found-block targets from ${OLD_POOL_CONFIG}: ${SUBMIT_FLAGS}"
 fi
-if [[ -z "$GENESIS_ANCHOR" ]]; then
-  old_genesis="$(old_key genesis_anchor | tr -d '"')"
-  if [[ "$old_genesis" =~ ^[0-9a-fA-F]{64}$ && "$NP_GENESIS_ANCHOR" == UNSET ]]; then
-    GENESIS_ANCHOR="$old_genesis"
-    GENESIS_HEIGHT="${GENESIS_HEIGHT:-$(old_key genesis_btc_height)}"
-    log "Keeping the share-chain genesis from ${OLD_POOL_CONFIG}"
-  else
-    GENESIS_ANCHOR="$NP_GENESIS_ANCHOR"
-  fi
+if [[ -z "$PEER_NODES" && -r "$OLD_BITCOIN_CONF" ]]; then
+  RPC_ALLOW="$(sed -nE 's/^rpcallowip=([^[:space:]]+)$/\1/p' "$OLD_BITCOIN_CONF" | { /usr/bin/grep -vxE '127\.0\.0\.1(/32)?|::1' || true; } | paste -sd' ' -)"
 fi
-[[ -n "$GENESIS_HEIGHT" ]] || GENESIS_HEIGHT="$NP_GENESIS_HEIGHT"
-[[ "$GENESIS_HEIGHT" =~ ^[0-9]{1,10}$ ]] || err "--genesis-height must be a block height."
-if ! [[ "$RELAY_PORT" =~ ^[0-9]{1,5}$ ]] || (( RELAY_PORT == 0 || RELAY_PORT > 65535 )); then
-  err "--relay-port must be a TCP port."
-fi
-# The network's published genesis table and export digests, when it has them (mainnet).
-[[ -n "${LISTER_TABLE_DIGEST:-}" ]] || LISTER_TABLE_DIGEST="${NP_TABLE_DIGEST:-}"
-[[ -n "${LISTER_EXPORT_DIGEST:-}" ]] || LISTER_EXPORT_DIGEST="${NP_EXPORT_DIGEST:-}"
-for v in LISTER_TABLE_DIGEST LISTER_EXPORT_DIGEST; do
-  [[ -z "${!v:-}" || "${!v:-}" =~ ^[0-9a-fA-F]{64}$ ]] || err "--$(echo "$v" | tr 'A-Z_' 'a-z-') must be 64 hex characters."
+# --peer-node HOST: the other node. A Bitcoin link to its P2P port, its RPC as a found-block
+# target, and its address allowed to reach this node's RPC (so it can send its blocks here).
+for h in $PEER_NODES; do
+  [[ "$h" =~ ^[A-Za-z0-9._-]+$ ]] || err "--peer-node takes a host (an IP address or a name), not '${h}': the ports are the network's."
+  BITCOIN_PEERS+=" ${h}:${NP_P2P_PORT}"
+  SUBMIT_FLAGS+=" ${h}:8332"
+  peer_ip="$(pf_resolve_ip "$h")"
+  RPC_ALLOW+=" ${peer_ip:-$h}"
 done
-if [[ -n "${LISTER_GENESIS_EXPORT:-}" ]]; then
-  [[ -n "$LISTER_EXPORT_DIGEST" ]] || err "--lister-genesis-export needs --lister-export-digest."
-  [[ -f "$LISTER_GENESIS_EXPORT/ledger-export.bin" && -f "$LISTER_GENESIS_EXPORT/ledger-export.json" ]] \
-    || err "--lister-genesis-export ${LISTER_GENESIS_EXPORT} does not hold ledger-export.bin and ledger-export.json."
-  [[ "$(sha256sum "$LISTER_GENESIS_EXPORT/ledger-export.bin" | cut -d' ' -f1)" == "${LISTER_EXPORT_DIGEST,,}" ]] \
-    || err "ledger-export.bin in ${LISTER_GENESIS_EXPORT} does not hash to --lister-export-digest."
-fi
+BITCOIN_PEERS="$(np_uniq "$BITCOIN_PEERS")"
+RPC_ALLOW="$(np_uniq "$RPC_ALLOW")"
+SUBMIT_NODES=""
+for e in $SUBMIT_FLAGS; do
+  # A malformed entry is kept as given, for the preflight to name.
+  u="$(np_submit_url "$e")" || u="$e"
+  SUBMIT_NODES+=" $u"
+done
+SUBMIT_NODES="$(np_uniq "$SUBMIT_NODES")"
+SUBMIT_AUTH="$(_trim "${SUBMIT_AUTH:-}")"
+SUBMIT_AUTH_PRESENT=false
+[[ -s "$SUBMIT_AUTH_FILE" ]] && SUBMIT_AUTH_PRESENT=true
 
 # ⛔ Preflight, before anything on this machine is changed. A FAIL stops the install here.
 np_preflight || err "Preflight failed — fix the FAIL lines above and re-run."
@@ -1454,9 +1387,8 @@ fi
 if [[ -n "$admin_bin" ]]; then
   install -m755 -o root -g root "$admin_bin" /opt/ghost/bin/ghost-admin
 fi
-# ghost-audit (the miner's job check, the public prober and the open-listing lister) ships in the
-# node pool release. Installed on every node, so `--lister` can be switched on later; nothing runs
-# it unless the lister is enabled.
+# ghost-audit (`ghost-audit check`: a miner's check that a node's jobs pay the treasury and the
+# miner, and nothing else) ships in the release. Installed on every node; nothing runs it.
 audit_bin="$(find . -name ghost-audit -type f | head -1)"
 if [[ -n "$audit_bin" ]]; then
   install -m755 -o root -g root "$audit_bin" /opt/ghost/bin/ghost-audit
@@ -1525,6 +1457,13 @@ log "Writing /etc/bitcoin/bitcoin.conf (${NETWORK}, sync mode: ${SYNC_MODE})"
 # rpcbind); RPC stays on 8332 on every network so nothing downstream changes.
 RPC_USER="ghostrpc_mainnet"
 [[ "$NETWORK" == mainnet ]] || RPC_USER="ghostrpc_${NETWORK}"
+# dbcache by RAM: 1024 from 4 GB up, 450 below (np_dbcache).
+DBCACHE="$(np_dbcache "$(pf_mem_mb)")"
+# RPC is loopback-only unless another node is allowed in (--peer-node): then it listens on every
+# interface and Core refuses anyone but loopback and those addresses (rpcallowip); the firewall
+# opens 8332 to those addresses alone (below).
+RPC_BIND="127.0.0.1"
+[[ -n "$RPC_ALLOW" ]] && RPC_BIND="0.0.0.0"
 {
   if [[ "$NETWORK" != mainnet ]]; then
     echo "chain=${NETWORK}"
@@ -1539,13 +1478,19 @@ RPC_USER="ghostrpc_mainnet"
 rpcuser=${RPC_USER}
 rpcpassword=${RPCPW}
 rpcallowip=127.0.0.1
-rpcbind=127.0.0.1
+rpcbind=${RPC_BIND}
 rpcport=8332
 port=${NP_P2P_PORT}
 zmqpubhashblock=tcp://127.0.0.1:28332
 zmqpubhashtx=tcp://127.0.0.1:28333
 zmqpubsequence=tcp://127.0.0.1:28334
-dbcache=1024
+# 1024 from 4 GB of RAM up, Core's 450 below: ghostd's RSS reached 2.2 GB at 1024 (vm8, 2026-11-07).
+dbcache=${DBCACHE}
+# 125 is kept on a solo node, not raised. A found block reaches the network through this node's
+# outbound peers and the other node (addnode, a direct link that relays it as a compact block at
+# once), not through inbound count; more inbound peers cost memory on a 3-4 GB machine and buy
+# no propagation for the blocks found here.
+#
 # Core's default is 125. This was 50, which sounds merely conservative but is not: Core
 # reserves the outbound slots, so 50 leaves roughly 40 inbound, and a settled node sits at
 # ~39 of them. The node is then FULL, and a full node REFUSES new peers — including
@@ -1563,10 +1508,13 @@ EOF
   # The assumevalid block is a mainnet block.
   [[ "$NETWORK" == mainnet ]] && echo "assumevalid=${ASSUMEVALID}"
   [[ -n "$SIGNET_CHALLENGE" ]] && echo "signetchallenge=${SIGNET_CHALLENGE}"
+  for p in $RPC_ALLOW; do echo "rpcallowip=${p}"; done
+  # The other node (--peer-node) and any --bitcoin-peer: a standing connection each.
   for p in $BITCOIN_PEERS; do echo "addnode=${p}"; done
-  # Node pool block reserve: room for the node pool's coinbase (up to 22 KB) in every template.
-  # Must match NODE_POOL_BLOCK_RESERVED_WEIGHT in crates/ghost-common/src/node_pool_constants.rs.
-  echo "blockreservedweight=90000"
+  # Bitcoin Core's default reserve. A solo coinbase is about 250 bytes (1,000 WU) with the header and
+  # transaction count well inside 8,000 WU; the node pool's 90,000 (for a coinbase of up to 22 KB)
+  # only left fee-paying transactions out of every block.
+  echo "blockreservedweight=8000"
 } > /etc/bitcoin/bitcoin.conf
 
 # Tor wiring. `listen=1` is already written above; here we add the onion service
@@ -1610,7 +1558,7 @@ fi
 # ─────────────────────────── 6. pool config ──────────────────────────────────
 log "Writing /etc/ghost/pool.toml"
 
-# Every node is a public node pool node, so there is no mining_mode to write. Configs from older
+# Every node is a public Ghost Solo node, so there is no mining_mode to write. Configs from older
 # installs that still carry [network] mining_mode / private_mining_password / solo_payout_address,
 # [pool] treasury_address / min_payout_sats / payout_interval_blocks / node_payout_address /
 # share_shard / shard_*, or a [coordinator] section still load: those keys are read and ignored.
@@ -1658,8 +1606,13 @@ sv1_port = 3333
 http_port = 8080
 max_miners = 1000
 farm_port = 4444
-# No mesh: share-chain peers are in /etc/ghost/pool-config.toml, [node_pool.relay] peers.
+# No mesh. The other node of a two-node setup is in bitcoin.conf (addnode) and
+# /etc/ghost/pool-config.toml ([solo] submit_rpc).
 
+# The standard policy: every tier ghostd's mempool holds is one a template may use, as in Bitcoin
+# Core. full_open emits no -ghostpolicy flags (the tier gate is inert), so this node's templates
+# are built from the same mempool its peers hold, and its blocks reach them as compact blocks
+# they can rebuild without asking for transactions.
 [policy]
 profile = "full_open"
 
@@ -1807,14 +1760,13 @@ port = 4444
 min_individual_miner_hashrate = 100_000_000_000_000.0  # ~232,827 starting difficulty
 hobby_max_individual_miner_hashrate = 50_000_000_000_000.0"
 
-# translator_sv2 — accepts SV1 miners on :3333 and forwards SV2 to the local pool.
-# user_identity is this node's own payout address (public, not a secret): it is
-# the default miner-username prefix, and each SV1 miner may still authorise as
-# <address>.<worker> to attribute its own shares.
+# translator_sv2 — accepts SV1 miners on :3333 (and the farm tier on :4444) and forwards SV2 to
+# the local pool. Each SV1 miner authorises as <its own address>[.<worker>]: that address is what
+# its jobs pay.
 cat > /etc/ghost/translator-config.toml <<EOF
 # Bitcoin Ghost — SRI Translator (Stratum V1 -> V2). Generated by install-node.sh.
 #
-# BitAxe (SV1) -> translator (:3333) -> pool_sv2 (SV2 :34255) -> ghost-mining (TDP)
+# miners (SV1) -> translator (:3333, farm tier :4444) -> pool_sv2 (SV2 :34255) -> ghost-mining (TDP)
 
 # Listen for SV1 miners (standard stratum port)
 downstream_address = "0.0.0.0"
@@ -1829,9 +1781,10 @@ min_supported_version = 2
 # fan-out connections and reject a pool that advertises less. Braiins requires 7.
 downstream_extranonce2_size = 8
 
-# Default miner-username prefix (this node's fee address). A node pool miner authorises as
-# <its own address>.<worker>: the username is its payout address.
-user_identity = "${FEE_ADDRESS}"
+# The translator's own upstream identity, not a payee: a Ghost Solo miner authorises as
+# <its own address>[.<worker>], and that address is what its jobs pay. A username with no
+# address is refused by pool_sv2.
+user_identity = "ghost_miner"
 
 # Each miner gets its own upstream channel (per-miner share attribution).
 aggregate_channels = false
@@ -1850,15 +1803,15 @@ aggregate_channels = false
 # an 8-byte placeholder extranonce while the real prefix is 12, builds a 4-byte-short coinbase,
 # and has EVERY share rejected. \`mining.set_extranonce\` cannot rescue it — that is an optional
 # extension those clients never negotiate.
-# On the node pool a job credits its payee, so pool_sv2 builds none for a channel opened on
-# subscribe until the miner authorises: the translator then binds the channel to the miner's
+# A Ghost Solo job pays its miner, so pool_sv2 builds none for a channel opened on subscribe
+# until the miner authorises: the translator then binds the channel to the miner's
 # <address>.<worker> (an UpdateChannel carrying the Ghost payee TLV, extension 0x4748, required
 # below). Pipelining miners authorise within the debounce and open on authorize as before.
 open_channel_on_subscribe = true
 
 # Protocol extensions — the Ghost per-miner TLV extension (0x0002), and the Ghost agent extension
-# (0x4748), which carries each SV1 miner's user agent to pool_sv2's slot-class sensing loop.
-# Without 0x4748 every SV1 miner is sensed as an unknown agent and served the smallest class.
+# (0x4748), which carries the payee binding above. Without 0x4748 a channel opened on subscribe
+# is never bound to its miner and is given no job.
 supported_extensions = []
 required_extensions = [0x0002, 0x4748]
 
@@ -1886,10 +1839,9 @@ monitoring_address = "0.0.0.0:9092"
 min_individual_miner_hashrate = 1_000_000_000_000.0
 shares_per_minute = 6.0
 enable_vardiff = true
-# Every difficulty the translator assigns is a power-of-two tier (2^n, floor 2^10). The node pool
-# validates and credits a share at its tier, so an untiered difficulty would credit miners BELOW
-# what they mine at (pool_sv2 logs "not tier-shaped" for every such channel).
-quantise_to_tiers = true
+# Off: power-of-two difficulty tiers were the share chain's. A solo pool credits no shares, so
+# plain vardiff targets are right.
+quantise_to_tiers = false
 # ⛔ REMOVED: \`idle_timeout_secs\`. It was set here and by install-node.sh, documented as
 # "disconnect miners with no shares" — and NO Rust struct reads it. \`TranslatorConfig\` carries no
 # \`deny_unknown_fields\`, so it parsed, was discarded, and produced no warning, while reading to
@@ -1949,15 +1901,35 @@ ghost_pool_url = "127.0.0.1:8080"
 poll_interval_secs = 30
 EOF
 
-# pool_sv2 — SV2 pool bridging miners/translators to ghost-mining's TDP, and the node pool: the
-# canonical coinbase, the fee address and the share-chain relay. Holds the secret half of the
-# authority keypair, so this file is 0600 root-only. Rendered by np_render_pool_config (above),
-# which bins/pool-sv2/tests/installer_config.rs feeds to pool_sv2's own config loader.
-np_render_pool_config > /etc/ghost/pool-config.toml
-if [[ "$GENESIS_ANCHOR" == UNSET ]]; then
-  log "WARNING: no share-chain genesis is published for ${NETWORK}. /etc/ghost/pool-config.toml carries"
-  log "         genesis_anchor = \"UNSET\", and pool_sv2 refuses to start until it is set."
+# pool_sv2 — SV2 pool bridging miners/translators to ghost-mining's TDP, and Ghost Solo: every
+# miner's job pays the treasury and that miner, and found blocks also go to the other node.
+# Holds the secret half of the authority keypair, so this file is 0600 root-only. Rendered by
+# np_render_pool_config (above), which bins/pool-sv2/tests/installer_config.rs feeds to
+# pool_sv2's own config loader. An older install's [node_pool] section is not written again.
+#
+# The other nodes' RPC credentials ([solo] submit_rpc_auth_file) first, root-only like the config:
+# pool_sv2 runs as root, and the file is never logged. --submit-auth replaces it; a re-run without
+# it keeps it as it is (edited by hand or not). ⛔ The config names the file only when it exists:
+# pool_sv2 refuses to start on a credentials file it cannot read, and a pool that does not start
+# mines nothing, where one without credentials only has its blocks refused by the other node.
+if [[ -n "$SUBMIT_AUTH" ]]; then
+  ( umask 077
+    printf '# The other nodes'"'"' Bitcoin RPC credentials, for found blocks ([solo] submit_rpc). Written by\n# install-node.sh --submit-auth. One `user:password` (every node) or `http://host:port user:password`\n# (that node) a line. Then: sudo systemctl restart sri-pool\n%s\n' \
+      "$SUBMIT_AUTH" > "${SUBMIT_AUTH_FILE}.tmp" )
+  mv -f "${SUBMIT_AUTH_FILE}.tmp" "$SUBMIT_AUTH_FILE"
 fi
+SUBMIT_AUTH_READY=false
+if [[ -e "$SUBMIT_AUTH_FILE" ]]; then
+  chown root:root "$SUBMIT_AUTH_FILE"
+  chmod 600 "$SUBMIT_AUTH_FILE"
+  SUBMIT_AUTH_READY=true
+elif [[ -n "$SUBMIT_NODES" ]]; then
+  log "WARNING: found blocks also go to ${SUBMIT_NODES}, with no credentials (${SUBMIT_AUTH_FILE} is missing):"
+  log "         the other node refuses them. Re-run with --submit-auth <its rpcuser:rpcpassword>."
+fi
+np_render_pool_config > /etc/ghost/pool-config.toml
+# Miner statistics and found blocks ([solo] state_dir). pool_sv2 runs as root.
+install -d -m 0755 -o root -g root /var/lib/ghost/solo
 
 # update-pool-signature.sh keeps pool_signature in sync with ghost-mining's coinbase
 # tag (written by ghost-mining at startup to ~/.ghost/coinbase_tag). Runs as the
@@ -2073,7 +2045,10 @@ fi
 
 # ─────────────────────────── 9. systemd units ────────────────────────────────
 log "Installing systemd units"
-REAPER_FLAGS=""
+# ⛔ -ghostreaper=disabled is written, not left out: ghostd's Reaper defaults to ENABLED, so a unit
+# with no Reaper flag runs every detector and the node's mempool (and templates) drift from the
+# standard policy its peers run. Off by default on a solo node (see REAPER above); --reaper.
+REAPER_FLAGS="-ghostreaper=disabled"
 [[ "$REAPER" == "true" ]] && REAPER_FLAGS="-ghostreaper=enabled -ghostreaper-rejectinscription=1 -ghostreaper-rejectdropstuffing=1 -ghostreaper-rejectfakepubkey=1 -ghostreaper-rejectannex=1 -ghostreaper-rejectopreturn=1 -ghostreaper-rejectrunestone=1 -ghostreaper-maxopreturn=82 -ghostreaper-mindropsize=76"
 # Order ghostd after tor when Tor is enabled, so the control port is up before
 # ghostd tries to publish its onion. Empty otherwise → unit byte-identical.
@@ -2205,10 +2180,19 @@ EOF
 log "Configuring firewall"
 ufw allow 22/tcp        >/dev/null 2>&1   # ssh FIRST so we don't lock out
 ufw allow "${NP_P2P_PORT}/tcp" >/dev/null 2>&1   # bitcoin P2P
-ufw allow "${RELAY_PORT}/tcp" >/dev/null 2>&1   # node pool share-chain relay
-ufw allow 8080/tcp      >/dev/null 2>&1   # ghost API
+ufw allow 8080/tcp      >/dev/null 2>&1   # ghost API (miner pages: /api/v1/miner/<address>)
+# The other node's found blocks: Bitcoin RPC (8332) from its address alone (--peer-node). Nobody
+# else reaches 8332; ghostd also refuses anyone not in rpcallowip.
+for ip in $RPC_ALLOW; do
+  ufw allow proto tcp from "$ip" to any port 8332 >/dev/null 2>&1 || true
+done
+# The node pool's share-chain relay is gone: its port (8566, or as an older config named it) is
+# closed on a re-run.
+for p in $(np_uniq "8566 ${OLD_RELAY_PORT:-}"); do
+  ufw delete allow "${p}/tcp" >/dev/null 2>&1 || true
+done
 # The old mesh (8555-8562 ZMQ, 8563 Noise) and verification HTTPS (8443) stay CLOSED. ghost-mining
-# no longer runs the old mesh and binds 8443 to loopback, and a node pool node must never be
+# no longer runs the old mesh and binds 8443 to loopback, and a Ghost Solo node must never be
 # reachable by the old fleet's mesh, which keeps running `main`. The template server (TDP, 8442)
 # is for the node's own pool_sv2 only and listens on 127.0.0.1 (`--tdp-bind`), so it is not opened
 # either. A rule left by an older install is removed. The dashboard (3000) is loopback-only too.
@@ -2225,7 +2209,7 @@ fi
 ufw --force enable      >/dev/null 2>&1
 
 # Stratum V1 (3333) + V2 (34255) and the farm tier (4444) are always open: every
-# node is a public node pool node. The reconcile service still runs at boot and
+# node is a public Ghost Solo node. The reconcile service still runs at boot and
 # whenever pool.toml changes (a .path unit), so a rule removed by hand or left
 # closed by an older private/solo install is put back with no manual ufw step.
 log "Installing mining-firewall reconcile (stratum ports follow pool.toml)"
@@ -2573,34 +2557,26 @@ health_ghostd() {
   return 1
 }
 
-# ghost-mining's /health peer_count: the share-chain relay's peers, as pool_sv2 reports them.
-# Empty when ghost-mining does not answer or pool_sv2 did not (it reports null then).
-read_peer_count() {
+# ghost-mining's /health block_height: present whenever ghost-mining answers. Empty when it does not.
+read_node_height() {
   curl -fsS --max-time 8 "http://127.0.0.1:8080/health?unsigned=true" 2>/dev/null \
-    | grep -oE '"peer_count"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1 || true
+    | grep -oE '"block_height"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1 || true
 }
 
-# PEERS_BEFORE is the peer count read before anything was stopped. A node pool node may have no
-# relay peers at all (the first node of a network, or one nobody has dialled yet), and requiring
-# more than zero rolled back every update on such a node, healthy or not. So ghost-mining must
-# answer with a count (pool_sv2 is up and reporting), and a node that had peers must have them
-# again: an update that cut the node off still rolls back.
+# ghost-mining answers /health. ⛔ Not its peer_count any more: that was the node pool's share-chain
+# relay peers, which no Ghost Solo node has, so it stays null and would roll back every update.
+# pool_sv2 and the translator are checked by health_stratum (their listening ports).
 health_ghost_pool() {
-  local pc need=0
-  [[ "${PEERS_BEFORE:-}" =~ ^[0-9]+$ ]] && (( PEERS_BEFORE > 0 )) && need=1
+  local h=""
   for _ in $(seq 1 30); do
-    pc="$(read_peer_count)"
-    if [[ -n "$pc" ]] && (( need == 0 || pc > 0 )); then
-      log "health: ghost-mining /health peer_count=$pc (before the update: ${PEERS_BEFORE:-unknown})"
+    h="$(read_node_height)"
+    if [[ -n "$h" ]]; then
+      log "health: ghost-mining /health answers (block_height=$h)"
       return 0
     fi
     sleep 2
   done
-  if (( need )); then
-    err "health: ghost-mining /health peer_count not > 0 (last='${pc:-none}'; it had ${PEERS_BEFORE} before the update)"
-  else
-    err "health: ghost-mining /health reports no peer count (last='${pc:-none}'): ghost-mining or pool_sv2 is not answering"
-  fi
+  err "health: ghost-mining /health does not answer: ghost-mining is not up"
   return 1
 }
 
@@ -2905,9 +2881,7 @@ main() {
   if [[ -x "$BIN_DIR/ghost-admin" && -n "$new_admin" ]]; then
     SWAP_DEST+=("$BIN_DIR/ghost-admin"); SWAP_SRC+=("$new_admin")
   fi
-  # ghost-audit runs the opt-in lister (ghost-lister.service). It is swapped with the rest and the
-  # lister, if it runs, is restarted onto it once the node is healthy (step 10); a stopped lister
-  # is left stopped.
+  # ghost-audit (a miner's job check; nothing runs it) is swapped with the rest.
   if [[ -x "$BIN_DIR/ghost-audit" && -n "$new_audit" ]]; then
     SWAP_DEST+=("$BIN_DIR/ghost-audit"); SWAP_SRC+=("$new_audit")
   fi
@@ -2964,8 +2938,6 @@ main() {
   # 7. Stop services (reverse start order: translator, pool, ghost-mining, ghostd), each
   #    verified inactive. Nothing has been swapped yet, so a refusal rolls back to a no-op.
   local STOP_FAILED="" START_FAILED=""
-  PEERS_BEFORE="$(read_peer_count)"
-  log "relay peers before the update: ${PEERS_BEFORE:-unknown}"
   stop_all || { err "$STOP_FAILED would not stop — rolling back"; rollback; write_status "rolled-back" "$STOP_FAILED failed to stop" "$latest"; exit 1; }
 
   # 8. Swap the verified binaries into place atomically (install = temp+rename).
@@ -2992,10 +2964,6 @@ main() {
     echo "$latest" > "$VERSION_FILE"; chmod 644 "$VERSION_FILE" 2>/dev/null || true
     local dash_note=""
     [[ -z "$new_dash" ]] || dash_note="; $(swap_dashboard "$new_dash" "$ts")"
-    # Node pool nodes only: the old network has no lister, and its update path stays as it was.
-    if [[ "$CHANNEL" == node-pool ]]; then
-      $SYSTEMCTL try-restart ghost-lister.service >/dev/null 2>&1 || warn "ghost-lister did not restart on the new ghost-audit"
-    fi
     log "UPDATE COMPLETE: now running $latest (backups: *.bak.${ts})${dash_note}"
     write_status "updated" "updated $installed -> $latest${dash_note}" "$latest"
     exit 0
@@ -4629,94 +4597,19 @@ else
   log "nightly backups disabled (--no-backups) — enable later: systemctl enable --now ghost-backup.timer"
 fi
 
-# ───────────────────────────── 10b2. open-listing lister ─────────────────────
-# Opt-in (--lister). Its user, directory, env file and unit are written on every install, so it
-# can be switched on later; it is ENABLED only with --lister (or kept enabled by a re-run) and a
-# configuration it can run on (np_lister_blocker). It needs no firewall rule: it only dials out,
-# and its node-list.json is served by ghost-mining on 8080.
-id ghost-audit >/dev/null 2>&1 || useradd -r -M -d "$NP_LISTER_DIR" -s /usr/sbin/nologin ghost-audit
-mkdir -p "$NP_LISTER_DIR"
-chown ghost-audit:ghost-audit "$NP_LISTER_DIR"
-chmod 755 "$NP_LISTER_DIR"
-# A re-run keeps the pins the last install wrote.
-[[ -n "$LISTER_TABLE_DIGEST" ]] || LISTER_TABLE_DIGEST="$(np_lister_old GHOST_AUDIT_GENESIS_TABLE_DIGEST "$NP_LISTER_ENV")"
-[[ -n "$LISTER_EXPORT_DIGEST" ]] || LISTER_EXPORT_DIGEST="$(np_lister_old GHOST_AUDIT_EXPORT_DIGEST "$NP_LISTER_ENV")"
-if [[ -n "$LISTER_GENESIS_EXPORT" ]]; then
-  # Copied where the sandboxed unit (ProtectHome) can read it; checked against its digest above.
-  mkdir -p "$NP_LISTER_EXPORT_DIR"
-  install -m644 -o ghost-audit -g ghost-audit "$LISTER_GENESIS_EXPORT/ledger-export.bin" \
-    "$LISTER_GENESIS_EXPORT/ledger-export.json" "$NP_LISTER_EXPORT_DIR/"
-fi
-LISTER_EXPORT_PRESENT=false
-[[ -f "$NP_LISTER_EXPORT_DIR/ledger-export.bin" && -f "$NP_LISTER_EXPORT_DIR/ledger-export.json" ]] && LISTER_EXPORT_PRESENT=true
-# Root-only: it holds the RPC password. systemd reads it as root before dropping to ghost-audit.
-( umask 077; np_lister_env_render > "${NP_LISTER_ENV}.tmp" )
-chown root:root "${NP_LISTER_ENV}.tmp"
-chmod 600 "${NP_LISTER_ENV}.tmp"
-mv -f "${NP_LISTER_ENV}.tmp" "$NP_LISTER_ENV"
-# Canonical copy: scripts/systemd/ghost-lister.service (scripts/check-inlined-copies.sh).
-cat > /etc/systemd/system/ghost-lister.service <<'GHOST_LISTER_SERVICE_EOF'
-[Unit]
-Description=Bitcoin Ghost open-listing lister (ghost-audit list)
-Documentation=https://bitcoinghost.org/docs.html#node-pool
-# Probes every node found in relay gossip each round and writes /var/lib/ghost-audit/node-list.json,
-# which ghost-mining serves read-only at GET /api/v1/node-pool/node-list for `ghost-audit merge`.
-# Opt-in: install-node.sh --lister. It submits no shares.
-After=network-online.target ghostd.service sri-pool.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=ghost-audit
-Group=ghost-audit
-# GHOST_AUDIT_RPC_USER / GHOST_AUDIT_RPC_PASSWORD, the genesis pins and GHOST_LISTER_ARGS, written by
-# the installer. Root-only (0600): systemd reads it before dropping to ghost-audit, and never shows
-# a file's contents to other users the way it shows Environment= lines.
-EnvironmentFile=/etc/ghost/lister.env
-ExecStart=/opt/ghost/bin/ghost-audit list --data-dir /var/lib/ghost-audit --state /var/lib/ghost-audit/list-state.json --out-json /var/lib/ghost-audit/node-list.json --out-dns /var/lib/ghost-audit/pool.zone $GHOST_LISTER_ARGS
-# 0755 and umask 022: ghost-mining (user ghost) reads node-list.json to serve it.
-StateDirectory=ghost-audit
-StateDirectoryMode=0755
-UMask=0022
-Restart=on-failure
-RestartSec=60
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=yes
-PrivateDevices=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-LockPersonality=yes
-
-[Install]
-WantedBy=multi-user.target
-GHOST_LISTER_SERVICE_EOF
-systemctl daemon-reload >/dev/null 2>&1 || true
-# >>> NP_LISTER_ENABLE
-if [[ -z "$LISTER" ]]; then
-  if systemctl is-enabled --quiet ghost-lister.service 2>/dev/null; then LISTER=true; else LISTER=false; fi
-fi
-LISTER_STATUS="off (--lister turns it on)"
-if [[ "$LISTER" == "true" ]]; then
-  lister_why="$(np_lister_blocker)"
-  [[ -x "$NP_AUDIT_BIN" ]] || lister_why="this release ships no ghost-audit"
-  if [[ -z "$lister_why" ]]; then
-    systemctl enable ghost-lister.service >/dev/null 2>&1 || true
-    systemctl restart ghost-lister.service >/dev/null 2>&1 || log "WARNING: ghost-lister did not start: sudo journalctl -u ghost-lister -n 50"
-    LISTER_STATUS="on: node-list.json served at http://${PUBIP:-<this node>}:8080/api/v1/node-pool/node-list"
-    log "open-listing lister ENABLED (ghost-lister.service)"
-  else
-    systemctl disable --now ghost-lister.service >/dev/null 2>&1 || true
-    LISTER_STATUS="NOT started: ${lister_why}"
-    log "WARNING: --lister was given but the lister cannot run: ${lister_why}. It is installed and left off; re-run with what is missing."
-  fi
-else
+# ─────────────────────── 10b2. what the node pool left behind ───────────────────
+# The open-listing lister and the share-chain relay are gone with the share chain. A re-run over a
+# node pool install stops and removes the lister's unit and env file (it holds the RPC password);
+# its user, its state (/var/lib/ghost-audit) and the relay's store (/var/lib/ghost/node-pool.db)
+# are data, kept like the rest until --uninstall --purge.
+# >>> NP_LISTER_GONE
+if [[ -e /etc/systemd/system/ghost-lister.service || -e /etc/ghost/lister.env ]]; then
   systemctl disable --now ghost-lister.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/ghost-lister.service /etc/ghost/lister.env
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  log "Removed the node pool's open-listing lister (ghost-lister.service, /etc/ghost/lister.env)"
 fi
-# <<< NP_LISTER_ENABLE
+# <<< NP_LISTER_GONE
 
 # ───────────────────────────── 10c. node dashboard ───────────────────────────
 # The operator dashboard (dashboard/, a Next.js standalone build) from this release, run by a
@@ -4820,32 +4713,6 @@ GHOST_DASHBOARD_SERVICE_EOF
   systemctl enable ghost-dashboard >/dev/null 2>&1 || true
 fi
 
-# ─────────────────────────── 10b. the genesis table ──────────────────────────
-# A node whose relay has never run imports the network's genesis table (the old ledger) BEFORE
-# the pool first starts: once the relay has run on its store, the import refuses it. Needs the
-# published ledger export (--genesis-export / --lister-genesis-export and its digest).
-NP_STORE=/var/lib/ghost/node-pool.db
-if [[ "$NETWORK" != regtest && ! -e "$NP_STORE" ]]; then
-  np_export_dir=""
-  if [[ -n "$LISTER_GENESIS_EXPORT" ]]; then np_export_dir="$LISTER_GENESIS_EXPORT"
-  elif [[ -f "$NP_LISTER_EXPORT_DIR/ledger-export.bin" ]]; then np_export_dir="$NP_LISTER_EXPORT_DIR"; fi
-  if [[ -n "$np_export_dir" && "$LISTER_EXPORT_DIGEST" =~ ^[0-9a-fA-F]{64}$ ]]; then
-    log "Importing the genesis table from ${np_export_dir}"
-    systemctl stop sri-translator sri-pool >/dev/null 2>&1 || true
-    np_import_out="$(/opt/ghost/bin/pool_sv2 -c /etc/ghost/pool-config.toml --np-import-genesis "$np_export_dir" \
-        --np-export-digest "${LISTER_EXPORT_DIGEST,,}" 2>&1)" \
-      || err "the genesis table import failed: $(printf '%s' "$np_import_out" | tail -3)"
-    np_verify_out="$(/opt/ghost/bin/pool_sv2 -c /etc/ghost/pool-config.toml --np-import-genesis "$np_export_dir" \
-        --np-export-digest "${LISTER_EXPORT_DIGEST,,}" --np-verify-genesis 2>&1)" \
-      || err "the genesis table does not verify: $(printf '%s' "$np_verify_out" | tail -3)"
-    log "$(printf '%s' "$np_verify_out" | sed -n 's/.*\(NODE_POOL_GENESIS_VERIFIED:.*table_root=[0-9a-f]*\).*/\1/p' | tail -1)"
-  else
-    log "WARNING: no genesis ledger export given (--genesis-export <dir>): this node has no genesis"
-    log "         table, and pool_sv2 will not run until one is imported before its first start:"
-    log "         sudo /opt/ghost/bin/pool_sv2 -c /etc/ghost/pool-config.toml --np-import-genesis <dir> --np-export-digest <sha256>"
-  fi
-fi
-
 # ─────────────────────────────── 11. start ───────────────────────────────────
 log "Starting services"
 systemctl daemon-reload
@@ -4888,39 +4755,47 @@ elif [[ -n "$post_chain" ]]; then
 else
   BITCOIN_CHECK="[FAIL] Bitcoin node does not answer on 127.0.0.1:8332 yet: sudo journalctl -u ghostd -n 50"
 fi
-GENESIS_STATUS="${GENESIS_ANCHOR:0:16}… at height ${GENESIS_HEIGHT}"
-[[ "$GENESIS_ANCHOR" == UNSET ]] && GENESIS_STATUS="UNSET — pool_sv2 will refuse to start until it is set in /etc/ghost/pool-config.toml"
-
 NODE_ID="$(sudo -u ghost /opt/ghost/bin/ghost-mining --config /etc/ghost/pool.toml --show-identity 2>/dev/null | grep -i 'Node ID' | head -1 || true)"
-MINER_POINTER="Point a miner at:  stratum+tcp://${PUBIP}:3333"
 if [[ -n "$DASHBOARD_SRC" ]]; then
   DASHBOARD_STATUS="$(systemctl is-active ghost-dashboard)  http://127.0.0.1:3000 on this machine (ssh -L 3000:127.0.0.1:3000 <you>@${PUBIP}, then open http://localhost:3000)
      Dashboard password: ${DASHBOARD_PW_NOTE}"
 else
   DASHBOARD_STATUS="not installed (${GHOST_VERSION} ships no dashboard)"
 fi
+if [[ -n "$SUBMIT_NODES" ]]; then
+  OTHER_NODE="found blocks also go to ${SUBMIT_NODES}$([[ "$SUBMIT_AUTH_READY" == true ]] || echo "  (NO credentials yet: --submit-auth)")"
+else
+  OTHER_NODE="none (--peer-node <the other node>): found blocks go to this node's ghostd only"
+fi
 cat <<EOF
 
-  ✅ Bitcoin Ghost node installed (${NETWORK}).
+  ✅ Bitcoin Ghost — Ghost Solo node installed (${NETWORK}).
      ${NODE_ID}
      ${BITCOIN_CHECK}
-     Fee address:     ${FEE_ADDRESS}
-     Relay:           port ${RELAY_PORT}, peers: ${RELAY_PEERS:-none yet}
-     Genesis:         ${GENESIS_STATUS}
+     Other node:      ${OTHER_NODE}
+     Bitcoin peers:   ${BITCOIN_PEERS:-none given (ghostd finds its own)}
      Alerts:          ${ALERT_WEBHOOK:-DISABLED (no --alert-webhook)}
-     Lister:          ${LISTER_STATUS}
      ghostd:          $(systemctl is-active ghostd)   (initial sync — full IBD takes hours; watch: sudo journalctl -u ghostd -f)
      ghost-mining-gate: $(systemctl is-active ghost-mining-gate)  (waiting for sync, then auto-starts ghost-mining)
      ghost-mining:    $(systemctl is-active ghost-mining)  (started by the gate)
      sri-pool:        $(systemctl is-active sri-pool)  (SV2 pool — started by the gate, after ghost-mining)
-     sri-translator:  $(systemctl is-active sri-translator)  (SV1->SV2 — started by the gate; serves miners on port 3333)
+     sri-translator:  $(systemctl is-active sri-translator)  (SV1->SV2 — started by the gate)
      dashboard:       ${DASHBOARD_STATUS}
 
-  "inactive" is expected for the last three until ghostd finishes syncing. The gate
-  then starts ghost-mining AUTOMATICALLY, followed by the
-  SV2 stratum stack (sri-pool + sri-translator), which serves miners on Stratum port
-  3333 (SV1) / 34255 (SV2). ${MINER_POINTER}
+  Miners connect to (username: their own Bitcoin address, optionally .<worker>; any password):
+     stratum+tcp://${PUBIP}:3333    SV1, small miners (Bitaxe, NerdAxe)
+     stratum+tcp://${PUBIP}:4444    SV1, the farm tier (S19/S21-class, rented hashrate)
+     ${PUBIP}:34255                 SV2, authority key ${SV2_AUTH_PUB}
+  A block a miner finds pays it the subsidy and every fee, less 0.5% of the subsidy (treasury).
+
+  "inactive" is expected for the last three services until ghostd finishes syncing. The gate
+  then starts ghost-mining AUTOMATICALLY, followed by the SV2 stratum stack (sri-pool +
+  sri-translator).
   Watch the gate:    sudo journalctl -u ghost-mining-gate -f
   Watch the stratum: sudo journalctl -u sri-pool -u sri-translator -f
+
+  Pairing with the other node: run the installer there with --peer-node ${PUBIP}
+  --submit-auth <this node's rpcuser:rpcpassword>, which are in /etc/bitcoin/bitcoin.conf:
+     sudo grep -E '^rpc(user|password)=' /etc/bitcoin/bitcoin.conf
 EOF
 

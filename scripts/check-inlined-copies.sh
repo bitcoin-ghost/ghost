@@ -70,9 +70,6 @@ PAIRS = {
     # The node dashboard's unit. dashboard/RUN.md shows the same unit for a hand install; the
     # one it showed before ordered itself after `ghost-node.service`, a unit no node has.
     "GHOST_DASHBOARD_SERVICE_EOF":      "scripts/systemd/ghost-dashboard.service",
-    # The opt-in open-listing lister (--lister). Its ProtectHome/StateDirectory sandbox decides
-    # what it can read and whether ghost-mining can serve its node-list.json.
-    "GHOST_LISTER_SERVICE_EOF":         "scripts/systemd/ghost-lister.service",
 }
 
 src = open(INSTALLER).read()
