@@ -9,7 +9,7 @@
 # compares the two byte-for-byte — edit both, or neither.
 set -euo pipefail
 PORTS=(3333 34255)
-# Every node is a public node pool node, so external miners are always accepted.
+# Every node is a public Ghost Pool node, so external miners are always accepted.
 # There is no mining mode left to key off: an older pool.toml that still carries a
 # `mining_mode` line is ignored by ghost-mining, and is ignored here too.
 for p in "${PORTS[@]}"; do ufw allow "${p}/tcp" >/dev/null 2>&1 || true; done

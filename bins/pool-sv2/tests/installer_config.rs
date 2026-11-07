@@ -1,12 +1,12 @@
 //! The installer's pool_sv2 config, loaded by pool_sv2 itself.
 //!
 //! `scripts/install-node.sh` renders `/etc/ghost/pool-config.toml` with `np_render_pool_config`
-//! and checks payout addresses with `np_fee_address_check`, both inside its
+//! and checks payout addresses with `np_payout_address_check`, both inside its
 //! `NODE_POOL_FUNCTIONS` block. This test runs that block out of the installer, unchanged, and
 //! holds pool_sv2 to it:
 //! - the rendered file parses as a [`PoolConfig`] the way `args.rs` loads one, on every network,
-//!   and pool_sv2 starts on it in solo mode: an old `[node_pool]` section is read as ignored,
-//!   never required;
+//!   with the `[solo]` keys pool_sv2 reads (network, state directory, found-block targets and
+//!   their credentials file, SV1 ports) and no `[node_pool]` section;
 //! - the shell's address check agrees with the payout classes pool_sv2 accepts from a miner
 //!   ([`Solo::payee_for_identity`]) plus the network, on every address class.
 //!
@@ -21,8 +21,7 @@ use stratum_apps::stratum_core::bitcoin::{address::NetworkUnchecked, Address, Ne
 
 const PUB: &str = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72";
 const SEC: &str = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n";
-const MAINNET_FEE: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
-const REGTEST_FEE: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+const REGTEST_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 
 fn installer() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install-node.sh")
@@ -54,16 +53,14 @@ fn bash(script: &str) -> (String, bool) {
     )
 }
 
-/// The installer's pool_sv2 config for `network`, rendered as an install would render it.
-fn render(network: &str, fee: &str, peers: &str, genesis: Option<(&str, u32)>) -> String {
-    let genesis = match genesis {
-        Some((a, h)) => format!("GENESIS_ANCHOR={a} GENESIS_HEIGHT={h}"),
-        None => "GENESIS_ANCHOR=$NP_GENESIS_ANCHOR GENESIS_HEIGHT=$NP_GENESIS_HEIGHT".into(),
-    };
+/// The installer's pool_sv2 config for `network`, rendered as an install would render it:
+/// `submit_nodes` are the found-block targets (space-separated URLs), `auth_ready` whether the
+/// credentials file was written.
+fn render(network: &str, submit_nodes: &str, auth_ready: bool) -> String {
     let (out, ok) = bash(&format!(
         "np_network_defaults {network}\n\
-         SV2_AUTH_PUB={PUB} SV2_AUTH_SEC={SEC} TDP_PUBKEY={PUB} APISECRET={} RPC_USER=u RPCPW=p \
-         NETWORK={network} FEE_ADDRESS={fee} RELAY_PORT=8566 RELAY_PEERS='{peers}' {genesis}\n\
+         SV2_AUTH_PUB={PUB} SV2_AUTH_SEC={SEC} TDP_PUBKEY={PUB} APISECRET={} \
+         NETWORK={network} SUBMIT_NODES='{submit_nodes}' SUBMIT_AUTH_READY={auth_ready}\n\
          np_render_pool_config",
         "ab".repeat(32)
     ));
@@ -82,28 +79,65 @@ fn load(toml: &str) -> PoolConfig {
 
 #[test]
 fn every_networks_config_parses_and_starts_solo() {
-    for (network, fee) in [
-        ("regtest", REGTEST_FEE),
-        ("mainnet", MAINNET_FEE),
-        (
-            "signet",
-            "tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7",
-        ),
-    ] {
-        let config = load(&render(network, fee, "", None));
-        // With or without [solo] (and an old [node_pool], which is ignored), the network the
-        // pool runs on must parse; pool_sv2 refuses to start otherwise.
+    for network in ["regtest", "mainnet", "signet"] {
+        let config = load(&render(network, "", false));
+        assert!(
+            !config.has_legacy_node_pool_section(),
+            "{network}: the installer writes no [node_pool] section"
+        );
         let solo = config.solo();
-        assert!(solo.network().is_ok(), "{network}");
-        if let Some(n) = &solo.network {
-            assert_eq!(
-                ghost_common::solo::SoloNetwork::parse(n).unwrap().as_str(),
-                network,
-                "the installer writes the network it installs"
-            );
-        }
+        assert_eq!(
+            solo.network.as_deref(),
+            Some(network),
+            "the installer writes the network it installs"
+        );
+        assert_eq!(solo.network().unwrap().as_str(), network);
+        assert_eq!(
+            solo.state_dir.as_deref(),
+            Some(std::path::Path::new("/var/lib/ghost/solo"))
+        );
+        assert!(
+            solo.submit_rpc.is_empty(),
+            "{network}: one node, no targets"
+        );
+        assert!(
+            solo.submit_rpc_auth_file.is_none(),
+            "{network}: no credentials file is named when none was written"
+        );
+        assert_eq!(solo.sv1_ports, vec![3333, 4444]);
         assert_eq!(config.listen_address().port(), 34255);
+        assert_eq!(
+            config.coinbase_reward_script().script_pubkey().as_bytes(),
+            &ghost_common::solo::TREASURY_SCRIPT[..],
+            "the group channel's script is the treasury's"
+        );
     }
+}
+
+#[test]
+fn a_two_node_config_names_the_other_node_and_its_credentials() {
+    let config = load(&render(
+        "mainnet",
+        "http://10.0.0.2:8332 https://b.example:8443",
+        true,
+    ));
+    let solo = config.solo();
+    assert_eq!(
+        solo.submit_rpc,
+        vec![
+            "http://10.0.0.2:8332".to_string(),
+            "https://b.example:8443".to_string()
+        ]
+    );
+    assert_eq!(
+        solo.submit_rpc_auth_file.as_deref(),
+        Some(std::path::Path::new("/etc/ghost/solo-submit-rpc.auth"))
+    );
+    // Targets without credentials: still written, the file not named (pool_sv2 refuses to start
+    // on a credentials file it cannot read).
+    let solo = load(&render("signet", "http://10.0.0.2:8332", false)).solo();
+    assert_eq!(solo.submit_rpc, vec!["http://10.0.0.2:8332".to_string()]);
+    assert!(solo.submit_rpc_auth_file.is_none());
 }
 
 #[test]
@@ -111,7 +145,7 @@ fn a_solo_section_is_read() {
     let toml = format!(
         "authority_public_key = \"{PUB}\"\nauthority_secret_key = \"{SEC}\"\n\
          cert_validity_sec = 3600\nlisten_address = \"0.0.0.0:34255\"\n\
-         coinbase_reward_script = \"addr({REGTEST_FEE})\"\npool_signature = \"- G H O S T -\"\n\
+         coinbase_reward_script = \"addr({REGTEST_ADDR})\"\npool_signature = \"- G H O S T -\"\n\
          shares_per_minute = 6.0\nshare_batch_size = 1\n\
          [template_provider_type.Sv2Tp]\naddress = \"127.0.0.1:8442\"\n\
          [solo]\nnetwork = \"regtest\"\nstate_dir = \"/var/lib/ghost/solo\"\n\
@@ -183,7 +217,7 @@ fn the_shell_address_check_agrees_with_pool_sv2() {
     for (net, network) in nets {
         let list: Vec<String> = cases.iter().map(|(_, a)| a.clone()).collect();
         let (out, ok) = bash(&format!(
-            "for a in {}; do if np_fee_address_check \"$a\" {net} >/dev/null; then echo ok; else echo no; fi; done",
+            "for a in {}; do if np_payout_address_check \"$a\" {net} >/dev/null; then echo ok; else echo no; fi; done",
             list.join(" ")
         ));
         assert!(ok);
