@@ -32,7 +32,6 @@ members = [
     "crates/ghost-storage",
     "crates/ghost-accounting",
     "crates/ghost-verification",
-    "crates/ghost-np-relay",
     # Node Binaries
     "bins/ghost-pool",
     "bins/ghost-stats",
@@ -77,7 +76,6 @@ ghost-storage = { path = "crates/ghost-storage" }
 ghost-accounting = { path = "crates/ghost-accounting" }
 ghost-mining = { path = "bins/ghost-pool" }
 ghost-verification = { path = "crates/ghost-verification" }
-ghost-np-relay = { path = "crates/ghost-np-relay" }
 # Async runtime
 tokio = { version = "1.36", features = ["full"] }
 

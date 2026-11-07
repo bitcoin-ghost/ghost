@@ -24,7 +24,7 @@
 //!
 //! An SV1 `mining.notify` carries the coinbase in two halves around the extranonce. The auditor
 //! fills the extranonce with its subscription's `extranonce1` and zeros for `extranonce2`: the
-//! outputs, the BIP34 height and the Ghost tags all sit outside the extranonce, so the bytes it
+//! outputs, and the BIP34 height sit outside the extranonce, so the bytes it
 //! fills in change nothing that is checked.
 
 use bitcoin::consensus::deserialize;

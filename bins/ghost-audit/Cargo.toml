@@ -26,7 +26,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Miner-side check that a node pool node's jobs pay the canonical coinbase and credit the miner, and the public prober open listing calls"
+description = "Miner-side check that a Ghost Solo node's jobs pay the miner and the treasury exactly, and nothing else"
 
 [lib]
 path = "src/lib.rs"
@@ -38,19 +38,11 @@ doc = false
 
 [dependencies]
 ghost-common = { workspace = true }
-ghost-np-relay = { workspace = true }
-ghost-storage = { workspace = true }
 stratum-apps = { path = "../../crates/stratum-apps" }
 bitcoin = { workspace = true }
-sha2 = { workspace = true }
 hex = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
-async-trait = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-chrono = { workspace = true }
-reqwest = { workspace = true }

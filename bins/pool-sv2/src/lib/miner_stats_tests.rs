@@ -9,7 +9,10 @@ const S: &[u8] = &[
 ];
 
 fn acc(d: f64) -> Outcome {
-    Outcome::Accepted { difficulty: d }
+    Outcome::Accepted {
+        difficulty: d,
+        share_difficulty: d,
+    }
 }
 
 #[test]
@@ -298,4 +301,39 @@ fn a_restart_long_after_drops_what_has_aged_out() {
     let m3 = MinerStats::open(path.clone(), T0 + 31 * 86_400);
     assert_eq!(m3.worker_count(), 0, "silent 31 days: dropped");
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[test]
+fn the_best_share_is_kept_ever_and_per_day() {
+    let m = MinerStats::in_memory(T0);
+    let best = |d: f64, sd: f64| Outcome::Accepted {
+        difficulty: d,
+        share_difficulty: sd,
+    };
+    m.record(S, "rig1", best(1.0, 5_000.0), T0);
+    m.record(S, "rig1", best(1.0, 70.0), T0 + 10);
+    let snap = m.snapshot(S, T0 + 20);
+    let w = &snap.workers["rig1"];
+    assert_eq!(w.best_ever, 5_000.0);
+    assert_eq!(w.best_24h(T0 + 20), 5_000.0);
+    // A day and more later the day's best is the newer, smaller share; the best ever stays.
+    m.record(S, "rig1", best(1.0, 90.0), T0 + 90_000);
+    let snap = m.snapshot(S, T0 + 90_000);
+    let w = &snap.workers["rig1"];
+    assert_eq!(w.best_ever, 5_000.0);
+    assert_eq!(w.best_24h(T0 + 90_000), 90.0);
+    assert_eq!(m.all(T0 + 90_000).len(), 1);
+}
+
+#[test]
+fn a_share_difficulty_is_read_from_its_header() {
+    // The genesis block's header: its hash meets about difficulty 2,536.
+    let genesis = hex::decode(concat!(
+        "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12",
+        "b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c"
+    ))
+    .unwrap();
+    let d = share_difficulty(&genesis).unwrap();
+    assert!((2_536.0..2_537.0).contains(&d), "{d}");
+    assert_eq!(share_difficulty(&[0u8; 10]), None);
 }

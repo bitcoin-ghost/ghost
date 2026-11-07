@@ -36,7 +36,7 @@ use tokio::net::TcpStream;
 
 use crate::job::Job;
 
-/// Longest line accepted from the node: a 500-output notify is about 44 KB.
+/// Longest line accepted from the node.
 const MAX_LINE: usize = 1 << 20;
 
 /// Why the stratum session failed.
@@ -68,8 +68,7 @@ pub struct Sv1Config {
     pub username: String,
     /// The password; nodes ignore it.
     pub password: String,
-    /// The user agent sent in `mining.subscribe`. The node picks the slot class from it, so
-    /// passing the miner's own firmware agent audits the class that miner is served.
+    /// The user agent sent in `mining.subscribe`.
     pub user_agent: String,
     /// Deadline for the handshake.
     pub timeout: Duration,
@@ -109,7 +108,7 @@ impl Sv1Session {
         // a placeholder extranonce (corrected only by mining.set_extranonce, which it sends only
         // to clients that asked for it), so every coinbase built from it failed to parse, or,
         // with open_channel_on_subscribe, its channel opened under a provisional identity that
-        // the node pool refuses.
+        // the pool refuses.
         let mut answers = s
             .calls(
                 &[

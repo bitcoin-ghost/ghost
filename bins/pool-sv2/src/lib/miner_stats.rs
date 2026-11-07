@@ -1,24 +1,23 @@
-//! Per-worker share statistics for the miner pages (W2.17).
+//! Per-worker share statistics for the miner pages.
 //!
 //! Every share a miner submits to this node is judged by the channel layer; the judgement and the
 //! difficulty of the job it was mined on land here, keyed by payee script and worker name (the
 //! part of the user identity after the first `.`). From them the miner API
 //! ([`crate::node_pool_miner_api`]) derives hashrate over time, accepted, stale and rejected
-//! counts with their reasons, and when each worker last sent a share.
+//! counts with their reasons, when each worker last sent a share, and its best share (the
+//! highest difficulty its hash met, ever and per bucket, so a 24-hour best can be read too).
 //!
 //! ## Where it is kept, and why not in the store
 //!
 //! In memory, in two bounded rings per worker: [`FINE`] (5-minute buckets for 24 hours) and
 //! [`COARSE`] (1-hour buckets for 30 days). Only buckets that saw a share are held, so an idle
-//! worker costs nothing and a busy one at most 1,008 buckets. The whole set is written to a small
-//! JSON file next to the relay's store (`miner-stats.json`, mode 0600) every
-//! [`SAVE_INTERVAL`] and read back on start, so a restart keeps the history.
+//! worker costs nothing and a busy one at most 1,008 buckets. With `[solo] state_dir` set, the
+//! whole set is written to `miner-stats.json` there (mode 0600) every [`SAVE_INTERVAL`] and read
+//! back on start, so a restart keeps the history.
 //!
-//! This is local, unverifiable telemetry about one node's connections, not ledger state: no
-//! peer can check it and nothing is paid from it. Putting it in the node pool store would need a
-//! migration (v66) for data with none of the store's guarantees, and would add a write on every
-//! share to the database the relay and settlement depend on. A crash loses at most the last
-//! [`SAVE_INTERVAL`] of statistics, never a sat.
+//! This is local telemetry about this pool's connections: nothing is paid from it (a block pays
+//! its finder in its own coinbase). A crash loses at most the last [`SAVE_INTERVAL`] of
+//! statistics, never a sat.
 //!
 //! What a restart does to the numbers is explicit rather than hidden: [`Snapshot::collecting_since`]
 //! is when this node's history begins (the oldest file it has kept going, or the process start),
@@ -136,8 +135,10 @@ impl RejectReason {
 pub enum Outcome {
     /// Accepted, on a job of this difficulty.
     Accepted {
-        /// The job's difficulty (difficulty-1 multiples).
+        /// The job's difficulty (difficulty-1 multiples): what the share is worth in work.
         difficulty: f64,
+        /// The difficulty the share's hash actually met (0 when unknown).
+        share_difficulty: f64,
     },
     /// `stale-share`: mined on a tip that moved.
     Stale,
@@ -152,7 +153,13 @@ impl Outcome {
         difficulty: f64,
     ) -> Outcome {
         match res {
-            Ok(_) => Outcome::Accepted { difficulty },
+            Ok(
+                ShareValidationResult::Valid(_, header80)
+                | ShareValidationResult::BlockFound(_, _, _, header80),
+            ) => Outcome::Accepted {
+                difficulty,
+                share_difficulty: share_difficulty(header80).unwrap_or(0.0),
+            },
             Err(ShareValidationError::Stale) => Outcome::Stale,
             Err(ShareValidationError::Invalid) => Outcome::Rejected(RejectReason::InvalidShare),
             Err(ShareValidationError::InvalidJobId) => {
@@ -172,6 +179,14 @@ impl Outcome {
     }
 }
 
+/// The difficulty an 80-byte header's hash meets: difficulty-1 target over the hash.
+pub fn share_difficulty(header80: &[u8]) -> Option<f64> {
+    use stratum_apps::stratum_core::bitcoin::{block::Header, consensus, hashes::Hash, Target};
+    let header: Header = consensus::deserialize(header80).ok()?;
+    let d = Target::from_le_bytes(header.block_hash().to_byte_array()).difficulty_float();
+    d.is_finite().then_some(d)
+}
+
 /// One bucket's counts.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Bucket {
@@ -185,15 +200,24 @@ pub struct Bucket {
     pub stale: u64,
     /// Refused shares, by [`RejectReason`] index.
     pub rejected: [u64; REASONS],
+    /// The best accepted share's difficulty in the bucket.
+    #[serde(default)]
+    pub best: f64,
 }
 
 impl Bucket {
     fn add(&mut self, o: Outcome) {
         match o {
-            Outcome::Accepted { difficulty } => {
+            Outcome::Accepted {
+                difficulty,
+                share_difficulty,
+            } => {
                 self.accepted += 1;
                 if difficulty.is_finite() && difficulty > 0.0 {
                     self.work += difficulty;
+                }
+                if share_difficulty.is_finite() && share_difficulty > self.best {
+                    self.best = share_difficulty;
                 }
             }
             Outcome::Stale => self.stale += 1,
@@ -282,6 +306,9 @@ pub struct WorkerStats {
     pub last_share_at: Option<u64>,
     /// Its last submission of any outcome, unix seconds.
     pub last_submit_at: u64,
+    /// The best share's difficulty it has ever sent here.
+    #[serde(default)]
+    pub best_ever: f64,
 }
 
 impl WorkerStats {
@@ -291,6 +318,7 @@ impl WorkerStats {
             coarse: Ring::default(),
             last_share_at: None,
             last_submit_at: now,
+            best_ever: 0.0,
         }
     }
 
@@ -300,9 +328,25 @@ impl WorkerStats {
         self.fine.prune(FINE, now);
         self.coarse.prune(COARSE, now);
         self.last_submit_at = self.last_submit_at.max(now);
-        if matches!(o, Outcome::Accepted { .. }) {
+        if let Outcome::Accepted {
+            share_difficulty, ..
+        } = o
+        {
             self.last_share_at = Some(self.last_share_at.map_or(now, |t| t.max(now)));
+            if share_difficulty.is_finite() && share_difficulty > self.best_ever {
+                self.best_ever = share_difficulty;
+            }
         }
+    }
+
+    /// The best share's difficulty in the 24 hours before `now` (0 when none).
+    pub fn best_24h(&self, now: u64) -> f64 {
+        let from = now.saturating_sub(86_400);
+        self.fine
+            .buckets()
+            .filter(|b| b.start + FINE.width > from)
+            .map(|b| b.best)
+            .fold(0.0, f64::max)
     }
 
     /// The ring of a resolution.
@@ -457,12 +501,12 @@ impl MinerStats {
                 Ok(f) => warn!(
                     path = %path.display(),
                     version = f.version,
-                    "NODE_POOL: miner statistics file has an unknown version; starting afresh"
+                    "SOLO: miner statistics file has an unknown version; starting afresh"
                 ),
                 Err(e) => {
                     warn!(
                         path = %path.display(),
-                        "NODE_POOL: miner statistics file does not parse ({e}); set aside, \
+                        "SOLO: miner statistics file does not parse ({e}); set aside, \
                          starting afresh"
                     );
                     let _ = std::fs::rename(&path, path.with_extension("json.bad"));
@@ -471,7 +515,7 @@ impl MinerStats {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => warn!(
                 path = %path.display(),
-                "NODE_POOL: cannot read the miner statistics file ({e}); starting afresh"
+                "SOLO: cannot read the miner statistics file ({e}); starting afresh"
             ),
         }
         MinerStats {
@@ -480,9 +524,9 @@ impl MinerStats {
         }
     }
 
-    /// Where the statistics of a relay whose store is `db_path` are saved: beside it.
-    pub fn path_beside(db_path: &Path) -> PathBuf {
-        db_path.with_file_name("miner-stats.json")
+    /// Where the statistics of a pool whose state directory is `dir` are saved.
+    pub fn path_in(dir: &Path) -> PathBuf {
+        dir.join("miner-stats.json")
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -526,6 +570,21 @@ impl MinerStats {
             collecting_since: st.collecting_since,
             workers,
         }
+    }
+
+    /// Every worker of every payee, pruned to `now`.
+    pub fn all(&self, now: u64) -> Vec<(Vec<u8>, String, WorkerStats)> {
+        let st = self.lock();
+        let mut out = vec![];
+        for (s, ws) in &st.workers {
+            for (w, stats) in ws {
+                let mut stats = stats.clone();
+                stats.fine.prune(FINE, now);
+                stats.coarse.prune(COARSE, now);
+                out.push((s.clone(), w.clone(), stats));
+            }
+        }
+        out
     }
 
     /// When this node's history begins.
@@ -614,8 +673,8 @@ impl MinerStats {
                 let m = me.clone();
                 match tokio::task::spawn_blocking(move || m.save(now_secs())).await {
                     Ok(Ok(())) => {}
-                    Ok(Err(e)) => warn!("NODE_POOL: could not save miner statistics: {e}"),
-                    Err(e) => warn!("NODE_POOL: miner statistics save task failed: {e}"),
+                    Ok(Err(e)) => warn!("SOLO: could not save miner statistics: {e}"),
+                    Err(e) => warn!("SOLO: miner statistics save task failed: {e}"),
                 }
             }
         });

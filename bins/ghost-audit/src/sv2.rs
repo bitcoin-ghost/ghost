@@ -35,14 +35,14 @@
 //!   zeros and judges the coinbase exactly as it judges an SV1 job;
 //! - a **standard** channel's job carries only the merkle root ([`crate::sv2::StandardJob`]).
 //!   The coinbase behind it is checked by rebuilding it ([`crate::sv2::rebuild_standard`]): see
-//!   [`crate::audit_sv2_jobs`].
+//!   [`crate::audit_sv2`].
 
 use std::str::FromStr;
 use std::time::Duration;
 
-use bitcoin::consensus::deserialize;
+use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::hashes::{sha256d, Hash};
-use bitcoin::{Target, Transaction};
+use bitcoin::{ScriptBuf, Target, Transaction};
 use stratum_apps::key_utils::Secp256k1PublicKey;
 use stratum_apps::network_helpers::noise_stream::{NoiseTcpReadHalf, NoiseTcpWriteHalf};
 use stratum_apps::network_helpers::{connect_with_noise, Error as NetError};
@@ -55,15 +55,6 @@ use stratum_apps::stratum_core::noise_sv2::Error as NoiseError;
 use stratum_apps::stratum_core::parsers_sv2::{AnyMessage, CommonMessages, Mining};
 use stratum_apps::utils::protocol_message_type::{protocol_message_type, MessageType};
 use tokio::net::TcpStream;
-
-use ghost_common::canonical_payout::{coinbase_outputs, ledger_root_of, subsidy, Halving, Table};
-use ghost_common::coinbase_tags::{
-    encode_node_tag, encode_payout_tag, extract_node_tag, extract_payout_tag,
-    MAX_DIFFICULTY_TIER_LOG2, MIN_DIFFICULTY_TIER_LOG2,
-};
-use ghost_common::node_pool_constants::SLOT_CLASSES;
-use ghost_common::share_commit::ShareTagPreimage;
-use ghost_np_relay::relay::JobAnchor;
 
 use crate::job::Job;
 
@@ -107,7 +98,7 @@ pub enum Sv2Error {
 }
 
 /// What the auditor tells the node it is, in `SetupConnection`. The node may pick an extended
-/// channel's slot class from these, so passing the miner's own audits the class it is served.
+/// channel's handling from these, so passing the miner's own audits what that miner is served.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Sv2Device {
     /// `vendor`.
@@ -137,7 +128,7 @@ pub struct Sv2Config {
     /// `host:port` of the node's SV2 port.
     pub addr: String,
     /// The authority public key the node's Noise certificate must be signed by (base58check, as
-    /// pool_sv2 prints it and the relay `Advert` carries it).
+    /// as pool_sv2 prints it).
     pub authority_key: String,
     /// The channel's `user_identity`: the payout address (optionally `address.worker`).
     pub username: String,
@@ -675,189 +666,51 @@ impl MiningMsg {
     }
 }
 
-fn varint(n: usize, out: &mut Vec<u8>) {
-    match n {
-        0..=0xfc => out.push(n as u8),
-        0xfd..=0xffff => {
-            out.push(0xfd);
-            out.extend_from_slice(&(n as u16).to_le_bytes());
-        }
-        _ => {
-            out.push(0xfe);
-            out.extend_from_slice(&(n as u32).to_le_bytes());
-        }
-    }
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
-}
-
-/// The tiers to try for a standard job: the one its difficulty quantises to first (pool_sv2's
-/// `tier_for_target`), then every other tier a node can commit (`10..=63`; pool_sv2 clamps to
-/// that range, and a share outside it is not credited anywhere).
-fn tier_order(difficulty: Option<f64>) -> Vec<u8> {
-    let (lo, hi) = (
-        MIN_DIFFICULTY_TIER_LOG2 as u8,
-        MAX_DIFFICULTY_TIER_LOG2 as u8,
-    );
-    let expected = difficulty.map(|d| {
-        (d.max(1.0) * (1.0 + 1e-9))
-            .log2()
-            .floor()
-            .clamp(lo as f64, hi as f64) as u8
-    });
-    let mut order: Vec<u8> = expected.into_iter().collect();
-    order.extend((lo..=hi).filter(|t| Some(*t) != expected));
-    order
-}
-
-/// Rebuild the coinbase behind a standard job, or `None` if no canonical coinbase crediting
-/// `payee` hashes to its merkle root.
+/// Rebuild the coinbase behind a standard job from an extended job on the same template, or
+/// `None` if the rebuilt coinbase does not hash to the standard job's merkle root.
 ///
-/// A standard job is only a merkle root, so the auditor cannot read its coinbase; it can only
-/// guess it and check the guess. The node builds every channel's job from the same template
-/// with the same layout (pool_sv2's job factory), so an extended job on that template, `ext`,
-/// gives everything a standard coinbase takes from the template: version, BIP34 height and the
-/// rest of the template's scriptSig, sequence, lock time, the witness commitment, the fees and
-/// the finder's script, and the merkle path. What differs per channel the auditor supplies
-/// itself, canonically:
-///
-/// - the `GHPP` slot and `GHNT` tag, for every stamp the node disclosed with its table held
-///   (`tables`), every slot class and every tier from 10 to 63, with `payee` and the node's
-///   `node_id`;
-/// - the outputs: the canonical outputs for that stamp's table, `h` and slot class, built by
-///   [`ghost_common::canonical_payout::coinbase_outputs`] as pool_sv2 builds them;
-/// - the extranonce: the standard channel's prefix.
-///
-/// A candidate whose txid folds up `ext`'s merkle path to the job's merkle root is the coinbase
-/// the miner would hash (a second preimage of sha256d is out of reach), and it is returned as a
-/// [`Job`] for the ordinary checks. No candidate matching means the job's coinbase is not a
-/// canonical coinbase crediting `payee` under any stamp the node discloses, or that `ext` is
-/// from another template.
-pub fn rebuild_standard(
-    std: &StandardJob,
-    ext: &ExtendedJob,
-    payee: &[u8],
-    node_id: &[u8; 32],
-    tables: &[(JobAnchor, std::sync::Arc<Table>)],
-    h: u32,
-    halving: Halving,
-) -> Option<Job> {
-    let cb = &ext.job.coinbase;
-    let input = cb.input.first()?;
+/// A standard job is only a merkle root, so the auditor cannot read its coinbase. pool_sv2 builds
+/// every channel's job from the same template with the same layout, and on a solo pool the same
+/// miner's outputs are the same on both channels: only the extranonce differs. So the extended
+/// job's coinbase with its extranonce replaced by the standard channel's prefix is the coinbase
+/// the standard job commits to, if its txid folds up the extended job's merkle path to the
+/// standard job's merkle root (a second preimage of sha256d is out of reach). No match means the
+/// standard job's coinbase is not this miner's solo coinbase, or `ext` is from another template.
+pub fn rebuild_standard(std: &StandardJob, ext: &ExtendedJob) -> Option<Job> {
+    let mut cb = ext.job.coinbase.clone();
+    let input = cb.input.first_mut()?;
     let sig = input.script_sig.as_bytes();
     let n = ext.extranonce_len;
     if n == 0 || n > 75 || sig.len() <= n || sig[sig.len() - n - 1] as usize != n {
         return None;
     }
-    let body = &sig[..sig.len() - n - 1];
-    let old_pp = encode_payout_tag(&extract_payout_tag(body)?);
-    let old_nt = encode_node_tag(&extract_node_tag(body)?);
-    let pp_at = find(body, &old_pp)?;
-    let nt_at = find(body, &old_nt)?;
     let en = &std.extranonce_prefix;
     if en.is_empty() || en.len() > 75 {
         return None;
     }
-
-    let outs: Vec<(u64, Vec<u8>)> = cb
-        .output
-        .iter()
-        .map(|o| (o.value.to_sat(), o.script_pubkey.to_bytes()))
-        .collect();
-    ledger_root_of(&outs)?;
-    let g = outs.len() - 2;
-    let template_tail = &outs[g + 1..];
-    let total = outs.iter().try_fold(0u64, |a, (v, _)| a.checked_add(*v))?;
-    let fees = total.checked_sub(subsidy(h, halving))?;
-    // The finder output, when there is one, sits just before the ledger commitment. It holds the
-    // fees and, on a cleared ledger, the surplus, so it can be there with no fees at all (it
-    // used to be looked for only when there were fees, and every standard job of a node whose
-    // ledger had cleared failed as not canonical). The output there is the finder's unless it is
-    // the treasury (the first output) or a payee on a table: then the extended job has no
-    // finder output and its script is not known here.
-    let finder: Vec<u8> = {
-        let at = g.checked_sub(1)?;
-        let s = &outs.get(at)?.1;
-        let payee = at == 0 || tables.iter().any(|(_, t)| t.contains_key(s));
-        if fees > 0 || !payee {
-            s.clone()
-        } else {
-            Vec::new()
-        }
-    };
-
-    let mut head = Vec::with_capacity(41);
-    head.extend_from_slice(&cb.version.0.to_le_bytes());
-    head.push(1);
-    head.extend_from_slice(&[0u8; 32]);
-    head.extend_from_slice(&u32::MAX.to_le_bytes());
-    let tiers = tier_order(std.difficulty);
-
-    for (stamp, table) in tables {
-        // The full class first: pool_sv2 serves it to every standard channel.
-        for class in SLOT_CLASSES.into_iter().rev() {
-            let Ok((canon, _)) =
-                coinbase_outputs(h, halving, table, class as usize, &finder, fees, &[0; 32])
-            else {
-                continue;
-            };
-            let mut outputs: Vec<(u64, Vec<u8>)> = canon[..canon.len() - 1].to_vec();
-            outputs.extend_from_slice(template_tail);
-            let mut tail = Vec::new();
-            tail.extend_from_slice(&input.sequence.0.to_le_bytes());
-            varint(outputs.len(), &mut tail);
-            for (v, s) in &outputs {
-                tail.extend_from_slice(&v.to_le_bytes());
-                varint(s.len(), &mut tail);
-                tail.extend_from_slice(s);
-            }
-            tail.extend_from_slice(&cb.lock_time.to_consensus_u32().to_le_bytes());
-            for &tier in &tiers {
-                let pre = ShareTagPreimage {
-                    node_id: *node_id,
-                    tier,
-                    slot_class: class,
-                    payee_script: payee.to_vec(),
-                    parent_anchor: stamp.parent_anchor,
-                    batch_root: stamp.batch_root,
-                };
-                let mut s = body.to_vec();
-                s[pp_at..pp_at + old_pp.len()]
-                    .copy_from_slice(&encode_payout_tag(&pre.parent_anchor_tag()));
-                s[nt_at..nt_at + old_nt.len()].copy_from_slice(&encode_node_tag(&pre.tag()));
-                s.push(en.len() as u8);
-                s.extend_from_slice(en);
-                let mut raw = head.clone();
-                varint(s.len(), &mut raw);
-                raw.extend_from_slice(&s);
-                raw.extend_from_slice(&tail);
-                let mut root = sha256d::Hash::hash(&raw).to_byte_array();
-                for node in &ext.job.merkle_branch {
-                    let mut b = [0u8; 64];
-                    b[..32].copy_from_slice(&root);
-                    b[32..].copy_from_slice(node);
-                    root = sha256d::Hash::hash(&b).to_byte_array();
-                }
-                if root == std.merkle_root {
-                    let coinbase: Transaction = deserialize(&raw).ok()?;
-                    return Some(Job {
-                        job_id: std.job_id.clone(),
-                        prev_hash: std.prev_hash,
-                        coinbase,
-                        coinbase_bytes: raw.len(),
-                        merkle_branch: ext.job.merkle_branch.clone(),
-                        version: std.version,
-                        bits: std.bits,
-                        time: std.time,
-                        difficulty: std.difficulty,
-                    });
-                }
-            }
-        }
+    let mut s = sig[..sig.len() - n - 1].to_vec();
+    s.push(en.len() as u8);
+    s.extend_from_slice(en);
+    input.script_sig = ScriptBuf::from_bytes(s);
+    let raw = serialize(&cb);
+    let mut root = cb.compute_txid().to_byte_array();
+    for node in &ext.job.merkle_branch {
+        let mut b = [0u8; 64];
+        b[..32].copy_from_slice(&root);
+        b[32..].copy_from_slice(node);
+        root = sha256d::Hash::hash(&b).to_byte_array();
     }
-    None
+    (root == std.merkle_root).then(|| Job {
+        job_id: std.job_id.clone(),
+        prev_hash: std.prev_hash,
+        coinbase: cb,
+        coinbase_bytes: raw.len(),
+        merkle_branch: ext.job.merkle_branch.clone(),
+        version: std.version,
+        bits: std.bits,
+        time: std.time,
+        difficulty: std.difficulty,
+    })
 }
 
 #[cfg(test)]
@@ -882,17 +735,6 @@ mod tests {
                 ..Sv2Device::default()
             }
         );
-    }
-
-    #[test]
-    fn the_channel_tier_is_tried_first_then_every_committable_tier() {
-        let o = tier_order(Some(2_328.0));
-        assert_eq!(o[0], 11);
-        assert_eq!(o.len(), 54);
-        assert!(o.iter().all(|t| (10..=63).contains(t)));
-        // Below the floor the floor tier is first, as pool_sv2 clamps.
-        assert_eq!(tier_order(Some(3.0))[0], 10);
-        assert_eq!(tier_order(None).len(), 54);
     }
 
     #[test]
