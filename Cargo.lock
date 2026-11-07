@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-ghost-tests"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "bitcoin",
  "ghost-buds",
@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "bitcoin_core_sv2"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "async-channel 1.9.0",
  "bitcoin-capnp-types",
@@ -2077,7 +2077,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-accounting"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "bitcoin",
  "ed25519-dalek",
@@ -2086,30 +2086,22 @@ dependencies = [
 
 [[package]]
 name = "ghost-audit"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
- "async-trait",
  "bitcoin",
- "chrono",
  "clap",
  "ghost-common",
- "ghost-np-relay",
- "ghost-storage",
  "hex",
- "reqwest",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "stratum-apps",
  "thiserror 1.0.69",
  "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
 name = "ghost-buds"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "bitcoin",
  "ghost-common",
@@ -2119,11 +2111,11 @@ dependencies = [
 
 [[package]]
 name = "ghost-build-info"
-version = "2.0.1"
+version = "2.1.0"
 
 [[package]]
 name = "ghost-cli"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2137,7 +2129,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-common"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "bitcoin",
@@ -2168,7 +2160,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-mining"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -2210,24 +2202,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "ghost-np-relay"
-version = "2.0.1"
-dependencies = [
- "async-trait",
- "bitcoin",
- "ghost-common",
- "ghost-storage",
- "hex",
- "rand 0.8.6",
- "sha2 0.10.9",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "ghost-policy"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "bitcoin",
  "ghost-buds",
@@ -2238,7 +2214,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-reaper"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "bitcoin",
  "hex",
@@ -2249,7 +2225,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-setup"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "clap",
  "dirs 5.0.1",
@@ -2258,7 +2234,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-stats"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -2275,7 +2251,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-storage"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -2294,7 +2270,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-verification"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "axum 0.7.9",
  "base64 0.22.1",
@@ -3661,7 +3637,7 @@ dependencies = [
 
 [[package]]
 name = "pool_sv2"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "async-channel 1.9.0",
  "bitcoin_core_sv2",
@@ -3669,8 +3645,6 @@ dependencies = [
  "config",
  "ghost-build-info",
  "ghost-common",
- "ghost-np-relay",
- "ghost-storage",
  "hex",
  "hotpath",
  "reqwest",
@@ -4643,7 +4617,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stratum-apps"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "async-channel 1.9.0",
  "axum 0.8.9",
@@ -5328,7 +5302,7 @@ dependencies = [
 
 [[package]]
 name = "translator_sv2"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "async-channel 1.9.0",
  "clap",
