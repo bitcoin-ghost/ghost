@@ -99,9 +99,20 @@ pool_sv2 serves, on its loopback monitoring listener, and ghost-mining forwards 
   address's hashrate (`network difficulty x 2^32 / hashrate`).
 - `GET /api/v1/miner/{address}/history?window=24h|7d|30d`: the same as series.
 - `GET /api/v1/pool/status`: network, Bitcoin tip and difficulty, connected miners and workers,
-  pool hashrate, best share, blocks found, the fee policy and the ports.
+  pool hashrate, best share, blocks found, the fee policy, the ports with the SV2 authority public
+  key miners pin (`ports.sv2_authority_public_key`), and each `submit_rpc` node with what the last
+  reachability check found (`submit_nodes[]`: `node`, `reachable`, `last_checked_at`,
+  `last_ok_at`, `height`, `error`; pool_sv2 asks each node `getblockchaininfo` every 60 s with a
+  10 s timeout; credentials never appear).
+- `GET /api/v1/pool/miners` (operator only): every payout address with an open channel or a share
+  in the last 24 hours, with its online, idle and offline workers, hashrate, shares, best share and
+  blocks found, the most hashrate first. It names miners, so ghost-mining serves it only to
+  HMAC-signed requests (the dashboard's proxy signs them with `INTERNAL_AUTH_KEY`); unsigned it is
+  `401`, and the website proxy never forwards it.
 
-The JSON of each is documented in `bins/pool-sv2/src/lib/solo_api.rs`. `/api/v1/node-pool/status`
+The JSON of each is documented in `bins/pool-sv2/src/lib/solo_api.rs`. The website shows each
+node's SV2 key from its live status, and `ghost-web/pool-nodes.json`'s key only when a node does
+not report one. `/api/v1/node-pool/status`
 still answers, as an alias of `/api/v1/pool/status`; the ledger routes answer `410 Gone`.
 
 ## Checking a node
@@ -110,3 +121,15 @@ still answers, as an alias of `/api/v1/pool/status`; the ledger routes answer `4
 jobs, submits nothing, and checks that each job's coinbase pays the treasury exactly
 `subsidy / 200` and your address the rest, with nothing else. `--sv2 <host>:34255
 --authority-key <key>` checks the SV2 port the same way. Exit 0 is a pass, 1 a fail.
+
+## End-to-end test
+
+`scripts/regtest-solo/run.sh` (CI workflow `Solo e2e`, `.github/workflows/solo-e2e.yml`) runs two
+peered regtest nodes, each the released ghostd + ghost-mining + pool_sv2 (`[solo] submit_rpc` =
+the other node) + translator, with miners on 3333, 4444 and SV2 34255 under different addresses.
+It checks every pool block's coinbase against the rule (fees included, across regtest's halving at
+150), that each block reached both nodes, the three API routes, a pool_sv2 killed while the other
+keeps mining, `ghost-audit check` passing an honest node and refusing a hostile build
+(`--features solo-fault-injection`, `GHOST_SOLO_FAULT=skim-treasury`), and a stopped submit node
+reported unreachable. `run.sh --fetch-ghostd` fetches and verifies ghostd; `run.sh --build` builds
+the rest.

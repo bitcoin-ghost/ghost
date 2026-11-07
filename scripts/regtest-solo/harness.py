@@ -796,6 +796,14 @@ def submitted_to_both(h):
 
 def api(h):
     ev, ok = [], True
+    # A hashrate is null until the pool has observed a minute of its window: wait out the first
+    # minute of the later pool's statistics.
+    for n in h.nodes:
+        try:
+            wait_for(lambda: n.status()["pool_hashrate_hs"]["15m"] is not None, 90, step=2,
+                     what=f"node{n.i}'s first minute of statistics")
+        except TimeoutError as e:
+            ev.append(str(e))
     for n in h.nodes:
         st = n.status()
         chain = [b for b in h.state["blocks"] if any(b[2][1][1] == m.script for m in n.miners)]
@@ -865,19 +873,15 @@ def api(h):
 
 def audit_honest(h):
     n = h.nodes[0]
-    # The miners mine meanwhile, so new jobs come.
-    n.pause(n.miners, False)
     ev, ok = [], True
-    try:
-        for proto in ("sv1-3333", "sv1-4444", "sv2"):
-            addr = payee(f"audit/{proto}", "tr")[0]
-            code, out = audit(h, n, proto, addr)
-            passes = len(re.findall(r"^PASS", out, re.M))
-            if code != 0 or passes < 1:
-                ok = False
-            ev.append(f"{proto}: exit {code}, {passes} job(s) PASS" + ("" if code == 0 else ": " + out.strip()[-300:]))
-    finally:
-        n.pause(n.miners, True)
+    # A miner is sent the current job as soon as it is authorised: no mining is needed for jobs.
+    for proto in ("sv1-3333", "sv1-4444", "sv2"):
+        addr = payee(f"audit/{proto}", "tr")[0]
+        code, out = audit(h, n, proto, addr)
+        passes = len(re.findall(r"^PASS", out, re.M))
+        if code != 0 or passes < 1:
+            ok = False
+        ev.append(f"{proto}: exit {code}, {passes} job(s) PASS" + ("" if code == 0 else ": " + out.strip()[-300:]))
     result("ghost-audit check passes against an honest node on 3333, 4444 and SV2",
            "PASS" if ok else "FAIL", ev)
 
@@ -908,8 +912,13 @@ def failover(h):
     except TimeoutError as e:
         ok = False
         ev.append(str(e))
-    time.sleep(3)
-    new = n0.status()["blocks_found"][before:]
+    try:
+        new = wait_for(lambda: (lambda bl: bl if all(b["submitted"] for b in bl) else None)(
+            n0.status()["blocks_found"][before:]), 60, step=2, what="node0's submissions to node1")
+    except TimeoutError as e:
+        ok = False
+        ev.append(str(e))
+        new = n0.status()["blocks_found"][before:]
     for b in new:
         res = [s["result"] for s in b["submitted"]]
         if not res or res[0] not in ("accepted", "duplicate"):
