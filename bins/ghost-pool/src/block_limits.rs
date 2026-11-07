@@ -530,7 +530,7 @@ mod tests {
     }
 
     /// The W0.2 case: a full template under the default 8,000 WU reserve has no room for a
-    /// 2.25 KB coinbase.
+    /// 2.25 KB coinbase (the node pool's), which is why the solo ceiling is far below it.
     #[test]
     fn default_reserve_cannot_carry_a_2_25_kb_coinbase() {
         let limits = BlockLimits {
@@ -546,7 +546,8 @@ mod tests {
             non_witness_bytes: 2_250,
             sigop_cost: 0,
         };
-        assert!(assess(limits, small, &txs).ok());
+        // Weight alone: both are above the solo ceiling, MAX_COINBASE_BYTES.
+        assert!(!assess(limits, small, &txs).over_weight());
         assert!(assess(limits, large, &txs).over_weight());
     }
 
