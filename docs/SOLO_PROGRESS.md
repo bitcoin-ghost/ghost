@@ -61,5 +61,11 @@ then so CI stays green).
 `NODE_POOL_FUNCTIONS` / `np_network_defaults` / `np_render_pool_config` / `np_fee_address_check`;
 if those are renamed, update that test with them.
 
-## Next
-- Get CI green.
+## Status
+- Rust core: CI run 42393399054 on 96fbfcbc, all 11 jobs success (Format, Clippy, Docs, MSRV,
+  Unused deps, Security Audit, Test ubuntu/macos, Integration tests, SV2 integration, Coverage).
+- Dormant, left in place: ghost-mining `alert_monitors::spawn_relay_peers_monitor` (not started),
+  ghost-verification `/api/v1/node-pool/node-list` + `node_list_path`, ghost-common
+  `coinbase_tags` GHPP/GHNT (ghost-mining still emits placeholder slots; pool_sv2 strips them),
+  `docs/node-pool-reference/`, np_* migrations (by instruction), translator agent TLV sending and
+  `quantise_to_tiers` branch, stale "node pool" comments in the translator.
