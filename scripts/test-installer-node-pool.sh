@@ -124,7 +124,7 @@ is "a good machine passes" 0 "$rc"
 has "it says so" "Preflight: passed." "$out"
 has "fee address line"   "[PASS] fee address is a valid mainnet P2WPKH address" "$out"
 has "RAM line"           "[PASS] RAM: 16000 MB" "$out"
-has "disk line"          "[PASS] disk: 900 GB free on /var/lib (needs 60 GB)" "$out"
+has "disk line"          "[PASS] disk: 900 GB available on /var/lib (needs 25 GB)" "$out"
 has "relay port line"    "[PASS] port 8566 is free" "$out"
 has "P2P port line"      "[PASS] port 8333 is free" "$out"
 has "fresh Bitcoin line" "[PASS] no Bitcoin node yet" "$out"
@@ -140,11 +140,11 @@ has "with a FAIL line" "[FAIL] fee address '1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2':
 has "and the verdict" "Preflight: 1 check(s) FAILED. Nothing has been changed." "$out"
 FEE_ADDRESS=bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4
 
-MEM=3000; pf;  has "too little RAM fails" "[FAIL] RAM: 3000 MB, a mainnet node needs at least 7000 MB" "$out"
-MEM=9000; pf;  has "little RAM warns"     "[WARN] RAM: 9000 MB, 15000 MB or more recommended" "$out"
+MEM=2000; pf;  has "too little RAM fails" "[FAIL] RAM: 2000 MB, a mainnet node needs at least 2800 MB" "$out"
+MEM=3000; pf;  has "little RAM warns"     "[WARN] RAM: 3000 MB, 3800 MB or more recommended" "$out"
 is "a warning alone still passes" 0 "$rc"
 MEM=16000
-DISK=40; pf;   has "too little disk fails" "[FAIL] disk: 40 GB free on /var/lib, this node (mainnet, sync ibd) needs 60 GB" "$out"
+DISK=20; pf;   has "too little disk fails" "[FAIL] disk: 20 GB available on /var/lib (free plus any chain already there), this node (mainnet, sync ibd) needs 25 GB" "$out"
 DISK=900
 OWNER[8566]=nginx; pf
 has "a relay port held by another process fails" "[FAIL] port 8566 is in use by nginx; this node needs it" "$out"

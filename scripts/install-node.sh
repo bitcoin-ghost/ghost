@@ -402,10 +402,12 @@ np_network_defaults() {
   NP_GENESIS_HEIGHT=0
   case "$net" in
     mainnet)
-      NP_P2P_PORT=8333; NP_MIN_RAM_MB=7000; NP_WARN_RAM_MB=15000
+      # Pruned (prune=550): the chain state is about 12 GB (measured on the old fleet, 2026-11-07),
+      # and the old stack runs in 3 GB of RAM; the node pool adds about 0.5 GB (soak, 2026-11-06).
+      NP_P2P_PORT=8333; NP_MIN_RAM_MB=2800; NP_WARN_RAM_MB=3800
       if [[ "$archive" == "true" ]]; then NP_MIN_DISK_GB=800
       elif [[ "$sync" == "haze" ]]; then NP_MIN_DISK_GB=250
-      else NP_MIN_DISK_GB=60; fi;;
+      else NP_MIN_DISK_GB=25; fi;;
     signet)
       NP_P2P_PORT=38333; NP_MIN_RAM_MB=3500; NP_WARN_RAM_MB=7000; NP_MIN_DISK_GB=30;;
     regtest)
@@ -536,10 +538,14 @@ pf_line() {
   return 0
 }
 pf_mem_mb() { awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo 2>/dev/null || true; }
-# Free space, in GB, on the filesystem that will hold the chain.
+# Space, in GB, the chain can use on the filesystem that holds it: free space plus a chain
+# already in /var/lib/bitcoin (a re-run or a machine that already runs a Bitcoin node keeps it).
 pf_disk_free_gb() {
-  local d=/var/lib
-  df -Pk "$d" 2>/dev/null | awk 'NR == 2 {print int($4 / 1048576)}' || true
+  local d=/var/lib free have=0
+  free="$(df -Pk "$d" 2>/dev/null | awk 'NR == 2 {print $4}')" || true
+  [[ -n "$free" ]] || return 0
+  if [[ -d /var/lib/bitcoin ]]; then have="$(du -sk /var/lib/bitcoin 2>/dev/null | awk '{print $1}')"; fi
+  echo $(( (free + ${have:-0}) / 1048576 ))
 }
 # The process listening on a TCP port, or nothing when the port is free.
 pf_port_owner() {
@@ -582,8 +588,8 @@ np_preflight() {
 
   disk="$(pf_disk_free_gb)"
   if [[ -z "$disk" ]]; then pf_line WARN "disk: free space on /var/lib could not be read"
-  elif (( disk < NP_MIN_DISK_GB )); then pf_line FAIL "disk: ${disk} GB free on /var/lib, this node (${NETWORK}, sync ${SYNC_MODE}$([[ "$ARCHIVE" == true ]] && echo ", archive")) needs ${NP_MIN_DISK_GB} GB"
-  else pf_line PASS "disk: ${disk} GB free on /var/lib (needs ${NP_MIN_DISK_GB} GB)"; fi
+  elif (( disk < NP_MIN_DISK_GB )); then pf_line FAIL "disk: ${disk} GB available on /var/lib (free plus any chain already there), this node (${NETWORK}, sync ${SYNC_MODE}$([[ "$ARCHIVE" == true ]] && echo ", archive")) needs ${NP_MIN_DISK_GB} GB"
+  else pf_line PASS "disk: ${disk} GB available on /var/lib (needs ${NP_MIN_DISK_GB} GB)"; fi
 
   # Ports this node listens on. Held by one of the node's own processes is a re-run, not a clash.
   for p in "$NP_P2P_PORT" 8332 8080 8442 3333 4444 34255 9090 "$RELAY_PORT"; do
