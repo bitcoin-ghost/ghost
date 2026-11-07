@@ -1308,14 +1308,8 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Relay-peers monitor: reads the share-chain relay's peer count from pool_sv2's node pool
-    // status into `/health` `peer_count`, and fires `PeerCountDrop` when it falls (rate-limited)
-    // and, edge-triggered, when it reaches zero. Replaces the old mesh's peer count.
-    ghost_pool::alert_monitors::spawn_relay_peers_monitor(
-        Arc::clone(&alert_dispatcher),
-        Arc::clone(&verification_state),
-        shutdown_tx.subscribe(),
-    );
+    // The relay-peers monitor (`alert_monitors::spawn_relay_peers_monitor`) is not started: the
+    // solo pool has no share-chain relay, so there are no relay peers to count.
 
     // Start the behind-tip monitor. Edge-triggered `BehindTip` alert when this
     // node's local height lags the best header its Bitcoin node has heard of, or

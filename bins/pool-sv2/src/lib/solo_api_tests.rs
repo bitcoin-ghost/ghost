@@ -8,7 +8,8 @@ const ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 
 fn api() -> SoloApi {
     let stats = Arc::new(MinerStats::in_memory(T0 - 7_200));
-    let solo = Arc::new(Solo::new(ghost_common::solo::SoloNetwork::Regtest).with_miner_stats(stats));
+    let solo =
+        Arc::new(Solo::new(ghost_common::solo::SoloNetwork::Regtest).with_miner_stats(stats));
     let mut api = SoloApi::new(solo, vec![3333, 4444], 34255, vec![]);
     api.clock = || T0;
     api

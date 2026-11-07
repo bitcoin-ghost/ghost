@@ -23,7 +23,7 @@
 //! Ghost Accounting - share difficulty
 //!
 //! The canonical share difficulty and proof-of-work checks ([`DifficultyCalculator`]) the node's
-//! share ingest uses. Payouts are the node pool's (`ghost_common::canonical_payout`).
+//! share ingest uses. A block pays its finder in its own coinbase (`ghost_common::solo`).
 
 #![deny(unreachable_pub)]
 

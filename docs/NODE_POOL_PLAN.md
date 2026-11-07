@@ -1,5 +1,7 @@
 # Ghost Node Pool: build plan
 
+> **ARCHIVED (2026-11-07).** The node pool was replaced by Ghost Solo (`SOLO.md`): no share chain, no ledger, each block pays its finder. This design, and the code that built it, live on the `feat/node-pool` branch. Nothing below describes what this branch runs.
+
 Companion to `NODE_POOL_SPEC.md`. Simulations, the firmware research and the hardware test kit live outside the repo for now; paths starting `sims/` or `hardware-test/` are relative to that working folder.
 
 ## Approach change, 11-02: rip out, flag-day cutover

@@ -23,9 +23,9 @@
 //! Template processor for block template management
 //!
 //! Fetches templates from Bitcoin Core, applies BUDS filtering, and serves them to pool_sv2 over
-//! the Template Distribution Protocol. The node pool owns the coinbase: a template carries the
-//! whole coinbase value (subsidy plus fees) and the witness commitment as its only output, and
-//! pool_sv2 builds each job's canonical outputs (`ghost_common::canonical_payout`) on it.
+//! the Template Distribution Protocol. pool_sv2 owns the coinbase: a template carries the whole
+//! coinbase value (subsidy plus fees) and the witness commitment as its only output, and pool_sv2
+//! builds each job's solo outputs (`ghost_common::solo`) on it.
 //!
 //! # Lock Ordering (M-16 / HIGH-POOL-4)
 //!
@@ -1430,20 +1430,18 @@ impl TemplateProcessor {
     }
 
     /// What the block currently being built splits, for the dashboard: the subsidy, the
-    /// treasury's base `S/200`, the miners' pool `Rm`, and the fees, which all go to the finder.
-    /// Which miners a block pays depends on the job's slot class and is decided per job in
-    /// pool_sv2 (`ghost_common::canonical_payout`); the change that `Rm` cannot pay goes to the
-    /// treasury on top of its base.
+    /// treasury's `S/200`, the finder's `S - S/200`, and the fees, which all go to the finder
+    /// too (`ghost_common::solo`, built per job by pool_sv2).
     pub fn current_coinbase_breakdown(&self) -> Option<serde_json::Value> {
         let w = self.current_work.read();
         let w = w.as_ref()?;
         let h = u32::try_from(w.height).ok()?;
-        use ghost_common::canonical_payout::{split, Halving};
+        use ghost_common::solo::{split, Halving};
         let halving = match self.config.network {
             BitcoinNetwork::Regtest => Halving::REGTEST,
             _ => Halving::MAINNET,
         };
-        let (treasury_base_sat, miner_pool_sat) = split(h, halving);
+        let (treasury_base_sat, miner_pool_sat) = split(h, halving, 0);
         Some(serde_json::json!({
             "height": w.height,
             "subsidy_sat": w.subsidy,

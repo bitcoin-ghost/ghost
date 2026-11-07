@@ -151,13 +151,19 @@ fn assert_pays(tx: &Transaction, miner: &[u8]) {
     let s = subsidy(HEIGHT, Halving::MAINNET);
     assert_eq!(s, 312_500_000);
     assert_eq!(tx.output.len(), 3, "treasury, miner, witness commitment");
-    assert_eq!(tx.output[0].script_pubkey.as_bytes(), TREASURY_SCRIPT.as_slice());
+    assert_eq!(
+        tx.output[0].script_pubkey.as_bytes(),
+        TREASURY_SCRIPT.as_slice()
+    );
     assert_eq!(tx.output[0].value.to_sat(), s / 200);
     assert_eq!(tx.output[0].value.to_sat(), 1_562_500);
     assert_eq!(tx.output[1].script_pubkey.as_bytes(), miner);
     assert_eq!(tx.output[1].value.to_sat(), s - s / 200 + FEES);
     assert_eq!(tx.output[2].value.to_sat(), 0);
-    assert!(tx.output[2].script_pubkey.as_bytes().starts_with(&[0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]));
+    assert!(tx.output[2]
+        .script_pubkey
+        .as_bytes()
+        .starts_with(&[0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]));
     // No share-chain tags in the scriptSig.
     let sig = tx.input[0].script_sig.to_bytes();
     assert_eq!(extract_node_tag(&sig), None);
@@ -242,9 +248,15 @@ fn two_miners_on_two_channels_each_mine_a_block_that_pays_them() {
 fn a_channel_without_a_payout_address_gets_no_job() {
     let solo = Solo::new(SoloNetwork::Mainnet);
     let t = template(1);
-    for bad in ["", "rig1", "sri/donate", "1BoatSLRHtKNngkdXEeobR76b53LETtpyT"] {
+    for bad in [
+        "",
+        "rig1",
+        "sri/donate",
+        "1BoatSLRHtKNngkdXEeobR76b53LETtpyT",
+    ] {
         assert!(
-            solo.job_outputs((9, 9), ChannelKind::Extended, bad, &t).is_err(),
+            solo.job_outputs((9, 9), ChannelKind::Extended, bad, &t)
+                .is_err(),
             "{bad:?}"
         );
     }

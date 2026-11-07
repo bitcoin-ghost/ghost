@@ -1,5 +1,7 @@
 # Ghost Node Pool: specification
 
+> **ARCHIVED (2026-11-07).** The node pool was replaced by Ghost Solo (`SOLO.md`): no share chain, no ledger, each block pays its finder. This design, and the code that built it, live on the `feat/node-pool` branch. Nothing below describes what this branch runs.
+
 Status: draft 11, 2026-11-02, against `main` at `f1cc40519`. Replaces the #608 path. Nothing here has been built or run on signet or mainnet. Simulation results are in `sims/`; line counts and durations are estimates.
 
 ## TLDR

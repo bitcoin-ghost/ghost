@@ -451,7 +451,11 @@ fn counts_24h(w: &WorkerStats, now: u64) -> Counts {
 
 /// The summed rates of `workers`, observed since `since`: unknown per span when the pool has not
 /// observed enough of it.
-pub fn sum_rates<'a>(workers: impl Iterator<Item = &'a WorkerStats>, since: u64, now: u64) -> Rates {
+pub fn sum_rates<'a>(
+    workers: impl Iterator<Item = &'a WorkerStats>,
+    since: u64,
+    now: u64,
+) -> Rates {
     let mut work = [0.0f64; 3];
     for st in workers {
         let (_, spans) = worker_rates(&st.fine, since, now);
@@ -806,7 +810,8 @@ impl SoloApi {
             .map(|(_, _, w)| BestShare::of(w, now))
             .fold(BestShare::default(), BestShare::max);
         let channels = self.solo.channel_status();
-        let connected: HashSet<&[u8]> = channels.iter().map(|c| c.payee_script.as_slice()).collect();
+        let connected: HashSet<&[u8]> =
+            channels.iter().map(|c| c.payee_script.as_slice()).collect();
         let job_height = self.solo.job_height();
         let tip = self.solo.tip();
         let next = job_height.map(|h| split(h, self.solo.halving(), 0));

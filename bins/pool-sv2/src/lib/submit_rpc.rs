@@ -231,8 +231,14 @@ mod tests {
 
     #[test]
     fn labels_never_carry_credentials_or_paths() {
-        assert_eq!(label_of("http://u:p@10.0.0.2:8332/wallet/x"), "http://10.0.0.2:8332");
-        assert_eq!(label_of("https://node.example:443"), "https://node.example:443");
+        assert_eq!(
+            label_of("http://u:p@10.0.0.2:8332/wallet/x"),
+            "http://10.0.0.2:8332"
+        );
+        assert_eq!(
+            label_of("https://node.example:443"),
+            "https://node.example:443"
+        );
         assert_eq!(label_of("10.0.0.2:8332"), "http://10.0.0.2:8332");
     }
 
@@ -269,7 +275,11 @@ mod tests {
             Some(&f),
         )
         .unwrap();
-        let auth: Vec<_> = t.endpoints.iter().map(|e| e.auth.clone().unwrap()).collect();
+        let auth: Vec<_> = t
+            .endpoints
+            .iter()
+            .map(|e| e.auth.clone().unwrap())
+            .collect();
         assert_eq!(auth[0], ("ua".into(), "pa".into()));
         assert_eq!(auth[1], ("ud".into(), "pd".into()));
         assert_eq!(auth[2], ("ui".into(), "pi".into()));
@@ -292,7 +302,9 @@ mod tests {
             Err("duplicate".to_string())
         );
         assert_eq!(
-            submit_verdict(&serde_json::json!({"result": null, "error": {"code": -1, "message": "bad"}})),
+            submit_verdict(
+                &serde_json::json!({"result": null, "error": {"code": -1, "message": "bad"}})
+            ),
             Err("bad".to_string())
         );
     }

@@ -317,19 +317,19 @@ async fn cmd_key_verify(path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// `node status`: the node pool's health, from `GET /api/v1/node-pool/status` (served by pool_sv2,
+/// `node status`: the solo pool's status, from `GET /api/v1/pool/status` (served by pool_sv2,
 /// forwarded by ghost-mining).
 async fn cmd_node_pool_status(client: &ApiClient, format: OutputFormat) -> Result<()> {
-    let status: serde_json::Value = client.get("/node-pool/status").await?;
+    let status: serde_json::Value = client.get("/pool/status").await?;
     match format {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&status)?),
-        OutputFormat::Text => print!("{}", render_node_pool_status(&status)),
+        OutputFormat::Text => print!("{}", render_pool_status(&status)),
     }
     Ok(())
 }
 
-/// The node pool status as plain lines. Missing fields print as `?`, never as a healthy default.
-fn render_node_pool_status(v: &serde_json::Value) -> String {
+/// The pool status as plain lines. Missing fields print as `?`, never as a healthy default.
+fn render_pool_status(v: &serde_json::Value) -> String {
     use std::fmt::Write as _;
     fn f(v: &serde_json::Value) -> String {
         match v {
@@ -338,99 +338,63 @@ fn render_node_pool_status(v: &serde_json::Value) -> String {
             other => other.to_string(),
         }
     }
-    let short = |v: &serde_json::Value| {
-        let s = f(v);
-        if s.len() > 16 {
-            format!("{}…", &s[..16])
-        } else {
-            s
-        }
+    let rate = |v: &serde_json::Value| v.as_f64().map_or_else(|| "?".to_string(), fmt_hashrate);
+    let sats = |v: &serde_json::Value| {
+        v.as_u64()
+            .map_or_else(|| "?".to_string(), |n| group_digits(i128::from(n)))
     };
     let mut o = String::new();
-    let chain = &v["share_chain"];
-    let st = &v["settlement"];
-    let _ = writeln!(o, "=== Node pool ({}) ===", f(&v["network"]));
+    let b = &v["bitcoin"];
+    let _ = writeln!(o, "=== Ghost Solo ({}) ===", f(&v["network"]));
     let _ = writeln!(
         o,
-        "  relay tip:     {} (anchor height {}, Bitcoin height {}, T_net {})",
-        short(&chain["tip"]),
-        f(&chain["anchor_height"]),
-        f(&chain["btc_height"]),
-        f(&chain["t_net"])
+        "  bitcoin tip:   {} ({}), difficulty {}",
+        f(&b["tip_height"]),
+        f(&b["tip_hash"]),
+        f(&b["network_difficulty"])
     );
     let _ = writeln!(
         o,
-        "  genesis:       {} at height {} ({})",
-        short(&v["start"]["genesis_anchor"]),
-        f(&v["start"]["genesis_btc_height"]),
-        f(&v["start"]["source"])
+        "  miners:        {} addresses, {} workers",
+        f(&v["miners"]["connected"]),
+        f(&v["miners"]["workers"])
     );
-    let _ = writeln!(o, "  peers:         {}", f(&v["peers"]));
-    let caught_up = match st["caught_up"].as_bool() {
-        Some(true) => "yes".to_string(),
-        Some(false) => "NO".to_string(),
-        None => "?".to_string(),
-    };
-    let provisional = st["provisional"].as_array().map_or(0, Vec::len);
+    let h = &v["pool_hashrate_hs"];
     let _ = writeln!(
         o,
-        "  settlement:    caught up {caught_up} (synced {} of Bitcoin tip {}), {provisional} provisional",
-        f(&st["synced_height"]),
-        f(&st["bitcoin_tip"])
+        "  pool hashrate: {} (15m), {} (1h), {} (24h)",
+        rate(&h["15m"]),
+        rate(&h["1h"]),
+        rate(&h["24h"])
     );
     let _ = writeln!(
         o,
-        "  pool hashrate: {}",
-        pool_hashrate_line(&v["pool_hashrate"])
+        "  best share:    {} (ever), {} (24h)",
+        f(&v["best_share"]["ever"]),
+        f(&v["best_share"]["24h"])
     );
-    let _ = writeln!(o, "  total owed:    {}", total_owed_line(&v["total_owed"]));
-    let _ = writeln!(o, "  fee address:   {}", f(&v["fee_address"]));
-    let _ = writeln!(o, "  ledger rows:   {}", f(&v["ledger_rows"]));
-    let miners = v["miners"].as_array().cloned().unwrap_or_default();
-    let _ = writeln!(o, "  miners:        {}", miners.len());
-    for m in &miners {
+    let fp = &v["fee_policy"];
+    let _ = writeln!(
+        o,
+        "  next block:    {} sats to the treasury ({}), {} sats + fees to the finder",
+        sats(&fp["treasury_sats_next_block"]),
+        f(&fp["treasury_address"]),
+        sats(&fp["miner_sats_next_block_before_fees"])
+    );
+    let blocks = v["blocks_found"].as_array().cloned().unwrap_or_default();
+    let _ = writeln!(o, "  blocks found:  {}", blocks.len());
+    for blk in &blocks {
         let _ = writeln!(
             o,
-            "    {} {} class {}{}",
-            f(&m["address"]),
-            f(&m["kind"]),
-            f(&m["slot_class"]),
-            m["sensing"]["model"]
-                .as_str()
-                .map(|x| format!(" ({x})"))
-                .unwrap_or_default()
+            "    {} {} to {} ({} sats), check {}",
+            f(&blk["height"]),
+            f(&blk["hash"]),
+            f(&blk["address"]),
+            sats(&blk["reward_sats"]),
+            f(&blk["check"])
         );
-        if let Some(w) = m["firmware_warning"].as_str() {
-            let _ = writeln!(o, "      warning: {w}");
-        }
     }
     o
-}
-
-/// `pool_hashrate` as one line: the rate and the window it was measured over, or why it could not
-/// be measured. `?` when the node does not report it (a pool_sv2 older than the field).
-fn pool_hashrate_line(h: &serde_json::Value) -> String {
-    if !h.is_object() {
-        return "?".to_string();
-    }
-    let n = |k: &str| {
-        h[k].as_u64()
-            .map_or_else(|| "?".to_string(), |x| x.to_string())
-    };
-    match h["hashes_per_sec"].as_f64() {
-        Some(hs) => format!(
-            "{} over {} Bitcoin blocks (job heights {} to {}, {} credited shares)",
-            fmt_hashrate(hs),
-            n("window_blocks"),
-            n("from_job_height"),
-            n("to_job_height"),
-            n("credited_shares")
-        ),
-        None => format!(
-            "not measured: {}",
-            h["unavailable"].as_str().unwrap_or("no reason given")
-        ),
-    }
 }
 
 fn fmt_hashrate(hs: f64) -> String {
@@ -448,25 +412,6 @@ fn fmt_hashrate(hs: f64) -> String {
         }
     }
     format!("{hs:.0} H/s")
-}
-
-/// Units of `2^-32` sat per whole sat.
-const UNITS_PER_SAT: i128 = 1 << 32;
-
-/// `total_owed` in whole sats rounded down, from the exact `units` (a decimal string), as the
-/// dashboard and the website show it. `sats` is an i64 that saturates on a large enough ledger,
-/// so it is used only when `units` is missing or not an integer. `?` when neither is there.
-fn total_owed_line(a: &serde_json::Value) -> String {
-    if let Some(units) = a["units"].as_str().and_then(|u| u.parse::<i128>().ok()) {
-        return format!(
-            "{} sats ({units} units of 2^-32 sat)",
-            group_digits(units.div_euclid(UNITS_PER_SAT))
-        );
-    }
-    match a["sats"].as_i64() {
-        Some(sats) => format!("{} sats", group_digits(i128::from(sats))),
-        None => "?".to_string(),
-    }
 }
 
 /// `1234567` -> `1,234,567`.
@@ -563,82 +508,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn node_pool_status_renders_every_health_line() {
+    fn pool_status_renders_every_line() {
         let v = serde_json::json!({
             "network": "regtest",
-            "start": {"genesis_anchor": "8d8cd561340ff83e99410e115619d64a", "genesis_btc_height": 0,
-                      "source": "default"},
-            "share_chain": {"tip": "abababababababababab", "anchor_height": 7, "btc_height": 998,
-                            "t_net": 10},
-            "peers": 2,
-            "settlement": {"caught_up": false, "synced_height": 990, "bitcoin_tip": 999,
-                           "provisional": [{"height": 960, "block_hash": "00"}]},
-            "fee_address": "bcrt1qfee",
-            "ledger_rows": 3,
-            "pool_hashrate": {"hashes_per_sec": 101808185.67, "from_job_height": 856,
-                              "to_job_height": 999, "window_blocks": 144, "credited_shares": 2,
-                              "unavailable": null},
-            "total_owed": {"units": "130996625984789", "sats": 30500},
-            "miners": [{"address": "bcrt1qminer", "kind": "extended", "slot_class": 9,
-                        "sensing": {"model": "Stock Antminer"},
-                        "firmware_warning": "Stock Antminer firmware is limited to slot class 9"}]
+            "bitcoin": {"tip_height": 999, "tip_hash": "00ab", "job_height": 1000,
+                        "network_difficulty": 1.0},
+            "miners": {"connected": 2, "workers": 3},
+            "pool_hashrate_hs": {"15m": 101808185.67, "1h": null, "24h": 2.0e12},
+            "best_share": {"ever": 5000.0, "24h": 70.0},
+            "fee_policy": {"treasury_address": "bcrt1qtreasury",
+                           "treasury_sats_next_block": 24414,
+                           "miner_sats_next_block_before_fees": 4858398},
+            "blocks_found": [{"height": 990, "hash": "00cd", "address": "bcrt1qminer",
+                              "reward_sats": 4858398, "check": "ok"}]
         });
-        let out = render_node_pool_status(&v);
+        let out = render_pool_status(&v);
         for want in [
-            "Node pool (regtest)",
-            "relay tip:     abababababababab… (anchor height 7, Bitcoin height 998, T_net 10)",
-            "peers:         2",
-            "caught up NO (synced 990 of Bitcoin tip 999), 1 provisional",
-            "fee address:   bcrt1qfee",
-            "pool hashrate: 101.81 MH/s over 144 Bitcoin blocks (job heights 856 to 999, 2 credited shares)",
-            "total owed:    30,500 sats (130996625984789 units of 2^-32 sat)",
-            "bcrt1qminer extended class 9 (Stock Antminer)",
-            "warning: Stock Antminer firmware is limited to slot class 9",
+            "Ghost Solo (regtest)",
+            "bitcoin tip:   999 (00ab), difficulty 1.0",
+            "miners:        2 addresses, 3 workers",
+            "pool hashrate: 101.81 MH/s (15m), ? (1h), 2.00 TH/s (24h)",
+            "best share:    5000.0 (ever), 70.0 (24h)",
+            "next block:    24,414 sats to the treasury (bcrt1qtreasury), 4,858,398 sats + fees",
+            "blocks found:  1",
+            "990 00cd to bcrt1qminer (4,858,398 sats), check ok",
         ] {
             assert!(out.contains(want), "{want:?} missing from:\n{out}");
         }
-        let empty = render_node_pool_status(&serde_json::json!({}));
+        let empty = render_pool_status(&serde_json::json!({}));
         assert!(
-            empty.contains("caught up ?"),
+            empty.contains("bitcoin tip:   ? (?)"),
             "unknown is not healthy: {empty}"
         );
-        assert!(empty.contains("pool hashrate: ?\n"), "{empty}");
-        assert!(empty.contains("total owed:    ?\n"), "{empty}");
+        assert!(empty.contains("blocks found:  0"), "{empty}");
     }
 
     #[test]
-    fn node_pool_status_says_why_the_hashrate_is_not_measured() {
-        let v = serde_json::json!({"pool_hashrate": {
-            "hashes_per_sec": null, "from_job_height": null, "to_job_height": null,
-            "window_blocks": 0, "credited_shares": 0,
-            "unavailable": "settlement has not seen a Bitcoin tip yet"}});
-        let out = render_node_pool_status(&v);
-        assert!(
-            out.contains(
-                "pool hashrate: not measured: settlement has not seen a Bitcoin tip yet\n"
-            ),
-            "{out}"
-        );
-    }
-
-    #[test]
-    fn total_owed_comes_from_the_exact_units_not_the_saturating_sats() {
-        // 2^96 units = 2^64 sats, past i64::MAX, where pool_sv2's `sats` saturates.
-        let out = total_owed_line(&serde_json::json!({
-            "units": "79228162514264337593543950336", "sats": i64::MAX}));
-        assert!(
-            out.starts_with("18,446,744,073,709,551,616 sats ("),
-            "{out}"
-        );
-        // Rounded down, below zero too.
-        let out = total_owed_line(&serde_json::json!({"units": "-1", "sats": -1}));
-        assert!(out.starts_with("-1 sats ("), "{out}");
-        let out = total_owed_line(&serde_json::json!({"units": "131000000000000", "sats": 0}));
-        assert!(out.starts_with("30,500 sats ("), "{out}");
-        // No usable units: the API's sats.
-        let out = total_owed_line(&serde_json::json!({"units": "x", "sats": 12}));
-        assert_eq!(out, "12 sats");
+    fn digits_are_grouped() {
         assert_eq!(group_digits(999), "999");
         assert_eq!(group_digits(-1_000), "-1,000");
+        assert_eq!(group_digits(1_234_567), "1,234,567");
     }
 }

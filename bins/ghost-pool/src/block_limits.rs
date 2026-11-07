@@ -13,8 +13,8 @@
 //!   the largest coinbase the node pool builds, and a job that still does not fit, or whose
 //!   coinbase is above `MAX_COINBASE_BYTES`, is refused.
 
-use ghost_common::node_pool_constants::MAX_COINBASE_BYTES;
 use ghost_common::rpc::{BlockTemplate, TemplateTransaction};
+use ghost_common::solo::MAX_COINBASE_BYTES;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Consensus maximum block weight (BIP141).
@@ -552,7 +552,7 @@ mod tests {
     /// Under the node pool's 90,000 WU reserve the ceiling coinbase fits a full template.
     #[test]
     fn node_pool_reserve_carries_the_ceiling_coinbase() {
-        use ghost_common::node_pool_constants::NODE_POOL_BLOCK_RESERVED_WEIGHT;
+        use ghost_common::solo::BLOCK_RESERVED_WEIGHT as NODE_POOL_BLOCK_RESERVED_WEIGHT;
         let limits = BlockLimits {
             weight: MAX_BLOCK_WEIGHT,
             sigop_cost: MAX_BLOCK_SIGOPS_COST,

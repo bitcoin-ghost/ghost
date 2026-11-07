@@ -377,9 +377,7 @@ impl Solo {
             return template.clone();
         }
         let mut out = template.clone();
-        out.coinbase_prefix = stripped
-            .try_into()
-            .expect("a shorter prefix still fits");
+        out.coinbase_prefix = stripped.try_into().expect("a shorter prefix still fits");
         out
     }
 
@@ -706,11 +704,7 @@ pub fn strip_ghost_tags(prefix: &[u8]) -> Vec<u8> {
         return prefix.to_vec();
     };
     let payout = tag_len_at(&prefix[height_len..], PAYOUT_TAG_MAGIC, PAYOUT_ID_LEN);
-    let node = tag_len_at(
-        &prefix[height_len + payout..],
-        NODE_TAG_MAGIC,
-        NODE_ID_LEN,
-    );
+    let node = tag_len_at(&prefix[height_len + payout..], NODE_TAG_MAGIC, NODE_ID_LEN);
     let mut out = prefix[..height_len].to_vec();
     out.extend_from_slice(&prefix[height_len + payout + node..]);
     out

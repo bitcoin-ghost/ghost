@@ -49,7 +49,10 @@ fn a_block_is_header_count_coinbase_transactions() {
 fn identities_and_payee_tlvs() {
     assert!(Solo::payee_for_identity("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4.rig1").is_ok());
     assert_eq!(Solo::payee_for_identity(""), Err("no-payout-address"));
-    assert_eq!(Solo::payee_for_identity("worker1"), Err("no-payout-address"));
+    assert_eq!(
+        Solo::payee_for_identity("worker1"),
+        Err("no-payout-address")
+    );
     let tlv = Tlv::new(
         AGENT_TLV_EXTENSION_TYPE,
         PAYEE_TLV_FIELD_TYPE,

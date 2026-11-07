@@ -1,14 +1,14 @@
-//! The node pool's public API routes (W2.11), and the routes of removed features.
+//! The solo pool's public API routes, and the routes of removed features.
 //!
-//! - `GET /api/v1/ledger/{address}`, `GET /api/v1/node-pool/status`, and the miner pages'
-//!   `GET /api/v1/miner/{address}` and `GET /api/v1/miner/{address}/history?window=24h|7d|30d`
-//!   (W2.17) are forwarded to
-//!   pool_sv2's node pool API ([`crate::server::VerificationState::node_pool_api`]), which owns
-//!   the share-chain ledger, its store and the live relay state. ghost-mining cannot read that
-//!   store (pool_sv2 runs as root and writes it 0600) and holds none of the live state, so it
-//!   forwards rather than re-deriving: the answer, its status code and its body pass through
-//!   unchanged. pool_sv2 not answering is a 503 that says so.
-//! - `GET /api/v1/node-pool/node-list` serves this node's open-listing lister's `node-list.json`
+//! - `GET /api/v1/miner/{address}`, `GET /api/v1/miner/{address}/history?window=24h|7d|30d` and
+//!   `GET /api/v1/pool/status` are forwarded to the same paths on pool_sv2's API
+//!   ([`crate::server::VerificationState::node_pool_api`], its loopback monitoring listener),
+//!   which owns the miners' statistics, the found blocks and the live channels. ghost-mining
+//!   holds none of that state, so it forwards rather than re-deriving: the answer, its status
+//!   code and its body pass through unchanged. pool_sv2 not answering is a 503 that says so. The
+//!   JSON is documented in pool_sv2's `solo_api.rs`. `GET /api/v1/node-pool/status` is kept as
+//!   an alias of `/api/v1/pool/status` until every caller has moved.
+//! - `GET /api/v1/node-pool/node-list` (dormant: the open-listing lister is gone) serves this node's open-listing lister's `node-list.json`
 //!   (`ghost-audit list`, enabled with `install-node.sh --lister`) read-only, so `ghost-audit
 //!   merge` can collect each lister's list over the API port every node already exposes, with no
 //!   new port or process. It reads one fixed file
@@ -32,7 +32,7 @@ use axum::{
 
 use crate::server::VerificationState;
 
-/// Longest a forwarded request may take: the ledger may wait on the relay for its next table.
+/// Longest a forwarded request may take.
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
 /// Largest forwarded body.
 const FORWARD_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -96,24 +96,14 @@ fn checked_address(address: &str) -> Result<&str, Box<Response>> {
     Ok(a)
 }
 
-/// `GET /api/v1/ledger/{address}`: one miner's balance, queue position, shares and payouts.
-async fn ledger_handler(
-    State(state): State<Arc<VerificationState>>,
-    Path(address): Path<String>,
-) -> Response {
-    match checked_address(&address) {
-        Ok(a) => forward(&state, &format!("/api/v1/node-pool/ledger/{a}")).await,
-        Err(r) => *r,
-    }
-}
-
-/// `GET /api/v1/miner/{address}`: one miner's workers on this node and its expected wait.
+/// `GET /api/v1/miner/{address}`: one miner's workers, best shares, blocks found and expected
+/// time to a block.
 async fn miner_handler(
     State(state): State<Arc<VerificationState>>,
     Path(address): Path<String>,
 ) -> Response {
     match checked_address(&address) {
-        Ok(a) => forward(&state, &format!("/api/v1/node-pool/miner/{a}")).await,
+        Ok(a) => forward(&state, &format!("/api/v1/miner/{a}")).await,
         Err(r) => *r,
     }
 }
@@ -121,7 +111,7 @@ async fn miner_handler(
 /// History windows pool_sv2 serves.
 const HISTORY_WINDOWS: [&str; 3] = ["24h", "7d", "30d"];
 
-/// `GET /api/v1/miner/{address}/history?window=24h|7d|30d`: hashrate, shares and balance over
+/// `GET /api/v1/miner/{address}/history?window=24h|7d|30d`: hashrate, shares and best share over
 /// time. The window defaults to `24h`; any other value than the three is refused here.
 async fn miner_history_handler(
     State(state): State<Arc<VerificationState>>,
@@ -139,16 +129,12 @@ async fn miner_history_handler(
             format!("window {w:?} is not one of 24h, 7d or 30d"),
         );
     }
-    forward(
-        &state,
-        &format!("/api/v1/node-pool/miner/{a}/history?window={w}"),
-    )
-    .await
+    forward(&state, &format!("/api/v1/miner/{a}/history?window={w}")).await
 }
 
-/// `GET /api/v1/node-pool/status`: the pool-wide view.
+/// `GET /api/v1/pool/status` (and its old name `/api/v1/node-pool/status`): the pool-wide view.
 async fn status_handler(State(state): State<Arc<VerificationState>>) -> Response {
-    forward(&state, "/api/v1/node-pool/status").await
+    forward(&state, "/api/v1/pool/status").await
 }
 
 /// Schema of a lister's `node-list.json`.
@@ -197,13 +183,13 @@ async fn node_list_handler(State(state): State<Arc<VerificationState>>) -> Respo
         .into_response()
 }
 
-/// The public node pool routes.
+/// The public pool routes.
 pub(crate) fn node_pool_router() -> Router<Arc<VerificationState>> {
     Router::new()
         .route("/api/v1/node-pool/node-list", get(node_list_handler))
-        .route("/api/v1/ledger/:address", get(ledger_handler))
         .route("/api/v1/miner/:address", get(miner_handler))
         .route("/api/v1/miner/:address/history", get(miner_history_handler))
+        .route("/api/v1/pool/status", get(status_handler))
         .route("/api/v1/node-pool/status", get(status_handler))
 }
 
@@ -214,12 +200,17 @@ struct Removed {
     paths: &'static [&'static str],
 }
 
-const LEDGER: &str = "/api/v1/ledger/{address} and /api/v1/node-pool/status";
+const LEDGER: &str = "/api/v1/miner/{address} and /api/v1/pool/status";
 
 /// Every route of a removed feature that a client may still call. Paths are taken from the route
 /// tables of the releases that served them (`main` at `f1cc40519`) and from the old dashboard
 /// and test callers; a trailing `*rest` covers a whole removed family.
 const REMOVED: &[Removed] = &[
+    Removed {
+        feature: "the node pool's share-chain ledger",
+        replacement: LEDGER,
+        paths: &["/api/v1/ledger/*rest"],
+    },
     Removed {
         feature: "the old payout ledger, payout checkpoints and node rewards",
         replacement: LEDGER,
@@ -237,7 +228,7 @@ const REMOVED: &[Removed] = &[
     },
     Removed {
         feature: "elders, capabilities and the node-list checkpoint",
-        replacement: "/api/v1/node-pool/status",
+        replacement: "/api/v1/pool/status",
         paths: &[
             "/api/v1/network/elder",
             "/api/v1/config/elder",
@@ -252,7 +243,7 @@ const REMOVED: &[Removed] = &[
     },
     Removed {
         feature: "solo, private and public mining modes and the per-node payout address",
-        replacement: "the node pool is the only mode; see /api/v1/node-pool/status",
+        replacement: "every miner mines solo to its own address; see /api/v1/pool/status",
         paths: &[
             "/api/v1/mining/payout_address",
             "/api/v1/mining/private",
@@ -262,7 +253,7 @@ const REMOVED: &[Removed] = &[
     },
     Removed {
         feature: "Ghost Pay",
-        replacement: "none: Ghost Pay is not part of the node pool",
+        replacement: "none: Ghost Pay is not part of the pool",
         paths: &[
             "/api/v1/ghostpay/*rest",
             "/api/v1/ghost-pay/*rest",
@@ -273,7 +264,7 @@ const REMOVED: &[Removed] = &[
     },
     Removed {
         feature: "Wraith and ghost-lock",
-        replacement: "none: Wraith is not part of the node pool",
+        replacement: "none: Wraith is not part of the pool",
         paths: &[
             "/api/v1/wraith/*rest",
             "/api/v1/config/wraith",
@@ -282,7 +273,7 @@ const REMOVED: &[Removed] = &[
     },
     Removed {
         feature: "L2, zk, MPC and glyph",
-        replacement: "none: they are not part of the node pool",
+        replacement: "none: they are not part of the pool",
         paths: &[
             "/api/v1/l2/*rest",
             "/api/internal/l2/*rest",
@@ -307,7 +298,7 @@ pub(crate) fn removed_router() -> Router<Arc<VerificationState>> {
                             "error": "gone",
                             "feature": feature,
                             "detail": format!(
-                                "{feature} was removed with the move to the node pool"
+                                "{feature} was removed"
                             ),
                             "replacement": replacement,
                         })),
@@ -376,26 +367,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_ledger_and_status_are_forwarded_with_their_status_codes() {
-        let (base, seen) = upstream(200, r#"{"known":true,"balance":{"sats":5}}"#).await;
+    async fn the_status_is_forwarded_with_its_status_code() {
+        let (base, seen) = upstream(200, r#"{"network":"regtest"}"#).await;
         let app = crate::routes::create_router(state(&base));
-        let addr = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
-        let (code, v) = call(app.clone(), "GET", &format!("/api/v1/ledger/{addr}")).await;
+        let (code, v) = call(app.clone(), "GET", "/api/v1/pool/status").await;
         assert_eq!(code, StatusCode::OK);
-        assert_eq!(v["balance"]["sats"], 5);
+        assert_eq!(v["network"], "regtest");
         let (code, _) = call(app, "GET", "/api/v1/node-pool/status").await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(
             *seen.lock(),
             vec![
-                format!("/api/v1/node-pool/ledger/{addr}"),
-                "/api/v1/node-pool/status".to_string()
+                "/api/v1/pool/status".to_string(),
+                "/api/v1/pool/status".to_string()
             ]
         );
 
         let (base, _) = upstream(400, r#"{"error":"not a regtest address"}"#).await;
         let app = crate::routes::create_router(state(&base));
-        let (code, v) = call(app, "GET", "/api/v1/ledger/bc1qxyz").await;
+        let (code, v) = call(app, "GET", "/api/v1/miner/bc1qxyz").await;
         assert_eq!(
             code,
             StatusCode::BAD_REQUEST,
@@ -409,7 +399,7 @@ mod tests {
         let (base, seen) = upstream(200, "{}").await;
         let app = crate::routes::create_router(state(&base));
         for bad in ["a%2Fb", "abc%3Fx%3D1", &"q".repeat(101)] {
-            let (code, v) = call(app.clone(), "GET", &format!("/api/v1/ledger/{bad}")).await;
+            let (code, v) = call(app.clone(), "GET", &format!("/api/v1/miner/{bad}")).await;
             assert_eq!(code, StatusCode::BAD_REQUEST, "{bad}");
             assert!(v["error"]
                 .as_str()
@@ -458,10 +448,10 @@ mod tests {
             assert_eq!(code, StatusCode::OK, "{q}");
             assert_eq!(
                 seen.lock().last().unwrap(),
-                &format!("/api/v1/node-pool/miner/{addr}/history?window={want}")
+                &format!("/api/v1/miner/{addr}/history?window={want}")
             );
         }
-        assert_eq!(seen.lock()[0], format!("/api/v1/node-pool/miner/{addr}"));
+        assert_eq!(seen.lock()[0], format!("/api/v1/miner/{addr}"));
         let n = seen.lock().len();
 
         // Bad windows and addresses never reach pool_sv2.
@@ -543,8 +533,8 @@ mod tests {
         drop(l);
         let app = crate::routes::create_router(state(&base));
         for uri in [
+            "/api/v1/pool/status",
             "/api/v1/node-pool/status",
-            "/api/v1/ledger/bcrt1qabc",
             "/api/v1/miner/bcrt1qabc",
             "/api/v1/miner/bcrt1qabc/history?window=7d",
         ] {

@@ -1,15 +1,14 @@
-//! Node pool payee-script classes, where a miner's payout address is accepted.
+//! Payout-script classes, where a miner's payout address is accepted.
 //!
-//! The node pool pays only P2SH, P2WPKH, P2WSH and P2TR (spec 2.1): their sizes are bounded, so
-//! the 22 KB coinbase ceiling holds for every slot class, and they carry no sigops, so payouts
-//! never eat into the 400 sigop cost `getblocktemplate` leaves for the coinbase. P2PKH costs 4
-//! sigops an output and regtest lost a block at 120 of them.
+//! The solo pool pays only P2SH, P2WPKH, P2WSH and P2TR: their sizes are bounded and they carry
+//! no sigops, so a payout never eats into the sigop cost `getblocktemplate` leaves for the
+//! coinbase. P2PKH costs 4 sigops an output.
 //!
-//! The class itself is `ghost_common::share_commit::payee_script_class`, the same function a
-//! peer runs when it checks a share. This module turns an address into its script and applies
-//! the class rule.
+//! The class itself is `ghost_common::solo::payee_script_class`, the same function pool_sv2 runs
+//! when a channel opens. This module turns an address into its script and applies the class
+//! rule.
 
-use ghost_common::share_commit::{payee_script_class, PayeeScriptClass};
+use ghost_common::solo::{payee_script_class, PayeeScriptClass};
 use std::str::FromStr;
 
 /// Why a payout address is refused for the node pool.

@@ -23,9 +23,9 @@
 //! Ghost Pool Library
 //!
 //! The ghost-mining node: block templates for the co-located pool_sv2, the mesh health and
-//! discovery plumbing, round statistics and the operator API. What a block pays and who is owed
-//! is the node pool's (`ghost_common::canonical_payout`, built per job by pool_sv2 and settled by
-//! the node pool relay); nothing here decides it.
+//! discovery plumbing, round statistics and the operator API. What a block pays is the solo
+//! rule (`ghost_common::solo`, built per job by pool_sv2: the treasury `subsidy / 200`, the
+//! finding miner the rest); nothing here decides it.
 //!
 //! # Modules
 //!

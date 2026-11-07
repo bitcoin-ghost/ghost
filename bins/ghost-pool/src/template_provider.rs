@@ -949,9 +949,6 @@ async fn handle_submit_solution(
         .submit_block_with_coinbase(coinbase_tx, &coinbase_non_witness, &header, &work_state)
         .await?;
 
-    // Settlement is the node pool relay's: it sees the block enter the best chain and retires
-    // what its coinbase paid (`ghost_np_relay::settlement`).
-
     info!(
         "Block at height {} submitted successfully!",
         work_state.height
@@ -1356,9 +1353,9 @@ fn create_new_template(
 
     let merkle_path_seq: Seq0255<'static, U256<'static>> = merkle_path.into();
 
-    // The node pool's template: the witness commitment is the only output, and the whole
+    // The solo pool's template: the witness commitment is the only output, and the whole
     // coinbase value (subsidy + the kept transactions' fees) is left to pool_sv2, which builds
-    // each job's canonical outputs for its slot class (`ghost_common::canonical_payout`).
+    // each job's outputs for its own miner (`ghost_common::solo`).
     let coinbase_outputs: B064K<'static> = work_state
         .coinbase_outputs_serialized
         .clone()
