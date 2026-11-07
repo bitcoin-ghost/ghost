@@ -52,7 +52,10 @@ required top-level key (used only for the internal group channel; any valid addr
 
 Miner refusal codes changed: `no-payout-address`, `payout-address-type-refused` (were
 `node-pool-no-payee`, `node-pool-payee-script-refused`). The translator's `quantise_to_tiers`
-should be `false`.
+should be `false`: **installer worker, flip `scripts/install-node.sh` (~line 1892) AND
+`config/sri/translator-config.toml` to `quantise_to_tiers = false` in the same commit**
+(`check-stratum-config-agreement.sh` fails if they differ; the reference is left `true` until
+then so CI stays green).
 
 `bins/pool-sv2/tests/installer_config.rs` still renders the installer's pool config through
 `NODE_POOL_FUNCTIONS` / `np_network_defaults` / `np_render_pool_config` / `np_fee_address_check`;

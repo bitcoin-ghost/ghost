@@ -119,8 +119,10 @@ enable_vardiff = true
 job_keepalive_interval_secs = 60
 
 # Quantise every assigned difficulty to a power-of-two tier. The share chain needed it; the
-# solo pool does not (plain vardiff targets are right), so it is off.
-quantise_to_tiers = false
+# solo pool does not (plain vardiff targets are right) and it should be false. It stays true
+# here only until scripts/install-node.sh writes false: check-stratum-config-agreement.sh holds
+# the two files to one value, so flip both together.
+quantise_to_tiers = true
 
 # Upstream SRI Pool connection
 [[upstreams]]
