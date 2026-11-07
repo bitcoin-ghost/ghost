@@ -1,4 +1,4 @@
-//! Address keying and blob decoding for the shard's tables.
+//! Address keying for the shard's tables.
 //!
 //! ⚠ Rows are keyed by `H(plaintext address)`, **never the ciphertext**. Address encryption is
 //! randomised, so the same address encrypts to a different blob every time and a ciphertext key
@@ -11,8 +11,6 @@
 
 use sha2::{Digest, Sha256};
 
-use ghost_common::error::{GhostError, GhostResult};
-
 /// Deterministic lookup key for a payout address.
 ///
 /// NOT the ciphertext: `encrypt_sensitive` draws a fresh random nonce per call, so the same address
@@ -20,11 +18,6 @@ use ghost_common::error::{GhostError, GhostResult};
 /// insert a new row and a miner's balance would scatter across duplicates instead of accumulating.
 pub fn address_key(plaintext: &str) -> Vec<u8> {
     Sha256::digest(plaintext.as_bytes()).to_vec()
-}
-
-pub(crate) fn blob32(v: Vec<u8>, what: &str) -> GhostResult<[u8; 32]> {
-    <[u8; 32]>::try_from(v.as_slice())
-        .map_err(|_| GhostError::Database(format!("{what} is not 32 bytes")))
 }
 
 #[cfg(test)]

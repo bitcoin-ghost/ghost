@@ -3,16 +3,17 @@
 //! The pool is a solo pool. A miner's username is its Bitcoin address, and a block found on its
 //! job pays, in this order:
 //!
-//! 1. the treasury, [`TREASURY_SCRIPT`]: exactly `subsidy / 200` (0.5% of the subsidy, never of
+//! 1. the treasury, [`TREASURY_SCRIPT`](crate::solo::TREASURY_SCRIPT): exactly `subsidy / 200` (0.5% of the subsidy, never of
 //!    the fees);
 //! 2. the miner's own payout script: everything else, `subsidy - subsidy / 200 + fees`;
 //! 3. the witness commitment, as the template provider hands it over.
 //!
-//! Nothing else. [`solo_outputs`] builds the first two; [`check_solo_outputs`] checks a whole
+//! Nothing else. [`solo_outputs`](crate::solo::solo_outputs) builds the first two;
+//! [`check_solo_outputs`](crate::solo::check_solo_outputs) checks a whole
 //! coinbase against the rule (pool_sv2's post-submit alarm and `ghost-audit` use it).
 //!
 //! The subsidy halves every 210,000 blocks on mainnet and signet and every 150 on regtest
-//! ([`Halving`]). Pure: no I/O.
+//! ([`Halving`](crate::solo::Halving)). Pure: no I/O.
 
 /// Treasury base is `subsidy / TREASURY_DIVISOR`, 0.5% of the subsidy.
 pub const TREASURY_DIVISOR: u64 = 200;

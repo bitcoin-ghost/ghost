@@ -92,7 +92,7 @@ impl Sv2ClientsMonitoring for ChannelManager {
 
         downstream_refs
             .iter()
-            .filter_map(|d| downstream_to_sv2_client_info(d))
+            .filter_map(downstream_to_sv2_client_info)
             .collect()
     }
 
@@ -101,7 +101,7 @@ impl Sv2ClientsMonitoring for ChannelManager {
             .safe_lock(|d| {
                 d.downstream
                     .get(&client_id)
-                    .and_then(|c| downstream_to_sv2_client_info(c))
+                    .and_then(downstream_to_sv2_client_info)
             })
             .unwrap_or(None)
     }

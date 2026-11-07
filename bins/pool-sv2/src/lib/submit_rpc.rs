@@ -56,8 +56,14 @@ pub fn label_of(url: &str) -> String {
     format!("{scheme}://{host}")
 }
 
+/// A `user:password` pair.
+pub type Credentials = (String, String);
+
+/// A credentials file: per-endpoint credentials (keyed by `scheme://host:port`), and the default.
+pub type AuthEntries = (Vec<(String, Credentials)>, Option<Credentials>);
+
 /// Parse a credentials file: `(per-endpoint, default)`.
-pub fn parse_auth(text: &str) -> (Vec<(String, (String, String))>, Option<(String, String)>) {
+pub fn parse_auth(text: &str) -> AuthEntries {
     let mut per = vec![];
     let mut default = None;
     for line in text.lines() {

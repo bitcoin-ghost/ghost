@@ -319,19 +319,16 @@ impl Solo {
     ) -> Result<Vec<TxOut>, String> {
         let (height, own, fees) = self.template_parts(template)?;
         let mut st = self.lock();
-        if !st.channels.contains_key(&key) {
+        if let std::collections::hash_map::Entry::Vacant(e) = st.channels.entry(key) {
             let payee_script = Self::payee_for_identity(user_identity)
                 .map_err(|code| format!("the channel's identity is refused: {code}"))?;
-            st.channels.insert(
-                key,
-                ChannelSlot {
-                    kind,
-                    payee_script,
-                    user_identity: crate::miner_stats::clamp_identity(user_identity),
-                    building: None,
-                    jobs: VecDeque::new(),
-                },
-            );
+            e.insert(ChannelSlot {
+                kind,
+                payee_script,
+                user_identity: crate::miner_stats::clamp_identity(user_identity),
+                building: None,
+                jobs: VecDeque::new(),
+            });
         }
         let slot = st.channels.get_mut(&key).expect("registered above");
         let pay = solo_outputs(height, self.network.halving(), fees, &slot.payee_script);
