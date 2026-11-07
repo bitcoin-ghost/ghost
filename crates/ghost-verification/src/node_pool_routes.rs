@@ -9,7 +9,7 @@
 //!   JSON is documented in pool_sv2's `solo_api.rs`. `GET /api/v1/node-pool/status` is kept as
 //!   an alias of `/api/v1/pool/status` until every caller has moved.
 //! - `GET /api/v1/pool/miners` (operator only) is forwarded the same way, but it names every
-//!   connected miner's payout address, so it is not on the public tier: [`operator_router`] is
+//!   connected miner's payout address, so it is not on the public tier: `operator_router` is
 //!   merged into the HMAC-authenticated internal router (the dashboard's proxy signs its GETs),
 //!   and the website proxy never forwards it.
 //! - `GET /api/v1/node-pool/node-list` (dormant: the open-listing lister is gone) serves this node's open-listing lister's `node-list.json`
