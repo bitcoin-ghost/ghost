@@ -17,17 +17,18 @@ report to its keeper (the node operator). Built with Next.js and React.
 
 ## Overview
 
-The dashboard is the operator's view of a node pool node (W2.14). It provides:
-- **Overview** - node pool health (service answering, relay peers, settlement, provisional
-  blocks, share-chain sync), the Bitcoin node's sync, share-chain tip, fee address, and the
-  share chain's start values (genesis anchor, height, tier, table digest)
-- **Miners** - connected channels with their slot class, sensing state and firmware warnings;
-  per payout address its shares, hashrate, ledger balance, queue position and expected wait,
-  linking to a per-address page with workers, payouts and credited shares
-- **Pool Blocks** - recent pool blocks, what each paid, the treasury base and change, and
-  settlement (matched, provisional, mismatched, undone by a reorg)
-- **Share Chain** - tip, sync, relay counters, checkpoints and pruning
-- Bitcoin node, privacy, filtering, storage and system pages for the node itself
+The dashboard is the operator's view of a Ghost Pool node (a solo mining pool: a miner's username
+is its Bitcoin address and a block it finds pays it directly). It provides:
+- **Overview** - pool health (service answering, templates, backup submission, coinbase checks),
+  pool hashrate, connected miners and workers, best share, blocks found, the Bitcoin node's sync,
+  the other nodes found blocks are sent to and what they said, and the payout rule
+- **Miners** - look up a payout address; addresses that found a block here and the ones looked up
+  are listed with workers online, hashrate, shares, best share and expected time to a block,
+  linking to a per-address page with workers, odds, history and blocks found
+- **Blocks Found** - every block found here: what it paid, the coinbase check, the other nodes'
+  answers
+- Bitcoin node (sync, Zero-Sync, Haze, mempool), privacy, filtering, storage and system pages for
+  the node itself
 
 A value the node does not report is shown as unknown, and a failed call as unavailable; neither
 is ever shown as healthy or zero.
@@ -43,10 +44,10 @@ is ever shown as healthy or zero.
 ```
 
 The dashboard queries the node backend's REST API through its own `/api/proxy` route (which
-signs requests with `INTERNAL_AUTH_KEY`). The node pool pages read `GET /api/v1/node-pool/status`,
-`GET /api/v1/ledger/{address}` and `GET /api/v1/miner/{address}`, which the backend forwards to
-pool_sv2's loopback monitoring listener; their JSON is documented in
-`bins/pool-sv2/src/lib/node_pool_api.rs` and `node_pool_miner_api.rs`.
+signs requests with `INTERNAL_AUTH_KEY`). The Ghost Pool pages read `GET /api/v1/pool/status`,
+`GET /api/v1/miner/{address}` and `GET /api/v1/miner/{address}/history`, which the backend
+forwards to pool_sv2's loopback monitoring listener; their JSON is documented in
+`bins/pool-sv2/src/lib/solo_api.rs`.
 
 ## Development
 
@@ -137,17 +138,16 @@ and is out of scope for this dashboard change.
 
 | Route | Description |
 |-------|-------------|
-| `/` | Node pool health, Bitcoin sync, share-chain tip, settlement, fee address, start values |
-| `/miners` | Connected miners: slot class, sensing, firmware warnings, shares, balance, queue, wait |
-| `/miners/{address}` | One payout address: workers, ledger, next-block payout by class, payouts, shares |
-| `/blocks` | Recent pool blocks, payouts, treasury base and change, settlement |
-| `/share-chain` | Tip, sync, relay counters, checkpoints and pruning |
+| `/` | Pool health, hashrate, miners, best share, blocks found, Bitcoin sync, other nodes, payout rule |
+| `/miners` | Look up a payout address; listed addresses with workers, hashrate, shares, best share, odds |
+| `/miners/{address}` | One payout address: summary, expected time to a block, workers, history, blocks found |
+| `/blocks` | Blocks found: reward, fees, treasury, coinbase check, the other nodes' answers |
 | `/mining` | Stratum endpoints and the username rule |
-| `/settings` | Identity, node pool settings (read-only), alerts and node configuration |
+| `/settings` | Identity, Ghost Pool settings (read-only), alerts and node configuration |
 
 ## Tests
 
-`npm test` renders the node pool pages from sample JSON shaped as pool_sv2 serves it
+`npm test` renders the Ghost Pool pages from sample JSON shaped as pool_sv2 serves it
 (`tests/fixtures/`, checked field by field against the Rust structs) and from a failed API, with
 the real components compiled by `tests/helpers/tsx.js`.
 

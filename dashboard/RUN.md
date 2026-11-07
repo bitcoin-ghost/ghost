@@ -1,6 +1,6 @@
 # Running the node dashboard
 
-The node dashboard is the operator's view of a Ghost node pool node. This is the
+The node dashboard is the operator's view of a Ghost Pool node. This is the
 **standalone** Next.js build; it needs a **Node.js runtime (>= 22)** (the bundle ships only
 the app's minimal `node_modules`, not Node itself).
 
