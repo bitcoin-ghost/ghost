@@ -884,7 +884,7 @@ mod one_miner_channel_tests {
         s.request_id_to_downstream_id.insert(2, 2);
         let refusal = Mining::OpenMiningChannelError(OpenMiningChannelError {
             request_id: 1,
-            error_code: "node-pool-no-payee".to_string().try_into().unwrap(),
+            error_code: "no-payout-address".to_string().try_into().unwrap(),
         });
         s.process_upstream_message(Target::from_le_bytes([0xff; 32]), refusal, None)
             .await

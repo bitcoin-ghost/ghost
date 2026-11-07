@@ -19,8 +19,6 @@ path = "src/lib/mod.rs"
 [dependencies]
 stratum-apps = { path = "../../crates/stratum-apps", features = ["pool"] }
 ghost-common = { workspace = true }
-ghost-np-relay = { workspace = true }
-ghost-storage = { workspace = true }
 async-channel = "1.5.1"
 serde = { version = "1.0.89", features = ["derive", "alloc"], default-features = false }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
@@ -39,7 +37,3 @@ default = ["monitoring"]
 monitoring = ["stratum-apps/monitoring"]
 hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
-# Test only: GHOST_NP_FAULT makes this pool build hostile coinbases (node_pool_fault.rs), and
-# GHOST_NP_SYNC_FAULT makes its relay serve tampered sync data (ghost-np-relay fault.rs), for the
-# regtest harness's hostile nodes. Never enabled in a release build.
-np-fault-injection = ["ghost-np-relay/fault-injection"]

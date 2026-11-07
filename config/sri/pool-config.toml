@@ -120,37 +120,21 @@ batch_size = 1
 batch_timeout_ms = 2000
 max_retries = 3
 
-# NODE POOL: the only mode. pool_sv2 refuses to start without this section and its relay.
-# Every job carries its channel's GhostShare/v2 tag and the canonical coinbase of its slot class:
-# treasury, the owed miners, the finder (fee_address, every transaction fee), the GHNP table root
-# and the witness commitment. The translator must ship quantise_to_tiers = true.
-#
-# node_id is deliberately NOT set: pool_sv2 reads this node's identity from the co-located
-# ghost-mining's /health at startup. Set it only if ghost-mining is unreachable at startup; when
-# set it is checked against ghost-mining's answer and a mismatch refuses to start.
-[node_pool]
-# The node operator's fee address (P2SH, P2WPKH, P2WSH or P2TR).
-fee_address = "${NODE_FEE_ADDRESS}"
-
-# The share-chain relay and settlement, with their own store. The genesis is the network's
-# (regtest, signet, mainnet): where this node's share chain starts.
-[node_pool.relay]
-# mainnet runs only on the start compiled into pool_sv2; signet and regtest use genesis_anchor.
-network = "${NODE_POOL_NETWORK}"
-listen = "0.0.0.0:8566"
-peers = []
-db_path = "/var/lib/ghost/node-pool.db"
-genesis_anchor = "${NODE_POOL_GENESIS_ANCHOR}"
-genesis_btc_height = 0
-rpc_host = "127.0.0.1"
-rpc_port = 8332
-rpc_user = "${BITCOIN_RPC_USER}"
-rpc_password = "${BITCOIN_RPC_PASSWORD}"
-# Retention (W2.13). A ledger checkpoint is folded this many Bitcoin blocks below the share-chain
-# tip (0: never; at least 40). prune = true deletes stored batches below the older of the two kept
-# checkpoints; leave it off on archive nodes, which serve a fresh node's sync from genesis.
-# checkpoint_depth = 288
-# prune = false
+# GHOST SOLO. Every job pays, in its coinbase: the treasury exactly subsidy / 200, the miner whose
+# username (its Bitcoin address) opened the channel the rest (subsidy - subsidy / 200 + every fee),
+# and the witness commitment. Nothing else. See docs/SOLO.md. The whole section is optional.
+[solo]
+# mainnet (default), signet or regtest: the subsidy schedule and which addresses miners may use.
+network = "mainnet"
+# Where miner-stats.json and blocks-found.json are kept across restarts (unset: memory only).
+state_dir = "/var/lib/ghost/solo"
+# Other Bitcoin nodes every found block is also sent to (submitblock), in parallel, after the
+# local node. Credentials are read from submit_rpc_auth_file (one `user:password`, or
+# `url user:password`, a line; a .cookie file works), never from here, and are never logged.
+# submit_rpc = ["http://10.0.0.2:8332"]
+# submit_rpc_auth_file = "/etc/ghost/solo-submit-rpc.auth"
+# The translator's SV1 ports, shown by /api/v1/pool/status (3333 small miners, 4444 farm tier).
+sv1_ports = [3333, 4444]
 
 # Template Provider Configuration
 # Connects to ghost-mining's TDP server

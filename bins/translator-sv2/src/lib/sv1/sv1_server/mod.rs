@@ -299,7 +299,7 @@ pub(super) fn check_username_attributable(name: &str) -> Result<(), UsernameReje
 /// silent and costs someone their earnings.
 /// SV2 extension type of the Ghost user-agent TLV.
 ///
-/// ⚠ AUTHORITY: `ghost_common::slot_class_sensing::AGENT_TLV_EXTENSION_TYPE`, read by `pool_sv2`.
+/// ⚠ AUTHORITY: `ghost_common::solo::AGENT_TLV_EXTENSION_TYPE`, read by `pool_sv2`.
 /// Duplicated as a literal because this crate is an SRI fork that deliberately does not link the
 /// ghost workspace crates (see `difficulty_manager::MIN_DIFFICULTY_TIER_LOG2`). The pin test below
 /// and the pool's own test hold the two copies to the same value.
@@ -311,7 +311,7 @@ pub(crate) const GHOST_AGENT_FIELD_TYPE: u8 = 0x01;
 
 /// Field type of the payee identity inside [`GHOST_AGENT_EXTENSION_TYPE`], on the `UpdateChannel`
 /// that binds a provisionally opened channel to its miner's `<address>.<worker>`. Authority:
-/// `ghost_common::slot_class_sensing::PAYEE_TLV_FIELD_TYPE`.
+/// `ghost_common::solo::PAYEE_TLV_FIELD_TYPE`.
 pub(crate) const GHOST_PAYEE_FIELD_TYPE: u8 = 0x02;
 
 /// Longest agent forwarded, in bytes. Authority as above (`MAX_AGENT_LEN`).
@@ -720,7 +720,7 @@ mod ghost_agent_tlv_tests {
         parsers_sv2::{parse_message_frame_with_tlvs, AnyMessage, Mining, TlvList},
     };
 
-    /// The literals must match the pool's authority, `ghost_common::slot_class_sensing`.
+    /// The literals must match the pool's authority, `ghost_common::solo`.
     #[test]
     fn the_constants_match_the_pools() {
         assert_eq!(GHOST_AGENT_EXTENSION_TYPE, 0x4748);

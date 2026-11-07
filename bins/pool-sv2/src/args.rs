@@ -49,63 +49,6 @@ pub struct Args {
         help = "Print the base58 authority public key derived from a node key file and exit"
     )]
     pub tdp_pubkey_from_keyfile: Option<PathBuf>,
-    /// Import the cutover's ledger export in DIR (`ledger-export.bin` and `ledger-export.json`)
-    /// into `[node_pool.relay]`'s store as the share chain's genesis table, print its
-    /// `table_root`, and exit. Offline: run it before the relay first runs on the store. Rules in
-    /// `pool_sv2::node_pool_genesis_import`.
-    #[arg(
-        long = "np-import-genesis",
-        value_name = "DIR",
-        help = "Import the ledger export in DIR as the genesis table, print its table_root and exit",
-        requires = "np_export_digest"
-    )]
-    pub np_import_genesis: Option<PathBuf>,
-    /// The published sha256 of `ledger-export.bin`; the import refuses any other file.
-    #[arg(
-        long = "np-export-digest",
-        value_name = "HEX",
-        help = "Expected sha256 of ledger-export.bin (64 hex characters)",
-        requires = "np_import_genesis"
-    )]
-    pub np_export_digest: Option<String>,
-    /// With `--np-import-genesis`: write nothing; check the store holds this export's table.
-    #[arg(
-        long = "np-verify-genesis",
-        help = "With --np-import-genesis: verify the stored genesis table against the export, write nothing",
-        requires = "np_import_genesis"
-    )]
-    pub np_verify_genesis: bool,
-}
-
-/// `--np-import-genesis`: import or verify, print, and exit (0 on success, 2 on a refusal).
-fn import_genesis(config: &PoolConfig, dir: &std::path::Path, digest: &str, verify: bool) -> ! {
-    let result = (|| {
-        let relay = config
-            .node_pool()
-            .and_then(|n| n.relay.as_ref())
-            .ok_or_else(|| "the config has no [node_pool.relay] section".to_string())?;
-        let v = hex::decode(digest.trim()).map_err(|e| format!("--np-export-digest: {e}"))?;
-        let expected: [u8; 32] = v
-            .try_into()
-            .map_err(|_| "--np-export-digest: not 32 bytes".to_string())?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        pool_sv2::node_pool_genesis_import::run(relay, dir, &expected, verify, now)
-    })();
-    match result {
-        Ok(summary) => {
-            for line in summary.lines() {
-                println!("{line}");
-            }
-            std::process::exit(0);
-        }
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(2);
-        }
-    }
 }
 
 /// Read the first 32 bytes of a node identity key file and return them as a
@@ -168,11 +111,6 @@ pub fn process_cli_args() -> PoolConfig {
         .build()
         .and_then(|settings| settings.try_deserialize::<PoolConfig>())
         .expect("Failed to load or deserialize config");
-
-    if let Some(dir) = &args.np_import_genesis {
-        let digest = args.np_export_digest.as_deref().unwrap_or_default();
-        import_genesis(&config, dir, digest, args.np_verify_genesis);
-    }
 
     config.set_log_dir(args.log_file);
 
