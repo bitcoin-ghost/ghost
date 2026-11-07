@@ -10,8 +10,8 @@
 //! - the shell's address check agrees with the payout classes pool_sv2 accepts from a miner
 //!   ([`Solo::payee_for_identity`]) plus the network, on every address class.
 //!
-//! When the installer stops writing `[node_pool]` (the solo installer), the assertion on
-//! `has_legacy_node_pool_section` below flips: update it with it.
+//! `a_solo_section_is_read` does not use the installer: it pins the `[solo]` keys the installer
+//! must write (`docs/SOLO.md`).
 
 use std::{path::PathBuf, process::Command};
 
@@ -91,27 +91,32 @@ fn every_networks_config_parses_and_starts_solo() {
         ),
     ] {
         let config = load(&render(network, fee, "", None));
-        // The installer does not write [solo] yet: the defaults apply.
+        // With or without [solo] (and an old [node_pool], which is ignored), the network the
+        // pool runs on must parse; pool_sv2 refuses to start otherwise.
         let solo = config.solo();
         assert!(solo.network().is_ok(), "{network}");
-        assert!(solo.submit_rpc.is_empty());
-        assert_eq!(solo.sv1_ports, vec![3333, 4444]);
-        assert!(
-            config.has_legacy_node_pool_section(),
-            "{network}: the installer still writes [node_pool], which pool_sv2 ignores"
-        );
+        if let Some(n) = &solo.network {
+            assert_eq!(
+                ghost_common::solo::SoloNetwork::parse(n).unwrap().as_str(),
+                network,
+                "the installer writes the network it installs"
+            );
+        }
         assert_eq!(config.listen_address().port(), 34255);
     }
 }
 
 #[test]
 fn a_solo_section_is_read() {
-    let base = render("regtest", REGTEST_FEE, "", None)
-        .replace("[node_pool]", "[old_node_pool]")
-        .replace("[node_pool.relay]", "[old_node_pool.relay]");
     let toml = format!(
-        "{base}\n[solo]\nnetwork = \"regtest\"\nstate_dir = \"/var/lib/ghost/solo\"\n\
-         submit_rpc = [\"http://10.0.0.2:8332\"]\nsv1_ports = [3333]\n"
+        "authority_public_key = \"{PUB}\"\nauthority_secret_key = \"{SEC}\"\n\
+         cert_validity_sec = 3600\nlisten_address = \"0.0.0.0:34255\"\n\
+         coinbase_reward_script = \"addr({REGTEST_FEE})\"\npool_signature = \"- G H O S T -\"\n\
+         shares_per_minute = 6.0\nshare_batch_size = 1\n\
+         [template_provider_type.Sv2Tp]\naddress = \"127.0.0.1:8442\"\n\
+         [solo]\nnetwork = \"regtest\"\nstate_dir = \"/var/lib/ghost/solo\"\n\
+         submit_rpc = [\"http://10.0.0.2:8332\"]\n\
+         submit_rpc_auth_file = \"/etc/ghost/solo-submit-rpc.auth\"\nsv1_ports = [3333]\n"
     );
     let config = load(&toml);
     let solo = config.solo();
@@ -124,6 +129,10 @@ fn a_solo_section_is_read() {
         Some(std::path::Path::new("/var/lib/ghost/solo"))
     );
     assert_eq!(solo.submit_rpc, vec!["http://10.0.0.2:8332".to_string()]);
+    assert_eq!(
+        solo.submit_rpc_auth_file.as_deref(),
+        Some(std::path::Path::new("/etc/ghost/solo-submit-rpc.auth"))
+    );
     assert_eq!(solo.sv1_ports, vec![3333]);
     assert!(!config.has_legacy_node_pool_section());
 }

@@ -25,5 +25,38 @@ The product is described in `SOLO.md`.
 - Translator: `quantise_to_tiers` off in `config/sri/translator-config.toml`;
   `config/sri/pool-config.toml` has `[solo]` instead of `[node_pool]`.
 
+## pool_sv2 `[solo]` keys (settled; for the installer)
+
+All optional; `[node_pool]` / `[node_pool.relay]` are ignored (warning) and should be dropped.
+
+```toml
+[solo]
+network = "mainnet"                 # mainnet | signet | regtest (default mainnet) -- WRITE IT
+state_dir = "/var/lib/ghost/solo"   # miner-stats.json + blocks-found.json (unset = memory only)
+submit_rpc = ["http://10.0.0.2:8332"]   # other nodes' JSON-RPC URLs; default []
+submit_rpc_auth_file = "/etc/ghost/solo-submit-rpc.auth"  # else env GHOST_SOLO_SUBMIT_RPC_AUTH_FILE
+sv1_ports = [3333, 4444]            # shown by /api/v1/pool/status; default [3333, 4444]
+```
+
+Credentials file (read at start; unreadable file with submit_rpc set = pool refuses to start;
+mode 0600, readable by the pool's user). One entry a line, `#` comments and blank lines ignored:
+
+```text
+http://10.0.0.2:8332 user:password   # this endpoint only (matched on scheme://host:port)
+user:password                         # every endpoint without its own line
+```
+
+A Bitcoin Core `.cookie` (`__cookie__:<hex>`) is valid as is. A URL may also embed
+`http://user:pass@host:port`. Credentials are never logged. `coinbase_reward_script` is still a
+required top-level key (used only for the internal group channel; any valid address).
+
+Miner refusal codes changed: `no-payout-address`, `payout-address-type-refused` (were
+`node-pool-no-payee`, `node-pool-payee-script-refused`). The translator's `quantise_to_tiers`
+should be `false`.
+
+`bins/pool-sv2/tests/installer_config.rs` still renders the installer's pool config through
+`NODE_POOL_FUNCTIONS` / `np_network_defaults` / `np_render_pool_config` / `np_fee_address_check`;
+if those are renamed, update that test with them.
+
 ## Next
 - Get CI green.
