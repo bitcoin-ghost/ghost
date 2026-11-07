@@ -162,3 +162,7 @@ if those are renamed, update that test with them.
   every scenario PASS but API (the later pool's hashrate was still null inside its first minute;
   the harness now waits for it), 129 s of harness time.
 - Removed: `scripts/regtest-node-pool/` (the share-chain harness; kept on `feat/node-pool`).
+- On d80e0dc55: Solo e2e run 42419576714 success (all 12 harness results PASS, job 5 min, harness
+  129 s: 22 pool blocks 139..160 checked, 11 each side of the halving, 2 with fees; every block
+  `duplicate` at the other node, i.e. it already had it over P2P); CI run 42419581767 success, all
+  12 jobs.
