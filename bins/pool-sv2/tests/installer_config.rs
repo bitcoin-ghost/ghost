@@ -7,9 +7,9 @@
 //!   `[node_pool]` and `[node_pool.relay]` sections startup requires;
 //! - on regtest, whose genesis the installer defines, [`NodePool::resolve`] accepts it and the
 //!   relay starts on it and publishes the genesis anchor;
-//! - on mainnet, whose start is compiled into pool_sv2 (set at the flag day), the `UNSET`
-//!   placeholder runs on the compiled start, and any other genesis passed to the installer is
-//!   refused (W2.8);
+//! - on mainnet, whose start is compiled into pool_sv2 (set at the flag day), the installer writes
+//!   that start and pool_sv2 runs on it, and any other genesis passed to the installer is refused
+//!   (W2.8);
 //! - the shell's fee address check agrees with [`NodePool::fee_script`] plus the network on every
 //!   address class, so the installer neither writes an address pool_sv2 refuses nor refuses one
 //!   it accepts.
@@ -17,11 +17,7 @@
 use std::{path::PathBuf, process::Command};
 
 use ext_config::{Config, File, FileFormat};
-use pool_sv2::{
-    config::PoolConfig,
-    node_pool::NodePool,
-    node_pool_relay::{self, GENESIS_UNSET},
-};
+use pool_sv2::{config::PoolConfig, node_pool::NodePool, node_pool_relay};
 use stratum_apps::stratum_core::bitcoin::{address::NetworkUnchecked, Address, Network, ScriptBuf};
 
 const PUB: &str = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72";
@@ -186,20 +182,24 @@ async fn regtest_config_is_accepted_by_resolve_and_starts_the_relay() {
 #[test]
 fn mainnet_config_parses_and_runs_on_the_compiled_start() {
     let toml = render("mainnet", MAINNET_FEE, "", None);
-    assert!(toml.contains("PLACEHOLDER"), "the placeholder is marked");
+    assert!(
+        !toml.contains("PLACEHOLDER"),
+        "mainnet's start is published"
+    );
     let config = load(&toml);
     let np_cfg = config.node_pool().expect("[node_pool]");
     NodePool::fee_script(&np_cfg.fee_address).expect("the fee address is a payee class");
     let relay = np_cfg.relay.as_ref().expect("[node_pool.relay]");
-    assert_eq!(relay.genesis_anchor, GENESIS_UNSET);
     assert!(relay.peers.is_empty());
     assert!(relay.tier_base.is_none(), "mainnet tier 0 is difficulty 1");
     assert_eq!(relay.network.as_deref(), Some("mainnet"));
-    // Mainnet's start is compiled in: the installer's UNSET runs on it.
+    // The installer writes the compiled start itself, and pool_sv2 runs on it.
     let compiled = ghost_common::node_pool_network::MAINNET_START.expect("set at the flag day");
+    assert_eq!(relay.genesis_hash().unwrap(), compiled.genesis_anchor);
+    assert_eq!(relay.genesis_btc_height, compiled.genesis_btc_height);
     let start = relay
         .network_start()
-        .expect("UNSET takes the compiled start");
+        .expect("the installer's genesis is the compiled start");
     assert_eq!(
         (
             start.genesis_anchor,

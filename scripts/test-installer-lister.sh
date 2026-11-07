@@ -30,7 +30,7 @@ hasnt() { if printf '%s\n' "$3" | $G -qF -- "$2"; then printf "  [BAD] %s\n     
 
 echo "1. the option"
 is "default is empty (off, or as the last install left it)" 1 "$($G -cx 'LISTER=""' "$INSTALLER" || true)"
-arms="$($G -E '^[[:space:]]+--(no-)?lister(-table-digest|-genesis-export|-export-digest)?\)' "$INSTALLER")"
+arms="$($G -E '^[[:space:]]+--(no-)?lister(-table-digest|-genesis-export|-export-digest)?(\|--genesis-export)?\)' "$INSTALLER")"
 is "the five flags are parsed" 5 "$(printf '%s\n' "$arms" | $G -c . || true)"
 parse() {
     ( LISTER=""; LISTER_TABLE_DIGEST=""; CONFIG_FLAGS=0

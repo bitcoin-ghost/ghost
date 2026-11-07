@@ -61,7 +61,9 @@ is "unknown network refused" refused "$(refused "$(check bc1qw508d6qejxtdg4y5r3z
 
 echo "2. network defaults"
 np_network_defaults mainnet ibd false
-is "mainnet genesis is not published: UNSET" "UNSET 0" "$NP_GENESIS_ANCHOR $NP_GENESIS_HEIGHT"
+is "mainnet genesis is the flag-day start" "a512f0c9378c31fe34160ee6388b62289596e46110d45079eec8eafe8c4c4526 974875" "$NP_GENESIS_ANCHOR $NP_GENESIS_HEIGHT"
+is "mainnet table digest" 43e8165e "${NP_TABLE_DIGEST:0:8}"
+is "mainnet export digest" cfb62020 "${NP_EXPORT_DIGEST:0:8}"
 is "mainnet tier base is the default" "" "$NP_TIER_BASE"
 is "mainnet P2P port" 8333 "$NP_P2P_PORT"
 np_network_defaults mainnet haze false;  is "haze needs more disk" 250 "$NP_MIN_DISK_GB"
@@ -98,10 +100,14 @@ is "the [node_pool] section comes before [node_pool.relay]" yes \
    "$(a=$(printf '%s\n' "$out" | $G -nx '\[node_pool\]' | cut -d: -f1); b=$(printf '%s\n' "$out" | $G -nxF '[node_pool.relay]' | cut -d: -f1); [ "$a" -lt "$b" ] && echo yes)"
 out="$(render mainnet bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4 "")"
 has "mainnet: no peers is an empty list" 'peers = []' "$out"
-has "mainnet: the UNSET placeholder"     'genesis_anchor = "UNSET"' "$out"
-has "mainnet: marked as a placeholder"   'PLACEHOLDER. No share-chain genesis is published for mainnet' "$out"
-has "mainnet: says pool_sv2 refuses"     'REFUSES TO START' "$out"
+has "mainnet: the published genesis"     'genesis_anchor = "a512f0c9378c31fe34160ee6388b62289596e46110d45079eec8eafe8c4c4526"' "$out"
+has "mainnet: at the freeze height"      'genesis_btc_height = 974875' "$out"
+hasnt "mainnet: no placeholder warning"  'PLACEHOLDER' "$out"
 hasnt "mainnet: no tier_base key"        'tier_base = ' "$out"
+out="$(render signet tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx "")"
+has "signet: the UNSET placeholder"      'genesis_anchor = "UNSET"' "$out"
+has "signet: marked as a placeholder"    'PLACEHOLDER. No share-chain genesis is published for signet' "$out"
+has "signet: says pool_sv2 refuses"      'REFUSES TO START' "$out"
 out="$(render mainnet bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4 "" "ab$(printf 'cd%.0s' {1..31})" 975000)"
 has "a given genesis is written"        "genesis_anchor = \"ab$(printf 'cd%.0s' {1..31})\"" "$out"
 has "with its height"                   'genesis_btc_height = 975000' "$out"
@@ -300,10 +306,10 @@ validated_vars() {
       echo "$FEE_ADDRESS|$RELAY_PEERS|$GENESIS_ANCHOR|$GENESIS_HEIGHT" )
 }
 is "an upgrade from before the node pool takes the old payout address" \
-   "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4||UNSET|0" "$(validated_vars)"
+   "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4||a512f0c9378c31fe34160ee6388b62289596e46110d45079eec8eafe8c4c4526|974875" "$(validated_vars)"
 printf 'fee_address = "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3"\npeers = ["a:1", "b:2"]\ngenesis_anchor = "%s"\ngenesis_btc_height = 975000\n' "$(printf 'ab%.0s' {1..32})" > "$old"
-is "a re-run keeps the fee address, peers and a set genesis" \
-   "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3|a:1 b:2|$(printf 'ab%.0s' {1..32})|975000" "$(validated_vars)"
+is "a re-run keeps the fee address and peers; mainnet's genesis is the published one" \
+   "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3|a:1 b:2|a512f0c9378c31fe34160ee6388b62289596e46110d45079eec8eafe8c4c4526|974875" "$(validated_vars)"
 rm -f "$old"
 is "a genesis anchor needs its height" "ERR --genesis-anchor needs --genesis-height: the anchor's Bitcoin height is part of the genesis." \
    "$(validated bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4 mainnet "$(printf 'ab%.0s' {1..32})")"

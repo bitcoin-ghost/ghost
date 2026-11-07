@@ -52,9 +52,9 @@ ASSUMEVALID="000000000000000000010538edbfd2d5b809a33dd83f284aeea41c6d0d96968a"
 FEE_ADDRESS=""
 NETWORK="mainnet"          # mainnet | signet | regtest
 # The share-chain relay (`[node_pool.relay]`): the port peers dial, peers to dial first, and the
-# share chain's genesis. Empty genesis = the network's published one (np_network_defaults), which
-# for mainnet and signet is not published yet: the node is then written with an UNSET placeholder
-# and pool_sv2 refuses to start until it is set.
+# share chain's genesis. Empty genesis = the network's published one (np_network_defaults). Mainnet's
+# is published; signet's is not, so a signet node is written with an UNSET placeholder and pool_sv2
+# refuses to start until it is set.
 RELAY_PORT="8566"
 RELAY_PEERS=""
 # A custom signet (`signetchallenge`, hex) and Bitcoin peers to dial (`addnode`, host:port). The
@@ -164,6 +164,9 @@ Options:
                                 served read-only at http://<node>:8080/api/v1/node-pool/node-list
                                 for the website's merge. Off regtest it needs the three below.
   --lister-table-digest <hex> The network's pinned genesis table digest (table_root, 64 hex).
+  --genesis-export <dir>      The network's published ledger export (ledger-export.bin and
+                                .json): imported as this node's genesis table before the pool
+                                first starts, and given to the lister. Also --lister-genesis-export.
   --lister-genesis-export <dir>  The ledger export directory (ledger-export.bin and .json)
   --lister-export-digest <hex>     and its published sha256; copied for the lister's first run.
   --no-lister                 Stop and disable the lister (a re-run otherwise keeps it as it was).
@@ -238,7 +241,7 @@ while [[ $# -gt 0 ]]; do
     --lister)         LISTER="true"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --no-lister)      LISTER="false"; shift; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --lister-table-digest) LISTER_TABLE_DIGEST="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
-    --lister-genesis-export) LISTER_GENESIS_EXPORT="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
+    --lister-genesis-export|--genesis-export) LISTER_GENESIS_EXPORT="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --lister-export-digest) LISTER_EXPORT_DIGEST="$2"; shift 2; CONFIG_FLAGS=$((CONFIG_FLAGS+1));;
     --node-pool)      shift;;   # the only mode now; kept so old command lines still run
     --non-interactive) NON_INTERACTIVE="true"; shift;;
@@ -386,13 +389,15 @@ np_fee_address_check() {
 #   NP_TIER_BASE             [node_pool.relay] tier_base, empty for the difficulty-1 default
 #   NP_GENESIS_ANCHOR        the network's published share-chain genesis, or UNSET
 #   NP_GENESIS_HEIGHT        its btc_height (0 when UNSET)
+#   NP_TABLE_DIGEST          its genesis table digest (table_root), or empty
+#   NP_EXPORT_DIGEST         the sha256 of its published ledger export, or empty
 #   NP_MIN_RAM_MB / NP_WARN_RAM_MB, NP_MIN_DISK_GB   the preflight's floors
 #
-# ⛔ No share-chain genesis is published for mainnet or signet yet. They get UNSET, which
-# pool_sv2 refuses at startup by name (`NodePoolRelayConfig::genesis_hash`). Mainnet's start is
-# compiled into pool_sv2 (`node_pool_network::MAINNET_START`, W2.8): when it is set, these values
-# must equal it, and pool_sv2 refuses any other configured mainnet genesis. Guessing one would
-# start a private share chain that no other node joins. Regtest is a local test chain, so it gets
+# Mainnet's start is published (flag day 2026-11-07) and compiled into pool_sv2
+# (`node_pool_network::MAINNET_START`): these values are the same, and pool_sv2 refuses any other
+# configured mainnet genesis. No genesis is published for signet: it gets UNSET, which pool_sv2
+# refuses at startup by name (`NodePoolRelayConfig::genesis_hash`); guessing one would start a
+# private share chain that no other node joins. Regtest is a local test chain, so it gets
 # a fixed genesis every regtest node shares: sha256("GhostNodePool/genesis/regtest"), height 0, and
 # regtest's own proof-of-work limit as tier 0 so CPU-mined shares reach T_net.
 np_network_defaults() {
@@ -400,8 +405,15 @@ np_network_defaults() {
   NP_TIER_BASE=""
   NP_GENESIS_ANCHOR="UNSET"
   NP_GENESIS_HEIGHT=0
+  NP_TABLE_DIGEST=""
+  NP_EXPORT_DIGEST=""
   case "$net" in
     mainnet)
+      # The flag-day start (NODE_POOL_PLAN.md, FLAG_DAY_RUNBOOK.md): freeze 974,875.
+      NP_GENESIS_ANCHOR="a512f0c9378c31fe34160ee6388b62289596e46110d45079eec8eafe8c4c4526"
+      NP_GENESIS_HEIGHT=974875
+      NP_TABLE_DIGEST="43e8165e7ac1ba4b67b328ab0a2ecb8aa20cb2fb2a780b3e3527e59e71410d2d"
+      NP_EXPORT_DIGEST="cfb6202057a3f3b7cb3287cd404849b469880ed3584eb9a587ad6ca644dcb74e"
       # Pruned (prune=550): the chain state is about 12 GB (measured on the old fleet, 2026-11-07),
       # and the old stack runs in 3 GB of RAM; the node pool adds about 0.5 GB (soak, 2026-11-06).
       NP_P2P_PORT=8333; NP_MIN_RAM_MB=2800; NP_WARN_RAM_MB=3800
@@ -1197,6 +1209,9 @@ fi
 if ! [[ "$RELAY_PORT" =~ ^[0-9]{1,5}$ ]] || (( RELAY_PORT == 0 || RELAY_PORT > 65535 )); then
   err "--relay-port must be a TCP port."
 fi
+# The network's published genesis table and export digests, when it has them (mainnet).
+[[ -n "${LISTER_TABLE_DIGEST:-}" ]] || LISTER_TABLE_DIGEST="${NP_TABLE_DIGEST:-}"
+[[ -n "${LISTER_EXPORT_DIGEST:-}" ]] || LISTER_EXPORT_DIGEST="${NP_EXPORT_DIGEST:-}"
 for v in LISTER_TABLE_DIGEST LISTER_EXPORT_DIGEST; do
   [[ -z "${!v:-}" || "${!v:-}" =~ ^[0-9a-fA-F]{64}$ ]] || err "--$(echo "$v" | tr 'A-Z_' 'a-z-') must be 64 hex characters."
 done
@@ -4799,6 +4814,32 @@ WantedBy=multi-user.target
 GHOST_DASHBOARD_SERVICE_EOF
   systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl enable ghost-dashboard >/dev/null 2>&1 || true
+fi
+
+# ─────────────────────────── 10b. the genesis table ──────────────────────────
+# A node whose relay has never run imports the network's genesis table (the old ledger) BEFORE
+# the pool first starts: once the relay has run on its store, the import refuses it. Needs the
+# published ledger export (--genesis-export / --lister-genesis-export and its digest).
+NP_STORE=/var/lib/ghost/node-pool.db
+if [[ "$NETWORK" != regtest && ! -e "$NP_STORE" ]]; then
+  np_export_dir=""
+  if [[ -n "$LISTER_GENESIS_EXPORT" ]]; then np_export_dir="$LISTER_GENESIS_EXPORT"
+  elif [[ -f "$NP_LISTER_EXPORT_DIR/ledger-export.bin" ]]; then np_export_dir="$NP_LISTER_EXPORT_DIR"; fi
+  if [[ -n "$np_export_dir" && "$LISTER_EXPORT_DIGEST" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    log "Importing the genesis table from ${np_export_dir}"
+    systemctl stop sri-translator sri-pool >/dev/null 2>&1 || true
+    np_import_out="$(/opt/ghost/bin/pool_sv2 -c /etc/ghost/pool-config.toml --np-import-genesis "$np_export_dir" \
+        --np-export-digest "${LISTER_EXPORT_DIGEST,,}" 2>&1)" \
+      || err "the genesis table import failed: $(printf '%s' "$np_import_out" | tail -3)"
+    np_verify_out="$(/opt/ghost/bin/pool_sv2 -c /etc/ghost/pool-config.toml --np-import-genesis "$np_export_dir" \
+        --np-export-digest "${LISTER_EXPORT_DIGEST,,}" --np-verify-genesis 2>&1)" \
+      || err "the genesis table does not verify: $(printf '%s' "$np_verify_out" | tail -3)"
+    log "$(printf '%s' "$np_verify_out" | sed -n 's/.*\(NODE_POOL_GENESIS_VERIFIED:.*table_root=[0-9a-f]*\).*/\1/p' | tail -1)"
+  else
+    log "WARNING: no genesis ledger export given (--genesis-export <dir>): this node has no genesis"
+    log "         table, and pool_sv2 will not run until one is imported before its first start:"
+    log "         sudo /opt/ghost/bin/pool_sv2 -c /etc/ghost/pool-config.toml --np-import-genesis <dir> --np-export-digest <sha256>"
+  fi
 fi
 
 # ─────────────────────────────── 11. start ───────────────────────────────────
