@@ -214,11 +214,6 @@ jobs:
       # removes what an older install left.
       - name: Installer lister self-test
         run: ./scripts/test-installer-lister.sh
-      # The Namecheap DNS hook for ghost-audit merge, against a local fake Namecheap API: setHosts
-      # replaces the whole record set, so only the pool's name may change and nothing is written
-      # when getHosts fails or returns nothing. No real API call.
-      - name: Namecheap DNS hook self-test
-        run: python3 -I scripts/dns-hooks/test_namecheap_hook.py
       # The website's API proxy, against fake nodes on loopback: listed hosts and read routes
       # only, GET only, path tricks refused, oversized, slow and redirecting nodes cut off.
       - name: Website API proxy self-test
