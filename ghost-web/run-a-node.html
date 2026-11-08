@@ -15,8 +15,8 @@
   <link rel="icon" href="/logo.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/style.css?v=20261107">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css?v=20261108">
   <script>
     (function () {
       var saved = null;
@@ -29,16 +29,19 @@
 <body>
 
 <header class="site-header">
-  <div class="container header-row">
-    <a href="/" class="brand"><svg class="logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg><span>Ghost Pool</span></a>
-    <nav class="nav" aria-label="Site">
+  <div class="container">
+    <a href="/" class="brand bare"><svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg><span class="wordmark">ghost pool</span></a>
+    <nav class="primary" aria-label="Site">
       <a href="/">home</a>
       <a href="/connect.html">connect</a>
       <a href="/miner.html">miner lookup</a>
       <a href="/faq.html">faq</a>
       <a href="/run-a-node.html" class="current" aria-current="page">run a node</a>
     </nav>
-    <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle colour scheme"></button>
+    <div class="utils">
+      <a href="https://github.com/bitcoin-ghost/ghost" class="bare icon-btn" aria-label="Source code on GitHub"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg></a>
+      <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle colour scheme"></button>
+    </div>
   </div>
 </header>
 
@@ -84,19 +87,27 @@ sudo GHOST_VERSION=np-latest bash install-node.sh --peer-node &lt;node A's IP&gt
 </main>
 
 <footer class="site-footer">
-  <div class="container footer-row">
-    <div>
-      <div class="brand"><svg class="logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg><span>Ghost Pool</span></div>
-      <p class="muted">A solo Bitcoin mining pool. Open source under the MIT license.</p>
+  <div class="container">
+    <div class="colophon">
+      <div class="brand"><svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg><span class="wordmark">ghost pool</span></div>
+      <div class="meta">A solo Bitcoin mining pool. No accounts, no KYC. Open source under the MIT license.</div>
     </div>
-    <ul class="footer-links">
-      <li><a href="/connect.html">Connect a miner</a></li>
-      <li><a href="/miner.html">Miner lookup</a></li>
-      <li><a href="/faq.html">FAQ</a></li>
-      <li><a href="/run-a-node.html">Run a node</a></li>
-      <li><a href="/security.html">Security</a></li>
-      <li><a href="https://github.com/bitcoin-ghost/ghost">Source code</a></li>
-    </ul>
+    <div>
+      <h4>Mine</h4>
+      <ul>
+        <li><a href="/connect.html">Connect a miner</a></li>
+        <li><a href="/miner.html">Miner lookup</a></li>
+        <li><a href="/faq.html">FAQ</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Operate</h4>
+      <ul>
+        <li><a href="/run-a-node.html">Run a node</a></li>
+        <li><a href="/security.html">Security</a></li>
+        <li><a href="https://github.com/bitcoin-ghost/ghost">Source code</a></li>
+      </ul>
+    </div>
   </div>
 </footer>
 
