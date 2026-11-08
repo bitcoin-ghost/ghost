@@ -747,6 +747,22 @@ def halving(h):
            "finder 2,487,500,000 + fees", "PASS" if ok else "FAIL", ev)
 
 
+def delivered(answer, node, block):
+    """The other node's `submitblock` answer means the block reached it: `accepted` or `duplicate`
+    outright, or `inconclusive` provided the block is then on that node's active chain.
+    `inconclusive` is Core's answer when the block is stored but not yet connected, which happens
+    when the same block arrives over P2P while the RPC submit is in flight. Seen in CI on
+    2026-11-08 (failover, block 161) on a run where node1 did reach node0's tip."""
+    if answer in ("accepted", "duplicate"):
+        return True
+    if answer != "inconclusive":
+        return False
+    try:
+        return node.rpc("getblockhash", block["height"]) == block["hash"]
+    except RuntimeError:
+        return False
+
+
 def submitted_to_both(h):
     """Every block a pool found: sent to the other node (accepted or duplicate), on both chains."""
     ev, ok, n_blocks = [], True, 0
@@ -766,7 +782,7 @@ def submitted_to_both(h):
         for b in found:
             n_blocks += 1
             res = {s["node"]: s["result"] for s in b["submitted"]}
-            if res.get(label) not in ("accepted", "duplicate"):
+            if not delivered(res.get(label), other, b):
                 ok = False
                 ev.append(f"node{n.i} block {b['height']}: the other node said {res}")
             for m in h.nodes:
@@ -921,7 +937,7 @@ def failover(h):
         new = n0.status()["blocks_found"][before:]
     for b in new:
         res = [s["result"] for s in b["submitted"]]
-        if not res or res[0] not in ("accepted", "duplicate"):
+        if not res or not delivered(res[0], n1, b):
             ok = False
             ev.append(f"block {b['height']}: node1's ghostd said {res}")
     ev.append(f"node1's pool_sv2 killed (alive: {n1.procs['pool_sv2'].alive()}); node0 mined {h0 + 1}..{h1}, "
