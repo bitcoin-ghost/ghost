@@ -414,3 +414,11 @@ main ol:not([class]), main ul:not([class]) { padding-left: 22px; }
   .stat { padding: 20px; }
   .stat-value { font-size: 24px; }
 }
+
+/* Miner lookup: the live miner list under the lookup box. */
+#list-mode { padding-top: 48px; }
+.miner-list td a.mono { white-space: nowrap; }
+@media (max-width: 640px) {
+  .miner-list .opt { display: none; }
+  .miner-list th, .miner-list td { padding-left: 10px; padding-right: 10px; }
+}

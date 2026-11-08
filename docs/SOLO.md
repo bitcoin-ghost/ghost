@@ -104,11 +104,10 @@ pool_sv2 serves, on its loopback monitoring listener, and ghost-mining forwards 
   reachability check found (`submit_nodes[]`: `node`, `reachable`, `last_checked_at`,
   `last_ok_at`, `height`, `error`; pool_sv2 asks each node `getblockchaininfo` every 60 s with a
   10 s timeout; credentials never appear).
-- `GET /api/v1/pool/miners` (operator only): every payout address with an open channel or a share
-  in the last 24 hours, with its online, idle and offline workers, hashrate, shares, best share and
-  blocks found, the most hashrate first. It names miners, so ghost-mining serves it only to
-  HMAC-signed requests (the dashboard's proxy signs them with `INTERNAL_AUTH_KEY`); unsigned it is
-  `401`, and the website proxy never forwards it.
+- `GET /api/v1/pool/miners`: every payout address with an open channel or a share in the last 24
+  hours, with its online, idle and offline workers, hashrate, shares, best share and blocks found,
+  the most hashrate first. Public, like the per-address page: the website lists the pool's live
+  miners from it.
 
 The JSON of each is documented in `bins/pool-sv2/src/lib/solo_api.rs`. The website shows each
 node's SV2 key from its live status, and `ghost-web/pool-nodes.json`'s key only when a node does

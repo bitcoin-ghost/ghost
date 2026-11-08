@@ -16,7 +16,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/style.css?v=20261108">
+  <link rel="stylesheet" href="/style.css?v=20261108b">
   <script>
     (function () {
       var saved = null;
@@ -50,12 +50,21 @@
   <div class="container">
     <p class="eyebrow">miner lookup</p>
     <h1>Your miner.</h1>
-    <p class="lead">Enter the Bitcoin address your miner uses as its username. Every node is asked, and the answers are added up.</p>
+    <p class="lead">Type any part of the Bitcoin address your miner uses as its username: the live miners below narrow as you type. Pick yours, or enter the whole address.</p>
     <form class="lookup" id="lookup-form">
-      <input id="lookup-input" type="text" placeholder="bc1q…, bc1p… or 3…" autocomplete="off" spellcheck="false" aria-label="Bitcoin address">
+      <input id="lookup-input" type="text" placeholder="bc1q…, bc1p… or 3…, or any part of one" autocomplete="off" spellcheck="false" aria-label="Bitcoin address, or part of one">
       <button type="submit" class="btn btn-primary">Look up</button>
     </form>
     <p class="note">The page's link (<code>?address=…</code>) can be bookmarked; add <code>&amp;worker=&lt;name&gt;</code> to open on one worker.</p>
+  </div>
+</section>
+
+<section class="block" id="list-mode" hidden>
+  <div class="container">
+    <p class="section-label">live miners</p>
+    <h2>Mining on Ghost Pool now.</h2>
+    <p class="section-lead">Every address with a connected worker or a share in the last 24 hours, on every node, the most hashrate first (averaged over 15 minutes). Refreshes every minute.</p>
+    <div id="ml-list" aria-live="polite"></div>
   </div>
 </section>
 
@@ -147,6 +156,6 @@
 </footer>
 
 <script src="/pool.js"></script>
-<script src="/miner.js"></script>
+<script src="/miner.js?v=20261108b"></script>
 </body>
 </html>

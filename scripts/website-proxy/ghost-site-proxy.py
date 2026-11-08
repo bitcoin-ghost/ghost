@@ -25,7 +25,8 @@ Everything else is 404, and every method but GET is 405. Without these rules thi
   a bad one stops the proxy from starting: it never runs with a guessed list. The request names a
   node only by its id; nothing in it chooses a host or a port.
 - **Only the read routes the pages use**, matched on the raw request path before any decoding:
-  `/api/v1/pool/status`, `/api/v1/miner/<addr>` and `/api/v1/miner/<addr>/history`, `<addr>`
+  `/api/v1/pool/status`, `/api/v1/pool/miners`, `/api/v1/miner/<addr>` and
+  `/api/v1/miner/<addr>/history`, `<addr>`
   1-100 letters and digits. The only query forwarded is `window=24h|7d|30d` on history. No `..`,
   no `%`, no other characters reach a node.
 - **Nothing of the viewer's is forwarded**: no header, cookie or body. The request to the node
@@ -34,8 +35,8 @@ Everything else is 404, and every method but GET is 405. Without these rules thi
 - **Bounded.** --timeout seconds for the whole answer (connect, headers and body); a node that
   takes longer is 504. A body over --max-bytes is 502 and nothing of it is sent. A redirect is
   never followed (502). At most --max-inflight requests to nodes at once, then 503. A node's
-  `/api/v1/pool/status` answer (200 only) is cached for --status-cache seconds, so a crowd of
-  viewers on the home page costs one request per node.
+  `/api/v1/pool/status` and `/api/v1/pool/miners` answers (200 only) are cached for
+  --status-cache seconds, so a crowd of viewers costs one request per node.
 
 Logs one line per request to stdout (journald). Python 3.8+, standard library only.
 """
@@ -53,9 +54,13 @@ import time
 
 ADDR = r"[A-Za-z0-9]{1,100}"
 STATUS_ROUTE = "/api/v1/pool/status"
+MINERS_ROUTE = "/api/v1/pool/miners"
+# Answers that are the same for every viewer, cached for --status-cache seconds.
+CACHED_ROUTES = (STATUS_ROUTE, MINERS_ROUTE)
 # The read routes a page may ask a node for: (path regex, allowed query keys and values).
 ROUTES = [
     (re.compile(r"^/api/v1/pool/status$"), {}),
+    (re.compile(r"^/api/v1/pool/miners$"), {}),
     (re.compile(r"^/api/v1/miner/" + ADDR + r"$"), {}),
     (re.compile(r"^/api/v1/miner/" + ADDR + r"/history$"), {"window": {"24h", "7d", "30d"}}),
 ]
@@ -202,7 +207,7 @@ class Proxy:
         self.upstream = upstream
         self.status_cache = status_cache
         self.cache_lock = threading.Lock()
-        self.cached = {}  # node id -> (expires, body)
+        self.cached = {}  # (node id, route) -> (expires, body)
 
     def handle(self, method, raw):
         """(code, body bytes, extra headers) for one request."""
@@ -216,19 +221,19 @@ class Proxy:
         fwd = route_query(m.group(2), query)
         if node is None or fwd is None:
             return 404, b'{"error":"not found"}', {}
-        is_status = fwd == STATUS_ROUTE
-        if is_status:
+        cacheable = fwd in CACHED_ROUTES
+        if cacheable:
             with self.cache_lock:
-                c = self.cached.get(node.id)
+                c = self.cached.get((node.id, fwd))
                 if c and c[0] > time.monotonic():
                     return 200, c[1], {"X-Ghost-Node": node.id}
         try:
             code, body = self.upstream.get(node.host, node.port, fwd)
         except Upstream.Fail as f:
             return f.code, json.dumps({"error": f.msg, "node": node.id}).encode(), {}
-        if is_status and code == 200 and self.status_cache > 0:
+        if cacheable and code == 200 and self.status_cache > 0:
             with self.cache_lock:
-                self.cached[node.id] = (time.monotonic() + self.status_cache, body)
+                self.cached[(node.id, fwd)] = (time.monotonic() + self.status_cache, body)
         return code, body, {"X-Ghost-Node": node.id}
 
 
