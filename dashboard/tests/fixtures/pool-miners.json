@@ -1,0 +1,57 @@
+{
+  "network": "mainnet",
+  "generated_at": 1800000000,
+  "collecting_since": 1799990000,
+  "miners": [
+    {
+      "address": "bc1p5d7rjq7g6rdk2yhzks9smlaqtedr4dekq08ge8ztwac72sfr9rusxg3297",
+      "connected": true,
+      "workers": 3,
+      "online": 2,
+      "idle": 1,
+      "offline": 0,
+      "hashrate_hs": {
+        "15m": 200000000000000.0,
+        "1h": 180000000000000.0,
+        "24h": 150000000000000.0
+      },
+      "shares_24h": {
+        "accepted": 1500,
+        "stale": 2,
+        "rejected": 0,
+        "reject_reasons": {}
+      },
+      "last_share_at": 1799999995,
+      "best_share": {
+        "ever": 99000000000.0,
+        "24h": 1200000000.0
+      },
+      "blocks_found": 1
+    },
+    {
+      "address": "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
+      "connected": false,
+      "workers": 1,
+      "online": 0,
+      "idle": 0,
+      "offline": 1,
+      "hashrate_hs": {
+        "15m": null,
+        "1h": null,
+        "24h": 2000000000000.0
+      },
+      "shares_24h": {
+        "accepted": 40,
+        "stale": 0,
+        "rejected": 0,
+        "reject_reasons": {}
+      },
+      "last_share_at": 1799950000,
+      "best_share": {
+        "ever": 3000000.0,
+        "24h": 3000000.0
+      },
+      "blocks_found": 0
+    }
+  ]
+}

@@ -196,9 +196,6 @@ pub enum GhostError {
     )]
     TreasuryOverflow { current_balance: u64, amount: u64 },
 
-    #[error("L2 fee overflow: calculating total fees would exceed u64::MAX")]
-    L2FeeOverflow,
-
     #[error("Hash mismatch: expected {expected}, got {actual}")]
     HashMismatch { expected: String, actual: String },
 
@@ -237,24 +234,6 @@ pub enum GhostError {
 
     #[error("Invalid verification response: {0}")]
     InvalidVerificationResponse(String),
-
-    // =========================================================================
-    // Ghost Pay L2 Errors
-    // =========================================================================
-    #[error("Ghost Pay error: {0}")]
-    GhostPay(String),
-
-    #[error("Insufficient L2 balance: have={have}, need={need}")]
-    InsufficientL2Balance { have: u64, need: u64 },
-
-    #[error("Invalid L2 transfer: {0}")]
-    InvalidL2Transfer(String),
-
-    #[error("Wraith mixing error: {0}")]
-    WraithMixing(String),
-
-    #[error("Invalid ZK proof: {0}")]
-    InvalidZkProof(String),
 
     // =========================================================================
     // Address Errors

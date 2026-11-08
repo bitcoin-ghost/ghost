@@ -222,8 +222,15 @@ async fn aggregated_translator_triggers_fallback_on_close_channel_message() {
 #[tokio::test]
 async fn tproxy_sends_single_open_extended_mining_channel_in_aggregated_mode() {
     start_tracing();
-    let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::High);
-    let (pool, pool_addr, _) = start_pool(sv2_tp_config(tp_addr), vec![], vec![], false).await;
+    let (tp, tp_addr) = start_template_provider(None, DifficultyLevel::High);
+    let (pool, pool_addr, _) = start_pool(
+        sv2_tp_config(tp_addr),
+        tp.bitcoin_core(),
+        vec![],
+        vec![],
+        false,
+    )
+    .await;
 
     let (pool_translator_sniffer, pool_translator_sniffer_addr) =
         start_sniffer("0", pool_addr, false, vec![], None);
@@ -294,8 +301,14 @@ async fn aggregated_translator_correctly_deals_with_group_channels() {
         None,
     );
 
-    let (pool, pool_addr, _) =
-        start_pool(sv2_tp_config(sniffer_pool_tp_addr), vec![], vec![], false).await;
+    let (pool, pool_addr, _) = start_pool(
+        sv2_tp_config(sniffer_pool_tp_addr),
+        tp.bitcoin_core(),
+        vec![],
+        vec![],
+        false,
+    )
+    .await;
 
     // ignore SubmitSharesSuccess messages, so we can keep the assertion flow simple
     let ignore_submit_shares_success = IgnoreMessage::new(

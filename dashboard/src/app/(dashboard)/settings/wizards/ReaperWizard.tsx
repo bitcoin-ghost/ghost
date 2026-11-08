@@ -139,14 +139,6 @@ export default function ReaperWizard({ isOpen, onClose }: ReaperWizardProps) {
                   <Toggle enabled={data.enabled} onChange={(e) => setData({ enabled: e })} label="Reaper" />
                 </div>
               </div>
-              {data.enabled && (
-                <div className="p-4 rounded-lg bg-[var(--green)]/20 border border-[var(--green)]">
-                  <div className="flex items-center gap-2">
-                    <Badge variant="success">+2 Shares</Badge>
-                    <span className="text-sm text-[color:var(--green)]">Enables Reaper capability verification for node rewards</span>
-                  </div>
-                </div>
-              )}
             </div>
           )}
 

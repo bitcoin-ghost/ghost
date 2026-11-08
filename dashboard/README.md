@@ -17,13 +17,21 @@ report to its keeper (the node operator). Built with Next.js and React.
 
 ## Overview
 
-The dashboard provides:
-- **Node Status** - Sync height, peer count, uptime, and service health
-- **Mining** - Stratum connections, hashrate, shares, blocks found
-- **Rewards** - Share breakdown (5-4-3-2-1 model), payout history, earnings projections
-- **Ghost Pay (L2)** - Block height, epoch, wraith sessions, settlement status
-- **Mesh Network** - Consensus status, peer connections, verification challenges
-- **Swarm Management** - Multi-node fleet monitoring and alerts
+The dashboard is the operator's view of a Ghost Pool node (a solo mining pool: a miner's username
+is its Bitcoin address and a block it finds pays it directly). It provides:
+- **Overview** - pool health (service answering, templates, backup submission, coinbase checks),
+  pool hashrate, connected miners and workers, best share, blocks found, the Bitcoin node's sync,
+  the other nodes found blocks are sent to and what they said, and the payout rule
+- **Miners** - look up a payout address; addresses that found a block here and the ones looked up
+  are listed with workers online, hashrate, shares, best share and expected time to a block,
+  linking to a per-address page with workers, odds, history and blocks found
+- **Blocks Found** - every block found here: what it paid, the coinbase check, the other nodes'
+  answers
+- Bitcoin node (sync, Zero-Sync, Haze, mempool), privacy, filtering, storage and system pages for
+  the node itself
+
+A value the node does not report is shown as unknown, and a failed call as unavailable; neither
+is ever shown as healthy or zero.
 
 ## Architecture
 
@@ -35,11 +43,11 @@ The dashboard provides:
 +------------------+     +------------------+     +------------------+
 ```
 
-The dashboard queries the ghost-node REST API, which in turn:
-- Reads node configuration and status directly
-- Queries the ghost-mining SQLite database for challenge stats and payouts
-- Connects to ghost-pay-node for L2 status
-- Aggregates data from configured swarm nodes
+The dashboard queries the node backend's REST API through its own `/api/proxy` route (which
+signs requests with `INTERNAL_AUTH_KEY`). The Ghost Pool pages read `GET /api/v1/pool/status`,
+`GET /api/v1/miner/{address}` and `GET /api/v1/miner/{address}/history`, which the backend
+forwards to pool_sv2's loopback monitoring listener; their JSON is documented in
+`bins/pool-sv2/src/lib/solo_api.rs`.
 
 ## Development
 
@@ -130,51 +138,18 @@ and is out of scope for this dashboard change.
 
 | Route | Description |
 |-------|-------------|
-| `/` | Overview with key metrics |
-| `/mining` | Stratum mining status and connected miners |
-| `/rewards` | Share breakdown, earnings, payout history |
-| `/ghost-pay` | L2 network status, wraith sessions |
-| `/operator/mesh` | BFT consensus and verification challenges |
-| `/operator/rewards` | Detailed share contributions and network stats |
-| `/operator/swarm` | Multi-node fleet management |
-| `/network` | Pool-wide statistics and payout transparency |
-| `/settings` | Node configuration |
+| `/` | Pool health, hashrate, miners, best share, blocks found, Bitcoin sync, other nodes, payout rule |
+| `/miners` | Look up a payout address; listed addresses with workers, hashrate, shares, best share, odds |
+| `/miners/{address}` | One payout address: summary, expected time to a block, workers, history, blocks found |
+| `/blocks` | Blocks found: reward, fees, treasury, coinbase check, the other nodes' answers |
+| `/mining` | Stratum endpoints and the username rule |
+| `/settings` | Identity, Ghost Pool settings (read-only), alerts and node configuration |
 
-## Share Model (5-4-3-2-1)
+## Tests
 
-Nodes earn shares based on verified capabilities:
-
-| Feature | Shares | Verification |
-|---------|--------|--------------|
-| Archive Mode | +5 | Random historical block challenges (95% pass rate) |
-| Ghost Pay | +4 | L2 block challenges (90% pass rate) |
-| Public Mining | +3 | Stratum port accessibility checks (95% pass rate) |
-| Bitcoin Pure | +2 | Policy compliance challenges (95% pass rate) |
-| Elder Status | +1 | First 101 registered nodes |
-
-**Maximum: 15 shares per node**
-
-## API Integration
-
-The dashboard uses React Query for data fetching with automatic refresh:
-
-```typescript
-// Example: Fetch mesh status
-const { data, isLoading } = useMeshStatus();
-// Refreshes every 30 seconds
-
-// Example: Fetch rewards with custom interval
-const { data } = useRewards({ refetchInterval: 60_000 });
-```
-
-### Key API Endpoints
-
-- `GET /api/v1/status` - Node status
-- `GET /api/v1/mesh/status` - Consensus and challenge stats
-- `GET /api/v1/rewards/full` - Complete rewards breakdown
-- `GET /api/v1/rewards/node-history` - Payout history for this node
-- `GET /api/v1/ghostpay/status` - L2 network status
-- `GET /api/v1/swarm` - Fleet node status
+`npm test` renders the Ghost Pool pages from sample JSON shaped as pool_sv2 serves it
+(`tests/fixtures/`, checked field by field against the Rust structs) and from a failed API, with
+the real components compiled by `tests/helpers/tsx.js`.
 
 ## Deployment
 
@@ -222,54 +197,37 @@ Three details are load-bearing, and each has bitten us:
   reached over an SSH tunnel. Auth does not depend on this (the JWT fails
   closed regardless), but binding publicly removes a layer for no benefit.
 
-Secrets do **not** belong in this unit — keep them in a root-only drop-in at
-`/etc/systemd/system/ghost-dashboard.service.d/override.conf`, which is where
-`DASHBOARD_PASSWORD`, `DASHBOARD_TOKEN_TTL_SECS`, `INTERNAL_AUTH_KEY`,
-`GHOST_PAY_URL` and `GHOST_PAY_API_SECRET` live:
+Secrets do **not** belong in this unit. `DASHBOARD_PASSWORD` lives in
+`/etc/ghost/dashboard.env` (root-only, 600), which the unit reads with
+`EnvironmentFile=`: systemd shows `Environment=` values to every local user
+(`systemctl show`) and never shows a file's contents. `INTERNAL_AUTH_KEY` is in
+the `internal-auth.conf` drop-in, which `install-node.sh` keeps equal to
+`pool.toml`'s `internal_api_secret`.
 
-```ini
-[Service]
-Environment=DASHBOARD_PASSWORD=<value>
-```
+### On a node
 
-### With ghost-node
-
-When deployed alongside ghost-node, the dashboard is accessible at the node's IP on port 3000. Ensure the ghost-node API is running on port 8080.
+`install-node.sh` installs the dashboard with the node, from the same signed
+release (`bitcoin-ghost-<tag>-dashboard.tar.gz`, packed by
+`scripts/package-dashboard.sh`), with Node.js under `/opt/ghost/node`, as
+`ghost-dashboard.service` (`scripts/systemd/ghost-dashboard.service`). The
+auto-updater moves it with each node pool release. See `RUN.md`.
 
 ## Password recovery
 
-Auth is a single `DASHBOARD_PASSWORD`, read from the dashboard's systemd
-drop-in (`/etc/systemd/system/ghost-dashboard.service.d/override.conf`), and
-the dashboard binds loopback. So a forgotten password can lock the operator
-out — there is **no web-based reset**, because a web endpoint that reset the
-password would be an authentication bypass (anyone who could reach the login
-page could take over the node).
-
-Instead, the recovery credential is **node access itself**: reaching the
-dashboard already implies SSH or local access to the node, and only someone
-with that access should be able to reset the password. Run this on the node,
-as root:
+Auth is a single `DASHBOARD_PASSWORD`, and the dashboard binds loopback. There
+is **no web-based reset**, because a web endpoint that reset the password would
+be an authentication bypass (anyone who could reach the login page could take
+over the node). The recovery credential is **node access itself**: the
+installer generated the password on the node, and reading it needs root there:
 
 ```bash
-sudo scripts/agathion-reset-password.sh
+sudo grep DASHBOARD_PASSWORD /etc/ghost/dashboard.env
 ```
 
-It:
-
-- Generates a strong password (or accepts one via `--password <value>`).
-- Writes it to the systemd drop-in as the `DASHBOARD_PASSWORD=` line,
-  **preserving every other `Environment=` entry**, and creates the drop-in if
-  it does not exist yet.
-- Drops any explicit `DASHBOARD_JWT_SECRET=` so the JWT signing secret
-  re-derives from the new password — this plus the restart invalidates all
-  existing `ghost-session` cookies (old sessions die).
-- Runs `systemctl daemon-reload && systemctl restart ghost-dashboard`.
-- Prints the new password.
-
-The script backs up the drop-in before editing it and is idempotent (re-running
-just sets a fresh password). Useful flags: `--no-restart` (write only),
-`--service <name>` (non-default unit name), `--help`. The login page's "Forgot
-password?" link points operators here.
+To set a new one, edit that file and `sudo systemctl restart ghost-dashboard`.
+With `DASHBOARD_JWT_SECRET` unset (the default), the signing secret derives from
+the password, so a new password also ends every existing session. The login
+page's "Forgot password?" link says the same.
 
 ## Technology Stack
 

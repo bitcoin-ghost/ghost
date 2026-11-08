@@ -198,6 +198,8 @@ mod tests {
 
     // ── ClientInfo unit tests ───────────────────────────────────────
 
+    /// The node pool fields are absent from the JSON unless set, so every existing reader sees
+    /// the same document, and a document without them still parses.
     #[test]
     fn client_info_empty_channels() {
         let client = create_sv2_client_info(1, vec![], vec![]);

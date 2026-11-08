@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FAQ · Ghost Pool</title>
+  <meta name="description" content="Plain answers about Ghost Pool: solo versus pooled odds, no KYC, the fee, what happens when you find a block, and coinbase maturity.">
+  <meta property="og:site_name" content="Ghost Pool">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="FAQ · Ghost Pool">
+  <meta property="og:description" content="Plain answers about Ghost Pool: solo versus pooled odds, no KYC, the fee, what happens when you find a block, and coinbase maturity.">
+  <meta property="og:url" content="https://bitcoinghost.org/faq.html">
+  <meta property="og:image" content="https://bitcoinghost.org/logo.png">
+  <meta name="twitter:card" content="summary">
+  <link rel="icon" href="/logo.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css?v=20261108">
+  <script>
+    (function () {
+      var saved = null;
+      try { saved = localStorage.getItem('ghost-theme'); } catch (e) {}
+      var dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+      document.documentElement.setAttribute('data-theme', saved || (dark ? 'dark' : 'light'));
+    })();
+  </script>
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container">
+    <a href="/" class="brand bare"><svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg><span class="wordmark">ghost pool</span></a>
+    <nav class="primary" aria-label="Site">
+      <a href="/">home</a>
+      <a href="/connect.html">connect</a>
+      <a href="/miner.html">miner lookup</a>
+      <a href="/faq.html" class="current" aria-current="page">faq</a>
+      <a href="/run-a-node.html">run a node</a>
+    </nav>
+    <div class="utils">
+      <a href="https://github.com/bitcoin-ghost/ghost" class="bare icon-btn" aria-label="Source code on GitHub"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg></a>
+      <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle colour scheme"></button>
+    </div>
+  </div>
+</header>
+
+<main>
+<section class="hero hero-small">
+  <div class="container">
+    <p class="eyebrow">faq</p>
+    <h1>Questions, answered plainly.</h1>
+  </div>
+</section>
+
+<section class="block">
+  <div class="container faq">
+
+    <h2 id="odds">Solo or pooled: what are my odds?</h2>
+    <p>The same hashrate finds the same number of blocks on average wherever it mines. What differs is how the reward reaches you.</p>
+    <ul class="plain-list">
+      <li><strong>In a pooled pool</strong> (PPS, FPPS, PPLNS) thousands of miners share every block the pool finds, so you get a small, steady amount, and the pool takes a fee of 1 to 4% for smoothing out the luck.</li>
+      <li><strong>Solo</strong>, you get nothing until your own miner finds a block, and then you get the whole block. If it never finds one, you get nothing at all.</li>
+    </ul>
+    <p>The average wait for a block is <code>network difficulty × 2<sup>32</sup> ÷ your hashrate</code>. At today's difficulty that is thousands of years for a 1 TH/s Bitaxe and decades for a single 200 TH/s Antminer. Each hash is an independent draw, so being "due" does not exist: you can find a block tomorrow, or never. The <a href="/miner.html">miner lookup</a> shows your average wait and your chance within a day, a month and a year.</p>
+    <p><strong>Solo mining is a lottery.</strong> Mine solo because you want a chance at a whole block, or to support decentralised block building, and only with hashrate whose electricity you can afford to spend with no return.</p>
+
+    <h2 id="kyc">Do I need an account? Is there KYC?</h2>
+    <p>No. There is no sign-up, no e-mail and no KYC. Your username is your Bitcoin address, and that is all the pool knows about you, apart from the IP address your miner connects from.</p>
+
+    <h2 id="fees">What does it cost?</h2>
+    <p>0.5% of the block subsidy, and only from a block you find: today 0.015625 BTC of the 3.125 BTC subsidy goes to the pool's treasury (<code class="break">bc1qgxg5ywk835c9fp6arz6d6x50xpk6y0ualt900k</code>). Every transaction fee in the block is yours. If you never find a block, you pay nothing.</p>
+    <p>The split is built into the pool software and checked on every block the pool finds. It is in the coinbase of every job your miner works on, so you can check it yourself (see <a href="#check">below</a>).</p>
+
+    <h2 id="found">What happens when my miner finds a block?</h2>
+    <ol class="plain-list">
+      <li>The node your miner is connected to submits the block to its own Bitcoin node at once, and sends it to the other node too, so it reaches the network even if one of them is slow or down.</li>
+      <li>The block's coinbase transaction pays your address directly: the subsidy less 0.5%, plus every fee. Nobody else touches the money.</li>
+      <li>The block shows on your <a href="/miner.html">miner page</a> and the <a href="/">home page</a>, with a link to a block explorer.</li>
+      <li>If another miner's block at the same height wins the race, yours is orphaned and pays nothing. This is rare, and it is a rule of Bitcoin, not of the pool.</li>
+    </ol>
+
+    <h2 id="maturity">When can I spend it?</h2>
+    <p>Bitcoin's rules make a coinbase output spendable only after 100 more blocks: about 17 hours. Your wallet will show it as immature until then.</p>
+
+    <h2 id="templates">Which transactions go in the blocks?</h2>
+    <p>The nodes build each block template from the highest-fee standard transactions in their mempool, with Bitcoin Core's standard policy. Stratum V2 Job Declaration, where your own node chooses the transactions, is coming soon.</p>
+
+    <h2 id="ports">Which port should I use?</h2>
+    <p><code>3333</code> for small miners (Bitaxe, NerdAxe, Avalon Nano): it starts at a low share difficulty. <code>4444</code> for larger machines (Antminer, Whatsminer, Avalon A-series, rented hashrate): it starts higher, so a fast miner does not flood the node with shares. <code>34255</code> is Stratum V2, encrypted, with the node's authority key. The share difficulty adjusts itself to your miner either way; it does not change your odds of finding a block.</p>
+
+    <h2 id="two-nodes">Why two nodes?</h2>
+    <p>Each is a backup for the other. Set one as your primary pool and the other as your backup, and your miner keeps working if one goes down. A block found through either is sent to the Bitcoin network through both.</p>
+
+    <h2 id="shares">What are shares and best share for, if I am paid only for blocks?</h2>
+    <p>Shares are how the pool sees that your miner is working and how fast. Your <em>best share</em> is the highest difficulty any of your hashes reached; a block needs a hash at the network difficulty. It is a measure of how close you have come, not a step towards a block: each hash is a new draw.</p>
+
+    <h2 id="check">Can I check the pool is not cheating?</h2>
+    <p>Yes. Every job the pool sends has the full coinbase in it. <code>ghost-audit check --sv1 &lt;node&gt;:3333 --address &lt;your address&gt;</code> (in the <a href="https://github.com/bitcoin-ghost/ghost">source repository</a>) connects as a miner, takes a few jobs, submits nothing, and checks that each pays the treasury exactly subsidy ÷ 200 and your address the rest, with nothing else. <code>--sv2 &lt;node&gt;:34255 --authority-key &lt;key&gt;</code> checks the SV2 port the same way.</p>
+
+    <h2 id="trust">What do I have to trust?</h2>
+    <p>That the node submits your block when you find one. A node could, in principle, withhold a block your miner found; you would not be paid, and it would not be paid either. The coinbase split itself you can check, as above. The software is open source.</p>
+  </div>
+</section>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="colophon">
+      <div class="brand"><svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg><span class="wordmark">ghost pool</span></div>
+      <div class="meta">A solo Bitcoin mining pool. No accounts, no KYC. Open source under the MIT license.</div>
+    </div>
+    <div>
+      <h4>Mine</h4>
+      <ul>
+        <li><a href="/connect.html">Connect a miner</a></li>
+        <li><a href="/miner.html">Miner lookup</a></li>
+        <li><a href="/faq.html">FAQ</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Operate</h4>
+      <ul>
+        <li><a href="/run-a-node.html">Run a node</a></li>
+        <li><a href="/security.html">Security</a></li>
+        <li><a href="https://github.com/bitcoin-ghost/ghost">Source code</a></li>
+      </ul>
+    </div>
+  </div>
+</footer>
+
+<script src="/pool.js"></script>
+
+</body>
+</html>

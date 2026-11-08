@@ -20,8 +20,8 @@ const plexMono = IBM_Plex_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Ghost Node",
-  description: "Ghost Node — the familiar spirit that watches your Ghost node",
+  title: "Ghost Pool node",
+  description: "The operator dashboard of a Ghost Pool node",
 };
 
 // Inline script that runs before paint so there's no flash of wrong theme on

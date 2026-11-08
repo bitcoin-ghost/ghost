@@ -3,7 +3,6 @@ use stratum_apps::{
     config_helpers::CoinbaseRewardScript,
     stratum_core::{
         binary_sv2::Str0255,
-        bitcoin::{Amount, TxOut},
         common_messages_sv2::{Protocol, SetupConnection},
         mining_sv2::CloseChannel,
         parsers_sv2::{Mining, Tlv},
@@ -77,9 +76,9 @@ pub(crate) fn create_close_channel_msg(channel_id: ChannelId, msg: &str) -> Clos
     }
 }
 
-/// Represents the payout mode for a mining connection.
-///
-/// This determines how the coinbase reward is distributed:
+/// How a channel's user identity names its payee. The node pool takes the address of the solo
+/// forms as the miner's payout script (`NodePool::payee_for_identity`); the coinbase itself is
+/// always the canonical one. The SRI forms parsed here:
 /// - `Solo`: Full reward goes to the miner's specified payout address. Pattern:
 ///   `sri/solo/<payout_address>/<worker_name>` or plain Bitcoin address
 /// - `Donate`: Partial donation to pool, remainder to miner. Pattern:
@@ -97,51 +96,6 @@ pub enum PayoutMode {
     },
     /// Full donation mode: full reward goes to the pool.
     FullDonation,
-}
-
-impl PayoutMode {
-    pub fn coinbase_outputs(
-        &self,
-        total_value: u64,
-        pool_script: &CoinbaseRewardScript,
-    ) -> Vec<TxOut> {
-        match self {
-            PayoutMode::Solo {
-                script: coinbase_script,
-            } => {
-                vec![TxOut {
-                    value: Amount::from_sat(total_value),
-                    script_pubkey: coinbase_script.script_pubkey(),
-                }]
-            }
-
-            PayoutMode::Donate {
-                percentage,
-                script: miner_script,
-            } => {
-                let pool_value = (total_value * *percentage as u64) / 100;
-                let miner_value = total_value.saturating_sub(pool_value);
-
-                vec![
-                    TxOut {
-                        value: Amount::from_sat(pool_value),
-                        script_pubkey: pool_script.script_pubkey(),
-                    },
-                    TxOut {
-                        value: Amount::from_sat(miner_value),
-                        script_pubkey: miner_script.script_pubkey(),
-                    },
-                ]
-            }
-
-            PayoutMode::FullDonation => {
-                vec![TxOut {
-                    value: Amount::from_sat(total_value),
-                    script_pubkey: pool_script.script_pubkey(),
-                }]
-            }
-        }
-    }
 }
 
 #[allow(clippy::result_large_err)]

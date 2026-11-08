@@ -28,10 +28,58 @@ use tracing::{debug, info, warn};
 use ghost_common::error::{GhostError, GhostResult};
 
 /// Current schema version
-const SCHEMA_VERSION: u32 = 62;
+const SCHEMA_VERSION: u32 = 65;
+
+/// The schema version this binary migrates to, for code outside this module (tests, tools).
+pub const LATEST_SCHEMA_VERSION: u32 = SCHEMA_VERSION;
+
+/// The first schema version stored negated in `PRAGMA user_version` (v65, the node pool cutover).
+///
+/// Every binary from before v65 reads `user_version` as a `u32` when it opens the database, and a
+/// negative value fails that read, so an old binary refuses a v65 database at open instead of
+/// running against the tables v65 dropped (`migration_v65.rs`). Versions below this one
+/// are stored as they always were.
+pub const FIRST_NEGATED_SCHEMA_VERSION: u32 = 65;
+
+/// Decode a raw `PRAGMA user_version`: `0..=64` as stored, `-65` and below as their negation.
+/// Anything else (a positive value at or above 65, or a negative one above -65) was not written
+/// by this code and is refused rather than guessed at.
+pub fn decode_schema_version(raw: i64) -> GhostResult<u32> {
+    let first = FIRST_NEGATED_SCHEMA_VERSION as i64;
+    if (0..first).contains(&raw) {
+        return Ok(raw as u32);
+    }
+    if raw <= -first && raw >= -(u32::MAX as i64) {
+        return Ok((-raw) as u32);
+    }
+    Err(GhostError::Migration(format!(
+        "PRAGMA user_version is {raw}, which no Ghost build writes: versions below \
+         {FIRST_NEGATED_SCHEMA_VERSION} are stored as they are and later ones negated"
+    )))
+}
+
+/// The raw `PRAGMA user_version` value for schema version `v` (see [`decode_schema_version`]).
+pub fn encode_schema_version(v: u32) -> i64 {
+    if v >= FIRST_NEGATED_SCHEMA_VERSION {
+        -(v as i64)
+    } else {
+        v as i64
+    }
+}
+
+/// The decoded schema version of an open database.
+pub fn schema_version(conn: &Connection) -> GhostResult<u32> {
+    get_schema_version(conn)
+}
 
 /// Run all pending migrations
 pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
+    run_migrations_to(conn, SCHEMA_VERSION)
+}
+
+/// Run the pending migrations up to and including `target` (tests build a database at an earlier
+/// version with it; production always passes [`SCHEMA_VERSION`]).
+pub(crate) fn run_migrations_to(conn: &Connection, target: u32) -> GhostResult<()> {
     let current_version = get_schema_version(conn)?;
 
     // A database AHEAD of the binary is always a mistake, and it used to be completely silent.
@@ -55,14 +103,14 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         return Ok(());
     }
 
-    if current_version == SCHEMA_VERSION {
+    if current_version >= target {
         debug!(version = current_version, "Database schema up to date");
         return Ok(());
     }
 
     info!(
         from = current_version,
-        to = SCHEMA_VERSION,
+        to = target,
         "Running database migrations"
     );
 
@@ -139,24 +187,38 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
         (60, migrate_v60),
         (61, migrate_v61),
         (62, migrate_v62),
+        (63, migrate_v63),
+        (64, migrate_v64),
     ];
 
+    // v65's refusals, before anything runs: a database it will refuse must not first be moved
+    // through the migrations below it (an old fleet database is at v62).
+    if current_version < crate::migration_v65::V65 && crate::migration_v65::V65 <= target {
+        crate::migration_v65::preflight(conn, current_version)?;
+    }
+
     for &(version, migrate_fn) in pre_v10 {
-        if current_version < version {
+        if current_version < version && version <= target {
             run_migration_tx(conn, version, migrate_fn)?;
         }
     }
 
     // v10 manages its own PRAGMA foreign_keys ON/OFF and cannot be wrapped
-    if current_version < 10 {
+    if current_version < 10 && 10 <= target {
         migrate_v10(conn)?;
         set_schema_version(conn, 10)?;
     }
 
     for &(version, migrate_fn) in post_v10 {
-        if current_version < version {
+        if current_version < version && version <= target {
             run_migration_tx(conn, version, migrate_fn)?;
         }
+    }
+
+    // v65 manages its own transaction: its backup (`VACUUM INTO`) cannot run inside one, and its
+    // space reclamation runs after the commit.
+    if current_version < crate::migration_v65::V65 && crate::migration_v65::V65 <= target {
+        crate::migration_v65::run(conn, set_schema_version)?;
     }
 
     // A migration that rewrites a large table leaves the whole rewrite sitting in the WAL, and
@@ -173,7 +235,7 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
     // and refusing to start over a housekeeping step would turn a disk-space nuisance into an
     // outage on every node at once. It must also run OUTSIDE a transaction, which is why it sits
     // here rather than inside `run_migration_tx`.
-    if current_version < SCHEMA_VERSION {
+    if current_version < target {
         if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
             warn!(
                 "post-migration WAL checkpoint failed; the WAL will shrink at the next \
@@ -188,10 +250,10 @@ pub fn run_migrations(conn: &Connection) -> GhostResult<()> {
 
 /// Get current schema version
 fn get_schema_version(conn: &Connection) -> GhostResult<u32> {
-    let version: u32 = conn
+    let raw: i64 = conn
         .query_row("PRAGMA user_version;", [], |row| row.get(0))
         .map_err(|e| GhostError::Database(e.to_string()))?;
-    Ok(version)
+    decode_schema_version(raw)
 }
 
 /// Set schema version
@@ -204,11 +266,11 @@ fn get_schema_version(conn: &Connection) -> GhostResult<u32> {
 ///
 /// SECURITY: While format! is used, u32 cannot produce SQL injection.
 /// The version number is bounded by u32::MAX and only contains digits.
-fn set_schema_version(conn: &Connection, version: u32) -> GhostResult<()> {
+pub(crate) fn set_schema_version(conn: &Connection, version: u32) -> GhostResult<()> {
     // PRAGMA does not support ? parameters
     // SECURITY: Use Display formatting for u32 which produces only ASCII digits 0-9
     // This is SQL injection safe because u32.to_string() cannot contain ', ", ;, or --
-    let sql = format!("PRAGMA user_version = {}", version);
+    let sql = format!("PRAGMA user_version = {}", encode_schema_version(version));
     conn.execute(&sql, [])
         .map_err(|e| GhostError::Database(e.to_string()))?;
     Ok(())
@@ -2705,6 +2767,232 @@ fn migrate_v53(conn: &Connection) -> GhostResult<()> {
     Ok(())
 }
 
+/// v63: node pool storage (W2.4): the anchor chain, batches and their shares, the face-unit
+/// ledger with its credit and retirement journals, pinned snapshot roots and per-miner sensing.
+///
+/// Additive only: new `np_*` tables, nothing existing is touched, and an older binary opens the
+/// newer database and ignores them. Dark: nothing in the running node reads or writes them yet;
+/// the typed API is `node_pool_store`.
+///
+/// Every face-unit amount is a 32-byte two's complement big-endian BLOB, the encoding
+/// `canonical_payout::table_root` hashes. Balances are `i128` face units (`2^-32` sat) and may be
+/// negative, so an SQLite INTEGER (`i64`) would cap a balance at about 21.47 BTC.
+///
+/// Payee scripts are stored as plain bytes: they are already public in every share's coinbase,
+/// and the ledger keys on script bytes, never on address strings.
+fn migrate_v63(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v63: node pool tables");
+    conn.execute_batch(NODE_POOL_V63_DDL)
+        .map_err(|e| GhostError::Migration(e.to_string()))?;
+    info!("v63: created the node pool tables (np_*, dormant)");
+    Ok(())
+}
+
+/// The v63 schema. `IF NOT EXISTS` throughout, so a replay is a no-op.
+const NODE_POOL_V63_DDL: &str = "
+    -- One row per anchor header. `parent` is NULL only for the genesis anchor. `t_net` is the
+    -- tier in force for the anchor (it met t_net + 8); `cum_work` is the cumulative anchor work,
+    -- genesis to here, as a 32-byte big-endian integer.
+    CREATE TABLE IF NOT EXISTS np_anchors (
+        hash         BLOB    PRIMARY KEY CHECK (typeof(hash) = 'blob' AND length(hash) = 32),
+        parent       BLOB    CHECK (parent IS NULL
+                                    OR (typeof(parent) = 'blob' AND length(parent) = 32)),
+        height       INTEGER NOT NULL CHECK (height >= 0),
+        t_net        INTEGER NOT NULL CHECK (t_net BETWEEN 0 AND 255),
+        btc_height   INTEGER NOT NULL CHECK (btc_height >= 0),
+        cum_work     BLOB    NOT NULL CHECK (typeof(cum_work) = 'blob' AND length(cum_work) = 32),
+        batch_root   BLOB    NOT NULL CHECK (typeof(batch_root) = 'blob'
+                                             AND length(batch_root) = 32),
+        received_at  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_np_anchors_parent ON np_anchors(parent);
+    CREATE INDEX IF NOT EXISTS idx_np_anchors_btc_height ON np_anchors(btc_height);
+
+    -- An anchor's batch, once held. `btc_height` is the anchor's, copied so retention can prune
+    -- by it without a join.
+    CREATE TABLE IF NOT EXISTS np_batches (
+        anchor_hash  BLOB    PRIMARY KEY REFERENCES np_anchors(hash),
+        batch_root   BLOB    NOT NULL CHECK (typeof(batch_root) = 'blob'
+                                             AND length(batch_root) = 32),
+        share_count  INTEGER NOT NULL CHECK (share_count >= 0),
+        btc_height   INTEGER NOT NULL CHECK (btc_height >= 0),
+        received_at  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_np_batches_btc_height ON np_batches(btc_height);
+
+    -- One row per share, whatever number of batches carry it (a losing anchor's shares are
+    -- re-included on the winning fork). Everything `share_commit::verify_share` reads from the
+    -- share itself: the 80-byte header, the raw coinbase, the merkle branch (concatenated
+    -- 32-byte hashes) and the tag preimage. `job_height` is the caller's resolution of the
+    -- header's prev_hash, plus one. `share_id` is sha256d(header).
+    CREATE TABLE IF NOT EXISTS np_shares (
+        share_id       BLOB    PRIMARY KEY CHECK (typeof(share_id) = 'blob'
+                                                  AND length(share_id) = 32),
+        header         BLOB    NOT NULL CHECK (typeof(header) = 'blob' AND length(header) = 80),
+        coinbase       BLOB    NOT NULL CHECK (typeof(coinbase) = 'blob'),
+        merkle_branch  BLOB    NOT NULL CHECK (typeof(merkle_branch) = 'blob'
+                                               AND length(merkle_branch) % 32 = 0),
+        node_id        BLOB    NOT NULL CHECK (typeof(node_id) = 'blob' AND length(node_id) = 32),
+        tier           INTEGER NOT NULL CHECK (tier BETWEEN 0 AND 255),
+        slot_class     INTEGER NOT NULL CHECK (slot_class BETWEEN 0 AND 65535),
+        payee_script   BLOB    NOT NULL CHECK (typeof(payee_script) = 'blob'),
+        parent_anchor  BLOB    NOT NULL CHECK (typeof(parent_anchor) = 'blob'
+                                               AND length(parent_anchor) = 32),
+        batch_root     BLOB    NOT NULL CHECK (typeof(batch_root) = 'blob'
+                                               AND length(batch_root) = 32),
+        job_height     INTEGER NOT NULL CHECK (job_height >= 0)
+    );
+
+    -- A batch's shares in batch order, with what each earned under its including anchor:
+    -- the credited tier is max(T_net, committed tier), so it belongs to the inclusion, not to
+    -- the share. `face` is face units, 32-byte two's complement big-endian.
+    CREATE TABLE IF NOT EXISTS np_batch_shares (
+        anchor_hash    BLOB    NOT NULL REFERENCES np_batches(anchor_hash) ON DELETE CASCADE,
+        position       INTEGER NOT NULL CHECK (position >= 0),
+        share_id       BLOB    NOT NULL REFERENCES np_shares(share_id),
+        credited_tier  INTEGER NOT NULL CHECK (credited_tier BETWEEN 0 AND 255),
+        face           BLOB    NOT NULL CHECK (typeof(face) = 'blob' AND length(face) = 32),
+        PRIMARY KEY (anchor_hash, position),
+        UNIQUE (anchor_hash, share_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_np_batch_shares_share ON np_batch_shares(share_id);
+
+    -- The materialised balance table: one row per payee script. `owed` is face units
+    -- (2^-32 sat), 32-byte two's complement big-endian, and may be negative. `queue_since` is
+    -- NULL below the 1,000-sat floor.
+    CREATE TABLE IF NOT EXISTS np_ledger (
+        script       BLOB    PRIMARY KEY CHECK (typeof(script) = 'blob'),
+        owed         BLOB    NOT NULL CHECK (typeof(owed) = 'blob' AND length(owed) = 32),
+        queue_since  INTEGER CHECK (queue_since IS NULL OR queue_since >= 0)
+    );
+
+    -- Every change to np_ledger, in order. Undo is strictly last-in first-out, which is what
+    -- makes it exact. kind 0 = a credit event keyed by its anchor, kind 1 = a block keyed by its
+    -- hash. At most one block per Bitcoin height is applied at a time.
+    CREATE TABLE IF NOT EXISTS np_ledger_events (
+        seq          INTEGER PRIMARY KEY,
+        kind         INTEGER NOT NULL CHECK (kind IN (0, 1)),
+        event_key    BLOB    NOT NULL CHECK (typeof(event_key) = 'blob'
+                                             AND length(event_key) = 32),
+        height       INTEGER NOT NULL CHECK (height >= 0),
+        applied_at   INTEGER NOT NULL,
+        UNIQUE (kind, event_key)
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_np_ledger_events_block_height
+        ON np_ledger_events(height) WHERE kind = 1;
+
+    -- Credits applied by a credit event, with the row each replaced (prior_present = 0 means
+    -- the script had no row).
+    CREATE TABLE IF NOT EXISTS np_credits (
+        event_key          BLOB    NOT NULL CHECK (typeof(event_key) = 'blob'
+                                                   AND length(event_key) = 32),
+        position           INTEGER NOT NULL CHECK (position >= 0),
+        credit_height      INTEGER NOT NULL CHECK (credit_height >= 0),
+        script             BLOB    NOT NULL CHECK (typeof(script) = 'blob'),
+        amount             BLOB    NOT NULL CHECK (typeof(amount) = 'blob' AND length(amount) = 32),
+        prior_present      INTEGER NOT NULL CHECK (prior_present IN (0, 1)),
+        prior_owed         BLOB    CHECK (prior_owed IS NULL
+                                          OR (typeof(prior_owed) = 'blob'
+                                              AND length(prior_owed) = 32)),
+        prior_queue_since  INTEGER,
+        PRIMARY KEY (event_key, position)
+    );
+    CREATE INDEX IF NOT EXISTS idx_np_credits_height ON np_credits(credit_height);
+
+    -- Retirements per block, in coinbase pay order, with the row each replaced, for reorg undo.
+    CREATE TABLE IF NOT EXISTS np_retirements (
+        block_hash         BLOB    NOT NULL CHECK (typeof(block_hash) = 'blob'
+                                                   AND length(block_hash) = 32),
+        position           INTEGER NOT NULL CHECK (position >= 0),
+        height             INTEGER NOT NULL CHECK (height >= 0),
+        script             BLOB    NOT NULL CHECK (typeof(script) = 'blob'),
+        amount             BLOB    NOT NULL CHECK (typeof(amount) = 'blob' AND length(amount) = 32),
+        prior_present      INTEGER NOT NULL CHECK (prior_present IN (0, 1)),
+        prior_owed         BLOB    CHECK (prior_owed IS NULL
+                                          OR (typeof(prior_owed) = 'blob'
+                                              AND length(prior_owed) = 32)),
+        prior_queue_since  INTEGER,
+        PRIMARY KEY (block_hash, position)
+    );
+    CREATE INDEX IF NOT EXISTS idx_np_retirements_height ON np_retirements(height);
+
+    -- Snapshot table roots pinned per cut height, per snapshot anchor (forks may disagree on
+    -- S(H) before they heal).
+    CREATE TABLE IF NOT EXISTS np_snapshot_roots (
+        cut_height   INTEGER NOT NULL CHECK (cut_height >= 0),
+        anchor_hash  BLOB    NOT NULL CHECK (typeof(anchor_hash) = 'blob'
+                                             AND length(anchor_hash) = 32),
+        table_root   BLOB    NOT NULL CHECK (typeof(table_root) = 'blob'
+                                             AND length(table_root) = 32),
+        row_count    INTEGER NOT NULL CHECK (row_count >= 0),
+        pinned_at    INTEGER NOT NULL,
+        PRIMARY KEY (cut_height, anchor_hash)
+    );
+
+    -- The latest sensing result per miner payee script and user agent: the highest slot class
+    -- that passed, the class that failed (if any), and when.
+    CREATE TABLE IF NOT EXISTS np_miner_sensing (
+        miner_script        BLOB    NOT NULL CHECK (typeof(miner_script) = 'blob'),
+        user_agent          TEXT    NOT NULL,
+        highest_pass_class  INTEGER CHECK (highest_pass_class IS NULL
+                                           OR highest_pass_class BETWEEN 0 AND 65535),
+        failed_class        INTEGER CHECK (failed_class IS NULL
+                                           OR failed_class BETWEEN 0 AND 65535),
+        sensed_at           INTEGER NOT NULL,
+        PRIMARY KEY (miner_script, user_agent)
+    );
+";
+
+/// v64: share-chain sync (W2.13): the Bitcoin block archive and the ledger checkpoints.
+///
+/// Additive only, like v63: two new `np_*` tables.
+///
+/// - `np_btc_blocks`: every Bitcoin header the node pool has met above its genesis (and the 11
+///   below it, for median time past), on every branch, with the block's coinbase and its merkle
+///   branch. Settlement and share checks walk a share's Bitcoin ancestry through it, and a peer
+///   whose Bitcoin node never saw a stale branch fetches it from here: Bitcoin peers do not serve
+///   stale blocks.
+/// - `np_checkpoints`: the folded ledger state at a deep anchor, so a restart does not replay
+///   every batch and batches below it can be pruned. `digest` covers `payload`; a row whose
+///   digest does not match is corrupt and is rebuilt.
+fn migrate_v64(conn: &Connection) -> GhostResult<()> {
+    debug!("Running migration v64: node pool sync tables");
+    conn.execute_batch(NODE_POOL_V64_DDL)
+        .map_err(|e| GhostError::Migration(e.to_string()))?;
+    info!("v64: created the node pool sync tables (np_btc_blocks, np_checkpoints)");
+    Ok(())
+}
+
+/// The v64 schema. `IF NOT EXISTS` throughout, so a replay is a no-op.
+const NODE_POOL_V64_DDL: &str = "
+    -- One row per archived Bitcoin block: the 80-byte header, its height, and (above the
+    -- archive floor) its coinbase without witness data and the merkle branch from the coinbase
+    -- txid to the header's merkle root. Stale blocks stay: shares and pool blocks refer to them.
+    CREATE TABLE IF NOT EXISTS np_btc_blocks (
+        hash         BLOB    PRIMARY KEY CHECK (typeof(hash) = 'blob' AND length(hash) = 32),
+        prev         BLOB    NOT NULL CHECK (typeof(prev) = 'blob' AND length(prev) = 32),
+        height       INTEGER NOT NULL CHECK (height >= 0),
+        header       BLOB    NOT NULL CHECK (typeof(header) = 'blob' AND length(header) = 80),
+        coinbase     BLOB    CHECK (coinbase IS NULL OR typeof(coinbase) = 'blob'),
+        branch       BLOB    CHECK (branch IS NULL
+                                    OR (typeof(branch) = 'blob' AND length(branch) % 32 = 0)),
+        received_at  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_np_btc_blocks_height ON np_btc_blocks(height);
+
+    -- Ledger checkpoints: the snapshot state folded at a deep anchor on the best chain.
+    -- `payload` is the relay's encoding; `digest` is sha256 over it with a domain tag.
+    CREATE TABLE IF NOT EXISTS np_checkpoints (
+        anchor_hash  BLOB    PRIMARY KEY CHECK (typeof(anchor_hash) = 'blob'
+                                                AND length(anchor_hash) = 32),
+        height       INTEGER NOT NULL CHECK (height >= 0),
+        btc_height   INTEGER NOT NULL CHECK (btc_height >= 0),
+        payload      BLOB    NOT NULL CHECK (typeof(payload) = 'blob'),
+        digest       BLOB    NOT NULL CHECK (typeof(digest) = 'blob' AND length(digest) = 32),
+        created_at   INTEGER NOT NULL
+    );
+";
+
 /// v62 (#1034): make the per-target ledger index covering.
 ///
 /// `ledger_voterset_challenger_rows` reads one target+capability over the seven-day window, once
@@ -3515,6 +3803,14 @@ fn migrate_v50(conn: &Connection) -> GhostResult<()> {
 
 #[cfg(test)]
 mod tests {
+    /// The last version before the node pool cutover. The tests of historical migrations read
+    /// tables v65 drops, so they stop here.
+    const PRE_CUTOVER: u32 = 64;
+
+    fn run_to_v64(conn: &Connection) -> GhostResult<()> {
+        run_migrations_to(conn, PRE_CUTOVER)
+    }
+
     use super::*;
     use rusqlite::Connection;
 
@@ -3569,11 +3865,11 @@ mod tests {
     #[test]
     fn v47_creates_the_checkpoint_table_and_tolerates_an_existing_one() {
         let conn = Connection::open_in_memory().expect("conn");
-        run_migrations(&conn).expect("migrate");
+        run_to_v64(&conn).expect("migrate");
         // Bind to the constant, not a literal: this test is about v47's table being
         // idempotent, so pinning the version number here just breaks it on every
         // subsequent migration (it did, on v48).
-        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(get_schema_version(&conn).unwrap(), PRE_CUTOVER);
 
         let sql: String = conn
             .query_row(
@@ -3664,7 +3960,7 @@ mod tests {
     #[test]
     fn v49_settlement_tables_have_the_reversal_columns() {
         let conn = Connection::open_in_memory().expect("conn");
-        run_migrations(&conn).expect("migrate");
+        run_to_v64(&conn).expect("migrate");
 
         for (table, required) in [
             (
@@ -3709,7 +4005,7 @@ mod tests {
     #[test]
     fn v49_outputs_hash_lookup_uses_the_index() {
         let conn = Connection::open_in_memory().expect("conn");
-        run_migrations(&conn).expect("migrate");
+        run_to_v64(&conn).expect("migrate");
 
         let plan: String = conn
             .query_row(
@@ -3863,6 +4159,83 @@ mod tests {
         assert_eq!(work, 1.0, "the work must be counted once, not twice");
     }
 
+    /// The `np_*` tables and their indexes, as SQLite records them.
+    fn np_schema(conn: &Connection) -> Vec<(String, String, Option<String>)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_master WHERE tbl_name LIKE 'np\\_%' \
+                 ESCAPE '\\' ORDER BY type, name",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    /// Everything else in the schema, which v63 must not touch.
+    fn other_schema(conn: &Connection) -> Vec<(String, String, Option<String>)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_master WHERE tbl_name NOT LIKE 'np\\_%' \
+                 ESCAPE '\\' ORDER BY type, name",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    /// v63 from a v62 database: only the np_* objects appear, the rest of the schema is
+    /// byte-identical, and the result equals a fresh database's.
+    #[test]
+    fn v63_migrates_a_v62_database_additively() {
+        let fresh = Connection::open_in_memory().unwrap();
+        run_to_v64(&fresh).unwrap();
+        let fresh_np = np_schema(&fresh);
+        assert_eq!(
+            fresh_np.iter().filter(|o| o.0 == "table").count(),
+            12,
+            "{fresh_np:?}"
+        );
+
+        let conn = Connection::open_in_memory().unwrap();
+        run_to_v64(&conn).unwrap();
+        for (kind, name, _) in np_schema(&conn) {
+            if kind == "table" {
+                conn.execute_batch(&format!("DROP TABLE IF EXISTS {name};"))
+                    .unwrap();
+            }
+        }
+        set_schema_version(&conn, 62).unwrap();
+        assert!(
+            np_schema(&conn).is_empty(),
+            "a v62 database has no np_ objects"
+        );
+        let before = other_schema(&conn);
+
+        run_to_v64(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), PRE_CUTOVER);
+        assert_eq!(
+            other_schema(&conn),
+            before,
+            "v63 touched an existing object"
+        );
+        assert_eq!(np_schema(&conn), fresh_np);
+    }
+
+    /// v63 replays over its own tables without error or change.
+    #[test]
+    fn v63_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        let once = np_schema(&conn);
+        migrate_v63(&conn).unwrap();
+        migrate_v64(&conn).unwrap();
+        assert_eq!(np_schema(&conn), once);
+    }
+
     #[test]
     fn test_migrations() {
         let conn = Connection::open_in_memory()
@@ -3963,7 +4336,7 @@ mod tests {
     #[test]
     fn test_v39_adds_ceremony_id_column() {
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
         let cols = get_column_names(&conn, "mpc_ceremony");
         assert!(
             cols.contains(&"ceremony_id".to_string()),
@@ -3977,7 +4350,7 @@ mod tests {
         setup_pre_v39_mpc(&conn);
         insert_synthetic_contributions(&conn, 5);
 
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
         let (count, cph, ossified, cid) =
             read_singleton(&conn).expect("singleton must be backfilled");
@@ -4001,9 +4374,9 @@ mod tests {
         setup_pre_v39_mpc(&conn);
         insert_synthetic_contributions(&conn, 5);
 
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
         // Re-running is version-gated and must not change the singleton.
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
         let (count, cph, _ossified, cid) = read_singleton(&conn).unwrap();
         assert_eq!(count, 5);
@@ -4025,7 +4398,7 @@ mod tests {
         )
         .unwrap();
 
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
         let (count, cph, _ossified, cid) = read_singleton(&conn).unwrap();
         assert_eq!(count, 2, "existing singleton count must NOT be overwritten");
@@ -4042,7 +4415,7 @@ mod tests {
         setup_pre_v39_mpc(&conn);
         // No contributions at all (fresh genesis DB).
 
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
         assert!(
             read_singleton(&conn).is_none(),
@@ -4057,7 +4430,7 @@ mod tests {
     #[test]
     fn test_v40_adds_ossified_file_hash_column() {
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
         let cols = get_column_names(&conn, "mpc_ceremony");
         assert!(
             cols.contains(&"ossified_file_hash".to_string()),
@@ -4081,9 +4454,9 @@ mod tests {
         )
         .unwrap();
 
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
-        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(get_schema_version(&conn).unwrap(), PRE_CUTOVER);
         let cols = get_column_names(&conn, "mpc_ceremony");
         assert!(cols.contains(&"ossified_file_hash".to_string()));
         // Existing data preserved; new column defaults to NULL.
@@ -4142,7 +4515,7 @@ mod tests {
     #[test]
     fn test_v2_challenge_tables_exist() {
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
         let tables = get_table_names(&conn);
         for expected in &[
@@ -4163,7 +4536,7 @@ mod tests {
     #[test]
     fn test_v10_foreign_key_cascades() {
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
         // Check that tables recreated in v10 have ON DELETE CASCADE.
         // PRAGMA foreign_key_list returns rows with columns:
@@ -4209,7 +4582,7 @@ mod tests {
     #[test]
     fn test_v13_mpc_tables_exist() {
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
         let tables = get_table_names(&conn);
         for expected in &["mpc_contributions", "mpc_verification_votes"] {
@@ -4225,7 +4598,7 @@ mod tests {
     #[test]
     fn test_v21_l2_tables_exist() {
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
         let tables = get_table_names(&conn);
         // v21 creates l2_notes and l2_nullifiers (the nullifier set)
@@ -4242,7 +4615,7 @@ mod tests {
     #[test]
     fn test_v23_triggers_exist() {
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
         let mut stmt = conn
             .prepare("SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name")
@@ -4283,11 +4656,11 @@ mod tests {
             version, SCHEMA_VERSION
         );
 
-        // Also verify directly via PRAGMA user_version
-        let pragma_version: u32 = conn
+        // Also verify directly via PRAGMA user_version: stored negated from v65 on.
+        let pragma_version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(pragma_version, SCHEMA_VERSION);
+        assert_eq!(pragma_version, encode_schema_version(SCHEMA_VERSION));
     }
 
     /// v38 created `wraith_bonds`; v57 drops it. A database that runs the
@@ -4460,7 +4833,7 @@ mod tests {
     #[test]
     fn v60_keeps_the_newest_arming_a_settled_row_and_both_recipient_types() {
         let conn = Connection::open_in_memory().expect("in-memory db");
-        run_migrations(&conn).expect("migrate to head");
+        run_to_v64(&conn).expect("migrate to head");
 
         // Head already carries the unique index, so the duplicate fixture cannot be inserted
         // through it. Drop it to recreate the pre-v60 shape, which is also what a real upgrade
@@ -4641,7 +5014,7 @@ mod tests {
     #[test]
     fn test_v24_burned_elder_positions() {
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
         let tables = get_table_names(&conn);
         assert!(
@@ -4766,7 +5139,7 @@ mod tests {
     #[test]
     fn v50s_sbc_schema_is_retired_at_head() {
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
         let tables = get_table_names(&conn);
         for t in [
@@ -4795,7 +5168,7 @@ mod tests {
     #[test]
     fn test_kv_store_table_exists() {
         let conn = Connection::open_in_memory().unwrap();
-        run_migrations(&conn).unwrap();
+        run_to_v64(&conn).unwrap();
 
         let tables = get_table_names(&conn);
         assert!(
@@ -4824,8 +5197,8 @@ mod tests {
     #[test]
     fn v53_applies_on_v52_and_is_idempotent() {
         let conn = Connection::open_in_memory().expect("conn");
-        run_migrations(&conn).expect("migrate");
-        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        run_to_v64(&conn).expect("migrate");
+        assert_eq!(get_schema_version(&conn).unwrap(), PRE_CUTOVER);
 
         let expected: &[(&str, &[&str])] = &[
             (
@@ -4910,8 +5283,8 @@ mod tests {
         // must not error and must land back on the current version.
         conn.execute("PRAGMA user_version = 52", [])
             .expect("rewind");
-        run_migrations(&conn).expect("v53 must tolerate existing tables");
-        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        run_to_v64(&conn).expect("v53 must tolerate existing tables");
+        assert_eq!(get_schema_version(&conn).unwrap(), PRE_CUTOVER);
 
         // Clean v52 case: no shard tables at all, exactly what the fleet's databases hold today.
         conn.execute_batch(
@@ -4921,8 +5294,8 @@ mod tests {
         .expect("drop");
         conn.execute("PRAGMA user_version = 52", [])
             .expect("rewind");
-        run_migrations(&conn).expect("v53 must apply on a v52 database");
-        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        run_to_v64(&conn).expect("v53 must apply on a v52 database");
+        assert_eq!(get_schema_version(&conn).unwrap(), PRE_CUTOVER);
         check_shape(&conn, "after migrating a v52 database");
     }
 

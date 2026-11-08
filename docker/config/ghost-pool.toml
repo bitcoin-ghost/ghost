@@ -30,16 +30,6 @@ http_port = 8080
 max_miners = 1000
 public_mining = true
 
-[network.p2p]
-share_propagation = 8555
-block_announcement = 8556
-consensus_voting = 8557
-health_monitoring = 8558
-discovery = 8559
-elder_management = 8560
-payout_proposal = 8561
-payout_transaction = 8562
-
 [policy]
 profile = "bitcoin_pure"
 
@@ -52,9 +42,3 @@ prune_height = 0
 [pool]
 treasury_address = ""
 min_payout_sats = 10000
-
-[ghost_pay]
-enabled = true
-virtual_block_secs = 10
-epoch_blocks = 100
-wraith_enabled = true

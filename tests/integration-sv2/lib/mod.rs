@@ -3,8 +3,10 @@ use crate::{
     mining_device::Secp256k1PublicKey as MiningDeviceSecp256k1PublicKey, sniffer::*,
     sv1_minerd::MinerdProcess, template_provider::*,
 };
+/// The Ghost extension, which a translator in front of the pool always negotiates: it binds a
+/// channel opened on `mining.subscribe` to its miner's payout address.
+pub use ghost_common::solo::{AGENT_TLV_EXTENSION_TYPE, PAYEE_TLV_FIELD_TYPE};
 use interceptor::InterceptAction;
-use jd_client_sv2::{config::ConfigJDCMode, JobDeclaratorClient};
 use once_cell::sync::OnceCell;
 use pool_sv2::PoolSv2;
 use std::{
@@ -50,11 +52,10 @@ const SHARES_PER_MINUTE: f32 = 120.0;
 
 pub const POOL_COINBASE_REWARD_ADDRESS: &str = "tb1qa0sm0hxzj0x25rh8gw5xlzwlsfvvyz8u96w3p8";
 const POOL_COINBASE_REWARD_DESCRIPTOR: &str = "addr(tb1qa0sm0hxzj0x25rh8gw5xlzwlsfvvyz8u96w3p8)";
-const JDC_COINBASE_REWARD_DESCRIPTOR: &str = "addr(tb1qpusf5256yxv50qt0pm0tue8k952fsu5lzsphft)";
 
 static LOGGER: OnceCell<()> = OnceCell::new();
 
-/// Helper to create Sv2Tp config for Pool/JDC with default public key.
+/// Helper to create Sv2Tp config for the Pool with default public key.
 pub fn sv2_tp_config(address: SocketAddr) -> TemplateProviderType {
     TemplateProviderType::Sv2Tp {
         address: address.to_string(),
@@ -117,12 +118,103 @@ pub fn start_sniffer(
     (sniffer, listening_address)
 }
 
+/// The `[solo]` section the harness runs pools with: the template provider's network, so the
+/// subsidy schedule and the miners' addresses are checked as on a real node. Nothing else:
+/// statistics in memory, found blocks submitted to the local node only.
+fn solo_config(bitcoin_core: &BitcoinCore) -> pool_sv2::config::SoloConfig {
+    pool_sv2::config::SoloConfig {
+        network: Some(
+            if bitcoin_core.is_signet() {
+                "signet"
+            } else {
+                "regtest"
+            }
+            .to_string(),
+        ),
+        ..Default::default()
+    }
+}
+
+/// The running start of a pool: what `PoolSv2::start` returned, once it has.
+type PoolStart = tokio::task::JoinHandle<Result<(), pool_sv2::error::PoolErrorKind>>;
+
+/// Starts a pool on `template_provider_config`, as a solo pool over `bitcoin_core`, and
+/// returns once it is accepting connections. A pool that fails to start panics here with its
+/// error, rather than leaving the test to time out against a port nobody is listening on.
 pub async fn start_pool(
     template_provider_config: TemplateProviderType,
+    bitcoin_core: &BitcoinCore,
     supported_extensions: Vec<u16>,
     required_extensions: Vec<u16>,
     enable_monitoring: bool,
 ) -> (PoolSv2, SocketAddr, Option<SocketAddr>) {
+    let (pool, listening_address, monitoring_address, started) = spawn_pool(
+        template_provider_config,
+        bitcoin_core,
+        supported_extensions,
+        required_extensions,
+        enable_monitoring,
+    )
+    .await;
+    // Wait for the listener, not for a fixed time: startup waits for the template provider's
+    // first template before it binds. A start that returns before then
+    // has failed; its error is the test's failure.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if started.is_finished() {
+            match started.await {
+                Ok(Ok(())) => panic!("pool_sv2 exited before it listened on {listening_address}"),
+                Ok(Err(e)) => panic!("pool_sv2 refused to start: {e:?}"),
+                Err(e) => panic!("pool_sv2 start task failed: {e}"),
+            }
+        }
+        if tokio::net::TcpStream::connect(listening_address)
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pool_sv2 did not listen on {listening_address} within 60s"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    (pool, listening_address, monitoring_address)
+}
+
+/// [`start_pool`] for a test that keeps the template provider's templates from the pool: such a
+/// pool never listens, since it serves no miner before it has a template, so this returns as
+/// soon as the pool is spawned. A start that fails is logged as an error.
+pub async fn start_pool_without_templates(
+    template_provider_config: TemplateProviderType,
+    bitcoin_core: &BitcoinCore,
+) -> PoolSv2 {
+    let (pool, _, _, started) = spawn_pool(
+        template_provider_config,
+        bitcoin_core,
+        vec![],
+        vec![],
+        false,
+    )
+    .await;
+    tokio::spawn(async move {
+        match started.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!("pool_sv2 refused to start: {e:?}"),
+            Err(e) => tracing::error!("pool_sv2 start task failed: {e}"),
+        }
+    });
+    pool
+}
+
+async fn spawn_pool(
+    template_provider_config: TemplateProviderType,
+    bitcoin_core: &BitcoinCore,
+    supported_extensions: Vec<u16>,
+    required_extensions: Vec<u16>,
+    enable_monitoring: bool,
+) -> (PoolSv2, SocketAddr, Option<SocketAddr>, PoolStart) {
     use pool_sv2::config::PoolConfig;
     let listening_address = get_available_address();
     let authority_public_key = Secp256k1PublicKey::try_from(
@@ -151,7 +243,7 @@ pub async fn start_pool(
         None
     };
     let monitoring_cache_refresh_secs = if enable_monitoring { Some(1) } else { None };
-    let config = PoolConfig::new(
+    let mut config = PoolConfig::new(
         connection_config,
         template_provider_config,
         authority_config,
@@ -163,8 +255,8 @@ pub async fn start_pool(
         required_extensions,
         monitoring_address,
         monitoring_cache_refresh_secs,
-        None, // no JDS
     );
+    config.set_solo(solo_config(bitcoin_core));
     // `get_available_address` keeps the port BOUND so nothing can steal it between choice and
     // use (#408, #612). `PoolSv2` binds the address itself, so that reservation has to be handed
     // back first or the pool's own bind fails with `AddrInUse` — which is exactly what was
@@ -176,11 +268,8 @@ pub async fn start_pool(
 
     let pool = PoolSv2::new(config);
     let pool_clone = pool.clone();
-    tokio::spawn(async move {
-        _ = pool_clone.start().await;
-    });
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    (pool, listening_address, monitoring_address)
+    let started = tokio::spawn(async move { pool_clone.start().await });
+    (pool, listening_address, monitoring_address, started)
 }
 
 pub fn start_template_provider(
@@ -199,165 +288,6 @@ pub fn start_bitcoin_core(difficulty_level: DifficultyLevel) -> BitcoinCore {
     let bitcoin_core = BitcoinCore::start(address.port(), difficulty_level);
     bitcoin_core.generate_blocks(1);
     bitcoin_core
-}
-
-pub fn start_jdc(
-    pool: &[(SocketAddr, SocketAddr)], // (pool_address, jds_address)
-    template_provider_config: TemplateProviderType,
-    supported_extensions: Vec<u16>,
-    required_extensions: Vec<u16>,
-    enable_monitoring: bool,
-    jdc_mode: Option<ConfigJDCMode>,
-) -> (JobDeclaratorClient, SocketAddr, Option<SocketAddr>) {
-    use jd_client_sv2::config::{JobDeclaratorClientConfig, PoolConfig, ProtocolConfig, Upstream};
-    let jdc_address = get_available_address();
-    let max_supported_version = 2;
-    let min_supported_version = 2;
-    let authority_public_key = Secp256k1PublicKey::try_from(
-        "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72".to_string(),
-    )
-    .unwrap();
-    let authority_secret_key = Secp256k1SecretKey::try_from(
-        "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n".to_string(),
-    )
-    .unwrap();
-    let coinbase_reward_script =
-        CoinbaseRewardScript::from_descriptor(JDC_COINBASE_REWARD_DESCRIPTOR).unwrap();
-    let authority_pubkey = Secp256k1PublicKey::try_from(
-        "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72".to_string(),
-    )
-    .unwrap();
-    let upstreams = pool
-        .iter()
-        .map(|(pool_addr, jds_addr)| {
-            Upstream::new(
-                authority_pubkey,
-                pool_addr.ip().to_string(),
-                pool_addr.port(),
-                jds_addr.ip().to_string(),
-                jds_addr.port(),
-            )
-        })
-        .collect();
-    let pool_config = PoolConfig::new(authority_public_key, authority_secret_key);
-    let protocol_config = ProtocolConfig::new(
-        max_supported_version,
-        min_supported_version,
-        coinbase_reward_script,
-    );
-    let shares_per_minute = 10.0;
-    let shares_batch_size = 1;
-    let user_identity = "IT-test".to_string();
-    let jdc_signature = "JDC".to_string();
-    let monitoring_address = if enable_monitoring {
-        Some(get_available_address())
-    } else {
-        None
-    };
-    let monitoring_cache_refresh_secs = if enable_monitoring { Some(1) } else { None };
-    let jd_client_proxy = JobDeclaratorClientConfig::new(
-        jdc_address,
-        protocol_config,
-        user_identity,
-        shares_per_minute,
-        shares_batch_size,
-        pool_config,
-        3600,
-        template_provider_config,
-        upstreams,
-        jdc_signature,
-        jdc_mode,
-        supported_extensions,
-        required_extensions,
-        monitoring_address,
-        monitoring_cache_refresh_secs,
-    );
-    // The reservation from `get_available_address` keeps the port BOUND (#408, #612). A real
-    // component binds the address itself, so the reservation must be handed back first or its
-    // bind fails with `AddrInUse` — the harness holding the port against the component it chose
-    // it for. That was the root cause behind 14 of the 18 targets (#617).
-    release_reservation(jdc_address);
-    if let Some(addr) = monitoring_address {
-        release_reservation(addr);
-    }
-
-    let ret = jd_client_sv2::JobDeclaratorClient::new(jd_client_proxy);
-    let ret_clone = ret.clone();
-    tokio::spawn(async move { ret_clone.start().await });
-    (ret, jdc_address, monitoring_address)
-}
-
-pub async fn start_pool_with_jds(
-    bitcoin_core: &BitcoinCore,
-    supported_extensions: Vec<u16>,
-    required_extensions: Vec<u16>,
-    enable_monitoring: bool,
-) -> (PoolSv2, SocketAddr, SocketAddr, Option<SocketAddr>) {
-    use pool_sv2::config::{AuthorityConfig, ConnectionConfig, JDSPartialConfig, PoolConfig};
-
-    let pool_address = get_available_address();
-    let jds_address = get_available_address();
-
-    let authority_public_key = Secp256k1PublicKey::try_from(
-        "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72".to_string(),
-    )
-    .expect("failed");
-    let authority_secret_key = Secp256k1SecretKey::try_from(
-        "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n".to_string(),
-    )
-    .expect("failed");
-    let cert_validity_sec = 3600;
-    let coinbase_reward_script =
-        CoinbaseRewardScript::from_descriptor(POOL_COINBASE_REWARD_DESCRIPTOR).unwrap();
-
-    let template_provider_config = ipc_config(
-        bitcoin_core.data_dir().clone(),
-        bitcoin_core.is_signet(),
-        None,
-    );
-
-    let pool_signature = "Stratum V2 SRI Pool".to_string();
-    let connection_config = ConnectionConfig::new(pool_address, cert_validity_sec, pool_signature);
-    let authority_config = AuthorityConfig::new(authority_public_key, authority_secret_key);
-    let share_batch_size = 1;
-    let monitoring_address = if enable_monitoring {
-        Some(get_available_address())
-    } else {
-        None
-    };
-    let monitoring_cache_refresh_secs = if enable_monitoring { Some(1) } else { None };
-    let config = PoolConfig::new(
-        connection_config,
-        template_provider_config,
-        authority_config,
-        coinbase_reward_script.clone(),
-        SHARES_PER_MINUTE,
-        share_batch_size,
-        1,
-        supported_extensions.clone(),
-        required_extensions.clone(),
-        monitoring_address,
-        monitoring_cache_refresh_secs,
-        Some(JDSPartialConfig::new(jds_address)),
-    );
-
-    // The reservation from `get_available_address` keeps the port BOUND (#408, #612). A real
-    // component binds the address itself, so the reservation must be handed back first or its
-    // bind fails with `AddrInUse` — the harness holding the port against the component it chose
-    // it for. That was the root cause behind 14 of the 18 targets (#617).
-    release_reservation(pool_address);
-    release_reservation(jds_address);
-    if let Some(addr) = monitoring_address {
-        release_reservation(addr);
-    }
-
-    let pool = PoolSv2::new(config);
-    let pool_clone = pool.clone();
-    tokio::spawn(async move {
-        _ = pool_clone.start().await;
-    });
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    (pool, pool_address, jds_address, monitoring_address)
 }
 
 pub async fn start_sv2_translator(
@@ -418,7 +348,9 @@ pub async fn start_sv2_translator(
         2,
         2,
         downstream_extranonce2_size,
-        "user_identity".to_string(),
+        // As the installer writes it: the default username prefix is a payout address, so a
+        // miner authorising with a bare worker name still names a payee the node pool accepts.
+        POOL_COINBASE_REWARD_ADDRESS.to_string(),
         aggregate_channels,
         supported_extensions,
         required_extensions,
@@ -442,6 +374,18 @@ pub async fn start_sv2_translator(
     // target`, so `SubmitSharesExtended` never reached the pool and five targets failed as a
     // 60s sniffer timeout — which reads like a broken SV2 path rather than a stale test config.
     config.open_channel_on_subscribe = true;
+    // Also as production runs it. A channel opened on subscribe carries the provisional identity,
+    // which pool_sv2 accepts only from a client that negotiated the Ghost agent extension: that
+    // extension's `UpdateChannel` binds the miner's payee once it authorises. Without it the pool
+    // refuses the channel (`no-payout-address`) and minerd, a serialising client, never gets a
+    // job.
+    if !config
+        .required_extensions
+        .contains(&AGENT_TLV_EXTENSION_TYPE)
+    {
+        config.required_extensions.push(AGENT_TLV_EXTENSION_TYPE);
+    }
+    // `quantise_to_tiers` stays off, as the solo pool ships it.
     // The reservation from `get_available_address` keeps the port BOUND (#408, #612). A real
     // component binds the address itself, so the reservation must be handed back first or its
     // bind fails with `AddrInUse` — the harness holding the port against the component it chose
@@ -481,6 +425,9 @@ pub fn start_mining_device_sv2(
     nominal_hashrate_multiplier: Option<f32>,
     single_submit: bool,
 ) {
+    // The pool opens a channel only for an identity it can pay: a bare or empty one is refused
+    // `no-payout-address`. A device given no identity mines to the harness address.
+    let user_id = user_id.or_else(|| Some(POOL_COINBASE_REWARD_ADDRESS.to_string()));
     tokio::spawn(async move {
         crate::mining_device::connect(
             upstream.to_string(),

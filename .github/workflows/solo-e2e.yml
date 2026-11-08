@@ -1,0 +1,85 @@
+name: Solo e2e
+
+# Ghost Pool's end-to-end harness (scripts/regtest-solo/): two peered regtest nodes, each ghostd
+# (the released build) + ghost-mining + pool_sv2 [solo] + translator, miners on 3333, 4444 and
+# SV2 34255, every found block's coinbase checked against the payout rule, the APIs, a pool_sv2
+# killed, ghost-audit against an honest and a hostile (treasury-skimming) build.
+
+on:
+  push:
+    branches: [ghost-solo]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Pinned: CI should not change behaviour because someone cut a release.
+  GHOSTD_VERSION: v1.11.46
+
+jobs:
+  solo-e2e:
+    name: Solo e2e (regtest, two nodes)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # A first, cold build may run out of the job's time; keep what it built.
+          cache-on-failure: true
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+      - name: Runner image (apt cache key)
+        id: runner-image
+        run: echo "id=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: /tmp/apt-debs
+          key: apt-debs-${{ runner.os }}-${{ steps.runner-image.outputs.id }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}
+      - name: Install Linux deps
+        timeout-minutes: 6
+        run: .github/scripts/install-linux-deps.sh
+      - name: Cache the released ghostd
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ghost-regtest
+          key: ghostd-${{ runner.os }}-${{ env.GHOSTD_VERSION }}
+      - name: Fetch and verify ghostd
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bin="$(scripts/regtest-solo/run.sh --fetch-ghostd "$GHOSTD_VERSION")"
+          "$bin" -version | head -1
+      - name: Build the hostile pool_sv2 (solo-fault-injection)
+        timeout-minutes: 15
+        run: |
+          cargo build -p pool_sv2 --features solo-fault-injection
+          mkdir -p target/hostile
+          cp target/debug/pool_sv2 target/hostile/pool_sv2
+      - name: Build the node's binaries and the SV2 mining device
+        timeout-minutes: 20
+        run: |
+          cargo build -p ghost-mining -p pool_sv2 -p translator_sv2 -p ghost-audit
+          cargo build -p integration_tests_sv2 --bin mining_device
+          ls -la target/debug/ghost-mining target/debug/pool_sv2 target/debug/translator_sv2 \
+                 target/debug/ghost-audit target/debug/mining_device target/hostile/pool_sv2
+      - name: Run the harness
+        timeout-minutes: 15
+        run: |
+          scripts/regtest-solo/run.sh --bitcoind "$HOME/.cache/ghost-regtest/ghostd-$GHOSTD_VERSION/ghostd" \
+            --logs-to "$RUNNER_TEMP/solo-e2e-logs"
+      - name: Keep the run's logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: solo-e2e-logs
+          path: ${{ runner.temp }}/solo-e2e-logs
+          if-no-files-found: ignore
+          retention-days: 7

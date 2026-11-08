@@ -1,32 +1,28 @@
-<!-- Bitcoin Ghost · Security -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Security · Bitcoin Ghost</title>
-  <meta name="description" content="How to report bugs, vulnerabilities, and security issues in Bitcoin Ghost.">
-  <meta property="og:site_name" content="Bitcoin Ghost">
+  <title>Security · Ghost Pool</title>
+  <meta name="description" content="How to report a bug or a security issue in Ghost Pool.">
+  <meta property="og:site_name" content="Ghost Pool">
   <meta property="og:type" content="website">
-  <meta property="og:title" content="Security · Bitcoin Ghost">
-  <meta property="og:description" content="How to report bugs and vulnerabilities in Bitcoin Ghost. Public issues on GitHub, private advisories for exploitable bugs.">
+  <meta property="og:title" content="Security · Ghost Pool">
+  <meta property="og:description" content="How to report a bug or a security issue in Ghost Pool.">
   <meta property="og:url" content="https://bitcoinghost.org/security.html">
   <meta property="og:image" content="https://bitcoinghost.org/logo.png">
   <meta name="twitter:card" content="summary">
-  <meta name="twitter:site" content="@defenwycke">
-  <meta name="twitter:creator" content="@defenwycke">
-  <meta name="twitter:title" content="Security · Bitcoin Ghost">
-  <meta name="twitter:description" content="How to report bugs and vulnerabilities in Bitcoin Ghost. Public issues on GitHub, private advisories for exploitable bugs.">
-  <meta name="twitter:image" content="https://bitcoinghost.org/logo.png">
+  <link rel="icon" href="/logo.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/style.css?v=20260424">
+  <link rel="stylesheet" href="/style.css?v=20261108">
   <script>
     (function () {
-      var saved = localStorage.getItem('ghost-theme');
-      var system = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-      document.documentElement.setAttribute('data-theme', saved || system);
+      var saved = null;
+      try { saved = localStorage.getItem('ghost-theme'); } catch (e) {}
+      var dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+      document.documentElement.setAttribute('data-theme', saved || (dark ? 'dark' : 'light'));
     })();
   </script>
 </head>
@@ -34,285 +30,67 @@
 
 <header class="site-header">
   <div class="container">
-    <a href="/" class="brand bare">
-      <svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <path d="M9 10h.01"/>
-        <path d="M15 10h.01"/>
-        <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
-      </svg>
-      <span class="wordmark">bitcoinghost</span>
-    </a>
-    <nav class="primary">
-      <a href="/">overview</a>
-      <a href="/core.html">core</a>
-      <a href="/pool.html">pool</a>
-      <a href="/pay.html">pay</a>
-      <a href="/nodes.html">nodes</a>
-      <a href="/hazync.html">hazync</a>
-      <a href="/miners.html">miners</a>
-      <a href="/downloads.html">downloads</a>
-      <a href="/docs/">docs</a>
+    <a href="/" class="brand bare"><svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg><span class="wordmark">ghost pool</span></a>
+    <nav class="primary" aria-label="Site">
+      <a href="/">home</a>
+      <a href="/connect.html">connect</a>
+      <a href="/miner.html">miner lookup</a>
+      <a href="/faq.html">faq</a>
+      <a href="/run-a-node.html">run a node</a>
     </nav>
     <div class="utils">
-      <a href="https://github.com/bitcoin-ghost" class="bare icon-btn" aria-label="GitHub">
-        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/>
-        </svg>
-      </a>
-      <button id="theme-toggle" class="theme-toggle" aria-label="Toggle colour scheme"></button>
+      <a href="https://github.com/bitcoin-ghost/ghost" class="bare icon-btn" aria-label="Source code on GitHub"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg></a>
+      <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle colour scheme"></button>
     </div>
   </div>
 </header>
 
-<section class="hero">
+<main>
+<section class="hero hero-small">
   <div class="container">
-    <span class="eyebrow">Security</span>
-    <h1>Reporting bugs and vulnerabilities.</h1>
-    <p class="lead">
-      Bitcoin Ghost is decentralised software — there's no company to phone, no
-      support desk, no SLA. Bugs and vulnerabilities are handled transparently on
-      GitHub. Where a disclosure needs to stay private until a fix ships, use
-      GitHub's private advisory flow.
-    </p>
-    <div class="hero-actions">
-      <a href="https://github.com/bitcoin-ghost/ghost/issues/new/choose" class="btn btn-primary">Open an issue <span class="arrow">→</span></a>
-      <a href="https://github.com/bitcoin-ghost/ghost/security/advisories/new" class="btn btn-ghost">Private advisory</a>
-    </div>
+    <p class="eyebrow">security</p>
+    <h1>Reporting a problem.</h1>
   </div>
 </section>
 
 <section class="block">
-  <div class="container">
-    <div class="section-label">how to report</div>
-    <h2 class="section-title">Three paths, depending on what you found.</h2>
-    <p class="section-lead">
-      Pick the channel that matches the nature of the issue. Everything else is
-      noise and slows down a fix.
-    </p>
-
-    <ol class="quickstart-steps">
-      <li>
-        <div class="qs-n">1</div>
-        <div class="qs-body">
-          <div class="qs-title">A normal bug or feature request</div>
-          <div class="qs-desc">
-            Something crashes, misbehaves, or feels wrong, but isn't exploitable.
-            Open a public issue at
-            <a href="https://github.com/bitcoin-ghost/ghost/issues">github.com/bitcoin-ghost/ghost/issues</a>.
-            Include version, OS, and steps to reproduce. Pull requests welcome for
-            anything — see <a href="https://github.com/bitcoin-ghost/ghost/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a>.
-          </div>
-        </div>
-      </li>
-      <li>
-        <div class="qs-n">2</div>
-        <div class="qs-body">
-          <div class="qs-title">A security vulnerability</div>
-          <div class="qs-desc">
-            Something that could steal funds, forge shares, crash the mesh, or
-            leak user data. Do <strong>not</strong> open a public issue. Use
-            GitHub's private vulnerability reporting at
-            <a href="https://github.com/bitcoin-ghost/ghost/security/advisories/new">github.com/bitcoin-ghost/ghost/security/advisories/new</a>.
-            The maintainer gets notified, the thread stays private until a fix
-            ships, and a CVE can be assigned from the same form.
-          </div>
-        </div>
-      </li>
-      <li>
-        <div class="qs-n">3</div>
-        <div class="qs-body">
-          <div class="qs-title">An active incident on the mesh</div>
-          <div class="qs-desc">
-            You see nodes misbehaving right now — bad payouts, consensus stall,
-            duplicate blocks, anything that looks like coordinated abuse. Open a
-            private advisory as in step 2 and tag it <code>incident</code>. During
-            the nurture phase (pre-ossification), the maintainer will triage
-            quickly.
-          </div>
-        </div>
-      </li>
-    </ol>
+  <div class="container faq">
+    <h2>A bug that cannot be used to hurt anyone</h2>
+    <p>Open an issue on <a href="https://github.com/bitcoin-ghost/ghost/issues">GitHub</a>, with what you did, what you expected and what happened.</p>
+    <h2>Something exploitable</h2>
+    <p>Do not open a public issue. Report it privately through <a href="https://github.com/bitcoin-ghost/ghost/security/advisories/new">a GitHub security advisory</a>. Anything that could redirect a block's reward, change the coinbase split, withhold or delay a found block, crash a node, or reach a node's private interfaces counts.</p>
+    <h2>What happens next</h2>
+    <p>You get an answer, the issue is fixed on the nodes, and you are credited in the fix unless you ask not to be. Please give the fix time to reach the nodes before you publish.</p>
   </div>
 </section>
-
-<section class="block">
-  <div class="container">
-    <div class="section-label">scope</div>
-    <h2 class="section-title">What counts as a security issue.</h2>
-    <p class="section-lead">
-      Anything that lets an attacker take someone else's funds, break consensus,
-      or unmask a user. If in doubt, file it privately — better to over-report
-      than to publish an exploit.
-    </p>
-
-    <ul class="feature-list node-core-pink">
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M9 10h.01"/><path d="M15 10h.01"/>
-          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
-        </svg>
-        <div>
-          <div class="fl-name">Fund-flow bugs <span class="fl-badge">in scope</span></div>
-          <div class="fl-desc">Coinbase miscalculations, payout inflation, treasury drain, L2 settlement bypass, unshielding without a burn — anything that moves sats to the wrong address.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M9 10h.01"/><path d="M15 10h.01"/>
-          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
-        </svg>
-        <div>
-          <div class="fl-name">Consensus faults <span class="fl-badge">in scope</span></div>
-          <div class="fl-desc">Ways to force a BFT vote split, forge shares, fake an elder, or otherwise get honest nodes to disagree about a deterministic outcome.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M9 10h.01"/><path d="M15 10h.01"/>
-          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
-        </svg>
-        <div>
-          <div class="fl-name">Privacy leaks <span class="fl-badge">in scope</span></div>
-          <div class="fl-desc">Anything that links a shielded note to a sender, a Wraith output to an input, or a light-wallet address to the operator querying it.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M9 10h.01"/><path d="M15 10h.01"/>
-          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
-        </svg>
-        <div>
-          <div class="fl-name">Cryptographic weaknesses <span class="fl-badge">in scope</span></div>
-          <div class="fl-desc">Signature forgery, ZK-circuit soundness bugs, Pedersen commitment collisions, RNG predictability — anything that breaks the crypto layer.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M9 10h.01"/><path d="M15 10h.01"/>
-          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
-        </svg>
-        <div>
-          <div class="fl-name">Ghost Tap wallet bugs <span class="fl-badge">in scope</span></div>
-          <div class="fl-desc">Key material leaking off-device, seed recovery failures, transaction signing against the wrong context, UI phishing vectors in the app.</div>
-        </div>
-      </li>
-      <li>
-        <svg class="gh-bullet" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M9 10h.01"/><path d="M15 10h.01"/>
-          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
-        </svg>
-        <div>
-          <div class="fl-name">This website <span class="fl-badge">out of scope</span></div>
-          <div class="fl-desc">bitcoinghost.org is a static documentation site. It doesn't hold funds or user data. Typos, layout bugs, and broken links are normal issues — open a public ticket.</div>
-        </div>
-      </li>
-    </ul>
-  </div>
-</section>
-
-<section class="block">
-  <div class="container">
-    <div class="section-label">process</div>
-    <h2 class="section-title">What happens after you report.</h2>
-    <p class="section-lead">
-      During the nurture phase (pre-ossification) the maintainer triages privately
-      reported issues and ships fixes as ordinary commits after disclosure ends.
-      The shape of the flow:
-    </p>
-
-    <ol class="quickstart-steps">
-      <li>
-        <div class="qs-n">1</div>
-        <div class="qs-body">
-          <div class="qs-title">Acknowledgement</div>
-          <div class="qs-desc">Maintainer replies on the private advisory thread within a few days. No separate email, no form.</div>
-        </div>
-      </li>
-      <li>
-        <div class="qs-n">2</div>
-        <div class="qs-body">
-          <div class="qs-title">Validation + severity</div>
-          <div class="qs-desc">If it reproduces, we agree severity and a target fix window. If it doesn't, we ask for more detail.</div>
-        </div>
-      </li>
-      <li>
-        <div class="qs-n">3</div>
-        <div class="qs-body">
-          <div class="qs-title">Fix on a private branch</div>
-          <div class="qs-desc">Patch developed on a GitHub private advisory branch. Reporter is invited to review if they want to.</div>
-        </div>
-      </li>
-      <li>
-        <div class="qs-n">4</div>
-        <div class="qs-body">
-          <div class="qs-title">Coordinated release</div>
-          <div class="qs-desc">Binary release ships, node operators get 7 days to upgrade, then the advisory is made public with full write-up and reporter credit (if wanted).</div>
-        </div>
-      </li>
-    </ol>
-
-    <div class="pending-note">
-      A full-stack security audit (findings GHOST-01 through GHOST-13) is
-      complete — every finding is fixed in the shipping binaries, backed by a
-      multi-node adversarial test harness. The write-up lives in
-      <code>docs/</code> in the <a href="https://github.com/bitcoin-ghost/ghost">source repository</a>.
-    </div>
-
-    <div class="pending-note">
-      After ossification (target: 5+ years from mainnet launch) the codebase
-      freezes and this process ends. At that point security reports are still
-      welcome on GitHub, but fixes only land if the community agrees on a
-      consensus-compatible patch. The maintainer steps back; the protocol
-      belongs to the node operators.
-    </div>
-  </div>
-</section>
+</main>
 
 <footer class="site-footer">
   <div class="container">
     <div class="colophon">
-      <div class="brand">
-        <svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="width:22px;height:22px;">
-          <path d="M9 10h.01"/>
-          <path d="M15 10h.01"/>
-          <path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/>
-        </svg>
-        <span class="wordmark">bitcoinghost</span>
-      </div>
-      <div class="meta">Open source under the MIT license. No ICO, no foundation, no venture money.</div>
+      <div class="brand"><svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg><span class="wordmark">ghost pool</span></div>
+      <div class="meta">A solo Bitcoin mining pool. No accounts, no KYC. Open source under the MIT license.</div>
     </div>
-    <div><h4>Core</h4><ul></ul></div>
-    <div><h4>Pool</h4><ul></ul></div>
-    <div><h4>Pay</h4><ul></ul></div>
-    <div><h4>Products</h4><ul></ul></div>
     <div>
-      <h4>Project</h4>
+      <h4>Mine</h4>
       <ul>
-        <li><a href="https://github.com/bitcoin-ghost">GitHub</a></li>
-        <li><a href="https://x.com/defenwycke">@defenwycke</a></li>
-        <li><a href="https://defenwycke.org">defenwycke.org</a></li>
-        <li><a href="https://github.com/bitcoin-ghost/ghost/blob/main/LICENSE">MIT License</a></li>
+        <li><a href="/connect.html">Connect a miner</a></li>
+        <li><a href="/miner.html">Miner lookup</a></li>
+        <li><a href="/faq.html">FAQ</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Operate</h4>
+      <ul>
+        <li><a href="/run-a-node.html">Run a node</a></li>
+        <li><a href="/security.html">Security</a></li>
+        <li><a href="https://github.com/bitcoin-ghost/ghost">Source code</a></li>
       </ul>
     </div>
   </div>
 </footer>
 
-<script>
-  (function () {
-    var html = document.documentElement;
-    var btn = document.getElementById('theme-toggle');
-    var sun = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>';
-    var moon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
-    function render() { btn.innerHTML = html.getAttribute('data-theme') === 'dark' ? sun : moon; }
-    render();
-    btn.addEventListener('click', function () {
-      var next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
-      html.setAttribute('data-theme', next);
-      localStorage.setItem('ghost-theme', next);
-      render();
-    });
-  })();
-</script>
+<script src="/pool.js"></script>
 
 </body>
 </html>

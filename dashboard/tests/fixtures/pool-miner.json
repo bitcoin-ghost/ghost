@@ -1,0 +1,48 @@
+{
+  "address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+  "network": "mainnet",
+  "script_hex": "0014751e76e8199196d454941c45d1b3a323f1433bd6",
+  "generated_at": 1800000000,
+  "collecting_since": 1799990000,
+  "summary": {
+    "workers": 2, "online": 1, "idle": 0, "offline": 1,
+    "hashrate_hs": { "15m": 1.2e14, "1h": 1.1e14, "24h": 9.8e13 },
+    "shares_24h": { "accepted": 812, "stale": 3, "rejected": 1, "reject_reasons": { "duplicate-share": 1 } },
+    "last_share_at": 1799999990,
+    "best_share": { "ever": 4.1e9, "24h": 2.2e8 }
+  },
+  "workers": [
+    {
+      "name": "rig1", "status": "online", "last_share_at": 1799999990, "last_submit_at": 1799999990,
+      "hashrate_hs": { "15m": 1.2e14, "1h": 1.1e14, "24h": 9.8e13 },
+      "shares_24h": { "accepted": 812, "stale": 3, "rejected": 1, "reject_reasons": { "duplicate-share": 1 } },
+      "best_share": { "ever": 4.1e9, "24h": 2.2e8 },
+      "connections": [{ "downstream_id": 4, "channel_id": 1, "kind": "extended" }]
+    },
+    {
+      "name": "rig2", "status": "offline", "last_share_at": 1799900000, "last_submit_at": 1799900000,
+      "hashrate_hs": { "15m": null, "1h": null, "24h": 1.0e12 },
+      "shares_24h": { "accepted": 0, "stale": 0, "rejected": 0, "reject_reasons": {} },
+      "best_share": { "ever": 1.0e6, "24h": 0 },
+      "connections": []
+    }
+  ],
+  "blocks_found": [
+    {
+      "height": 974000,
+      "hash": "000000000000000000011111111111111111111111111111111111111111aaaa",
+      "address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+      "worker": "rig1",
+      "reward_sats": 311000000,
+      "treasury_sats": 1562500,
+      "fees_sats": 62500,
+      "found_at": 1799000000,
+      "check": "ok",
+      "submitted": [{ "node": "http://10.0.0.2:8332", "result": "duplicate" }]
+    }
+  ],
+  "expected_time_to_block": {
+    "known": true, "seconds": 4294967296.0, "hashrate_hs": 1.1e14, "hashrate_window": "1h",
+    "network_difficulty": 1.1e14, "reason": null
+  }
+}

@@ -9,7 +9,6 @@
 //! A template is documentation that people paste into production. A wrong one is worse than a
 //! missing one, because it is believed.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// Repo-root `config/` directory, resolved from this crate rather than the cwd so the test works
@@ -35,10 +34,97 @@ fn templates() -> Vec<PathBuf> {
 ///
 /// Unknown keys are silently ignored, so a stale one produces no error anywhere — it just quietly
 /// tells the reader something untrue. Add to this list whenever a config field is deleted.
-const REMOVED_KEYS: &[(&str, &str)] = &[(
-    "public_mining",
-    "removed — `mining_mode` is the single source of truth for discoverability",
-)];
+const REMOVED_KEYS: &[(&str, &str)] = &[
+    ("public_mining", "removed — every node is a node pool node"),
+    ("wraith_enabled", "removed with Wraith"),
+    ("wraith_election_enabled", "removed with Wraith"),
+    (
+        "coordinator_port",
+        "removed with the in-process Wraith coordinator",
+    ),
+    (
+        "coordinator_role_enabled",
+        "removed with the in-process Wraith coordinator",
+    ),
+    (
+        "coordinator_fee_address",
+        "removed with the in-process Wraith coordinator",
+    ),
+    ("virtual_block_secs", "removed with Ghost Pay"),
+    ("epoch_blocks", "removed with Ghost Pay"),
+    ("genesis_password", "removed with the MPC ceremony"),
+    ("mining_mode", "removed with solo and private modes"),
+    (
+        "private_mining_password",
+        "removed with solo and private modes",
+    ),
+    ("solo_payout_address", "removed with solo and private modes"),
+    (
+        "treasury_address",
+        "removed — the treasury is the node pool's compiled-in address",
+    ),
+    ("min_payout_sats", "removed with the old payout ledger"),
+    (
+        "payout_interval_blocks",
+        "removed with the old payout ledger",
+    ),
+    ("share_shard", "removed with the share shard"),
+    ("shard_arm_genesis", "removed with the share shard"),
+    ("shard_coinbase", "removed with the share shard"),
+    ("node_payout_address", "removed with node rewards"),
+    ("noise_enabled", "removed with the old mesh"),
+    ("seed_nodes", "removed with the old mesh"),
+    (
+        "share_propagation",
+        "removed with the old mesh's `[network.p2p]` ports",
+    ),
+    (
+        "block_announcement",
+        "removed with the old mesh's `[network.p2p]` ports",
+    ),
+    (
+        "consensus_voting",
+        "removed with the old mesh's `[network.p2p]` ports",
+    ),
+    (
+        "health_monitoring",
+        "removed with the old mesh's `[network.p2p]` ports",
+    ),
+    (
+        "elder_management",
+        "removed with the old mesh's `[network.p2p]` ports",
+    ),
+    (
+        "payout_proposal",
+        "removed with the old mesh's `[network.p2p]` ports",
+    ),
+    (
+        "payout_transaction",
+        "removed with the old mesh's `[network.p2p]` ports",
+    ),
+];
+
+/// Sections that were removed whole. Installed configs may still carry them and load (they are
+/// read and ignored), but a template must not offer them.
+const REMOVED_SECTIONS: &[(&str, &str)] = &[
+    ("ghost_pay", "removed with Ghost Pay"),
+    ("coordinator", "removed with the coordinator capability"),
+];
+
+#[test]
+fn no_template_has_a_removed_section() {
+    for p in templates() {
+        let raw = std::fs::read_to_string(&p).expect("readable");
+        let doc: toml::Table = raw.parse().expect("valid TOML");
+        for (section, why) in REMOVED_SECTIONS {
+            assert!(
+                !doc.contains_key(*section),
+                "{} has a `[{section}]` section, which was {why}",
+                p.display()
+            );
+        }
+    }
+}
 
 #[test]
 fn every_shipped_template_parses_as_toml() {
@@ -70,81 +156,6 @@ fn no_template_sets_a_removed_key() {
                 );
             }
         }
-    }
-}
-
-/// Each mode's required keys, mirroring what config validation enforces at load.
-///
-/// If this drifts from the real validation the templates stop being runnable, which is the whole
-/// failure this file exists to prevent — so it is asserted against every shipped template rather
-/// than against a hand-written fixture.
-#[test]
-fn every_template_declares_what_its_mode_requires() {
-    for p in templates() {
-        let raw = std::fs::read_to_string(&p).expect("readable");
-        let doc: toml::Table = raw.parse().expect("valid TOML");
-        let Some(network) = doc.get("network").and_then(|v| v.as_table()) else {
-            continue; // not a node config (no [network] section)
-        };
-        let Some(mode) = network.get("mining_mode").and_then(|v| v.as_str()) else {
-            continue;
-        };
-
-        let keys: BTreeSet<&str> = network.keys().map(|k| k.as_str()).collect();
-        // Mirrors `NodeConfig::validate_mining_mode` in ghost-common — the validation that
-        // actually runs at load against the TOML.
-        //
-        // ⚠ Do NOT take these from `TemplateConfig::validate` in template.rs. That validates a
-        // struct built in code, not the config file: `pool_payout_address` is a TemplateConfig
-        // field populated from `config.pool.treasury_address` at main.rs:3074 and is not a TOML
-        // key at all. Asserting it here would demand a key that does nothing — the same defect as
-        // the `public_mining` line this file exists to keep out.
-        let required: &[&str] = match mode {
-            // Needs `signing_key` for DNS registration; no payout key in [network].
-            "public_pool" => &["signing_key"],
-            // Password-gated. Miners are paid from the aggregated ledger, not a [network] key.
-            "private_pool" => &["private_mining_password"],
-            // Password-gated, and names the single address the coinbase pays.
-            "private_solo" => &["private_mining_password", "solo_payout_address"],
-            other => panic!("{} declares unknown mining_mode `{other}`", p.display()),
-        };
-
-        for k in required {
-            assert!(
-                keys.contains(k),
-                "{} is mining_mode = \"{mode}\" but does not set `{k}`, which that mode requires \
-                 — following this template would fail config validation at startup",
-                p.display()
-            );
-        }
-    }
-}
-
-/// There must be a template for every mode, or a mode is undeployable in practice.
-///
-/// `private_pool` had none until 2026-08-19: the mode existed, was reachable from the API's
-/// "disable public mining" toggle, and there was nothing to copy.
-#[test]
-fn every_mining_mode_has_a_template() {
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    for p in templates() {
-        let raw = std::fs::read_to_string(&p).expect("readable");
-        let doc: toml::Table = raw.parse().expect("valid TOML");
-        if let Some(m) = doc
-            .get("network")
-            .and_then(|v| v.as_table())
-            .and_then(|n| n.get("mining_mode"))
-            .and_then(|v| v.as_str())
-        {
-            seen.insert(m.to_string());
-        }
-    }
-    for mode in ["public_pool", "private_pool", "private_solo"] {
-        assert!(
-            seen.contains(mode),
-            "no shipped template declares mining_mode = \"{mode}\" — an operator has nothing to \
-             copy, and has to discover its required keys from validation errors"
-        );
     }
 }
 
@@ -304,4 +315,140 @@ fn the_installers_alerts_block_parses_in_both_shapes() {
         "no `[alerts]` shape in install-node.sh ever sets `enabled = true` — the --alert-webhook \
          path must produce a genuinely enabled block, or #985 is not fixed"
     );
+}
+
+/// A config installed before the removals must still load, and must not write the dead keys back.
+///
+/// Installed `pool.toml` files carry a `[ghost_pay]` section (every installer wrote one), `[pool]
+/// genesis_password` on nodes that guarded the MPC genesis, a `[coordinator]` section on nodes that
+/// opted into the coordinator capability, and the old ledger's keys: `[network] mining_mode`, the
+/// private and solo settings, `[pool] treasury_address`, `min_payout_sats`,
+/// `payout_interval_blocks`, `node_payout_address` and the share-shard flags, and the old mesh's
+/// `[network] noise_enabled`, `seed_nodes` and `[network.p2p]` ports. The structs reject
+/// unknown keys, so each retired key and section is accepted explicitly and ignored. If this test
+/// fails, upgrading a node would leave it unable to start.
+///
+/// zk and MPC never had `pool.toml` keys of their own (they were configured through the
+/// `ZK_*` / `MPC_PARAMS_PATH` environment), and no `[l2]` section ever existed, so there is
+/// nothing else to tolerate.
+#[test]
+fn a_config_with_retired_keys_still_loads() {
+    let mut raw = std::fs::read_to_string(config_dir().join("mainnet.toml")).expect("read");
+    for section in ["[ghost_pay]", "[coordinator]"] {
+        assert!(
+            !raw.contains(section),
+            "the template still has a {section} section"
+        );
+    }
+    raw = raw.replacen(
+        "[pool]\n",
+        "[pool]\n\
+         genesis_password = \"retired\"\n\
+         treasury_address = \"bc1qexample\"\n\
+         min_payout_sats = 100000\n\
+         payout_interval_blocks = 100\n\
+         node_payout_address = \"bc1qexample\"\n\
+         share_shard = true\n\
+         shard_arm_genesis = true\n\
+         shard_coinbase = false\n",
+        1,
+    );
+    assert!(
+        raw.contains("genesis_password = \"retired\""),
+        "the template has no [pool] section"
+    );
+    raw = raw.replacen(
+        "[network]\n",
+        "[network]\n\
+         mining_mode = \"private_solo\"\n\
+         private_mining_password = \"retired-password\"\n\
+         solo_payout_address = \"bc1qexample\"\n\
+         noise_enabled = true\n\
+         seed_nodes = [\"203.0.113.7:8559\"]\n",
+        1,
+    );
+    assert!(
+        raw.contains("mining_mode = \"private_solo\""),
+        "the template has no [network] section"
+    );
+    raw.push_str(
+        "\n[ghost_pay]\n\
+         enabled = true\n\
+         virtual_block_secs = 10\n\
+         epoch_blocks = 2160\n\
+         payout_address = \"bc1qexample\"\n\
+         wraith_enabled = true\n\
+         transfer_fee_bps = 10\n\
+         \n[coordinator]\n\
+         wraith_election_enabled = true\n\
+         coordinator_enabled = true\n\
+         advertised_endpoint = \"203.0.113.7:9100\"\n\
+         coordinator_port = 9100\n\
+         coordinator_role_enabled = true\n\
+         coordinator_fee_address = \"bc1qexample\"\n\
+         \n[network.p2p]\n\
+         share_propagation = 8555\n\
+         block_announcement = 8556\n\
+         consensus_voting = 8557\n\
+         health_monitoring = 8558\n\
+         discovery = 8559\n\
+         elder_management = 8560\n\
+         payout_proposal = 8561\n\
+         payout_transaction = 8562\n",
+    );
+
+    let cfg: ghost_common::config::NodeConfig = toml::from_str(&raw)
+        .unwrap_or_else(|e| panic!("a config with the retired keys must load: {e}"));
+
+    // Written back, the retired keys are gone and the rest survives.
+    let written = toml::to_string(&cfg).expect("serialize");
+    for key in [
+        "ghost_pay",
+        "virtual_block_secs",
+        "epoch_blocks",
+        "genesis_password",
+        "wraith_enabled",
+        "coordinator",
+        "advertised_endpoint",
+        "mining_mode",
+        "private_mining_password",
+        "solo_payout_address",
+        "treasury_address",
+        "min_payout_sats",
+        "payout_interval_blocks",
+        "node_payout_address",
+        "share_shard",
+        "shard_arm_genesis",
+        "shard_coinbase",
+        "noise_enabled",
+        "seed_nodes",
+        "[network.p2p]",
+        "share_propagation",
+        "payout_transaction",
+    ] {
+        assert!(
+            !written.contains(key),
+            "retired key `{key}` was written back"
+        );
+    }
+    assert!(written.contains("[pool]"));
+    assert!(written.contains("internal_api_secret"));
+
+    // A real typo is still refused, in a retired-key-bearing section and beside them.
+    for (from, to) in [
+        ("shard_coinbase = false", "shard_coinbsae = false"),
+        (
+            "mining_mode = \"private_solo\"",
+            "mining_mdoe = \"private_solo\"",
+        ),
+        ("max_miners = 10000", "max_minres = 10000"),
+        ("noise_enabled = true", "noise_enabeld = true"),
+    ] {
+        assert!(raw.contains(from), "fixture lost `{from}`");
+        let typo = raw.replacen(from, to, 1);
+        assert!(
+            toml::from_str::<ghost_common::config::NodeConfig>(&typo).is_err(),
+            "an unknown key that was never a config field must still be rejected: `{to}`"
+        );
+    }
 }

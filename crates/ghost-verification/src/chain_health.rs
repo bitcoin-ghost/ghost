@@ -61,7 +61,7 @@ pub enum TipStatusKind {
 pub struct TipStatus {
     /// This node's current local L1 height.
     pub local_height: u64,
-    /// Highest L1 height reported by a fresh connected mesh peer (0 = unknown).
+    /// Highest Bitcoin header the node's Bitcoin node has heard of (0 = unknown).
     pub best_peer_height: u64,
     /// How many blocks behind the best peer (0 when caught up or peer unknown).
     pub behind_by: u64,

@@ -10,19 +10,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # The Tauri desktop crates (wraith-wallet-gui, ghost-tap-desktop) need a built
-  # JS frontend (`dist/`) before `tauri::generate_context!` will compile, which is
-  # a separate Node pipeline from the Rust workspace. They are excluded from the
-  # pure-Rust jobs below and built on their own; everything else gets full coverage.
-  WORKSPACE_EXCLUDES: --workspace --exclude wraith-wallet-gui --exclude ghost-tap-desktop
+  WORKSPACE_EXCLUDES: --workspace
   # System packages the Rust workspace needs: Cap'n Proto (bitcoin-core-sv2 build
   # script) and SQLite (ghost-storage).
   LINUX_DEPS: libsqlite3-dev capnproto libcapnp-dev
-  # What the Tauri desktop crates need on top: webkit2gtk is the webview, and `patchelf` is
-  # used by the bundler. A superset of LINUX_DEPS so the one install script covers both.
-  TAURI_DEPS: >-
-    libsqlite3-dev capnproto libcapnp-dev libwebkit2gtk-4.1-dev libgtk-3-dev
-    libayatana-appindicator3-dev librsvg2-dev patchelf
 
 jobs:
   # Format check
@@ -74,6 +65,11 @@ jobs:
       # almost no miner sockets, so the capacity model never saw it.
       - name: Socket-holding units raise LimitNOFILE
         run: ./scripts/check-socket-units-raise-nofile.sh
+      # The miner page is plain JavaScript with no build step: a syntax error ships as a blank
+      # page and a renamed API field as NaN or a made-up zero. Parse every site script and render
+      # the page under node from sample and failed API answers (W2.17).
+      - name: Miner page renders
+        run: ./scripts/check-miner-page.sh
       # The pre-deploy SV1 smoke test's declared-difficulty case could not distinguish
       # "delivered late" from "never delivered" — both printed the floor — which is what
       # misdirected the #455 investigation. This runs that case against fake pools with known
@@ -111,12 +107,28 @@ jobs:
       # release, stub binaries and a recording systemctl.
       - name: auto-update swap self-test
         run: ./scripts/test-auto-update-swap.sh
+      # The node pool's release channel: np-latest, the channel marker, the updater following
+      # np- only on a node pool node and behaving exactly as before on a node without the marker
+      # (compared against the updater at ab480563b, fetched here because the checkout is shallow).
+      - name: Release channel self-test
+        run: |
+          git fetch --no-tags --depth=1 origin ab480563b31dcb65026837cebee12de48194a7d5
+          ./scripts/test-release-channel.sh
+      # The old network releases on v* tags and its nodes follow `releases/latest`; node pool
+      # releases are np-v* pre-releases. A trigger that matched both, or a node pool release that
+      # could become latest, would move the old fleet onto a node pool build.
+      - name: Release workflows keep the channels apart
+        run: ./scripts/check-release-workflows.sh
       # release.sh orchestrates the roll, and two of its steps failed silently in v1.11.38: it
       # reported a release "published" that was still a draft (#857), and it rolled genesis FIRST
       # against its own stated rule (#856). Both are the shape a self-test catches and a reader
       # does not. Stubbed `gh`, throwaway repo, no node touched.
       - name: Release-orchestrator self-test
         run: ./scripts/test-release-orchestrator.sh
+      # release.sh --node-pool: np- tag, pre-release, make_latest=false, `releases/latest` read back
+      # unchanged, and no phase that rolls the old fleet. Stubbed `gh`, throwaway repos.
+      - name: Node pool release-orchestrator self-test
+        run: ./scripts/test-release-node-pool.sh
       # E-1 forbids key material from a generator other than the OS CSPRNG. `thread_rng()` has
       # been substituted for `OsRng` three times here — once in the wallet seed, once minting the
       # SV2 AUTHORITY keypair while the doc comment claimed OsRng (#705). E-5 rules out catching
@@ -125,25 +137,9 @@ jobs:
         run: ./scripts/check-key-material-rng.sh
       # A select! branch that recv()s AND THEN works is not cancellation-safe: when a sibling
       # completes first, select! drops it along with the message it already took off the queue.
-      # Found five times (#854, #926) and baselined at 21 more across jd-client, jd-server and
-      # pool-sv2. A ratchet — the baseline may shrink, never grow.
+      # Found five times (#854, #926) and baselined across the SV2 apps. A ratchet — the baseline may shrink, never grow.
       - name: select! cancellation safety
         run: ./scripts/check-select-cancellation-safety.sh
-      # The 5-4-3-2-1 weights are protocol constants that the payout path reads — and the
-      # dashboard API open-codes the same ladder TWICE, plus `"max_shares"` three times. A reweight
-      # that misses a copy does not change anyone's payment (payouts divide by the sum of actual
-      # shares, never by MAX_NODE_SHARES), it just makes the dashboard quietly wrong. #736 will
-      # have to delete GHOST_PAY_SHARES from all of them.
-      - name: Capability ladder agrees with the constants
-        run: ./scripts/check-capability-ladder-agrees.sh
-      # A capability is earned by passing its verification challenges, so the config endpoint (#403)
-      # must never let an operator set one. `apply()` enforces that by default-deny, and the test
-      # pinning it named four paths BY HAND — one of which (`pool.public_mining`) is not a field of
-      # any settings struct, while `network.mining_mode` and `coordinator.coordinator_enabled`, the
-      # two that actually drive a claim, went unmentioned (#963). This derives the field list from
-      # `NodeCapabilities` so a new capability cannot be added without the mapping being completed.
-      - name: Capability claims are not remotely settable
-        run: ./scripts/check-capability-claims-are-not-settable.sh
       # The deploy gate counts `batches delivered` by grepping sri-pool's journal for a line that
       # is `debug!` in a module the fleet's RUST_LOG does not enable — so it was structurally 0 on
       # every node for ever, while its own comment told the reader 0 meant "no batch accepted"
@@ -151,20 +147,6 @@ jobs:
       # file and a metric died in another, and nothing connected them (#947).
       - name: Counted log lines are enabled
         run: ./scripts/check-counted-log-lines-are-enabled.sh
-      # #780: a node must STATE which gates it enforces, or "is this node armed, and at what
-      # height?" has no answer short of reading the binary. ADDRESS_PROOF_ENFORCEMENT was
-      # resolved, stored and given an accessor — and never logged, so once armed at 970,500 an
-      # enforcing node looked identical to a dormant one. The existing test asserts that SOME
-      # armed height appears, which is a sample and cannot see a missing field.
-      - name: Every activation gate is logged
-        run: ./scripts/check-every-gate-is-logged.sh
-      # The convergence endpoint is the instrument that decides whether the mesh node-list gate
-      # gets armed (#402). #943 added a third root to the checkpoint and made vote acceptance
-      # depend on it, without updating that endpoint — so it would have reported "converged"
-      # having never compared a root every vote checks, and a fleet agreeing on three roots of
-      # four finalises nothing, silently. Nothing connected the two files; this does.
-      - name: Convergence covers every committed root
-        run: ./scripts/check-convergence-covers-every-root.sh
       # `broadcast::Receiver::recv()` returns `Lagged(n)` — "you missed n events", RECOVERABLE —
       # and `Closed`, the only terminal one. `while let Ok(..)` cannot tell them apart and exits on
       # both. Four live loops shipped that way (#984), including the task that CREATES THE PAYOUT
@@ -189,15 +171,6 @@ jobs:
       # the outage the cap prevents. This accept task has four early returns plus a normal end.
       - name: SV2 connection slot is taken before the spawn
         run: ./scripts/check-connection-slot-is-taken-before-spawn.sh
-      # A miner-side shim rebuilds `checkpoint_hash` to check any signature at all, so every value
-      # that hash commits to must be in the blob the public endpoint serves. The hash has been
-      # bumped TWICE by ADDING a root (v2 advert_root, v3 coordinator_roster_root) and nothing
-      # connected it to the producer — the v2 bump shipped a blob with no `adverts`/`advert_root`,
-      # which no shim could verify, and it went unnoticed because the endpoint 404s below the gate
-      # (#970). The test written for that regression rebuilds the message from the RECORD, so it
-      # cannot see a field missing from the JSON.
-      - name: Served checkpoint carries everything the hash commits
-        run: ./scripts/check-served-checkpoint-carries-the-hash.sh
       # The swarm-refusal test loops action strings through `swarm_not_implemented` to prove the
       # fleet-control routes return an honest 501 rather than fabricating success. It tests the
       # HELPER, so when a route becomes real its string stays in the loop and the test keeps
@@ -207,12 +180,6 @@ jobs:
       # see it happening to itself.
       - name: Swarm-refusal test covers only live refusals
         run: ./scripts/check-swarm-refusal-test-is-current.sh
-      # `with_address_enforcement` carries a CONSENSUS height (#605): above it, a challenger
-      # caught lying about its address stops counting toward the diversity floor, which changes
-      # which nodes qualify and how the node-reward pool splits. There are FIVE construction
-      # sites in ghost-mining; one that missed the gate would diverge from the fleet silently.
-      - name: Address-enforcement wiring
-        run: ./scripts/check-address-enforcement-wiring.sh
       # install-node.sh hardens the secret-bearing configs at install time and nothing ever
       # asked again, so four of eight nodes sat at 644 ghost:ghost on a file carrying
       # authority_secret_key (#916). The reconciler that closes that is only worth having if it
@@ -229,11 +196,61 @@ jobs:
       # the job on every node and enables it unless --no-backups.
       - name: Installer nightly-backup option self-test
         run: ./scripts/test-installer-backups.sh
+      # blockreservedweight: the installer writes ghost_common::solo::BLOCK_RESERVED_WEIGHT (Core's
+      # 8,000 WU), which must hold ghost-mining's coinbase ceiling, MAX_COINBASE_BYTES.
+      - name: Installer node pool reserve self-test
+        run: ./scripts/test-installer-node-pool-reserve.sh
+      # Ghost Pool: the payout address check, per-network defaults, the rendered pool_sv2 [solo]
+      # config, preflight lines, flags (--peer-node, --submit-node, --submit-auth), wizard,
+      # firewall and mempool policy. pool_sv2 itself loads the rendered config in
+      # bins/pool-sv2/tests/installer_config.rs.
+      - name: Installer node pool self-test
+        run: ./scripts/test-installer-node-pool.sh
+      # --uninstall removes what the installer added and keeps the node's data unless --purge;
+      # 22/tcp is never closed and nothing happens without a confirmation. Throwaway root.
+      - name: Installer uninstall self-test
+        run: ./scripts/test-installer-uninstall.sh
+      # The lister is gone with the share chain: nothing installs one, and a re-run or --uninstall
+      # removes what an older install left.
+      - name: Installer lister self-test
+        run: ./scripts/test-installer-lister.sh
+      # The website's API proxy, against fake nodes on loopback: listed hosts and read routes
+      # only, GET only, path tricks refused, oversized, slow and redirecting nodes cut off.
+      - name: Website API proxy self-test
+        run: python3 -I scripts/website-proxy/test_ghost_site_proxy.py
       # Fuzz targets depend on internal APIs and rot silently when a signature changes.
       # One had been importing a module that no longer existed, unnoticed, because no job
       # built them (#468). Build only — running the fuzzers belongs in a scheduled job.
       - name: Fuzz targets build
         run: ./scripts/check-fuzz-targets.sh
+
+  # The node dashboard (Next.js): types, lint, the page tests and a production build. The
+  # release workflows build it too, but only on a tag; this catches a broken page before then.
+  dashboard:
+    name: Dashboard
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v5
+      # Node 22, as dashboard/Dockerfile and the release workflows; the page tests need
+      # module.registerHooks (22.15 and later).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+      - name: Type check
+        run: npx tsc --noEmit
+      - name: Lint
+        run: npm run lint
+      - name: Page tests
+        run: npm test
+      - name: Build
+        run: npm run build
 
   # Clippy lints
   clippy:
@@ -268,15 +285,7 @@ jobs:
       # under review — which is the only moment it is cheap to fix.
       #
       # The six `-A` entries are pre-existing style choices, not new exemptions.
-      #
-      # One warning remains and is deliberately NOT covered: cargo reports that
-      # proc-macro-error2 v2.0.1 contains code a future rustc will reject. It arrives via
-      # ghost-cli -> tabled 0.20 -> tabled_derive, 2.0.1 is the latest published version, and
-      # it is a cargo future-incompat NOTE rather than a rustc lint — so it does not fail this
-      # gate and cannot be fixed here. It needs tabled to drop the dependency upstream.
       - run: cargo clippy $WORKSPACE_EXCLUDES --all-targets --all-features -- -D warnings -A clippy::derivable_impls -A clippy::clone_on_copy -A clippy::match_like_matches_macro -A clippy::manual_flatten -A clippy::redundant_slicing -A clippy::skip_while_next
-      # A message type nothing dispatches is wiring that does not exist.
-      - run: ./scripts/check-wiring.sh
 
   # Unused-dependency gate: fails if a crate declares a dependency it does not use.
   # Pairs with the per-crate `#![deny(unreachable_pub)]` ratchet — together they stop
@@ -304,25 +313,17 @@ jobs:
   # "GHOST-02: 0/8 nodes approved" — which reads like a catastrophic payout bug and was in fact a
   # stale fixture. Nobody saw it because nothing ran it (#580).
   #
-  # That target no longer exists: Stage 6 Release B deleted the BFT payout vote it exercised,
-  # along with `fleet_rehearsal`. `regtest_shard_coinbase_e2e` is the shard's replacement and is
-  # already in the sequence below. The rationale is kept because the failure mode it describes —
-  # a test that nothing runs — is what this job exists to prevent.
-  #
-  # `regtest_mining_modes_e2e` arrived with this same release and was NOT in the sequence, which
-  # is that exact failure mode again: `common::require_regtest()` returns `None` and the test
-  # SKIPS rather than fails whenever `GHOST_REGTEST_REQUIRED` is unset, so a bulk `cargo test`
-  # would have reported it green without ever starting a node. It runs FIRST, on a clean mempool,
-  # because `empty_template_e2e` parks a transaction on purpose.
+  # That target no longer exists, nor do its successors `regtest_shard_coinbase_e2e` and
+  # `regtest_mining_modes_e2e`: the node pool's canonical coinbase (W2.6) replaced the coinbase
+  # they proved. The rationale is kept because the failure mode it describes — a test that
+  # nothing runs — is what this job exists to prevent: `common::require_regtest()` returns `None`
+  # and a test SKIPS rather than fails whenever `GHOST_REGTEST_REQUIRED` is unset.
   #
   # This is a SEPARATE job, not a step on `test`, deliberately: adding it there pushed that job
   # from ~28 min past its 45-minute timeout and it was cancelled mid-run. Here it runs in
-  # parallel and cannot slow the critical path. Linux only — the same rationale the
-  # wraith-wallet step already documents.
+  # parallel and cannot slow the critical path. Linux only.
   #
   # Exclusions:
-  #   ghost-mpc / mpc-xproc-harness  -> `mpc-tests` job; they need a per-package feature that a
-  #                                    workspace-wide `--tests` cannot set
   #   integration_tests_sv2          -> 18 targets that spin up real SRI pool / template-provider
   #                                    processes (58 `start_pool` call sites; 4 of the 65 tests
   #                                    are `#[ignore]`d, not 1 — two whole targets are entirely
@@ -361,8 +362,6 @@ jobs:
       - name: Run integration tests
         run: |
           cargo test $WORKSPACE_EXCLUDES --tests \
-            --exclude ghost-mpc \
-            --exclude mpc-xproc-harness \
             --exclude integration_tests_sv2
       # Run the ghost-mining e2e targets against a REAL regtest node (#770).
       #
@@ -372,10 +371,8 @@ jobs:
       # an unreachable node a FAILURE rather than a skip, so that cannot silently recur.
       #
       # ⚠ Deliberately a SEPARATE step from the bulk `cargo test` above, and the targets run ONE
-      # AT A TIME. cargo runs test binaries in parallel and these share a single chain:
-      # `empty_template_e2e` parks a fee-paying transaction in the mempool on purpose, while
-      # `regtest_shard_coinbase_e2e` requires an empty one and drains it. Run concurrently they
-      # sabotage each other, so the sequencing is load-bearing rather than tidiness.
+      # AT A TIME: they share a single chain, and `empty_template_e2e` parks a fee-paying
+      # transaction in the mempool on purpose.
       #
       # Verified end to end on a blank chain before landing: 4 passed + 1 ignored, 1 passed,
       # 1 passed, including a real `submitblock` accepted by ghostd.
@@ -392,7 +389,7 @@ jobs:
           BITCOIN_RPC_USER: ghost
           BITCOIN_RPC_PASSWORD: ghostpass
         run: |
-          for t in regtest_mining_modes_e2e empty_template_e2e regtest_shard_coinbase_e2e; do
+          for t in empty_template_e2e; do
             echo "::group::$t"
             cargo test -p ghost-mining --test "$t"
             echo "::endgroup::"
@@ -407,9 +404,9 @@ jobs:
       # worse than not running them — 9 of the 18 currently fail and 2 more exceed 420s. The five that
       # are genuinely green run in the step after this one.
       #
-      # ⚠ 4 of the 65 tests are `#[ignore]`d, not 1 as this comment previously claimed, and two
-      # targets (`bitcoin_core_ipc_integration`, `jds_block_propagation`) are ignored ENTIRELY — they
-      # report `ok` having executed nothing.
+      # ⚠ `bitcoin_core_ipc_integration` is `#[ignore]`d ENTIRELY — it reports `ok` having executed
+      # nothing. The job-declaration targets went with jd-client and jd-server: the node pool
+      # refuses custom jobs.
       #
       # But COMPILING them is cheap — measured at 3m11s with no external services — and it catches the
       # rot that actually bit: `tests/integration` stopped compiling when f1c14cdb9 added a field to
@@ -455,19 +452,14 @@ jobs:
   #   sv2_mining_device                  passes locally in 11s, hung >15min on a CI runner. It
   #                                      measures real CPU hashrate against a wall clock, which
   #                                      is the least reproducible thing a shared runner can do.
-  #   jd_integration                     11/0 locally, 10/1 on a CI runner — the
-  #                                      `jds_wont_exit_upon_receiving_unexpected_txids...` case
-  #                                      timed out waiting for ProvideMissingTransactions. Second
-  #                                      time local green has failed to hold on a runner, so it
-  #                                      does not gate until it is proven green THERE.
   #   translator_integration             7 passed / 2 failed — real progress from "never
   #                                      finished", but not green yet.
   #   translator_aggregated_integration  all 4 pass INDIVIDUALLY; hang when run together, so
   #                                      something beyond TPROXY_MODE is not isolated between
   #                                      tests in that binary.
-  #   bitcoin_core_ipc_integration       3 of 3 `#[ignore]`d — reports ok having executed
-  #   jds_block_propagation              1 of 1 `#[ignore]`d    nothing. A green that cannot
-  #                                      fail is worse than no green at all.
+  #   bitcoin_core_ipc_integration       1 of 1 `#[ignore]`d — reports ok having executed
+  #                                      nothing. A green that cannot fail is worse than no
+  #                                      green at all.
   #
   # ⚠ Targets are listed EXPLICITLY. An exclusion list silently promotes every newly added target
   # to blocking the moment someone writes one, which is how a job people trust becomes a job
@@ -526,7 +518,7 @@ jobs:
       # can act on — which is exactly how sv2_mining_device's hang first presented.
       # ⚠ Targeted debug for the SV1 server, NOT a global `debug`.
       #
-      # #946: `jdc_receives_submit_shares_success` hung the full 420s on repeated
+      # #946: `jdc_receives_submit_shares_success` (since removed) hung the full 420s on repeated
       # `stratum_subscribe timed out` while the template provider stayed healthy. The miner's own
       # stderr said it could not attach; nothing said what the translator's SV1 server was doing,
       # so the occurrence was unattributable and all anyone could do was re-run it. The same shape
@@ -541,16 +533,8 @@ jobs:
         env:
           RUST_LOG: info,translator_sv2::sv1::sv1_server=debug,translator_sv2::sv1::downstream=debug
         run: |
-          for t in pool_solo_mining \
-                   pool_integration \
-                   jd_provide_missing_transaction \
-                   jd_tproxy_integration \
-                   jd_aggregated_tproxy_integration \
-                   jdc_block_propagation \
-                   jdc_cached_shares \
-                   jdc_receives_submit_shares_success \
+          for t in pool_integration \
                    monitoring_integration \
-                   monitoring_aggregated_topology \
                    extensions \
                    sv1 \
                    sniffer_integration \
@@ -561,34 +545,6 @@ jobs:
               || { echo "::endgroup::"; echo "::error::$t failed or exceeded 420s"; exit 1; }
             echo "::endgroup::"
           done
-
-  mpc-tests:
-    name: MPC integration
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Runner image (apt cache key)
-        id: runner-image
-        # .debs resolved on one runner image are not installable on another: a cache of
-        # systemd 259.9 dpkg'd onto a 259.5 image broke apt outright. Key on the image.
-        run: echo "id=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
-      - name: Cache apt packages
-        uses: actions/cache@v4
-        with:
-          path: /tmp/apt-debs
-          # Keyed on the install script, which carries the canonical package list. Change the
-          # list there and the key rotates on its own; a stale cache cannot outlive its contents.
-          key: apt-debs-${{ runner.os }}-${{ steps.runner-image.outputs.id }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}
-      - name: Install Linux deps
-        timeout-minutes: 6
-        run: .github/scripts/install-linux-deps.sh
-      - name: MPC lifecycle (small-cap harness)
-        run: cargo test -p ghost-mpc --test mpc_lifecycle --features mpc-test-cap
-      - name: MPC cross-process contribution flow
-        run: cargo test -p mpc-xproc-harness --test xproc --features mpc-test-cap
 
   # Build and test
   test:
@@ -646,44 +602,26 @@ jobs:
       - name: Build
         run: cargo build $WORKSPACE_EXCLUDES --all-targets
 
+      # `--lib` includes integration_tests_sv2's own unit tests, and
+      # `template_provider::tests::test_create_mempool_transaction` starts a real template
+      # provider, which downloads sv2-tp from github.com on first use. Uncached, a GitHub release
+      # outage turned this job red twice on 2026-11-08 (504 on all five attempts) while the SV2 job,
+      # reading the same file from this cache, stayed green. Same key and path as the SV2 job, so
+      # the two share one cache entry.
+      - name: Cache the harness tarballs
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: /tmp/sv2-tarballs
+          key: sv2-tarballs-${{ runner.os }}-${{ hashFiles('tests/integration-sv2/lib/template_provider.rs') }}
+      - name: Prefetch the harness tarballs
+        if: runner.os == 'Linux'
+        timeout-minutes: 12
+        run: .github/scripts/prefetch-sv2-tp-tarballs.sh
+
       # Run unit tests
       - name: Run unit tests
         run: cargo test $WORKSPACE_EXCLUDES --lib --bins
-
-      # Feature-gated modules, which the run above does NOT compile (#530).
-      #
-      # `ghost-consensus` has `default = []` and gates two modules behind features:
-      #
-      #   #[cfg(feature = "zk-consensus")]  pub mod nullifier_route_handler;   <- L2 tree sync
-      #   #[cfg(feature = "mpc-ceremony")]  pub mod mpc_handler;
-      #
-      # so plain `cargo test -p ghost-consensus` reports 267 passed while 72 tests are not even
-      # compiled — including every test for the L2 tree-sync and nullifier-routing code that is
-      # live on all 8 production nodes. A change to that module could be syntactically invalid
-      # and still show a green suite; that is not hypothetical, it happened while fixing #517.
-      #
-      # The clippy job already uses `--all-features`, so this code IS type-checked. Only its
-      # tests were missing, which is why nothing ever went red.
-      #
-      # NOT `--all-features`, deliberately. That would also switch on `ghost-verification`'s
-      # `allow-insecure` (changing what the security tests actually assert) and `zk-production`
-      # (which needs trusted-setup params a runner does not have). Naming the features keeps the
-      # gain without either surprise.
-      - name: Run unit tests (feature-gated consensus modules)
-        run: cargo test -p ghost-consensus --lib --features zk-consensus,mpc-ceremony
-
-      # Run wraith-wallet integration tests (separate from --lib --bins).
-      # These spin up the real wraithd binary against a tempdir socket, plus
-      # in-process mock GSPs — locks the wallet IPC and streaming push-channel
-      # contracts. Linux only: macOS runners can't bind Unix sockets the same
-      # way (shorter sun_path limit) and we don't need cross-platform coverage
-      # here; the unit + lib tests above already do.
-      - name: Run wraith-wallet integration tests
-        if: runner.os == 'Linux'
-        run: |
-          cargo test -p wraith-wallet-ipc
-          cargo test -p wraith-wallet-core --tests
-          cargo test -p wraith-wallet-daemon --tests
 
   # Documentation
   docs:
@@ -713,74 +651,6 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps $WORKSPACE_EXCLUDES --all-features
-
-  # The Tauri desktop crates, which every other job excludes.
-  #
-  # They were excluded because `tauri::generate_context!` will not compile until the JS
-  # frontend has been built into `dist/`, which is a Node pipeline the Rust jobs do not run.
-  # That is a reason to give them their own job, not a reason to leave them untested: the
-  # exclusion let a GUI change ship that did not typecheck, because nothing anywhere checked.
-  #
-  # Ordered cheapest-first on purpose. `tsc --noEmit` needs no system packages and catches the
-  # class of mistake the exclusion was hiding, so it runs before anything downloads webkit.
-  tauri:
-    name: Desktop (Tauri)
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: apps/wraith-wallet/gui/package-lock.json
-      - name: Install frontend deps
-        working-directory: apps/wraith-wallet/gui
-        run: npm ci --no-audit --no-fund
-      - name: Typecheck the frontend
-        working-directory: apps/wraith-wallet/gui
-        run: npx tsc --noEmit
-      - name: Build the frontend
-        working-directory: apps/wraith-wallet/gui
-        run: npx vite build
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Runner image (apt cache key)
-        id: runner-image
-        # .debs resolved on one runner image are not installable on another: a cache of
-        # systemd 259.9 dpkg'd onto a 259.5 image broke apt outright. Key on the image.
-        run: echo "id=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
-      - name: Cache apt packages
-        uses: actions/cache@v4
-        with:
-          path: /tmp/apt-debs
-          # Keyed on the install script AND this job's package list, because the list is passed
-          # in through `LINUX_DEPS` rather than living in the script. Sharing the pure-Rust jobs'
-          # key would hand this job a cache holding none of the packages it needs.
-          key: apt-debs-tauri-${{ runner.os }}-${{ steps.runner-image.outputs.id }}-${{ hashFiles('.github/scripts/install-linux-deps.sh') }}-${{ env.TAURI_DEPS }}
-      - name: Install Linux deps
-        # ⚠ 20, not the 6 the other jobs use, and not the 10 it was. TAURI_DEPS pulls ~212
-        # packages against their ~40, so a COLD apt cache takes far longer here. The cache key
-        # hashes install-linux-deps.sh, so any edit to that script rotates it and forces exactly
-        # that cold path on every job at once — which is how this job timed out at 10 minutes on
-        # 2026-09-30 mid-download, having fetched 212 packages and not finished.
-        timeout-minutes: 20
-        env:
-          LINUX_DEPS: ${{ env.TAURI_DEPS }}
-        run: .github/scripts/install-linux-deps.sh
-      # The GUI bundles `wraithd` as a Tauri sidecar (`externalBin`), and
-      # `tauri-build` fails at build-script time if the binary is not already
-      # sitting at the target-triple path. So the daemon is built first and
-      # placed where the bundler expects it — which also means CI proves the
-      # desktop bundle can actually assemble, not just that its Rust compiles.
-      - name: Build the sidecar daemon
-        run: |
-          cargo build -p wraith-wallet-daemon --bin wraithd
-          triple=$(rustc -vV | awk '/^host:/ {print $2}')
-          mkdir -p apps/wraith-wallet/gui/src-tauri/binaries
-          cp target/debug/wraithd "apps/wraith-wallet/gui/src-tauri/binaries/wraithd-$triple"
-      - name: Build the desktop crate
-        run: cargo build -p wraith-wallet-gui
 
   # Security audit
   audit:

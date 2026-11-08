@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Connect your miner · Ghost Pool</title>
+  <meta name="description" content="How to point a Bitaxe, Avalon, Antminer, Braiins OS or Stratum V2 miner at Ghost Pool. Your username is your Bitcoin address.">
+  <meta property="og:site_name" content="Ghost Pool">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Connect your miner · Ghost Pool">
+  <meta property="og:description" content="How to point a Bitaxe, Avalon, Antminer, Braiins OS or Stratum V2 miner at Ghost Pool. Your username is your Bitcoin address.">
+  <meta property="og:url" content="https://bitcoinghost.org/connect.html">
+  <meta property="og:image" content="https://bitcoinghost.org/logo.png">
+  <meta name="twitter:card" content="summary">
+  <link rel="icon" href="/logo.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css?v=20261108">
+  <script>
+    (function () {
+      var saved = null;
+      try { saved = localStorage.getItem('ghost-theme'); } catch (e) {}
+      var dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+      document.documentElement.setAttribute('data-theme', saved || (dark ? 'dark' : 'light'));
+    })();
+  </script>
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container">
+    <a href="/" class="brand bare"><svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg><span class="wordmark">ghost pool</span></a>
+    <nav class="primary" aria-label="Site">
+      <a href="/">home</a>
+      <a href="/connect.html" class="current" aria-current="page">connect</a>
+      <a href="/miner.html">miner lookup</a>
+      <a href="/faq.html">faq</a>
+      <a href="/run-a-node.html">run a node</a>
+    </nav>
+    <div class="utils">
+      <a href="https://github.com/bitcoin-ghost/ghost" class="bare icon-btn" aria-label="Source code on GitHub"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg></a>
+      <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle colour scheme"></button>
+    </div>
+  </div>
+</header>
+
+<main>
+<section class="hero hero-small">
+  <div class="container">
+    <p class="eyebrow">connect</p>
+    <h1>Connect your miner.</h1>
+    <p class="lead">Three settings: the pool URL, a username that is your Bitcoin address, and any password. Set both nodes, one as primary and one as backup.</p>
+  </div>
+</section>
+
+<section class="block">
+  <div class="container">
+    <p class="section-label">the nodes</p>
+    <h2>Pool URLs.</h2>
+    <div data-connect><p class="muted">Loading the node addresses…</p></div>
+    <noscript><p class="muted">The node addresses are listed in <a href="/pool-nodes.json">pool-nodes.json</a>.</p></noscript>
+    <p class="note">Click a URL to copy it.</p>
+  </div>
+</section>
+
+<section class="block">
+  <div class="container">
+    <p class="section-label">username</p>
+    <h2>Your Bitcoin address is your account.</h2>
+    <ul class="plain-list">
+      <li>Use <code>bc1q…</code> (SegWit), <code>bc1p…</code> (Taproot) or <code>3…</code> (P2SH) addresses. Legacy <code>1…</code> addresses are refused.</li>
+      <li>To tell machines apart, add a worker name after a dot: <code>bc1q…xyz.garage</code>. Workers on the same address are added up on your miner page.</li>
+      <li>The password is ignored. Put <code>x</code>.</li>
+      <li>Use an address from a wallet you control, and check it twice: a block pays exactly the address in your username, and nobody can redirect or refund it.</li>
+    </ul>
+  </div>
+</section>
+
+<section class="block">
+  <div class="container">
+    <p class="section-label">step by step</p>
+    <h2>By miner.</h2>
+
+    <div class="guide">
+      <h3>Bitaxe, NerdAxe and other AxeOS miners</h3>
+      <ol>
+        <li>Open the miner's web page (its IP address in a browser) and go to <strong>Settings</strong>.</li>
+        <li><strong>Stratum URL</strong>: the first node's host name, without <code>stratum+tcp://</code>. <strong>Port</strong>: <code>3333</code>.</li>
+        <li><strong>Stratum user</strong>: your address, optionally <code>.worker</code>. <strong>Password</strong>: <code>x</code>.</li>
+        <li>Newer AxeOS versions have a <strong>Fallback</strong> pool: set the second node there, also port <code>3333</code>.</li>
+        <li>Save and restart. The miner shows up on your <a href="/miner.html">miner page</a> within a minute of its first accepted share.</li>
+      </ol>
+    </div>
+
+    <div class="guide">
+      <h3>Avalon (Nano, Mini, Q and A-series)</h3>
+      <ol>
+        <li>Open the miner's web page or the Avalon app, and go to the pool settings.</li>
+        <li><strong>Pool 1</strong>: <code>stratum+tcp://&lt;first node&gt;:3333</code> for Nano and Mini, <code>:4444</code> for A-series machines.</li>
+        <li><strong>Worker</strong>: your address, optionally <code>.worker</code>. <strong>Password</strong>: <code>x</code>.</li>
+        <li><strong>Pool 2</strong>: the second node, same port and worker.</li>
+      </ol>
+    </div>
+
+    <div class="guide">
+      <h3>Antminer (stock firmware)</h3>
+      <ol>
+        <li>Open the miner's web page and go to <strong>Miner Configuration</strong> (or <strong>Settings → Pools</strong>).</li>
+        <li><strong>Pool 1 URL</strong>: <code>stratum+tcp://&lt;first node&gt;:4444</code>. <strong>Worker</strong>: your address, optionally <code>.worker</code>. <strong>Password</strong>: <code>x</code>.</li>
+        <li><strong>Pool 2 URL</strong>: <code>stratum+tcp://&lt;second node&gt;:4444</code>, same worker and password.</li>
+        <li>Save and apply. The miner switches to pool 2 by itself if pool 1 stops answering.</li>
+      </ol>
+    </div>
+
+    <div class="guide">
+      <h3>Braiins OS</h3>
+      <ol>
+        <li>Go to <strong>Configuration → Pools</strong> and add a pool group.</li>
+        <li>Add both nodes as <code>stratum+tcp://&lt;node&gt;:4444</code> with your address as the user and <code>x</code> as the password. The order sets which is tried first.</li>
+        <li>To use Stratum V2 instead, add each node's SV2 URL from the list above, including the authority key: <code>stratum2+tcp://&lt;node&gt;:34255/&lt;authority key&gt;</code>.</li>
+      </ol>
+    </div>
+
+    <div class="guide">
+      <h3>Stratum V2 (any SV2 miner or proxy)</h3>
+      <ol>
+        <li>Connect to port <code>34255</code> of either node. SV2 connections are encrypted and the miner checks the node's identity against its <strong>authority key</strong>: use the key published for that node above, and never a key you got anywhere else.</li>
+        <li>The user identity is your address, optionally <code>.worker</code>, exactly as for SV1.</li>
+        <li>Both standard and extended channels are supported. Job Declaration, where your own node builds the block template, is coming soon.</li>
+      </ol>
+    </div>
+  </div>
+</section>
+
+<section class="block">
+  <div class="container">
+    <p class="section-label">check</p>
+    <h2>Is it working?</h2>
+    <p class="section-lead">Look up your address on the <a href="/miner.html">miner lookup</a> page: you should see your workers online and shares being accepted. A few stale shares are normal. If nothing appears after a few minutes, check the address in the username, and that the miner reaches the node's port (some networks block outgoing ports other than 80 and 443).</p>
+  </div>
+</section>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="colophon">
+      <div class="brand"><svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg><span class="wordmark">ghost pool</span></div>
+      <div class="meta">A solo Bitcoin mining pool. No accounts, no KYC. Open source under the MIT license.</div>
+    </div>
+    <div>
+      <h4>Mine</h4>
+      <ul>
+        <li><a href="/connect.html">Connect a miner</a></li>
+        <li><a href="/miner.html">Miner lookup</a></li>
+        <li><a href="/faq.html">FAQ</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Operate</h4>
+      <ul>
+        <li><a href="/run-a-node.html">Run a node</a></li>
+        <li><a href="/security.html">Security</a></li>
+        <li><a href="https://github.com/bitcoin-ghost/ghost">Source code</a></li>
+      </ul>
+    </div>
+  </div>
+</footer>
+
+<script src="/pool.js"></script>
+
+</body>
+</html>

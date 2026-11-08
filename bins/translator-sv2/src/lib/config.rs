@@ -228,6 +228,11 @@ pub struct DownstreamDifficultyConfig {
     pub job_keepalive_interval_secs: u16,
     /// Quantise every assigned difficulty to a power-of-two tier (SHARE_TIER_BIND).
     ///
+    /// **Ghost Solo: off by default, and nothing needs it.** It existed so a share could carry
+    /// its tier for the share chain; the solo pool has no share chain and pays nothing from a
+    /// share, so plain vardiff targets are right. It is kept only so an old config that sets it
+    /// still loads, and can be removed with its `difficulty_manager` branch.
+    ///
     /// The emitting half of ghost-mining's `SHARE_TIER_BIND_HEIGHT`: a share can only commit to
     /// its difficulty tier inside the hashed coinbase if the difficulty it was ASSIGNED is a
     /// tier — `2^n`, floored at `2^10` (the authority for both numbers is

@@ -44,6 +44,23 @@ pub(super) fn is_mining_subscribe(msg: &Message) -> bool {
     }
 }
 
+/// The agent a `mining.subscribe` names (its first parameter), clamped like any agent.
+///
+/// Read when the subscribe is QUEUED, not when it is processed: the queue drains only after the
+/// channel opens, and the open (on authorize, or the subscribe debounce) is what carries the
+/// agent TLV to the pool's sensing loop. Read at processing time, the agent arrived after the
+/// open, and every SV1 miner was sensed as the translator itself.
+pub(super) fn subscribe_agent(msg: &Message) -> Option<String> {
+    match msg {
+        json_rpc::Message::StandardRequest(r) if r.method == "mining.subscribe" => r
+            .params
+            .get(0)
+            .and_then(|a| a.as_str())
+            .map(|a| clamp_agent(a).to_string()),
+        _ => None,
+    }
+}
+
 /// Check if Sv1 message is mining.suggest_difficulty.
 ///
 /// Like `mining.configure`, this must be processed IMMEDIATELY rather than queued behind
@@ -175,6 +192,34 @@ pub(super) fn parse_suggest_difficulty(msg: &Message) -> Option<f64> {
 /// caller omit the TLV entirely. Where the pool has the extension negotiated as *required* that
 /// share is marked unattributable and silently earns nothing, while the miner still receives
 /// `SubmitSharesSuccess`. `mining.authorize` does not currently reject that shape.
+/// The worker name a miner gets when it authorises with its bare payout address (the spec's
+/// username is the payout address; the worker is optional).
+pub(super) const DEFAULT_WORKER: &str = "default";
+
+/// The username as the translator keeps it: any `.d=<difficulty>` directive stripped, and a bare
+/// payout address given the [`DEFAULT_WORKER`], so `addr` and `addr.default` are the same miner.
+/// A bare name that is not an address is left alone (and refused by
+/// [`check_username_attributable`]): it names no payout target, and the config's prefix would
+/// credit the operator's address instead.
+pub(super) fn normalize_username(name: &str) -> (std::borrow::Cow<'_, str>, Option<f64>) {
+    let (name, difficulty) = split_username_difficulty(name);
+    if !name.contains('.') && is_address(name) {
+        (
+            std::borrow::Cow::Owned(format!("{name}.{DEFAULT_WORKER}")),
+            difficulty,
+        )
+    } else {
+        (std::borrow::Cow::Borrowed(name), difficulty)
+    }
+}
+
+/// Whether `s` parses as a Bitcoin address on any network (the pool checks the network and the
+/// script class when the channel opens).
+fn is_address(s: &str) -> bool {
+    use stratum_apps::stratum_core::bitcoin::{address::NetworkUnchecked, Address};
+    s.parse::<Address<NetworkUnchecked>>().is_ok()
+}
+
 pub(super) fn extract_worker_name(name: &str) -> &str {
     // FIRST dot: the worker is everything after it, so `addr.farm1.rig1` keeps `farm1.rig1`
     // rather than collapsing to `rig1` (#481).
@@ -252,6 +297,59 @@ pub(super) fn check_username_attributable(name: &str) -> Result<(), UsernameReje
 /// Returning `None` makes the caller omit the identity, which the pool treats as
 /// unattributable and refuses to credit. That is loud and costs one share; guessing is
 /// silent and costs someone their earnings.
+/// SV2 extension type of the Ghost user-agent TLV.
+///
+/// ⚠ AUTHORITY: `ghost_common::solo::AGENT_TLV_EXTENSION_TYPE`, read by `pool_sv2`.
+/// Duplicated as a literal because this crate is an SRI fork that deliberately does not link the
+/// ghost workspace crates (see `difficulty_manager::MIN_DIFFICULTY_TIER_LOG2`). The pin test below
+/// and the pool's own test hold the two copies to the same value.
+pub(crate) const GHOST_AGENT_EXTENSION_TYPE: u16 = 0x4748;
+
+/// Field type of the agent inside [`GHOST_AGENT_EXTENSION_TYPE`]. Authority as above
+/// (`AGENT_TLV_FIELD_TYPE`).
+pub(crate) const GHOST_AGENT_FIELD_TYPE: u8 = 0x01;
+
+/// Field type of the payee identity inside [`GHOST_AGENT_EXTENSION_TYPE`], on the `UpdateChannel`
+/// that binds a provisionally opened channel to its miner's `<address>.<worker>`. Authority:
+/// `ghost_common::solo::PAYEE_TLV_FIELD_TYPE`.
+pub(crate) const GHOST_PAYEE_FIELD_TYPE: u8 = 0x02;
+
+/// Longest agent forwarded, in bytes. Authority as above (`MAX_AGENT_LEN`).
+const MAX_AGENT_LEN: usize = 255;
+
+/// Cut an SV1 agent to [`MAX_AGENT_LEN`] bytes at a character boundary.
+fn clamp_agent(agent: &str) -> &str {
+    if agent.len() <= MAX_AGENT_LEN {
+        return agent;
+    }
+    let mut end = MAX_AGENT_LEN;
+    while !agent.is_char_boundary(end) {
+        end -= 1;
+    }
+    &agent[..end]
+}
+
+/// The Ghost agent TLV for an SV1 miner's `mining.subscribe` agent. The pool's node pool layer
+/// looks the agent up in its firmware ceiling table to choose the miner's slot class; the pool
+/// builds the coinbase, so the sensing loop lives there and this is the one fact it cannot see.
+fn ghost_agent_tlv(agent: &str) -> stratum_apps::stratum_core::parsers_sv2::Tlv {
+    stratum_apps::stratum_core::parsers_sv2::Tlv::new(
+        GHOST_AGENT_EXTENSION_TYPE,
+        GHOST_AGENT_FIELD_TYPE,
+        clamp_agent(agent).as_bytes().to_vec(),
+    )
+}
+
+/// The Ghost payee TLV: the authorised `<address>.<worker>` a provisionally opened channel
+/// credits from now on.
+pub(crate) fn ghost_payee_tlv(identity: &str) -> stratum_apps::stratum_core::parsers_sv2::Tlv {
+    stratum_apps::stratum_core::parsers_sv2::Tlv::new(
+        GHOST_AGENT_EXTENSION_TYPE,
+        GHOST_PAYEE_FIELD_TYPE,
+        identity.as_bytes().to_vec(),
+    )
+}
+
 fn tlv_compatible_username(s: &str) -> Option<&str> {
     if s.len() <= MAX_USER_IDENTITY_LENGTH {
         return Some(s);
@@ -507,6 +605,36 @@ mod username_difficulty_tests {
         assert_eq!(check_username_attributable(""), Err(NoSeparator));
     }
 
+    /// The spec's username is the payout address, the worker optional: a bare address is
+    /// accepted as `<address>.default`, with or without a `.d=` directive, and authorize, the
+    /// stored name and every submit agree on it. A bare name that is not an address is still
+    /// refused: it names no payout target.
+    #[test]
+    fn a_bare_payout_address_is_a_username_with_the_default_worker() {
+        for bare in [
+            ADDR,
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
+            "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0",
+            "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy",
+        ] {
+            let (n, d) = normalize_username(bare);
+            assert_eq!(n, format!("{bare}.{DEFAULT_WORKER}"));
+            assert_eq!(d, None);
+            assert_eq!(check_username_attributable(&n), Ok(()));
+            assert_eq!(extract_worker_name(&n), DEFAULT_WORKER);
+            let with_d = format!("{bare}.d=4096");
+            let (n2, d2) = normalize_username(&with_d);
+            assert_eq!((n2, d2), (n.clone(), Some(4096.0)));
+        }
+        let rig = format!("{ADDR}.rig1");
+        assert_eq!(normalize_username(&rig).0, rig, "a worker is kept");
+        assert_eq!(normalize_username("rig1").0, "rig1");
+        assert_eq!(
+            check_username_attributable(&normalize_username("rig1").0),
+            Err(UsernameRejection::NoSeparator)
+        );
+    }
+
     /// The address/worker split is on the FIRST dot, so a multi-dot worker survives intact.
     ///
     /// `bc1qAAA.farm1.rig1` and `bc1qAAA.farm2.rig1` used to collapse to the same identity,
@@ -579,6 +707,95 @@ mod worker_tlv_length_tests {
                 .unwrap_or_else(|e| panic!("encode rejected {identity:?}: {e:?}"));
             let decoded = UserIdentity::from_tlv(&tlv).expect("decode");
             assert_eq!(decoded.as_str().unwrap(), identity);
+        }
+    }
+}
+
+#[cfg(test)]
+mod ghost_agent_tlv_tests {
+    use super::*;
+    use stratum_apps::stratum_core::{
+        codec_sv2::StandardSv2Frame,
+        mining_sv2::OpenExtendedMiningChannel,
+        parsers_sv2::{parse_message_frame_with_tlvs, AnyMessage, Mining, TlvList},
+    };
+
+    /// The literals must match the pool's authority, `ghost_common::solo`.
+    #[test]
+    fn the_constants_match_the_pools() {
+        assert_eq!(GHOST_AGENT_EXTENSION_TYPE, 0x4748);
+        assert_eq!(GHOST_AGENT_FIELD_TYPE, 0x01);
+        assert_eq!(MAX_AGENT_LEN, 255);
+    }
+
+    /// The agent is read from a subscribe as it is queued; nothing else names one.
+    #[test]
+    fn a_queued_subscribe_yields_its_agent() {
+        let msg = |s: &str| serde_json::from_str::<Message>(s).unwrap();
+        assert_eq!(
+            subscribe_agent(&msg(
+                r#"{"id":1,"method":"mining.subscribe","params":["bitaxe/v2.10.0"]}"#
+            )),
+            Some("bitaxe/v2.10.0".to_string())
+        );
+        assert_eq!(
+            subscribe_agent(&msg(r#"{"id":1,"method":"mining.subscribe","params":[]}"#)),
+            None
+        );
+        assert_eq!(
+            subscribe_agent(&msg(
+                r#"{"id":2,"method":"mining.authorize","params":["a.w","x"]}"#
+            )),
+            None
+        );
+        let long = format!(
+            r#"{{"id":1,"method":"mining.subscribe","params":["{}"]}}"#,
+            "é".repeat(200)
+        );
+        assert!(subscribe_agent(&msg(&long)).unwrap().len() <= MAX_AGENT_LEN);
+    }
+
+    #[test]
+    fn long_agents_are_cut_at_a_character_boundary() {
+        let tlv = ghost_agent_tlv(&"é".repeat(200));
+        assert!(tlv.value.len() <= MAX_AGENT_LEN);
+        assert!(std::str::from_utf8(&tlv.value).is_ok());
+    }
+
+    /// The agent survives the frame the channel manager sends, and a pool that negotiated the
+    /// extension reads it back; one that did not never sees it.
+    #[test]
+    fn the_agent_rides_the_channel_open_frame() {
+        let open = OpenExtendedMiningChannel {
+            request_id: 1,
+            user_identity: "bc1qexample.rig1".as_bytes().to_vec().try_into().unwrap(),
+            nominal_hash_rate: 1.0e12,
+            max_target: vec![0xFFu8; 32].try_into().unwrap(),
+            min_extranonce_size: 4,
+        };
+        let tlv = ghost_agent_tlv("Antminer S19j Pro/1.0");
+        let bytes = TlvList::from_slice(&[tlv])
+            .unwrap()
+            .build_frame_bytes_with_tlvs(Mining::OpenExtendedMiningChannel(open))
+            .unwrap();
+        for (negotiated, expect) in [(vec![GHOST_AGENT_EXTENSION_TYPE], true), (vec![], false)] {
+            let mut frame =
+                StandardSv2Frame::<AnyMessage<'static>>::from_bytes(bytes.clone().into()).unwrap();
+            let header = frame.get_header().unwrap();
+            let (message, tlvs) =
+                parse_message_frame_with_tlvs(header, frame.payload(), &negotiated).unwrap();
+            assert!(matches!(
+                message,
+                AnyMessage::Mining(Mining::OpenExtendedMiningChannel(_))
+            ));
+            let agent = tlvs.unwrap_or_default().into_iter().find(|t| {
+                t.r#type.extension_type == GHOST_AGENT_EXTENSION_TYPE
+                    && t.r#type.field_type == GHOST_AGENT_FIELD_TYPE
+            });
+            assert_eq!(
+                agent.map(|t| t.value),
+                expect.then(|| b"Antminer S19j Pro/1.0".to_vec())
+            );
         }
     }
 }

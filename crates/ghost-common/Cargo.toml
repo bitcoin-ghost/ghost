@@ -44,7 +44,7 @@ tracing = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 # ZMQ block/tx feed for Bitcoin Core notifications. Optional + on by default so
-# node crates (ghost-mining, ghost-gsp, …) are unaffected, but wallet crates can
+# node crates (ghost-mining, …) are unaffected, but wallet crates can
 # opt out with `default-features = false` — `tmq` is UNIX-only and won't build
 # for the Windows target the Wraith Wallet ships to.
 tmq = { workspace = true, optional = true }
@@ -71,7 +71,3 @@ zmq = ["dep:tmq"]
 
 [dev-dependencies]
 tempfile = "3"
-# The epoch-summary Merkle tree is `ghost_reconciliation::compute_merkle_root`, injected at the
-# call sites because a regular dependency would be a cycle (ghost-reconciliation depends on this
-# crate). The dev-dependency lets the tests pin the REAL tree with a cross-crate golden vector.
-ghost-reconciliation = { workspace = true }

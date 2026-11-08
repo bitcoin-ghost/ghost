@@ -66,7 +66,6 @@ export default function NetworkPage() {
 
   const torActive = !!status?.tor_mode;
   const onion = status?.onion_address;
-  const peerCount = status?.peer_count ?? 0;
   const exposure = torActive ? (onion ? "tor" : "tor (no onion)") : "clearnet";
 
   return (
@@ -88,11 +87,6 @@ export default function NetworkPage() {
             label="Outbound transport"
             value={torActive ? "Tor" : "clearnet"}
             tooltip="Whether your node's outbound P2P connections run over clearnet or Tor."
-          />
-          <StatCard
-            label="Connected peers"
-            value={peerCount.toLocaleString()}
-            tooltip="Mesh peers currently connected to your node."
           />
           <StatCard
             label="Onion address"

@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Run a node · Ghost Pool</title>
+  <meta name="description" content="Run your own Ghost Pool node with the one-command installer: a Bitcoin node, the pool and its SV1 and SV2 ports, on one Ubuntu machine.">
+  <meta property="og:site_name" content="Ghost Pool">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Run a node · Ghost Pool">
+  <meta property="og:description" content="Run your own Ghost Pool node with the one-command installer: a Bitcoin node, the pool and its SV1 and SV2 ports, on one Ubuntu machine.">
+  <meta property="og:url" content="https://bitcoinghost.org/run-a-node.html">
+  <meta property="og:image" content="https://bitcoinghost.org/logo.png">
+  <meta name="twitter:card" content="summary">
+  <link rel="icon" href="/logo.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css?v=20261108">
+  <script>
+    (function () {
+      var saved = null;
+      try { saved = localStorage.getItem('ghost-theme'); } catch (e) {}
+      var dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+      document.documentElement.setAttribute('data-theme', saved || (dark ? 'dark' : 'light'));
+    })();
+  </script>
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container">
+    <a href="/" class="brand bare"><svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg><span class="wordmark">ghost pool</span></a>
+    <nav class="primary" aria-label="Site">
+      <a href="/">home</a>
+      <a href="/connect.html">connect</a>
+      <a href="/miner.html">miner lookup</a>
+      <a href="/faq.html">faq</a>
+      <a href="/run-a-node.html" class="current" aria-current="page">run a node</a>
+    </nav>
+    <div class="utils">
+      <a href="https://github.com/bitcoin-ghost/ghost" class="bare icon-btn" aria-label="Source code on GitHub"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg></a>
+      <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle colour scheme"></button>
+    </div>
+  </div>
+</header>
+
+<main>
+<section class="hero hero-small">
+  <div class="container">
+    <p class="eyebrow">run a node</p>
+    <h1>Run your own node.</h1>
+    <p class="lead">The software behind Ghost Pool is open source, and one installer sets up a whole node on an Ubuntu machine: a Bitcoin full node, the pool, its SV1 ports 3333 and 4444 and SV2 port 34255, and a dashboard. Point your own miners at it and you mine solo on your own node.</p>
+  </div>
+</section>
+
+<section class="block">
+  <div class="container">
+    <p class="section-label">what you get</p>
+    <h2>Same rules, your own machine.</h2>
+    <ul class="plain-list">
+      <li>The payout rule is compiled into the pool: a block found on your node pays its miner the subsidy and every fee, less 0.5% of the subsidy to the treasury, exactly as on the public nodes.</li>
+      <li>Your node builds its own block templates from its own mempool.</li>
+      <li>You can pair it with a second node of your own, so each submits the other's blocks (<code>--peer-node</code>).</li>
+      <li>A node of your own is not one of the two public Ghost Pool nodes, and it is not listed on this site.</li>
+    </ul>
+  </div>
+</section>
+
+<section class="block">
+  <div class="container">
+    <p class="section-label">install</p>
+    <h2>One command.</h2>
+    <p class="section-lead">Ubuntu 22.04 or newer, 4 GB of RAM, and at least 25 GB of disk for a pruned mainnet node (800 GB for a full archive). The first sync of the Bitcoin chain takes from several hours to a few days.</p>
+<pre><code>curl -fsSLO https://raw.githubusercontent.com/bitcoin-ghost/ghost/ghost-solo/scripts/install-node.sh
+less install-node.sh            # read what it does first
+sudo GHOST_VERSION=np-latest bash install-node.sh</code></pre>
+    <p class="note">Run it with no flags on a terminal for a guided setup, or <code>bash install-node.sh --help</code> for every option. Every binary it downloads is checked against the project's GPG release signature before it is installed. The installer is <a href="https://github.com/bitcoin-ghost/ghost/blob/ghost-solo/scripts/install-node.sh">scripts/install-node.sh</a> in the source repository.</p>
+    <h3>Two nodes backing each other up</h3>
+<pre><code># on node A
+sudo GHOST_VERSION=np-latest bash install-node.sh --peer-node &lt;node B's IP&gt; --submit-auth &lt;B's rpcuser:rpcpassword&gt;
+# on node B
+sudo GHOST_VERSION=np-latest bash install-node.sh --peer-node &lt;node A's IP&gt; --submit-auth &lt;A's rpcuser:rpcpassword&gt;</code></pre>
+    <p class="note">Each node sends every block its miners find to the other as well. Keep the link between them private (a VPN or a private network): the RPC password crosses it.</p>
+  </div>
+</section>
+</main>
+
+<footer class="site-footer">
+  <div class="container">
+    <div class="colophon">
+      <div class="brand"><svg class="logo-ghost" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M12 2a8 8 0 0 0-8 8v12l3-3 2.5 2.5L12 19l2.5 2.5L17 19l3 3V10a8 8 0 0 0-8-8z"/></svg><span class="wordmark">ghost pool</span></div>
+      <div class="meta">A solo Bitcoin mining pool. No accounts, no KYC. Open source under the MIT license.</div>
+    </div>
+    <div>
+      <h4>Mine</h4>
+      <ul>
+        <li><a href="/connect.html">Connect a miner</a></li>
+        <li><a href="/miner.html">Miner lookup</a></li>
+        <li><a href="/faq.html">FAQ</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Operate</h4>
+      <ul>
+        <li><a href="/run-a-node.html">Run a node</a></li>
+        <li><a href="/security.html">Security</a></li>
+        <li><a href="https://github.com/bitcoin-ghost/ghost">Source code</a></li>
+      </ul>
+    </div>
+  </div>
+</footer>
+
+<script src="/pool.js"></script>
+
+</body>
+</html>

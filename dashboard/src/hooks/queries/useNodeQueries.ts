@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { getNodeInfo, getNodeStatus, getBlockchainStatus, getChainHealth, getShares, getHealth, getNickname, setNickname } from '@/lib/api/node';
+import { getNodeInfo, getNodeStatus, getBlockchainStatus, getChainHealth, getHealth, getNickname, setNickname } from '@/lib/api/node';
 import { useNodeStore } from '@/stores';
 
 // Query keys for consistency
@@ -9,7 +9,6 @@ export const nodeKeys = {
   status: () => [...nodeKeys.all, 'status'] as const,
   blockchain: () => [...nodeKeys.all, 'blockchain'] as const,
   chainHealth: () => [...nodeKeys.all, 'chain-health'] as const,
-  shares: () => [...nodeKeys.all, 'shares'] as const,
   health: () => [...nodeKeys.all, 'health'] as const,
   nickname: () => [...nodeKeys.all, 'nickname'] as const,
 };
@@ -55,20 +54,6 @@ export function useChainHealth(options?: { refetchInterval?: number }) {
     queryKey: nodeKeys.chainHealth(),
     queryFn: getChainHealth,
     refetchInterval: options?.refetchInterval ?? 30_000, // Poll every 30 seconds
-  });
-}
-
-export function useShares() {
-  const setShares = useNodeStore((s) => s.setShares);
-
-  return useQuery({
-    queryKey: nodeKeys.shares(),
-    queryFn: getShares,
-    staleTime: 30_000, // 30 seconds
-    select: (data) => {
-      setShares(data);
-      return data;
-    },
   });
 }
 

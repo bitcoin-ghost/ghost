@@ -1,6 +1,6 @@
 //! The shared secret that authenticates one Ghost process to another.
 //!
-//! Every internal HTTP hop on a Ghost node — the dashboard's proxy, ghost-pay, and since #603 the
+//! Every internal HTTP hop on a Ghost node — the dashboard's proxy and, since #603, the
 //! share webhook that writes the payout ledger — proves itself by signing
 //! `HMAC-SHA256(secret, timestamp_le_bytes ‖ body)` under `internal_api_secret`, and sends it as
 //! `X-Ghost-Signature` alongside `X-Ghost-Timestamp`.

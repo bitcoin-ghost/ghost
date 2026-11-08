@@ -1,7 +1,7 @@
 name: Release Agathion
 
 # Triggered on Agathion-specific tags so the repo-wide `v*` tags (which build
-# ghost-mining / ghost-cli / etc.) and the `wraith-v*` tags don't accidentally cut
+# ghost-mining / ghost-cli / etc.) don't accidentally cut
 # an Agathion Node release. Agathion Node is the operator dashboard and is a
 # SEPARATE download from the node binaries — packaged as a Next.js standalone
 # bundle, launched with its custom auth-relay `server.js`.
@@ -107,98 +107,9 @@ jobs:
           test -f "$STAGING/package.json"     || { echo "ERROR: package.json missing from bundle"; exit 1; }
           test -d "$STAGING/node_modules/next" || { echo "ERROR: minimal node_modules/next missing from standalone"; exit 1; }
 
-          # Operator-facing run instructions.
-          cat > "$STAGING/RUN.md" <<'RUNEOF'
-          # Running Agathion Node
-
-          Agathion Node is your Ghost node's familiar — a local dashboard that
-          watches the node and reports to you, the operator. This is the
-          **standalone** Next.js bundle; it needs a **Node.js runtime (>= 22)**
-          installed on the machine (the bundle ships only the app's minimal
-          `node_modules`, not Node itself).
-
-          ## Start
-
-          ```bash
-          # from inside this directory
-          DASHBOARD_PASSWORD='choose-a-strong-password' node server.js
-          ```
-
-          The launch command is **`node server.js`** — NOT `next start`. The
-          custom `server.js` is the auth entrypoint: it wraps Next.js and owns
-          the HTTP `upgrade` event so the real-time `/api/ws` WebSocket is gated
-          by the same session JWT as the REST API. `next start` does not run that
-          relay and is incompatible with the standalone output.
-
-          ## Environment
-
-          | Variable | Required | Default | Purpose |
-          |----------|----------|---------|---------|
-          | `DASHBOARD_PASSWORD` | yes | — | Login password. Also derives the JWT signing secret when `DASHBOARD_JWT_SECRET` is unset. |
-          | `DASHBOARD_JWT_SECRET` | no | derived from `DASHBOARD_PASSWORD` | Explicit HS256 signing secret (must be >= 32 chars). |
-          | `PORT` | no | `3000` | Listen port. |
-          | `HOSTNAME` | no | `127.0.0.1` | Bind address. Loopback by design — reach it via SSH tunnel: `ssh -L 3000:localhost:3000 <node>`. Set `0.0.0.0` only for deliberate LAN exposure (password still enforced). |
-          | `NEXT_PUBLIC_API_URL` | no | `http://127.0.0.1:8080` | Ghost node REST/WS backend. |
-          | `GHOST_PAY_URL` | no | — | Ghost Pay (L2) backend URL; the L2 pages log a startup notice when unset but the server still runs. |
-
-          Then open http://localhost:3000 (through your SSH tunnel).
-
-          ## Deploying as a service
-
-          The unit is named `ghost-dashboard.service` for historical reasons —
-          keep that name for compatibility; only the user-facing product is
-          "Agathion Node". Install it at
-          `/etc/systemd/system/ghost-dashboard.service`, replacing
-          `WorkingDirectory` with wherever you unpacked this tarball:
-
-          ```ini
-          [Unit]
-          Description=Ghost Node Dashboard
-          After=ghost-node.service
-          Wants=ghost-node.service
-
-          [Service]
-          Type=simple
-          User=ghost
-          Group=ghost
-          WorkingDirectory=/home/ghost/agathion-node
-          ExecStart=/usr/bin/node server.js
-          Environment=NODE_ENV=production
-          Environment=PORT=3000
-          Environment=HOSTNAME=127.0.0.1
-          Restart=on-failure
-          RestartSec=10
-
-          [Install]
-          WantedBy=multi-user.target
-          ```
-
-          `ExecStart` must be `node server.js`. Neither `npm start` nor
-          `next start` works here: this is a standalone build, so its minimal
-          `node_modules` has no `package.json` scripts for `npm start` to run,
-          and `next start` does not serve the authenticated WS relay.
-
-          Put `DASHBOARD_PASSWORD` and any other secrets in a root-only drop-in
-          rather than in the unit itself:
-
-          ```bash
-          sudo install -d -m 700 /etc/systemd/system/ghost-dashboard.service.d
-          sudo tee /etc/systemd/system/ghost-dashboard.service.d/override.conf >/dev/null <<'EOF'
-          [Service]
-          Environment=DASHBOARD_PASSWORD=your-password-here
-          EOF
-          sudo chmod 600 /etc/systemd/system/ghost-dashboard.service.d/override.conf
-          sudo systemctl daemon-reload && sudo systemctl enable --now ghost-dashboard
-          ```
-
-          After any redeploy, confirm the unit is running the tree you just
-          installed — a stale `WorkingDirectory` is the usual cause of
-          "I deployed but nothing changed":
-
-          ```bash
-          systemctl show -p WorkingDirectory --value ghost-dashboard
-          ```
-          RUNEOF
+          # Operator-facing run instructions (dashboard/RUN.md, also in the node pool release's
+          # bundle, scripts/package-dashboard.sh).
+          cp dashboard/RUN.md "$STAGING/RUN.md"
 
           # Convenience launcher.
           cat > "$STAGING/start.sh" <<'STARTEOF'
@@ -230,7 +141,7 @@ jobs:
           ( cd dist && tar czf "${NAME}.tar.gz" "${NAME}" )
           ( cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
 
-          # Machine-readable manifest (mirrors the Wraith release manifest shape).
+          # Machine-readable manifest.
           TARBALL_SHA="$(sha256sum "dist/${NAME}.tar.gz" | cut -d' ' -f1)"
           TARBALL_SIZE="$(wc -c < "dist/${NAME}.tar.gz" | tr -d ' ')"
           cat > "dist/${NAME}.manifest.json" <<MEOF
@@ -288,7 +199,7 @@ jobs:
           # Combined checksum file covering the shipped tarball. This is the
           # primary trust anchor a user verifies before running. The release
           # engineer signs it OFFLINE into SHA256SUMS.asc with the release key —
-          # CI never holds the signing key (same model as the Wraith release).
+          # CI never holds the signing key.
           # Entries use the asset name as PUBLISHED (GitHub replaces spaces with
           # '.') so `sha256sum -c SHA256SUMS` matches the downloaded files.
           : > SHA256SUMS

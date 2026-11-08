@@ -1,5 +1,12 @@
 # Deployment Guide for get.bitcoinghost.org
 
+> **install.sh here is a retired-URL stub.** It installs nothing: it prints where the node pool
+> installer is and exits 1, so old instructions pointing at `/install.sh` can no longer install the
+> old network. The node pool installer is `scripts/install-node.sh`; the documented command
+> (`curl -sSL https://get.bitcoinghost.org | sudo GHOST_VERSION=... bash`) fetches whatever the
+> site root serves, which this guide does not set up. The light wallet installer (`wallet.sh`) is
+> removed with the wallet; a copy already on the server stays until it is deleted there.
+
 ## Prerequisites
 - DNS A record for `get.bitcoinghost.org` pointing to your Web VM IP (already done)
 - Ubuntu 22.04+ or Debian 12+ server
@@ -17,7 +24,6 @@ scp -r get/* user@web-vm:/tmp/ghost-get/
 # On the Web VM
 sudo mkdir -p /var/www/get.bitcoinghost.org
 sudo cp /tmp/ghost-get/install.sh /var/www/get.bitcoinghost.org/
-sudo cp /tmp/ghost-get/wallet.sh /var/www/get.bitcoinghost.org/
 sudo chown -R www-data:www-data /var/www/get.bitcoinghost.org
 sudo chmod 644 /var/www/get.bitcoinghost.org/*.sh
 ```
@@ -57,8 +63,6 @@ sudo systemctl reload nginx
 # Test install script
 curl -sSL https://get.bitcoinghost.org/install.sh | head -20
 
-# Test wallet script
-curl -sSL https://get.bitcoinghost.org/wallet.sh | head -20
 
 # Test health endpoint
 curl https://get.bitcoinghost.org/health
@@ -70,8 +74,7 @@ After deployment, the structure should be:
 
 ```
 /var/www/get.bitcoinghost.org/
-├── install.sh      # Full node installer
-├── wallet.sh       # Light wallet installer
+├── install.sh      # Retired-URL stub: prints where the node pool installer is and exits 1
 └── keys/           # (optional) GPG keys for signatures
     └── release.asc
 ```
@@ -83,13 +86,12 @@ If you want to provide signed install scripts:
 ```bash
 # Generate signatures
 gpg --armor --detach-sign install.sh
-gpg --armor --detach-sign wallet.sh
 
 # Export public key
 gpg --armor --export your-key-id > keys/release.asc
 
 # Copy to server
-scp install.sh.sig wallet.sh.sig keys/release.asc user@web-vm:/var/www/get.bitcoinghost.org/
+scp install.sh.sig keys/release.asc user@web-vm:/var/www/get.bitcoinghost.org/
 ```
 
 Users can then verify:

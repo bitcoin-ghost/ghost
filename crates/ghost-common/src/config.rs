@@ -24,12 +24,12 @@
 //!
 //! All node and pool configuration is defined here.
 
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::constants::*;
 use crate::signer::SignerConfig;
-use crate::types::TreasuryAddress;
 
 /// H-11: Validate config file permissions on Unix systems
 ///
@@ -108,18 +108,18 @@ pub struct NodeConfig {
     pub storage: StorageConfig,
     /// Pool configuration (treasury, fees)
     pub pool: PoolConfig,
-    /// Ghost Pay L2 configuration (optional)
-    pub ghost_pay: Option<GhostPayConfig>,
+    /// Retired `[ghost_pay]` section (Ghost Pay was removed), accepted with whatever keys it
+    /// carries so older installed configs still load. Never written back.
+    #[serde(default, skip_serializing, rename = "ghost_pay")]
+    pub retired_ghost_pay: Option<IgnoredAny>,
     /// Reaper configuration (dead code detection in witness scripts)
     #[serde(default)]
     pub reaper: ReaperSettings,
-    /// Decentralised Wraith coordinator-election configuration.
-    ///
-    /// Read-only and gated OFF by default: when `wraith_election_enabled` is
-    /// false the election service is never constructed and has zero effect on
-    /// the node (`tasks/plan_decentralised_coordinators.md`, increment 4).
-    #[serde(default)]
-    pub coordinator: CoordinatorConfig,
+    /// Retired `[coordinator]` section (the coordinator capability went with capabilities),
+    /// accepted with whatever keys it carries so older installed configs still load. Never
+    /// written back.
+    #[serde(default, skip_serializing, rename = "coordinator")]
+    pub retired_coordinator: Option<IgnoredAny>,
     /// ghostd launch flags this node manages via the `ghost-setup apply-reaper`
     /// systemd drop-in (e.g. Tor mode). Applied at ghostd startup, so changing
     /// one requires a ghostd restart.
@@ -266,68 +266,6 @@ impl NodeLaunchConfig {
     }
 }
 
-/// Decentralised Wraith coordinator-election settings.
-///
-/// This increment only *computes and exposes* the election read-only; it never
-/// activates a coordinator role, touches `coordinator_redundancy`, or changes
-/// any Wraith mixing or consensus message. With `wraith_election_enabled =
-/// false` (the default) it is inert.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CoordinatorConfig {
-    /// Compute the per-epoch coordinator election and expose it read-only via
-    /// `GET /api/v1/pool/coordinator`. Default false — dead code when off.
-    #[serde(default)]
-    pub wraith_election_enabled: bool,
-    /// Opt in to being an eligible Wraith coordinator — the same opt-in model as
-    /// `public_mining` for miners. When true the node advertises itself as
-    /// coordinator-capable to the mesh and may be elected. Earns the mixing
-    /// service fee, not 5-4-3-2-1 shares. Default false.
-    #[serde(default)]
-    pub coordinator_enabled: bool,
-    /// The reachable coordinator endpoint this node advertises: a public
-    /// `host:port` or a `.onion` hidden service. Operator-controlled so home
-    /// operators can advertise Tor instead of doxxing an IP. Required (non-empty)
-    /// before the node can actually be elected — no endpoint means wallets have
-    /// nowhere to dial.
-    #[serde(default)]
-    pub advertised_endpoint: Option<String>,
-    /// Port the in-process coordinator binds when this node is elected to a seat.
-    #[serde(default = "default_coordinator_port")]
-    pub coordinator_port: u16,
-    /// Actually RUN the coordinator when elected (vs. only advertising + being
-    /// electable). Separate from `coordinator_enabled` so discovery can be on
-    /// without auto-activating. SECURE-BY-DEFAULT: on mainnet, activation is
-    /// refused without a ghostd RPC endpoint — the coordinator verifies every
-    /// participant's input against the chain, and cannot take it on trust.
-    /// Default false.
-    #[serde(default)]
-    pub coordinator_role_enabled: bool,
-    /// Destination address for this coordinator's per-round service fee
-    /// (`service_fee_bps`). Without it rounds run fee-less.
-    #[serde(default)]
-    pub coordinator_fee_address: Option<String>,
-}
-
-/// Default port for the in-process Wraith coordinator (matches the standalone
-/// `wraith-coordinator` binary's default).
-fn default_coordinator_port() -> u16 {
-    9100
-}
-
-impl Default for CoordinatorConfig {
-    fn default() -> Self {
-        Self {
-            wraith_election_enabled: false,
-            coordinator_enabled: false,
-            advertised_endpoint: None,
-            coordinator_port: default_coordinator_port(),
-            coordinator_role_enabled: false,
-            coordinator_fee_address: None,
-        }
-    }
-}
-
 /// Configuration validation error
 #[derive(Debug, Clone)]
 pub struct ConfigValidationError {
@@ -384,55 +322,26 @@ impl ConfigValidationResult {
 }
 
 impl NodeConfig {
-    /// Whether a local ghost-pay L2 daemon is enabled on this node.
-    ///
-    /// Ghost Pay counts as enabled only when the `[ghost_pay]` block is present
-    /// AND its `enabled` flag is true. Pool-only nodes carry a `[ghost_pay]`
-    /// block (setup emits one by default) but with `enabled = false` and never
-    /// run the ghost-pay daemon, so the block's mere presence must NOT be read
-    /// as "ghost-pay is running here". This mirrors `validate_ghost_pay`, which
-    /// likewise treats `enabled = false` as off, and is the single source of
-    /// truth for whether ghost-mining should talk to a local ghost-pay.
-    pub fn ghost_pay_enabled(&self) -> bool {
-        self.ghost_pay.as_ref().is_some_and(|gp| gp.enabled)
-    }
-
-    /// Whether the operator enabled Wraith mixing on this node.
-    ///
-    /// Sourced from the `[ghost_pay] wraith_enabled` setting — the operator's
-    /// on/off choice. This is what the public status endpoints must surface,
-    /// as opposed to ghost-pay's internal "does this process host CoinJoin
-    /// sessions" signal (always false since mixing moved to wraith-coordinator).
-    /// Reads as false when no `[ghost_pay]` block is present.
-    pub fn wraith_enabled(&self) -> bool {
-        self.ghost_pay.as_ref().is_some_and(|gp| gp.wraith_enabled)
-    }
-
-    /// Reconcile the mutually-exclusive Ghost Mode / Public Mining pair.
+    /// Reconcile Ghost Mode with pool mining.
     ///
     /// A Ghost Mode node suppresses the peer transaction-relay path, so its
     /// mempool never fills and the blocks it builds are near-empty — the
-    /// operator forfeits all transaction-fee income (fees accrue to the node
-    /// operator; miners are paid from the subsidy less the pool fee). Running
-    /// Ghost Mode alongside Public Mining (`mining_mode = PublicPool`) is
-    /// therefore self-harming and must never be allowed.
+    /// operator forfeits all transaction-fee income, which in the node pool goes
+    /// to the node whose miner finds the block. Every node is a pool node, so
+    /// Ghost Mode is self-harming and must never be on.
     ///
-    /// If a config file enables both, this disables Ghost Mode and leaves
-    /// Public Mining active — Public Mining is the income-earning capability, so
-    /// keeping it and dropping the flag that zeroes its revenue is the safe
-    /// resolution. Returns `Some(message)` describing the change so the caller
-    /// can log it loudly, or `None` when there is no conflict.
+    /// If a config file enables it, this disables it. Returns `Some(message)`
+    /// describing the change so the caller can log it loudly, or `None` when
+    /// there is nothing to change.
     #[must_use]
     pub fn reconcile_ghost_mode_mining_exclusion(&mut self) -> Option<String> {
-        if self.network.ghost_mode && matches!(self.network.mining_mode, MiningMode::PublicPool) {
+        if self.network.ghost_mode {
             self.network.ghost_mode = false;
             Some(
-                "CONFLICT: `ghost_mode = true` and `mining_mode = PublicPool` were both set. \
+                "CONFLICT: `ghost_mode = true` is set, but every node is a pool node. \
                  A Ghost Mode node suppresses peer transactions and builds near-empty blocks, \
-                 forfeiting all transaction-fee income, so it cannot run as a public miner. \
-                 Ghost Mode has been DISABLED and Public Mining left active. Set \
-                 `ghost_mode = false` or switch `mining_mode` away from PublicPool in pool.toml \
-                 to silence this warning."
+                 forfeiting all transaction-fee income. Ghost Mode has been DISABLED. Set \
+                 `ghost_mode = false` in pool.toml to silence this warning."
                     .to_string(),
             )
         } else {
@@ -447,7 +356,6 @@ impl NodeConfig {
         let mut result = ConfigValidationResult::default();
 
         // Validate pool configuration
-        self.validate_pool(&mut result);
 
         // Validate Bitcoin RPC configuration
         self.validate_bitcoin(&mut result);
@@ -460,11 +368,6 @@ impl NodeConfig {
 
         // Validate signer configuration
         self.validate_signer(&mut result);
-
-        // Validate Ghost Pay configuration (if enabled)
-        if let Some(ref gp) = self.ghost_pay {
-            self.validate_ghost_pay(gp, &mut result);
-        }
 
         // CRITICAL: Validate mainnet security requirements (no overrides allowed)
         self.validate_mainnet_security(&mut result);
@@ -479,15 +382,10 @@ impl NodeConfig {
     ///
     /// # Requirements (Mainnet Only)
     ///
-    /// 1. **Noise Protocol Encryption** (`noise_enabled = true`)
-    ///    - P2P traffic must be encrypted to prevent eavesdropping and MITM attacks
-    ///
-    /// 2. **Internal API Authentication** (`internal_api_secret` configured)
+    /// 1. **Internal API Authentication** (`internal_api_secret` configured)
     ///    - Admin endpoints must be protected to prevent unauthorized access
     ///
-    /// 3. **Seed Nodes Configured** (`seed_nodes` non-empty) [M-15]
-    ///    - At least one seed node required for P2P network discovery
-    ///    - Without seed nodes, the node will be isolated and unable to participate
+    /// 2. **TLS key with a TLS certificate** (`tls.key_path` when `tls.cert_path` is set)
     ///
     /// These checks only apply when `bitcoin.network = "mainnet"`. Testnets allow
     /// relaxed security for development and testing purposes.
@@ -497,17 +395,7 @@ impl NodeConfig {
             return;
         }
 
-        // MAINNET REQUIREMENT 1: Noise Protocol encryption
-        if !self.network.noise_enabled {
-            result.add_error(
-                "network.noise_enabled",
-                "MAINNET SECURITY: Noise Protocol encryption is REQUIRED for mainnet. \
-                 Set noise_enabled = true in [network] section. \
-                 P2P traffic without encryption is vulnerable to eavesdropping and MITM attacks.",
-            );
-        }
-
-        // MAINNET REQUIREMENT 2: Internal API authentication
+        // MAINNET REQUIREMENT 1: Internal API authentication
         match &self.network.internal_api_secret {
             None => {
                 result.add_error(
@@ -536,19 +424,7 @@ impl NodeConfig {
             }
         }
 
-        // MAINNET REQUIREMENT 3: Seed nodes must be configured
-        // M-15: Without seed nodes, a mainnet node cannot discover peers and will be isolated,
-        // making it unable to participate in the P2P mesh or consensus.
-        if self.network.seed_nodes.is_empty() {
-            result.add_error(
-                "network.seed_nodes",
-                "MAINNET SECURITY: At least one seed node is REQUIRED for mainnet. \
-                 Configure seed_nodes in [network] section with valid peer addresses. \
-                 Without seed nodes, this node cannot discover the P2P network and will be isolated.",
-            );
-        }
-
-        // MAINNET REQUIREMENT 4: TLS certificates must be operator-provided
+        // MAINNET REQUIREMENT 2: TLS certificates must be operator-provided
         // Self-signed certificates are not acceptable for mainnet because they provide
         // no chain of trust. Clients have no way to verify they are connecting to the
         // legitimate node rather than a MITM attacker.
@@ -565,105 +441,6 @@ impl NodeConfig {
                 "network.tls.key_path",
                 "MAINNET SECURITY: TLS key path is REQUIRED when cert_path is set. \
                  Configure tls.key_path in [network] section.",
-            );
-        }
-    }
-
-    fn validate_pool(&self, result: &mut ConfigValidationResult) {
-        // Treasury address validation
-        if self.pool.treasury_address.is_empty() {
-            result.add_warning(
-                "pool.treasury_address",
-                "Treasury address not configured - pool fee collection disabled",
-            );
-        } else {
-            // Validate the TreasuryAddress configuration
-            if let Err(e) = self.pool.treasury_address.validate() {
-                result.add_error("pool.treasury_address", &e.to_string());
-            }
-
-            // Basic bech32 prefix validation
-            let addr = self.pool.treasury_address.address();
-            let valid_prefix = match self.bitcoin.network {
-                BitcoinNetwork::Mainnet => addr.starts_with("bc1"),
-                BitcoinNetwork::Signet | BitcoinNetwork::Testnet => addr.starts_with("tb1"),
-                BitcoinNetwork::Regtest => addr.starts_with("bcrt1"),
-            };
-            if !valid_prefix {
-                result.add_error(
-                    "pool.treasury_address",
-                    &format!(
-                        "Invalid address prefix for {} network",
-                        format!("{:?}", self.bitcoin.network).to_lowercase()
-                    ),
-                );
-            }
-
-            // Additional validation for multi-sig
-            if self.pool.treasury_address.is_multisig() {
-                if let Some((m, n)) = self.pool.treasury_address.multisig_params() {
-                    if m > n || n > 15 || m == 0 {
-                        result.add_error(
-                            "pool.treasury_address",
-                            &format!(
-                                "Invalid M-of-N multi-sig: {}-of-{} (M must be 1-N, N must be 1-15)",
-                                m, n
-                            ),
-                        );
-                    }
-                }
-            }
-        }
-
-        // Node reward address (#588). The field's own doc says "must be a valid bech32 address
-        // for the configured network", and until now nothing enforced it: the string went
-        // straight into `nodes.payout_address` unparsed, and every consumer reaches it through
-        // `assume_checked()` — which does not check, it asserts. A testnet or typo'd address
-        // therefore parsed happily and yielded a scriptPubKey paying to nothing spendable on
-        // mainnet, silently burning this node's share of the node rewards.
-        //
-        // Parsed with `require_network` rather than the `bc1` prefix test used for the treasury
-        // above: node rewards legitimately accept P2PKH, P2SH, P2WPKH, P2WSH and P2TR (see
-        // `template.rs`, which uses rust-bitcoin's generic parser), so a `bc1`-only test would
-        // reject valid mainnet addresses that pay out correctly today.
-        if let Some(ref addr) = self.pool.node_payout_address {
-            let want = self.bitcoin.network.to_bitcoin_network();
-            if addr.trim().is_empty() {
-                result.add_error(
-                    "pool.node_payout_address",
-                    "Set to an empty string — remove the key entirely to disable node rewards",
-                );
-            } else {
-                match addr
-                    .trim()
-                    .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
-                {
-                    Err(e) => result.add_error(
-                        "pool.node_payout_address",
-                        &format!("Not a valid Bitcoin address: {}", e),
-                    ),
-                    Ok(parsed) => {
-                        if parsed.require_network(want).is_err() {
-                            result.add_error(
-                                "pool.node_payout_address",
-                                &format!(
-                                    "Address is not valid on the {} network — node rewards paid \
-                                     to it would be unspendable",
-                                    format!("{:?}", self.bitcoin.network).to_lowercase()
-                                ),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // Minimum payout validation
-        const DUST_LIMIT: u64 = 546;
-        if self.pool.min_payout_sats < DUST_LIMIT {
-            result.add_error(
-                "pool.min_payout_sats",
-                &format!("Must be at least {} sats (dust limit)", DUST_LIMIT),
             );
         }
     }
@@ -723,20 +500,6 @@ impl NodeConfig {
             ("sv2_port", self.network.sv2_port),
             ("sv1_port", self.network.sv1_port),
             ("http_port", self.network.http_port),
-            ("p2p.share_propagation", self.network.p2p.share_propagation),
-            (
-                "p2p.block_announcement",
-                self.network.p2p.block_announcement,
-            ),
-            ("p2p.consensus_voting", self.network.p2p.consensus_voting),
-            ("p2p.health_monitoring", self.network.p2p.health_monitoring),
-            ("p2p.discovery", self.network.p2p.discovery),
-            ("p2p.elder_management", self.network.p2p.elder_management),
-            ("p2p.payout_proposal", self.network.p2p.payout_proposal),
-            (
-                "p2p.payout_transaction",
-                self.network.p2p.payout_transaction,
-            ),
         ];
 
         // Check for zero ports
@@ -758,226 +521,46 @@ impl NodeConfig {
             }
         }
 
+        if let Some(url) = &self.pool.node_pool_api {
+            if !is_loopback_http_base(url) {
+                result.add_error(
+                    "pool.node_pool_api",
+                    &format!(
+                        "node_pool_api must be http://<loopback address>:<port> (pool_sv2's \
+                         monitoring_address), got {url:?}"
+                    ),
+                );
+            }
+        }
+
         // Max miners validation
         if self.network.max_miners == 0 {
             result.add_warning("network.max_miners", "Set to 0 - no miners can connect");
         }
 
-        // Public mining without public address
-        if matches!(self.network.mining_mode, MiningMode::PublicPool)
-            && self.network.public_address.is_none()
-        {
+        // A pool node with no public address cannot tell miners where to connect.
+        if self.network.public_address.is_none() {
             result.add_warning(
                 "network.public_address",
-                "Public mining enabled but no public address configured",
+                "No public address configured - the API cannot tell miners where to connect",
             );
         }
 
-        // MANDATORY: Signing key required for public mining
-        if matches!(self.network.mining_mode, MiningMode::PublicPool) {
-            match &self.network.signing_key {
-                None => {
-                    result.add_error(
-                        "network.signing_key",
-                        "signing_key is REQUIRED when mining_mode = PublicPool. \
-                         Generate with: ghostd --generate-signing-key",
-                    );
-                }
-                Some(key) => {
-                    // Validate signing key format (64 hex chars = 32 bytes)
-                    if key.len() != 64 {
-                        result.add_error(
-                            "network.signing_key",
-                            &format!(
-                                "signing_key must be exactly 64 hex characters (32 bytes), got {}",
-                                key.len()
-                            ),
-                        );
-                    } else if !key.chars().all(|c| c.is_ascii_hexdigit()) {
-                        result.add_error(
-                            "network.signing_key",
-                            "signing_key must contain only hexadecimal characters (0-9, a-f, A-F)",
-                        );
-                    }
-                }
-            }
-        }
-
-        // Validate seed nodes use secure protocols and have valid format
-        for (i, seed) in self.network.seed_nodes.iter().enumerate() {
-            let field = format!("network.seed_nodes[{}]", i);
-
-            // Allow localhost without TLS for development
-            let is_localhost = seed.starts_with("127.0.0.1")
-                || seed.starts_with("localhost")
-                || seed.starts_with("::1")
-                || seed.contains("://127.0.0.1")
-                || seed.contains("://localhost")
-                || seed.contains("://[::1]");
-
-            // If it's a URL, check for HTTP vs HTTPS
-            if seed.starts_with("http://") && !is_localhost {
+        // signing_key is optional; when set it must be well formed.
+        if let Some(key) = &self.network.signing_key {
+            if key.len() != 64 {
                 result.add_error(
-                    &field,
+                    "network.signing_key",
                     &format!(
-                        "Insecure HTTP URL for remote seed node: {}. Use HTTPS or TCP for P2P.",
-                        seed
+                        "signing_key must be exactly 64 hex characters (32 bytes), got {}",
+                        key.len()
                     ),
                 );
-            }
-
-            // Warn about insecure localhost (defense in depth)
-            if seed.starts_with("http://") && is_localhost {
-                result.add_warning(
-                    &field,
-                    "Using HTTP for localhost seed node. Consider HTTPS for defense in depth.",
+            } else if !key.chars().all(|c| c.is_ascii_hexdigit()) {
+                result.add_error(
+                    "network.signing_key",
+                    "signing_key must contain only hexadecimal characters (0-9, a-f, A-F)",
                 );
-            }
-
-            // Validate host:port format for non-URL seeds
-            if !seed.starts_with("http://") && !seed.starts_with("https://") {
-                // IPv6 format: [::1]:8559 or plain host:port
-                let has_port = if seed.starts_with('[') {
-                    // IPv6: expect [addr]:port
-                    seed.contains("]:")
-                } else {
-                    seed.contains(':') && seed.matches(':').count() == 1
-                };
-
-                if !has_port {
-                    result.add_error(
-                        &field,
-                        &format!(
-                            "Seed node '{}' must be in host:port format (e.g. 'seed1.example.com:8559')",
-                            seed
-                        ),
-                    );
-                } else {
-                    // Validate port is numeric
-                    let port_str = if seed.starts_with('[') {
-                        seed.rsplit("]:").next().unwrap_or("")
-                    } else {
-                        seed.rsplit(':').next().unwrap_or("")
-                    };
-                    if port_str.parse::<u16>().is_err() {
-                        result.add_error(
-                            &field,
-                            &format!("Seed node '{}' has invalid port: '{}'", seed, port_str),
-                        );
-                    }
-                }
-            }
-        }
-
-        // M1: Mainnet requires at least 3 seed nodes for network redundancy
-        if self.bitcoin.network == BitcoinNetwork::Mainnet && self.network.seed_nodes.len() < 3 {
-            result.add_error(
-                "network.seed_nodes",
-                &format!(
-                    "MAINNET SECURITY: At least 3 seed nodes are required for mainnet (got {}). \
-                     A single seed node is a single point of failure for peer discovery.",
-                    self.network.seed_nodes.len()
-                ),
-            );
-        }
-
-        // Validate mining mode configuration
-        self.validate_mining_mode(result);
-    }
-
-    fn validate_mining_mode(&self, result: &mut ConfigValidationResult) {
-        match self.network.mining_mode {
-            MiningMode::PublicPool => {
-                // PublicPool requires signing_key for DNS registration
-                // (already validated above in public_mining check).
-                // The legacy `public_mining` bool was removed — mining_mode is
-                // the single source of truth.
-            }
-            MiningMode::PrivatePool => {
-                // PrivatePool requires private_mining_password
-                match &self.network.private_mining_password {
-                    None => {
-                        result.add_error(
-                            "network.private_mining_password",
-                            "private_mining_password is REQUIRED when mining_mode = private_pool",
-                        );
-                    }
-                    Some(password) => {
-                        // L-17: Enforce minimum password length with an error, not just a warning
-                        // Weak passwords expose private mining endpoints to brute-force attacks
-                        if password.len() < 8 {
-                            result.add_error(
-                                "network.private_mining_password",
-                                &format!(
-                                    "L-17: Password must be at least 8 characters (got {}). \
-                                     Weak passwords expose private mining to brute-force attacks.",
-                                    password.len()
-                                ),
-                            );
-                        }
-                    }
-                }
-            }
-            MiningMode::PrivateSolo => {
-                // PrivateSolo requires both password and solo_payout_address
-                match &self.network.private_mining_password {
-                    None => {
-                        result.add_error(
-                            "network.private_mining_password",
-                            "private_mining_password is REQUIRED when mining_mode = private_solo",
-                        );
-                    }
-                    Some(password) => {
-                        // L-17: Enforce minimum password length with an error, not just a warning
-                        // Weak passwords expose private mining endpoints to brute-force attacks
-                        if password.len() < 8 {
-                            result.add_error(
-                                "network.private_mining_password",
-                                &format!(
-                                    "L-17: Password must be at least 8 characters (got {}). \
-                                     Weak passwords expose private mining to brute-force attacks.",
-                                    password.len()
-                                ),
-                            );
-                        }
-                    }
-                }
-
-                // solo_payout_address is required
-                match &self.network.solo_payout_address {
-                    None => {
-                        result.add_error(
-                            "network.solo_payout_address",
-                            "solo_payout_address is REQUIRED when mining_mode = private_solo",
-                        );
-                    }
-                    Some(addr) => {
-                        if addr.is_empty() {
-                            result.add_error(
-                                "network.solo_payout_address",
-                                "solo_payout_address cannot be empty",
-                            );
-                        } else {
-                            // Validate bech32 prefix matches network
-                            let valid_prefix = match self.bitcoin.network {
-                                BitcoinNetwork::Mainnet => addr.starts_with("bc1"),
-                                BitcoinNetwork::Signet | BitcoinNetwork::Testnet => {
-                                    addr.starts_with("tb1")
-                                }
-                                BitcoinNetwork::Regtest => addr.starts_with("bcrt1"),
-                            };
-                            if !valid_prefix {
-                                result.add_error(
-                                    "network.solo_payout_address",
-                                    &format!(
-                                        "Invalid address prefix for {} network",
-                                        format!("{:?}", self.bitcoin.network).to_lowercase()
-                                    ),
-                                );
-                            }
-                        }
-                    }
-                }
             }
         }
     }
@@ -1011,28 +594,6 @@ impl NodeConfig {
                     "KMS signer is not yet implemented. Use type = \"local\".",
                 );
             }
-        }
-    }
-
-    fn validate_ghost_pay(&self, gp: &GhostPayConfig, result: &mut ConfigValidationResult) {
-        if !gp.enabled {
-            return;
-        }
-
-        // Virtual block time
-        if gp.virtual_block_secs == 0 {
-            result.add_error("ghost_pay.virtual_block_secs", "Cannot be 0");
-        }
-        if gp.virtual_block_secs < 10 {
-            result.add_warning(
-                "ghost_pay.virtual_block_secs",
-                "Very short virtual block time may cause issues",
-            );
-        }
-
-        // Epoch blocks
-        if gp.epoch_blocks == 0 {
-            result.add_error("ghost_pay.epoch_blocks", "Cannot be 0");
         }
     }
 
@@ -1205,50 +766,13 @@ pub enum BitcoinNetwork {
     Regtest,
 }
 
-/// Mining mode configuration
+/// Default pool tag stamped into the coinbase scriptsig when neither `pool.coinbase_extra` nor
+/// `pool.pool_name` is set.
 ///
-/// Determines how the pool operates and who can mine.
-///
-/// # TOML Example
-/// ```toml
-/// [network]
-/// mining_mode = "private_solo"
-/// private_mining_password = "mysecretpassword"
-/// solo_payout_address = "tb1q..."
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum MiningMode {
-    /// DNS registered, anyone can mine, pool-aggregated rewards
-    #[default]
-    PublicPool,
-    /// Password required, pool-aggregated rewards, not in DNS
-    PrivatePool,
-    /// Password required, 99% + fees to operator's address, not in DNS
-    PrivateSolo,
-}
-
-impl MiningMode {
-    /// Returns the default coinbase scriptsig tag for this mining mode.
-    /// Visible on block explorers to identify the pool and its mode.
-    /// Tag stamped into the coinbase scriptsig.
-    ///
-    /// Deliberately terse. The scriptsig has a 100-byte consensus ceiling and the measured mainnet
-    /// coinbase already used 53 of it, 24 of which was this tag in its spaced-out form
-    /// (`- G H O S T - PublicPool`). Upcoming work needs ~44 bytes there for two commitments — the
-    /// payout identity a won block pays, and the node a share was mined to — which left only ~3
-    /// bytes of margin. Trimming the tag to `GHOST <mode>` recovers 8 bytes on the public path and
-    /// more on the others, taking the margin to a comfortable ~11.
-    ///
-    /// It stays human-readable in a block explorer, which is the only thing it is for.
-    pub fn default_coinbase_tag(&self) -> &'static str {
-        match self {
-            MiningMode::PublicPool => "GHOST PublicPool",
-            MiningMode::PrivatePool => "GHOST SoloPool",
-            MiningMode::PrivateSolo => "GHOST Solo",
-        }
-    }
-}
+/// Deliberately terse: the scriptsig has a 100-byte consensus ceiling shared with the height
+/// push, the payout-tag slot, the node tag and the extranonce. It stays human-readable in a block
+/// explorer, which is the only thing it is for.
+pub const DEFAULT_COINBASE_TAG: &str = "GHOST PublicPool";
 
 impl BitcoinNetwork {
     /// Canonical lowercase network name, matching the serde representation and
@@ -1293,8 +817,7 @@ impl BitcoinNetwork {
 
 /// TLS configuration for HTTP servers
 ///
-/// Controls HTTPS for the verification (8080), Ghost Pay (8800), and GSP (8900) servers.
-/// P2P mesh (ports 8555-8562) uses Noise protocol and does NOT need TLS.
+/// Controls HTTPS for the verification server (8080).
 ///
 /// If neither `cert_path` nor `key_path` is set, a self-signed certificate is
 /// automatically generated at startup. For mainnet, operator-provided certificates
@@ -1342,31 +865,31 @@ pub struct NetworkConfig {
     /// SRI / nginx / dashboard keep talking plain HTTP on `http_port`.
     #[serde(default = "default_verification_https_port")]
     pub verification_https_port: u16,
-    /// P2P consensus ports
-    pub p2p: P2PPortConfig,
-    /// Seed nodes for P2P discovery
-    pub seed_nodes: Vec<String>,
+    /// Retired `[network.p2p]` table: the old mesh's ports. The old mesh was removed (the node
+    /// pool agrees on its ledger over the share-chain relay in pool_sv2), so the table is
+    /// accepted with whatever keys it carries so older installed configs still load. Never
+    /// written back.
+    #[serde(default, skip_serializing, rename = "p2p")]
+    pub retired_p2p: Option<IgnoredAny>,
+    /// Retired key, see `retired_p2p`: the old mesh's seed nodes.
+    #[serde(default, skip_serializing, rename = "seed_nodes")]
+    pub retired_seed_nodes: Option<IgnoredAny>,
     /// Maximum connected miners
     pub max_miners: u32,
-    /// Signing key for message authentication (REQUIRED for mining_mode = PublicPool)
+    /// Signing key for message authentication (optional)
     /// Must be 64 hex characters (32 bytes). Generate with: ghostd --generate-signing-key
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing_key: Option<String>,
-    /// Mining mode: public_pool, private_pool, or private_solo
-    ///
-    /// - PublicPool: DNS registered, anyone can mine, pool-aggregated rewards
-    /// - PrivatePool: Password required, pool-aggregated rewards, not in DNS
-    /// - PrivateSolo: Password required, 99% + fees to operator's address
-    #[serde(default)]
-    pub mining_mode: MiningMode,
-    /// Password required for private mining modes (PrivatePool, PrivateSolo)
-    /// Minimum 8 characters recommended.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub private_mining_password: Option<String>,
-    /// Payout address for PrivateSolo mode (required when mining_mode = private_solo)
-    /// Must be a valid bech32 address for the configured network.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub solo_payout_address: Option<String>,
+    /// Retired mining-mode keys: every node is a pool node, so solo and private modes are gone.
+    /// Accepted so older installed configs still load. Never written back.
+    #[serde(default, skip_serializing, rename = "mining_mode")]
+    pub retired_mining_mode: Option<IgnoredAny>,
+    /// Retired key, see `retired_mining_mode`.
+    #[serde(default, skip_serializing, rename = "private_mining_password")]
+    pub retired_private_mining_password: Option<IgnoredAny>,
+    /// Retired key, see `retired_mining_mode`.
+    #[serde(default, skip_serializing, rename = "solo_payout_address")]
+    pub retired_solo_payout_address: Option<IgnoredAny>,
     /// Internal API authentication secret (REQUIRED for mainnet)
     ///
     /// Protects `/api/internal/*` and `/admin/*` endpoints with HMAC-SHA256 authentication.
@@ -1383,23 +906,10 @@ pub struct NetworkConfig {
     /// refuse to start on mainnet without this setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub internal_api_secret: Option<String>,
-    /// Enable Noise Protocol encryption for P2P communication (REQUIRED for mainnet)
-    ///
-    /// When enabled, sensitive P2P messages (shares, blocks, votes, payouts)
-    /// are sent over encrypted Noise TCP channels instead of plaintext ZMQ.
-    ///
-    /// # Security (C-1)
-    ///
-    /// Without this, P2P traffic is unencrypted and vulnerable to:
-    /// - Eavesdropping on share submissions
-    /// - Man-in-the-middle attacks on consensus messages
-    /// - Traffic analysis of payout information
-    ///
-    /// **MAINNET REQUIREMENT**: This MUST be true for mainnet. The node will
-    /// refuse to start on mainnet with noise_enabled = false.
-    #[serde(default = "default_noise_enabled")]
-    pub noise_enabled: bool,
-    /// TLS configuration for HTTP servers (verification, Ghost Pay, GSP)
+    /// Retired key, see `retired_p2p`: the old mesh's Noise encryption switch.
+    #[serde(default, skip_serializing, rename = "noise_enabled")]
+    pub retired_noise_enabled: Option<IgnoredAny>,
+    /// TLS configuration for the verification HTTP server
     ///
     /// When configured with cert/key paths, HTTPS is enabled for all HTTP servers.
     /// When not configured, a self-signed certificate is auto-generated.
@@ -1453,10 +963,6 @@ pub struct NetworkConfig {
     pub rate_limit_trusted_ips: Vec<String>,
 }
 
-fn default_noise_enabled() -> bool {
-    true
-}
-
 fn default_verification_https_port() -> u16 {
     crate::constants::VERIFICATION_HTTPS_PORT
 }
@@ -1470,58 +976,21 @@ impl Default for NetworkConfig {
             farm_port: None,
             http_port: HTTP_API_PORT,
             verification_https_port: crate::constants::VERIFICATION_HTTPS_PORT,
-            p2p: P2PPortConfig::default(),
-            seed_nodes: Vec::new(),
+            retired_p2p: None,
+            retired_seed_nodes: None,
             max_miners: 1000,
             signing_key: None,
-            mining_mode: MiningMode::default(),
-            private_mining_password: None,
-            solo_payout_address: None,
+            retired_mining_mode: None,
+            retired_private_mining_password: None,
+            retired_solo_payout_address: None,
             internal_api_secret: None,
-            noise_enabled: true,
+            retired_noise_enabled: None,
             tls: TlsConfig::default(),
             ghost_mode: false,
             ghost_mode_local_egress: false,
             shroud_enabled: false,
             sv2_authority_public_key: None,
             rate_limit_trusted_ips: Vec::new(),
-        }
-    }
-}
-
-/// P2P consensus port configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct P2PPortConfig {
-    /// Share propagation port
-    pub share_propagation: u16,
-    /// Block announcement port
-    pub block_announcement: u16,
-    /// Consensus voting port
-    pub consensus_voting: u16,
-    /// Health monitoring port
-    pub health_monitoring: u16,
-    /// Discovery port
-    pub discovery: u16,
-    /// Elder management port
-    pub elder_management: u16,
-    /// Payout proposal port
-    pub payout_proposal: u16,
-    /// Payout transaction port
-    pub payout_transaction: u16,
-}
-
-impl Default for P2PPortConfig {
-    fn default() -> Self {
-        Self {
-            share_propagation: SHARE_PROPAGATION_PORT,
-            block_announcement: BLOCK_ANNOUNCEMENT_PORT,
-            consensus_voting: CONSENSUS_VOTING_PORT,
-            health_monitoring: HEALTH_MONITORING_PORT,
-            discovery: DISCOVERY_PORT,
-            elder_management: ELDER_MANAGEMENT_PORT,
-            payout_proposal: PAYOUT_PROPOSAL_PORT,
-            payout_transaction: PAYOUT_TRANSACTION_PORT,
         }
     }
 }
@@ -1848,35 +1317,6 @@ impl StorageConfig {
     }
 }
 
-/// Ghost Pay L2 configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GhostPayConfig {
-    /// Enable Ghost Pay
-    pub enabled: bool,
-    /// Virtual block time (seconds)
-    pub virtual_block_secs: u64,
-    /// Epoch length (virtual blocks)
-    pub epoch_blocks: u64,
-    /// Enable Wraith mixing
-    pub wraith_enabled: bool,
-    /// Operator payout address for GhostPay L2 settlements (None = unset)
-    #[serde(default)]
-    pub payout_address: Option<String>,
-}
-
-impl Default for GhostPayConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            virtual_block_secs: L2_VIRTUAL_BLOCK_SECS,
-            epoch_blocks: L2_EPOCH_BLOCKS,
-            wraith_enabled: true,
-            payout_address: None,
-        }
-    }
-}
-
 /// Reaper settings for dead code detection in witness scripts
 ///
 /// Controls filtering of transactions that contain inscriptions, data stuffing,
@@ -2055,7 +1495,7 @@ impl ReaperSettings {
 ///
 /// [alerts.events]
 /// block_found = true
-/// node_offline = true
+/// low_disk = true
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -2150,19 +1590,20 @@ pub struct TelegramChannel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AlertEvents {
-    /// Node became unreachable / unhealthy (health monitor).
-    #[serde(default = "default_true")]
-    pub node_offline: bool,
-    /// A verified capability regressed from qualified to drift/failing.
-    #[serde(default = "default_true")]
-    pub capability_drift: bool,
+    /// Retired `node_offline` and `capability_drift` events: nothing fires them since the old
+    /// mesh's health monitor and capabilities were removed. Accepted so older configs still load; never written back.
+    #[serde(default, skip_serializing, rename = "node_offline")]
+    pub retired_node_offline: Option<IgnoredAny>,
+    /// Retired key, see `retired_node_offline`.
+    #[serde(default, skip_serializing, rename = "capability_drift")]
+    pub retired_capability_drift: Option<IgnoredAny>,
     /// Free disk fell below the low-disk threshold.
     #[serde(default = "default_true")]
     pub low_disk: bool,
     /// A configuration change or update needs a node restart to apply.
     #[serde(default = "default_true")]
     pub restart_needed: bool,
-    /// Connected peer count dropped (mesh partition / peers lost).
+    /// Share-chain relay peers dropped, or there are none (the relay-peers monitor).
     #[serde(default = "default_true")]
     pub peer_count_drop: bool,
     /// This node found a block.
@@ -2196,8 +1637,8 @@ pub struct AlertEvents {
 impl Default for AlertEvents {
     fn default() -> Self {
         Self {
-            node_offline: true,
-            capability_drift: true,
+            retired_node_offline: None,
+            retired_capability_drift: None,
             low_disk: true,
             restart_needed: true,
             peer_count_drop: true,
@@ -2393,14 +1834,13 @@ impl BackupSchedule {
 /// ⚠ Two things would break that, and neither is true today:
 /// - an unconditional `#[serde(skip_serializing)]`, or a `skip_serializing_if` predicate that can
 ///   fire on a value the operator SET (e.g. "skip if default")
-/// - the degenerate case of writing an explicitly empty value — `seed_nodes = []` serializes away
-///   under `Vec::is_empty` and would be reported. Writing an empty list is equivalent to omitting
+/// - the degenerate case of writing an explicitly empty value — a `Vec` field skipped under
+///   `Vec::is_empty` serializes away when written as `[]` and would be reported. Writing an empty list is equivalent to omitting
 ///   it, so this is harmless, but it is the one shape that can produce a spurious name.
 ///
-/// ⛔ I nearly documented a false-positive class that does not exist, from a grep that matched a
-/// DIFFERENT struct's `http_port` and a neighbouring attribute. `ghost_pay.http_port` is genuinely
-/// ignored — `GhostPayConfig` has no such field. **Confirm against the struct, not against a grep,
-/// before believing either this function or a claim that it is wrong.**
+/// ⛔ Confirm a reported key against the struct, not against a grep, before believing either this
+/// function or a claim that it is wrong: a grep that matches a DIFFERENT struct's field of the same
+/// name nearly produced a false-positive class that does not exist.
 pub fn ignored_config_keys(raw: &str) -> Result<Vec<String>, String> {
     fn walk(v: &toml::Value, prefix: &str, out: &mut std::collections::BTreeSet<String>) {
         if let Some(t) = v.as_table() {
@@ -2513,99 +1953,43 @@ pub struct PoolConfig {
     /// (four nodes absent from the mining DNS for weeks while all reporting healthy).
     #[serde(default)]
     pub mining_dns_name: Option<String>,
-    /// Treasury address for pool fees
-    ///
-    /// Can be either:
-    /// - Simple string (single-sig bech32 address)
-    /// - Multi-sig configuration with witness script
-    ///
-    /// # Example (TOML)
-    /// ```toml
-    /// # Single-sig (simple)
-    /// treasury_address = "bc1q..."
-    ///
-    /// # Multi-sig (object)
-    /// [pool.treasury_address]
-    /// address = "bc1q..."
-    /// witness_script = "522102..."
-    /// required = 2
-    /// total = 3
-    /// ```
-    #[serde(default)]
-    pub treasury_address: TreasuryAddress,
-    /// Minimum payout threshold (satoshis)
-    pub min_payout_sats: u64,
-    /// Payout frequency (blocks)
-    pub payout_interval_blocks: u64,
-    /// Run the network shard: fold this node's own network-tier shares into its counter column
-    /// each epoch, and persist the result.
-    ///
-    /// A config flag rather than a height gate: it selects a behaviour, not an era
-    /// and for one more: gates exist so that shares already in the ledger stay valid across a rule
-    /// change, and the shard is seeded from a snapshot with no history behind it, so there is
-    /// nothing to activate around. A flag is also safe one node at a time, which is what makes a
-    /// canary mean anything.
-    ///
-    /// Dark by default: deploying the binary must not by itself start folding.
-    ///
-    /// See `docs/SHARE_SHARD.md`.
-    #[serde(default)]
-    pub share_shard: bool,
-
-    /// Run the Stage 5 genesis ceremony on startup, once.
-    ///
-    /// Dark by default like every other shard flag. Setting it converts THIS node's own copy of
-    /// the pinned anchor checkpoint into the opening balances, asserts the result against the
-    /// compile-time pin, and refuses to start the shard if it does not match — a loud local
-    /// self-check, not a fleet negotiation.
-    ///
-    /// **Idempotent.** Arming refuses once the genesis column exists, so leaving the flag set
-    /// across restarts is safe and is the intended steady state: the ceremony is "a data event
-    /// plus a config flip", and a flag that had to be unset again afterwards would be one more
-    /// thing to get wrong at the worst moment.
-    ///
-    /// ⚠ Requires `share_shard` — arming a runtime that is never constructed does nothing, and
-    /// silently doing nothing is the failure mode this whole design keeps running into.
-    #[serde(default)]
-    pub shard_arm_genesis: bool,
-
-    /// Stage 5 step 6: build the coinbase's MINER payouts from the shard, not the legacy ledger.
-    ///
-    /// ⛔ **This is the point of no return.** Every other shard flag is reversible — turn it off
-    /// and the shard stops observing. This one decides what a block actually pays. After it, the
-    /// `shares` rename follows and the legacy unpaid ledger stops being the source of truth.
-    ///
-    /// Requires `share_shard` AND an armed genesis: without the opening balances the shard owes
-    /// nobody the months of work the pool actually owes, and a block would pay only what has
-    /// accrued since the flag was set. The runtime refuses to use the shard source unless the
-    /// genesis column is installed, rather than trusting the operator to set three flags in the
-    /// right order.
-    ///
-    /// Substitutes ONLY the miner payouts. Node rewards, treasury, the 99/1 split, the dust
-    /// roll-in, the coinbase commitment and GHOST-02 recompute-reject are the same code on both
-    /// paths.
-    #[serde(default)]
-    pub shard_coinbase: bool,
-    /// Payout address for node rewards (5-4-3-2-1 capability shares)
-    /// Broadcast in health pings so peers know where to send node reward payouts.
-    /// Must be a valid bech32 address for the configured network.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node_payout_address: Option<String>,
+    /// Retired old-ledger keys: the treasury is the node pool's compiled-in address, payouts are
+    /// the canonical coinbase, and the share shard and node rewards are gone. Accepted so older
+    /// installed configs still load. Never written back.
+    #[serde(default, skip_serializing, rename = "treasury_address")]
+    pub retired_treasury_address: Option<IgnoredAny>,
+    /// Retired key, see `retired_treasury_address`.
+    #[serde(default, skip_serializing, rename = "min_payout_sats")]
+    pub retired_min_payout_sats: Option<IgnoredAny>,
+    /// Retired key, see `retired_treasury_address`.
+    #[serde(default, skip_serializing, rename = "payout_interval_blocks")]
+    pub retired_payout_interval_blocks: Option<IgnoredAny>,
+    /// Retired key, see `retired_treasury_address`.
+    #[serde(default, skip_serializing, rename = "share_shard")]
+    pub retired_share_shard: Option<IgnoredAny>,
+    /// Retired key, see `retired_treasury_address`.
+    #[serde(default, skip_serializing, rename = "shard_arm_genesis")]
+    pub retired_shard_arm_genesis: Option<IgnoredAny>,
+    /// Retired key, see `retired_treasury_address`.
+    #[serde(default, skip_serializing, rename = "shard_coinbase")]
+    pub retired_shard_coinbase: Option<IgnoredAny>,
+    /// Retired key, see `retired_treasury_address`.
+    #[serde(default, skip_serializing, rename = "node_payout_address")]
+    pub retired_node_payout_address: Option<IgnoredAny>,
     /// Optional custom pool name shown in coinbase (e.g. "SatoshiPool").
     /// Formatted as "GHOST {pool_name}" in the coinbase scriptsig.
-    /// If not set, falls back to mining_mode default (PublicPool, PrivatePool, PrivateSolo).
+    /// If not set, falls back to `DEFAULT_COINBASE_TAG`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_name: Option<String>,
     /// Optional coinbase scriptsig tag shown on block explorers.
     /// Advanced override — takes priority over pool_name if both are set.
-    /// If not set, auto-derives from pool_name or mining_mode.
+    /// If not set, auto-derives from pool_name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coinbase_extra: Option<String>,
-    /// Optional password required for --genesis flag. When set in the config,
-    /// the operator must also pass --genesis-password on the CLI for genesis to proceed.
-    /// Prevents accidental dual-genesis if someone mistakenly runs --genesis.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub genesis_password: Option<String>,
+    /// Retired `genesis_password` key (it guarded the removed MPC genesis), accepted so
+    /// older installed configs still load. Never written back.
+    #[serde(default, skip_serializing, rename = "genesis_password")]
+    pub retired_genesis_password: Option<IgnoredAny>,
     /// Block-priority lever: `max_fee` (default) orders the block by package fee
     /// rate; `payments_first` seats BUDS financial txs (T0/T1) ahead of data txs
     /// (T2/T3). Additive with `#[serde(default)]` so existing pool.toml files
@@ -2621,6 +2005,48 @@ pub struct PoolConfig {
     /// existing pool.toml files parse unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_refresh_secs: Option<u64>,
+
+    /// Where the colocated pool_sv2 serves the node pool API (its `monitoring_address`), as
+    /// `http://<loopback address>:<port>`. ghost-mining forwards `/api/v1/ledger/{address}`,
+    /// `/api/v1/node-pool/status` and `/api/v1/miner/{address}` there. `None` is the
+    /// installer's `http://127.0.0.1:9090`. Only loopback is accepted: the monitoring listener
+    /// is local by design, and the forwarder must never be pointed at another host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_pool_api: Option<String>,
+
+    /// Where this node's open-listing lister writes `node-list.json`, served read-only at
+    /// `GET /api/v1/node-pool/node-list`. `None` is the installer's
+    /// `/var/lib/ghost-audit/node-list.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_list_path: Option<PathBuf>,
+}
+
+/// Whether `url` is `http://<loopback IP or localhost>:<port>` with nothing after the port but an
+/// optional `/`: the only shape [`PoolConfig::node_pool_api`] accepts.
+pub fn is_loopback_http_base(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.strip_suffix('/').unwrap_or(rest);
+    if authority.contains('/') || authority.contains('@') {
+        return false;
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, p),
+        None => return false,
+    };
+    if port.is_empty() || port.parse::<u16>().map_or(true, |p| p == 0) {
+        return false;
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
 }
 
 impl PoolConfig {
@@ -2631,57 +2057,25 @@ impl PoolConfig {
     }
 }
 
-impl PoolConfig {
-    /// Validate pool configuration
-    ///
-    /// Returns an error if required fields are missing or invalid.
-    pub fn validate(&self) -> Result<(), String> {
-        if self.treasury_address.is_empty() {
-            return Err("treasury_address must be configured".to_string());
-        }
-
-        // Validate treasury address
-        if let Err(e) = self.treasury_address.validate() {
-            return Err(format!("treasury_address: {}", e));
-        }
-
-        if self.min_payout_sats == 0 {
-            return Err("min_payout_sats must be greater than 0".to_string());
-        }
-        Ok(())
-    }
-
-    /// Get the treasury address string (for backward compatibility)
-    pub fn treasury_address_str(&self) -> &str {
-        self.treasury_address.address()
-    }
-
-    /// Check if treasury is multi-sig
-    pub fn is_multisig_treasury(&self) -> bool {
-        self.treasury_address.is_multisig()
-    }
-}
-
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
             // Operator-specific; no domain baked in. `--status` skips the DNS check when unset.
             mining_dns_name: None,
-            // Default placeholder - MUST be configured in production
-            treasury_address: TreasuryAddress::default(),
-            min_payout_sats: 100_000, // 0.001 BTC minimum
-            payout_interval_blocks: 100,
-            // Dark by default: deploying the binary must not start batch traffic.
-            // Same rule: deploying the binary must not by itself start folding.
-            share_shard: false,
-            shard_arm_genesis: false,
-            shard_coinbase: false,
-            node_payout_address: None,
+            retired_treasury_address: None,
+            retired_min_payout_sats: None,
+            retired_payout_interval_blocks: None,
+            retired_share_shard: None,
+            retired_shard_arm_genesis: None,
+            retired_shard_coinbase: None,
+            retired_node_payout_address: None,
             pool_name: None,
             coinbase_extra: None,
-            genesis_password: None,
+            retired_genesis_password: None,
             block_priority: BlockPriority::default(),
             template_refresh_secs: None,
+            node_pool_api: None,
+            node_list_path: None,
         }
     }
 }
@@ -2869,7 +2263,16 @@ mod tests {
             block_found = true
         "#;
         let parsed: AlertEvents = toml::from_str(legacy).expect("legacy events parse");
-        assert!(!parsed.capability_drift, "explicit legacy value preserved");
+        // The retired events still load, and are not written back.
+        let written = toml::to_string(&parsed).expect("serialize");
+        for k in ["node_offline", "capability_drift"] {
+            assert!(!written.contains(k), "retired `{k}` written back");
+        }
+        assert!(parsed.low_disk && parsed.block_found);
+        assert!(
+            toml::from_str::<AlertEvents>("capability_drfit = true").is_err(),
+            "a typo is still refused"
+        );
         assert!(
             parsed.reorg_detected && parsed.behind_tip && parsed.update_available,
             "reorg/behind-tip/update events default ON for old configs"
@@ -2894,97 +2297,7 @@ mod tests {
         assert!(!parsed.reorg_detected && !parsed.behind_tip && !parsed.update_available);
         assert!(!parsed.mempool_congestion && !parsed.fee_spike && !parsed.failed_login);
         // Untouched events keep their default-ON.
-        assert!(parsed.node_offline && parsed.block_found);
-    }
-
-    #[test]
-    fn test_ghost_pay_enabled_predicate() {
-        // Pool-only node: no [ghost_pay] block at all → not enabled.
-        let mut config = NodeConfig::default();
-        assert!(config.ghost_pay.is_none());
-        assert!(
-            !config.ghost_pay_enabled(),
-            "absent [ghost_pay] must read as disabled"
-        );
-
-        // Pool-only node: [ghost_pay] block present but enabled = false
-        // (this is exactly what `setup` writes via GhostPayConfig::default()).
-        // The block's presence must NOT be mistaken for a running ghost-pay.
-        config.ghost_pay = Some(GhostPayConfig::default());
-        assert!(!config.ghost_pay.as_ref().unwrap().enabled);
-        assert!(
-            !config.ghost_pay_enabled(),
-            "[ghost_pay] with enabled = false must read as disabled"
-        );
-
-        // Core node: ghost-pay actually enabled.
-        config.ghost_pay = Some(GhostPayConfig {
-            enabled: true,
-            ..GhostPayConfig::default()
-        });
-        assert!(
-            config.ghost_pay_enabled(),
-            "[ghost_pay] with enabled = true must read as enabled"
-        );
-    }
-
-    #[test]
-    fn test_wraith_enabled_predicate() {
-        // No [ghost_pay] block → Wraith reads as off.
-        let mut config = NodeConfig::default();
-        assert!(config.ghost_pay.is_none());
-        assert!(
-            !config.wraith_enabled(),
-            "absent [ghost_pay] must read wraith as disabled"
-        );
-
-        // Operator disabled Wraith explicitly.
-        config.ghost_pay = Some(GhostPayConfig {
-            wraith_enabled: false,
-            ..GhostPayConfig::default()
-        });
-        assert!(!config.wraith_enabled());
-
-        // Operator enabled Wraith → predicate reflects the choice regardless of
-        // whether ghost-pay's `enabled` flag is set (it's a separate signal).
-        config.ghost_pay = Some(GhostPayConfig {
-            enabled: false,
-            wraith_enabled: true,
-            ..GhostPayConfig::default()
-        });
-        assert!(
-            config.wraith_enabled(),
-            "[ghost_pay] wraith_enabled = true must read as enabled"
-        );
-    }
-
-    #[test]
-    fn test_ghost_pay_enabled_from_toml() {
-        // The `enabled` flag round-trips through TOML: a pool-only node writes
-        // `enabled = false`, a core node `enabled = true`. Deserialise the
-        // [ghost_pay] block in isolation to confirm the flag is what the
-        // predicate keys off (NodeConfig sections other than reaper/coordinator
-        // aren't serde(default), so we parse the sub-struct directly).
-        let pool_only: GhostPayConfig = toml::from_str(
-            "enabled = false\nvirtual_block_secs = 10\nepoch_blocks = 2160\nwraith_enabled = true\n",
-        )
-        .unwrap();
-        assert!(!pool_only.enabled);
-
-        let core: GhostPayConfig = toml::from_str(
-            "enabled = true\nvirtual_block_secs = 10\nepoch_blocks = 2160\nwraith_enabled = true\n",
-        )
-        .unwrap();
-        assert!(core.enabled);
-
-        let mut config = NodeConfig {
-            ghost_pay: Some(pool_only),
-            ..Default::default()
-        };
-        assert!(!config.ghost_pay_enabled());
-        // The reassignment is the test: same node, block swapped for an enabled one.
-        config.ghost_pay = Some(core);
-        assert!(config.ghost_pay_enabled());
+        assert!(parsed.low_disk && parsed.block_found);
     }
 
     #[test]
@@ -3293,75 +2606,35 @@ mod tests {
     }
 
     #[test]
-    fn ghost_mode_and_public_mining_conflict_disables_ghost_mode() {
+    fn ghost_mode_is_disabled_on_a_pool_node() {
         let mut config = NodeConfig::default();
-        config.network.mining_mode = MiningMode::PublicPool;
         config.network.ghost_mode = true;
 
         let warning = config.reconcile_ghost_mode_mining_exclusion();
 
         assert!(
             warning.is_some(),
-            "a config enabling both Ghost Mode and Public Mining must be reconciled"
+            "a config enabling Ghost Mode must be reconciled"
         );
         assert!(
             !config.network.ghost_mode,
             "Ghost Mode must be disabled to preserve fee income"
         );
-        assert!(
-            matches!(config.network.mining_mode, MiningMode::PublicPool),
-            "Public Mining (the income-earning capability) must be left active"
-        );
     }
 
     #[test]
-    fn ghost_mode_without_public_mining_is_left_untouched() {
+    fn a_node_without_ghost_mode_is_left_untouched() {
         let mut config = NodeConfig::default();
-        config.network.mining_mode = MiningMode::PrivateSolo;
-        config.network.ghost_mode = true;
-
-        let warning = config.reconcile_ghost_mode_mining_exclusion();
-
-        assert!(warning.is_none(), "no conflict without Public Mining");
-        assert!(
-            config.network.ghost_mode,
-            "Ghost Mode must be preserved when it is safe"
-        );
-    }
-
-    #[test]
-    fn public_mining_without_ghost_mode_is_left_untouched() {
-        let mut config = NodeConfig::default();
-        config.network.mining_mode = MiningMode::PublicPool;
         config.network.ghost_mode = false;
 
         let warning = config.reconcile_ghost_mode_mining_exclusion();
 
         assert!(warning.is_none(), "no conflict when Ghost Mode is off");
-        assert!(
-            matches!(config.network.mining_mode, MiningMode::PublicPool),
-            "Public Mining must remain active"
-        );
-    }
-
-    #[test]
-    fn test_signing_key_required_for_public_mining() {
-        let mut config = NodeConfig::default();
-        config.network.mining_mode = MiningMode::PublicPool;
-        config.network.signing_key = None;
-
-        let result = config.validate();
-        assert!(!result.is_valid());
-        assert!(result
-            .errors
-            .iter()
-            .any(|e| e.field == "network.signing_key"));
     }
 
     #[test]
     fn test_signing_key_valid_format() {
         let mut config = NodeConfig::default();
-        config.network.mining_mode = MiningMode::PublicPool;
         // 64 hex chars = valid 32-byte key
         config.network.signing_key =
             Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string());
@@ -3377,7 +2650,6 @@ mod tests {
     #[test]
     fn test_signing_key_invalid_length() {
         let mut config = NodeConfig::default();
-        config.network.mining_mode = MiningMode::PublicPool;
         // Too short
         config.network.signing_key = Some("0123456789abcdef".to_string());
 
@@ -3392,7 +2664,6 @@ mod tests {
     #[test]
     fn test_signing_key_invalid_chars() {
         let mut config = NodeConfig::default();
-        config.network.mining_mode = MiningMode::PublicPool;
         // Contains non-hex chars (g, h, i, j)
         config.network.signing_key =
             Some("ghij456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string());
@@ -3403,192 +2674,6 @@ mod tests {
             .errors
             .iter()
             .any(|e| e.field == "network.signing_key" && e.message.contains("hexadecimal")));
-    }
-
-    #[test]
-    fn test_signing_key_not_required_private_mining() {
-        let mut config = NodeConfig::default();
-        config.network.mining_mode = MiningMode::PrivatePool;
-        config.network.private_mining_password = Some("strong-password".to_string());
-        config.network.signing_key = None;
-
-        let result = config.validate();
-        // Should not have signing_key error when not in PublicPool mode
-        assert!(!result
-            .errors
-            .iter()
-            .any(|e| e.field == "network.signing_key"));
-    }
-
-    #[test]
-    fn test_mining_mode_public_pool() {
-        let mut config = NodeConfig::default();
-        config.network.mining_mode = MiningMode::PublicPool;
-        config.network.signing_key =
-            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string());
-
-        let result = config.validate();
-        // Should not have mining_mode errors
-        assert!(!result
-            .errors
-            .iter()
-            .any(|e| e.field.contains("mining_mode")));
-    }
-
-    #[test]
-    fn test_mining_mode_private_pool_requires_password() {
-        let mut config = NodeConfig::default();
-        config.network.mining_mode = MiningMode::PrivatePool;
-        config.network.private_mining_password = None;
-
-        let result = config.validate();
-        assert!(result
-            .errors
-            .iter()
-            .any(|e| e.field == "network.private_mining_password"));
-    }
-
-    #[test]
-    fn test_mining_mode_private_pool_with_password() {
-        let mut config = NodeConfig::default();
-        config.network.mining_mode = MiningMode::PrivatePool;
-        config.network.private_mining_password = Some("mysecretpassword".to_string());
-
-        let result = config.validate();
-        // Should not have password error
-        assert!(!result
-            .errors
-            .iter()
-            .any(|e| e.field == "network.private_mining_password"));
-    }
-
-    #[test]
-    fn test_mining_mode_private_pool_short_password_error() {
-        // L-17 FIX: Short passwords now produce errors, not warnings
-        // Weak passwords expose private mining endpoints to brute-force attacks
-        let mut config = NodeConfig::default();
-        config.network.mining_mode = MiningMode::PrivatePool;
-        config.network.private_mining_password = Some("short".to_string()); // 5 chars
-
-        let result = config.validate();
-        // L-17: Should now be an error instead of a warning
-        assert!(result
-            .errors
-            .iter()
-            .any(|e| e.field == "network.private_mining_password"
-                && e.message.contains("at least 8 characters")));
-    }
-
-    #[test]
-    fn test_mining_mode_private_solo_requires_password_and_address() {
-        let mut config = NodeConfig::default();
-        config.network.mining_mode = MiningMode::PrivateSolo;
-        config.network.private_mining_password = None;
-        config.network.solo_payout_address = None;
-
-        let result = config.validate();
-        assert!(result
-            .errors
-            .iter()
-            .any(|e| e.field == "network.private_mining_password"));
-        assert!(result
-            .errors
-            .iter()
-            .any(|e| e.field == "network.solo_payout_address"));
-    }
-
-    #[test]
-    fn test_mining_mode_private_solo_valid() {
-        let mut config = NodeConfig::default();
-        config.bitcoin.network = BitcoinNetwork::Signet;
-        config.network.mining_mode = MiningMode::PrivateSolo;
-        config.network.private_mining_password = Some("mysecretpassword".to_string());
-        config.network.solo_payout_address =
-            Some("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx".to_string());
-
-        let result = config.validate();
-        // Should not have mining mode related errors
-        assert!(!result
-            .errors
-            .iter()
-            .any(|e| e.field == "network.private_mining_password"));
-        assert!(!result
-            .errors
-            .iter()
-            .any(|e| e.field == "network.solo_payout_address"));
-    }
-
-    #[test]
-    fn test_mining_mode_private_solo_wrong_network_address() {
-        let mut config = NodeConfig::default();
-        config.bitcoin.network = BitcoinNetwork::Mainnet;
-        config.network.mining_mode = MiningMode::PrivateSolo;
-        config.network.private_mining_password = Some("mysecretpassword".to_string());
-        // Using signet address on mainnet
-        config.network.solo_payout_address =
-            Some("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx".to_string());
-
-        let result = config.validate();
-        assert!(result
-            .errors
-            .iter()
-            .any(|e| e.field == "network.solo_payout_address"
-                && e.message.contains("Invalid address prefix")));
-    }
-
-    #[test]
-    fn test_mainnet_requires_seed_nodes() {
-        // M-15: Mainnet nodes must have seed_nodes configured to discover peers
-        let mut config = NodeConfig::default();
-        config.bitcoin.network = BitcoinNetwork::Mainnet;
-        config.network.noise_enabled = true;
-        config.network.internal_api_secret =
-            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string());
-        config.network.seed_nodes = vec![]; // Empty seed nodes
-
-        let result = config.validate();
-        assert!(result
-            .errors
-            .iter()
-            .any(|e| e.field == "network.seed_nodes" && e.message.contains("MAINNET SECURITY")));
-    }
-
-    #[test]
-    fn test_mainnet_with_seed_nodes_valid() {
-        // M-15: Mainnet nodes with seed_nodes configured should not error
-        // M1: Mainnet requires at least 3 seed nodes
-        let mut config = NodeConfig::default();
-        config.bitcoin.network = BitcoinNetwork::Mainnet;
-        config.network.noise_enabled = true;
-        config.network.internal_api_secret =
-            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string());
-        config.network.seed_nodes = vec![
-            "seed1.bitcoinghost.org:8559".to_string(),
-            "seed2.bitcoinghost.org:8559".to_string(),
-            "seed3.bitcoinghost.org:8559".to_string(),
-        ];
-
-        let result = config.validate();
-        // Should not have seed_nodes error
-        assert!(!result
-            .errors
-            .iter()
-            .any(|e| e.field == "network.seed_nodes"));
-    }
-
-    #[test]
-    fn test_signet_allows_empty_seed_nodes() {
-        // M-15: Signet (non-mainnet) nodes do not require seed nodes
-        let mut config = NodeConfig::default();
-        config.bitcoin.network = BitcoinNetwork::Signet;
-        config.network.seed_nodes = vec![]; // Empty is OK for signet
-
-        let result = config.validate();
-        // Should not have seed_nodes error on non-mainnet
-        assert!(!result
-            .errors
-            .iter()
-            .any(|e| e.field == "network.seed_nodes"));
     }
 
     #[test]
@@ -3625,6 +2710,72 @@ mod tests {
     }
 
     #[test]
+    fn node_pool_api_accepts_only_a_loopback_http_base() {
+        for ok in [
+            "http://127.0.0.1:9090",
+            "http://127.0.0.1:9090/",
+            "http://127.0.0.12:43021",
+            "http://localhost:9090",
+            "http://[::1]:9090",
+        ] {
+            assert!(is_loopback_http_base(ok), "{ok} should be accepted");
+        }
+        for bad in [
+            "https://127.0.0.1:9090",
+            "http://10.0.0.1:9090",
+            "http://example.org:9090",
+            "http://127.0.0.1",
+            "http://127.0.0.1:0",
+            "http://127.0.0.1:9090/api",
+            "http://user@127.0.0.1:9090",
+            "http://127.0.0.1.example.org:9090",
+            "127.0.0.1:9090",
+        ] {
+            assert!(!is_loopback_http_base(bad), "{bad} should be refused");
+        }
+    }
+
+    #[test]
+    fn node_pool_api_off_loopback_fails_validation() {
+        let mut config = NodeConfig::default();
+        assert!(!config
+            .validate()
+            .errors
+            .iter()
+            .any(|e| e.field == "pool.node_pool_api"));
+        config.pool.node_pool_api = Some("http://127.0.0.1:43021".into());
+        assert!(!config
+            .validate()
+            .errors
+            .iter()
+            .any(|e| e.field == "pool.node_pool_api"));
+        config.pool.node_pool_api = Some("http://192.0.2.7:9090".into());
+        assert!(config
+            .validate()
+            .errors
+            .iter()
+            .any(|e| e.field == "pool.node_pool_api"));
+    }
+
+    #[test]
+    fn node_pool_keys_parse_from_pool_toml() {
+        let pool: PoolConfig = toml::from_str(
+            "node_pool_api = \"http://127.0.0.1:43021\"\nnode_list_path = \"/srv/l/node-list.json\"\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            pool.node_pool_api.as_deref(),
+            Some("http://127.0.0.1:43021")
+        );
+        assert_eq!(
+            pool.node_list_path.as_deref(),
+            Some(std::path::Path::new("/srv/l/node-list.json"))
+        );
+        let none: PoolConfig = toml::from_str("").expect("parses");
+        assert!(none.node_pool_api.is_none() && none.node_list_path.is_none());
+    }
+
+    #[test]
     fn test_local_signer_passes_config_validation() {
         let mut config = NodeConfig::default();
         config.identity.signer = Some(SignerConfig::Local {
@@ -3642,14 +2793,8 @@ mod tests {
         // operators are aware of the cert source) but NOT a hard error.
         let mut config = NodeConfig::default();
         config.bitcoin.network = BitcoinNetwork::Mainnet;
-        config.network.noise_enabled = true;
         config.network.internal_api_secret =
             Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string());
-        config.network.seed_nodes = vec![
-            "seed1.bitcoinghost.org:8559".to_string(),
-            "seed2.bitcoinghost.org:8559".to_string(),
-            "seed3.bitcoinghost.org:8559".to_string(),
-        ];
         config.network.tls = TlsConfig::default();
 
         let result = config.validate();
@@ -3673,14 +2818,8 @@ mod tests {
     fn test_mainnet_tls_cert_without_key_errors() {
         let mut config = NodeConfig::default();
         config.bitcoin.network = BitcoinNetwork::Mainnet;
-        config.network.noise_enabled = true;
         config.network.internal_api_secret =
             Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string());
-        config.network.seed_nodes = vec![
-            "seed1.bitcoinghost.org:8559".to_string(),
-            "seed2.bitcoinghost.org:8559".to_string(),
-            "seed3.bitcoinghost.org:8559".to_string(),
-        ];
         config.network.tls = TlsConfig {
             cert_path: Some(PathBuf::from("/etc/ghost/cert.pem")),
             key_path: None, // Missing key
@@ -3699,14 +2838,8 @@ mod tests {
     fn test_mainnet_with_tls_cert_and_key_passes() {
         let mut config = NodeConfig::default();
         config.bitcoin.network = BitcoinNetwork::Mainnet;
-        config.network.noise_enabled = true;
         config.network.internal_api_secret =
             Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string());
-        config.network.seed_nodes = vec![
-            "seed1.bitcoinghost.org:8559".to_string(),
-            "seed2.bitcoinghost.org:8559".to_string(),
-            "seed3.bitcoinghost.org:8559".to_string(),
-        ];
         config.network.tls = TlsConfig {
             cert_path: Some(PathBuf::from("/etc/ghost/cert.pem")),
             key_path: Some(PathBuf::from("/etc/ghost/key.pem")),
@@ -3993,126 +3126,8 @@ rpc_ur1 = "http://localhost:8332"
         }
         // Guard against the directory moving and this silently checking nothing.
         assert!(
-            checked >= 4,
+            checked >= 2,
             "expected the shipped templates, found {checked}"
-        );
-    }
-
-    // ---------------------------------------------------------------- #588
-    // `node_payout_address` went unvalidated while its own doc promised otherwise. Every
-    // consumer reaches it via `assume_checked()`, which asserts rather than checks, so a
-    // wrong-network address became an unspendable scriptPubKey and burned the node reward.
-
-    /// Build a config that is otherwise quiet on `pool.node_payout_address`.
-    fn cfg_with_node_payout(addr: Option<&str>, network: BitcoinNetwork) -> NodeConfig {
-        let mut config = NodeConfig::default();
-        config.bitcoin.network = network;
-        config.pool.node_payout_address = addr.map(|a| a.to_string());
-        config
-    }
-
-    fn node_payout_errors(config: &NodeConfig) -> Vec<String> {
-        config
-            .validate()
-            .errors
-            .iter()
-            .filter(|e| e.field == "pool.node_payout_address")
-            .map(|e| e.message.clone())
-            .collect()
-    }
-
-    #[test]
-    fn mainnet_node_payout_address_of_every_supported_type_is_accepted() {
-        // The control. If this ever fails the check is rejecting addresses that pay out
-        // correctly today, which is worse than not checking at all. All five types are
-        // reachable because template.rs parses with rust-bitcoin's generic parser.
-        for (kind, addr) in [
-            ("P2PKH", "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"),
-            ("P2SH", "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy"),
-            ("P2WPKH", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"),
-            (
-                "P2WSH",
-                "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3",
-            ),
-            (
-                "P2TR",
-                "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0",
-            ),
-        ] {
-            let config = cfg_with_node_payout(Some(addr), BitcoinNetwork::Mainnet);
-            assert!(
-                node_payout_errors(&config).is_empty(),
-                "mainnet {} address must be accepted, got: {:?}",
-                kind,
-                node_payout_errors(&config)
-            );
-        }
-    }
-
-    #[test]
-    fn an_unset_node_payout_address_is_not_an_error() {
-        // Node rewards are opt-in; absence must stay silent or every node without one
-        // fails to start.
-        let config = cfg_with_node_payout(None, BitcoinNetwork::Mainnet);
-        assert!(node_payout_errors(&config).is_empty());
-    }
-
-    #[test]
-    fn a_testnet_node_payout_address_is_rejected_on_mainnet() {
-        // The live footgun: this parses, and `assume_checked()` would hand back a
-        // scriptPubKey that pays to nothing spendable on mainnet.
-        let config = cfg_with_node_payout(
-            Some("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"),
-            BitcoinNetwork::Mainnet,
-        );
-        let errs = node_payout_errors(&config);
-        assert_eq!(errs.len(), 1, "expected exactly one error, got {:?}", errs);
-        assert!(
-            errs[0].contains("not valid on the mainnet network"),
-            "message must name the network mismatch, got: {}",
-            errs[0]
-        );
-    }
-
-    #[test]
-    fn a_mainnet_node_payout_address_is_rejected_on_regtest() {
-        // The mirror image — the check must be about agreement, not about "is it bc1".
-        let config = cfg_with_node_payout(
-            Some("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"),
-            BitcoinNetwork::Regtest,
-        );
-        assert_eq!(node_payout_errors(&config).len(), 1);
-    }
-
-    #[test]
-    fn a_malformed_node_payout_address_is_rejected() {
-        // A transposed character fails bech32's checksum rather than the network test,
-        // so it must come back as a parse error and still be caught.
-        let config = cfg_with_node_payout(
-            Some("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5"),
-            BitcoinNetwork::Mainnet,
-        );
-        let errs = node_payout_errors(&config);
-        assert_eq!(errs.len(), 1, "expected one error, got {:?}", errs);
-        assert!(
-            errs[0].contains("Not a valid Bitcoin address"),
-            "got: {}",
-            errs[0]
-        );
-    }
-
-    #[test]
-    fn an_empty_node_payout_address_is_rejected_with_advice() {
-        // `node_payout_address = ""` is a distinct mistake from omitting the key, and the
-        // empty string reaches vote_handler's `payout.address.is_empty()` check as a
-        // proposal that cannot be voted through.
-        let config = cfg_with_node_payout(Some("   "), BitcoinNetwork::Mainnet);
-        let errs = node_payout_errors(&config);
-        assert_eq!(errs.len(), 1, "expected one error, got {:?}", errs);
-        assert!(
-            errs[0].contains("remove the key entirely"),
-            "got: {}",
-            errs[0]
         );
     }
 }

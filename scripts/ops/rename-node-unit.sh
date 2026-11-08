@@ -298,9 +298,9 @@ tail_rc=0
 reload=no
 
 # The boot gate. ghost-mining is deliberately NOT enabled at boot — the gate starts it once
-# ghostd has left initial block download. ⛔ The renamed gate is enabled but not STARTED: its
-# script also starts ghost-pay where a unit file for it exists, and running it now would do that
-# on a node where the service is retired. It runs at the next boot, which is its job.
+# ghostd has left initial block download. ⛔ The renamed gate is enabled but not STARTED: the node
+# is already running under its new name, so there is nothing for the gate to do until the next
+# boot, which is its job.
 if is_file "$UNIT_DIR/$OLD-gate.service" && [ ! -e "$UNIT_DIR/$NEW-gate.service" ]; then
     gate_enabled="$(sc is-enabled "$OLD-gate.service" 2>/dev/null || true)"
     if sed -e "s|Ghost Pool sync gate (starts $OLD once|Ghost Mining sync gate (starts $NEW once|" \

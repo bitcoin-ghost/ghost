@@ -28,19 +28,8 @@ import { useToast } from "@/components/ui/Toast";
 import { swarmKeys } from "@/hooks/queries/useSwarmQueries";
 import type { SwarmNode } from "@/types/api";
 
-function formatBtc(btc: number): string {
-  return btc.toFixed(4);
-}
-
 function formatUptime(percent: number): string {
   return `${percent.toFixed(1)}%`;
-}
-
-function formatHashrate(th: number): string {
-  if (th >= 1000) {
-    return `${(th / 1000).toFixed(1)} PH/s`;
-  }
-  return `${th.toFixed(0)} TH/s`;
 }
 
 // Small inline help affordance placed next to a label; the surrounding element
@@ -61,17 +50,16 @@ const TOOLTIPS = {
   nodes: "Total nodes tracked in this swarm.",
   online: "Nodes currently reporting healthy.",
   combinedHashrate: "Combined hashrate summed across the mesh.",
-  combinedShares: "Qualified capability shares summed across the swarm (max = 15 × node count).",
+  // The old mesh fed the aggregate tiles and the auto-discovered peers; it was removed.
+  meshGone:
+    "Unavailable: this was summed across the old mesh, which was removed. The page now lists this node only.",
   // This Node card
   nodeId: "This node's mesh identity — paste it into another node to add this one.",
   connectionAddress: "The endpoint other nodes add to reach this node.",
   // Per-node fields
-  uptime: "Trailing-7-day uptime %. Capabilities only count at ≥95%. — means this peer did not gossip it.",
-  peers: "Mesh peers this node is connected to. — means not gossiped.",
+  uptime: "Trailing-7-day uptime %. — means this peer did not gossip it.",
+  peers: "Relay peers the node reports. Ghost Pool has no relay, so this is normally — (not reported).",
   l1Height: "Bitcoin (L1) chain height. — means not gossiped.",
-  l2Height: "Ghost-Pay (L2) chain height. — means not gossiped.",
-  shares: "Qualified capability shares, out of a maximum of 15.",
-  capabilities: "Capabilities in the 5-4-3-2-1 model. Green = qualified; red = claimed but not yet verified.",
   // Status badges
   statusOnline: "Whether this node is reachable and reporting healthy.",
   mesh: "Auto-discovered gossip peer — can't be polled or removed from here.",
@@ -89,7 +77,7 @@ const TOOLTIPS = {
 };
 
 // Em-dash placeholder for values a mesh peer does not gossip (uptime %, mesh
-// peer count, L1/L2 heights, balance). These are genuinely unknown from here,
+// peer count, L1 height). These are genuinely unknown from here,
 // so we render "—" rather than a misleading 0.
 const NO_VALUE = "—";
 
@@ -141,7 +129,6 @@ export default function SwarmPage() {
   const [isUpdating, setIsUpdating] = useState(false);
 
   const nodes = swarmData?.nodes ?? [];
-  const stats = swarmData?.stats ?? null;
   const alerts = swarmData?.alerts ?? [];
 
   const handleAddNode = async () => {
@@ -433,29 +420,23 @@ export default function SwarmPage() {
 
       {/* Aggregate Stats — 4 StatCards */}
       <SectionErrorBoundary section="Aggregate Stats">
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <StatCard
             label="Nodes"
-            value={stats?.total_nodes ?? 0}
-            tooltip={TOOLTIPS.nodes}
+            value="unavailable"
+            tooltip={TOOLTIPS.meshGone}
             loading={swarmLoading}
           />
           <StatCard
             label="Online"
-            value={stats?.online_nodes ?? 0}
-            tooltip={TOOLTIPS.online}
+            value="unavailable"
+            tooltip={TOOLTIPS.meshGone}
             loading={swarmLoading}
           />
           <StatCard
             label="Combined Hashrate"
-            value={formatHashrate(stats?.combined_hashrate_th ?? 0)}
-            tooltip={TOOLTIPS.combinedHashrate}
-            loading={swarmLoading}
-          />
-          <StatCard
-            label="Combined Shares"
-            value={`${stats?.combined_shares ?? 0} / ${stats?.max_combined_shares ?? 0}`}
-            tooltip={TOOLTIPS.combinedShares}
+            value="unavailable"
+            tooltip={TOOLTIPS.meshGone}
             loading={swarmLoading}
           />
         </div>
@@ -571,35 +552,13 @@ export default function SwarmPage() {
                       <span className="text-[color:var(--dim)]">{orDash(node.l1_height, (v) => v.toLocaleString())}</span>
                     </div>
                   </Tooltip>
-                  <Tooltip content={TOOLTIPS.l2Height}>
-                    <div>
-                      <span className="text-[color:var(--fainter)]"><InfoIcon /> L2:</span>{" "}
-                      <span className="text-[color:var(--dim)]">{orDash(node.l2_height, (v) => v.toLocaleString())}</span>
-                    </div>
-                  </Tooltip>
                   <Tooltip content={TOOLTIPS.peers}>
                     <div>
                       <span className="text-[color:var(--fainter)]"><InfoIcon /> Peers:</span>{" "}
                       <span className="text-[color:var(--dim)]">{orDash(node.peer_count, (v) => String(v))}</span>
                     </div>
                   </Tooltip>
-                  <Tooltip content={TOOLTIPS.shares}>
-                    <div>
-                      <span className="text-[color:var(--fainter)]"><InfoIcon /> Shares:</span>{" "}
-                      <span className="text-[color:var(--dim)]">{node.shares ?? 0}/{node.max_shares ?? 15}</span>
-                    </div>
-                  </Tooltip>
                 </div>
-
-                <Tooltip content={TOOLTIPS.capabilities}>
-                  <div className="flex flex-wrap gap-1 mb-3">
-                    <Badge variant={node.archive_mode ? "success" : "error"} className="text-xs px-1.5 py-0">+5</Badge>
-                    <Badge variant={node.ghost_pay ? "success" : "error"} className="text-xs px-1.5 py-0">+4</Badge>
-                    <Badge variant={node.public_mining ? "success" : "error"} className="text-xs px-1.5 py-0">+3</Badge>
-                    <Badge variant={node.reaper ? "success" : "error"} className="text-xs px-1.5 py-0">+2</Badge>
-                    <Badge variant={node.elder ? "success" : "error"} className="text-xs px-1.5 py-0">+1</Badge>
-                  </div>
-                </Tooltip>
 
                 <div className="flex gap-1 pt-2 border-t border-[var(--rule)]">
                   <Tooltip content={TOOLTIPS.edit}>
@@ -667,16 +626,6 @@ export default function SwarmPage() {
                       <div className="text-sm text-[color:var(--dim)] mt-1">{node.address}</div>
                     </div>
                   </div>
-                  <div className="text-right">
-                    <div className="text-lg font-bold text-[color:var(--fg)]">
-                      {orDash(node.balance_btc, (v) => `${formatBtc(v)} BTC`)}
-                    </div>
-                    <Tooltip content={TOOLTIPS.shares}>
-                      <div className="text-sm text-[color:var(--dim)] inline-block">
-                        <InfoIcon /> {node.shares ?? 0}/{node.max_shares ?? 15} shares
-                      </div>
-                    </Tooltip>
-                  </div>
                 </div>
 
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-4 text-sm">
@@ -710,25 +659,7 @@ export default function SwarmPage() {
                       <div className="text-[color:var(--fg)] font-mono">{orDash(node.l1_height, (v) => v.toLocaleString())}</div>
                     </div>
                   </Tooltip>
-                  <Tooltip content={TOOLTIPS.l2Height}>
-                    <div>
-                      <span className="text-[color:var(--fainter)]"><InfoIcon /> L2 Height</span>
-                      <div className="text-[color:var(--fg)] font-mono">{orDash(node.l2_height, (v) => v.toLocaleString())}</div>
-                    </div>
-                  </Tooltip>
                 </div>
-
-                <Tooltip content={TOOLTIPS.capabilities}>
-                  <div className="flex flex-wrap gap-2 mt-4">
-                    <Badge variant={node.archive_mode ? "success" : "error"}>Archive +5</Badge>
-                    <Badge variant={node.ghost_pay ? "success" : "error"}>Ghost Pay +4</Badge>
-                    <Badge variant={node.public_mining ? "success" : "error"}>Public Mining +3</Badge>
-                    <Badge variant={node.reaper ? "success" : "error"}>Reaper +2</Badge>
-                    <Badge variant={node.elder ? "success" : "error"}>
-                      Elder{node.elder && node.elder_slot != null ? ` #${node.elder_slot}` : ""} +1
-                    </Badge>
-                  </div>
-                </Tooltip>
 
                 <div className="flex gap-2 mt-4 pt-4 border-t border-[var(--rule)]">
                   <Tooltip content={TOOLTIPS.edit}>

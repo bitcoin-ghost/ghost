@@ -92,7 +92,8 @@ share_batch_size = 1
 
 # Protocol extensions
 # Must SUPPORT what the translator REQUIRES (0x0002, worker-specific hashrate tracking).
-supported_extensions = [0x0002]
+# And the Ghost agent extension (0x4748) the translator requires for slot-class sensing.
+supported_extensions = [0x0002, 0x4748]
 required_extensions = []
 
 # Monitoring endpoint
@@ -119,24 +120,21 @@ batch_size = 1
 batch_timeout_ms = 2000
 max_retries = 3
 
-# SHARE_TIER_BIND (difficulty-tier commitment) — pool_sv2's half of a DORMANT two-part gate.
-# LEAVE COMMENTED OUT until the gate arms. Enabling it requires, in the SAME release:
-#   - activation_height equal to ghost-mining's SHARE_TIER_BIND_HEIGHT (a real block height,
-#     currently dormant at u64::MAX),
-#   - node_id equal to THIS node's 32-byte identity (hex) — the one ghost-mining derives its
-#     coinbase node tags from (`ghost-mining --show-identity`),
-#   - the translator shipped with quantise_to_tiers = true (translator-config.toml).
-# At/above the height, jobs are built per channel, each coinbase committing to the channel's
-# power-of-two difficulty tier; below it, behaviour is byte-identical to today.
-# SHARE_TIER_BIND: ARMED at 962100. Must equal ghost-mining's SHARE_TIER_BIND_HEIGHT, and the
-# translator must ship quantise_to_tiers = true in the SAME release — all three flip together.
-#
-# node_id is deliberately NOT set: pool_sv2 reads this node's identity from the co-located
-# ghost-mining's /health at startup, so the tags it stamps and the tags ghost-mining verifies cannot
-# disagree. Set it only if ghost-mining is unreachable at startup; when set it is checked against
-# ghost-mining's answer and a mismatch refuses to start.
-[share_tier_binding]
-activation_height = 962100
+# GHOST SOLO. Every job pays, in its coinbase: the treasury exactly subsidy / 200, the miner whose
+# username (its Bitcoin address) opened the channel the rest (subsidy - subsidy / 200 + every fee),
+# and the witness commitment. Nothing else. See docs/SOLO.md. The whole section is optional.
+[solo]
+# mainnet (default), signet or regtest: the subsidy schedule and which addresses miners may use.
+network = "mainnet"
+# Where miner-stats.json and blocks-found.json are kept across restarts (unset: memory only).
+state_dir = "/var/lib/ghost/solo"
+# Other Bitcoin nodes every found block is also sent to (submitblock), in parallel, after the
+# local node. Credentials are read from submit_rpc_auth_file (one `user:password`, or
+# `url user:password`, a line; a .cookie file works), never from here, and are never logged.
+# submit_rpc = ["http://10.0.0.2:8332"]
+# submit_rpc_auth_file = "/etc/ghost/solo-submit-rpc.auth"
+# The translator's SV1 ports, shown by /api/v1/pool/status (3333 small miners, 4444 farm tier).
+sv1_ports = [3333, 4444]
 
 # Template Provider Configuration
 # Connects to ghost-mining's TDP server

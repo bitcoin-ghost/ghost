@@ -7,17 +7,13 @@ import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
 import { StepIndicator } from "@/components/ui/Wizard";
 import { useToast } from "@/components/ui/Toast";
-import { ToggleRow, StatusRow } from "../shared";
-import { CapabilityToggles } from "@/components/settings/CapabilityToggles";
+import { StatusRow } from "../shared";
 import ReaperWizard from "../wizards/ReaperWizard";
 import {
   useNodeStatus,
   useHealth,
-  useShares,
   useConfig,
   useFullConfig,
-  useGhostPayStatus,
-  useSetWraith,
   useSetPolicyProfile,
 } from "@/hooks/queries";
 import type { PolicyProfileType } from "@/lib/api/config";
@@ -34,7 +30,6 @@ const POLICY_PRESETS: { name: PolicyProfileType; desc: string }[] = [
 
 const STEPS = [
   { id: "welcome", title: "Welcome" },
-  { id: "capabilities", title: "Capabilities" },
   { id: "policy", title: "Policy" },
   { id: "finish", title: "Finish" },
 ];
@@ -58,32 +53,16 @@ export default function OnboardingPage() {
   // Reads — current node state, used to pre-fill every step.
   const { data: status } = useNodeStatus();
   const { data: health } = useHealth();
-  const { data: shares } = useShares();
   const { data: config } = useConfig();
   const { data: fullConfig } = useFullConfig();
-  const { data: ghostPay } = useGhostPayStatus();
 
-  // Writes — Wraith mixing and the tier policy still live here; the five
-  // canonical capability rows are driven inside the shared CapabilityToggles
-  // component (the SAME hooks Settings › Capabilities uses).
-  const setWraith = useSetWraith();
+  // Writes — the tier policy.
   const setPolicyProfile = useSetPolicyProfile();
 
   // Composed wizard state.
   const [reaperWizardOpen, setReaperWizardOpen] = useState(false);
 
   const activePolicyProfile = String(fullConfig?.policy?.profile ?? "permissive");
-  const ghostPayRunning = Boolean(ghostPay?.l2_height);
-  const wraithEnabled = ghostPay?.wraith_enabled ?? false;
-
-  const handleWraithToggle = async (enabled: boolean) => {
-    try {
-      await setWraith.mutateAsync(enabled);
-      success("Saved", `Wraith mixing ${enabled ? "enabled" : "disabled"} — restart ghost-mining to apply`);
-    } catch (err) {
-      error("Failed", err instanceof Error ? err.message : "Unknown error");
-    }
-  };
 
   const handleActivatePreset = async (name: PolicyProfileType) => {
     try {
@@ -106,14 +85,13 @@ export default function OnboardingPage() {
 
   const reaperEnabled = config?.reaper ?? false;
   const archiveEnabled = status?.archive_mode ?? false;
-  const publicMiningEnabled = status?.public_mining ?? false;
 
   return (
     <div className="space-y-6">
       <Card>
         <CardHeader
           title="Node Setup"
-          subtitle="Review and confirm your node's capabilities and policy. Everything is pre-filled with your node's current values — adjust what you like, or accept the sane defaults."
+          subtitle="Review and confirm your node's transaction policy. Everything is pre-filled with your node's current values — adjust what you like, or accept the sane defaults."
         />
         <div className="py-2">
           <StepIndicator steps={STEPS} currentStep={step} />
@@ -137,7 +115,7 @@ export default function OnboardingPage() {
               }
             />
             <StatItem label="Block height" value={status?.block_height?.toLocaleString() ?? status?.sync_height?.toLocaleString() ?? "—"} />
-            <StatItem label="Peers" value={status?.peer_count ?? "—"} />
+            <StatItem label="Relay peers" value={status?.peer_count ?? "—"} />
             <StatItem
               label="Health"
               value={
@@ -148,57 +126,12 @@ export default function OnboardingPage() {
                 )
               }
             />
-            <StatItem
-              label="Elder status"
-              value={
-                shares?.elder ? (
-                  <Badge variant="success">Elder #{shares.elder_slot ?? "?"}</Badge>
-                ) : (
-                  <Badge variant="default">Not Elder</Badge>
-                )
-              }
-            />
-            <StatItem
-              label="Reward shares"
-              value={`${shares?.total ?? 0} / ${shares?.max_shares ?? 15}`}
-            />
           </div>
         </Card>
       )}
 
-      {/* Step 2: Capabilities */}
+      {/* Step 2: Policy */}
       {step === 1 && (
-        <Card>
-          <CardHeader
-            title="Capabilities"
-            subtitle="Capabilities earn shares in the node reward pool (5-4-3-2-1). Toggles are pre-set to your node's current values and save immediately."
-          />
-          <div className="space-y-3">
-            {/*
-             * The five reward capabilities share their markup + hooks with
-             * Settings › Capabilities. Onboarding presents Ghost Pay as an
-             * editable toggle and slots its Wraith mixing control in right
-             * after it.
-             */}
-            <CapabilityToggles
-              ghostPayControl="toggle"
-              afterGhostPay={
-                <ToggleRow
-                  label="Wraith Mixing"
-                  description="Let any L2 participant initiate a CoinJoin session through this node. Off means this node won't take part in mixing. Not a reward capability — a restart applies the change."
-                  enabled={wraithEnabled}
-                  onChange={handleWraithToggle}
-                  disabled={setWraith.isPending}
-                  badge={wraithEnabled ? <Badge variant="info">Mixing On</Badge> : null}
-                />
-              }
-            />
-          </div>
-        </Card>
-      )}
-
-      {/* Step 3: Policy */}
-      {step === 2 && (
         <div className="space-y-6">
           <Card>
             <CardHeader
@@ -210,7 +143,7 @@ export default function OnboardingPage() {
                 <div className="p-3 bg-[color-mix(in_srgb,var(--yellow)_18%,transparent)] border border-[color-mix(in_srgb,var(--yellow)_45%,transparent)] rounded-lg">
                   <div className="text-[color:var(--yellow)] font-medium">Locked by Reaper Mode</div>
                   <div className="text-sm text-[color:var(--yellow)]/80">
-                    Disable Reaper Mode in the previous step to change the tier policy.
+                    Disable Reaper Mode on the Reaper page to change the tier policy.
                   </div>
                 </div>
               )}
@@ -276,22 +209,14 @@ export default function OnboardingPage() {
         </div>
       )}
 
-      {/* Step 4: Finish */}
-      {step === 3 && (
+      {/* Step 3: Finish */}
+      {step === 2 && (
         <Card>
           <CardHeader title="All Set" subtitle="Here's your node's configuration. Finishing marks setup complete." />
           <div className="space-y-3">
             <StatItem
               label="Archive Mode"
               value={<Badge variant={archiveEnabled ? "success" : "default"}>{archiveEnabled ? "On" : "Off"}</Badge>}
-            />
-            <StatItem
-              label="Ghost Pay"
-              value={<Badge variant={ghostPayRunning ? "success" : "default"}>{ghostPayRunning ? "Running" : "Not Running"}</Badge>}
-            />
-            <StatItem
-              label="Public Mining"
-              value={<Badge variant={publicMiningEnabled ? "success" : "default"}>{publicMiningEnabled ? "On" : "Off"}</Badge>}
             />
             <StatItem
               label="Ghost Reaper"
@@ -307,7 +232,6 @@ export default function OnboardingPage() {
                 )
               }
             />
-            <StatItem label="Reward shares" value={`${shares?.total ?? 0} / ${shares?.max_shares ?? 15}`} />
           </div>
         </Card>
       )}

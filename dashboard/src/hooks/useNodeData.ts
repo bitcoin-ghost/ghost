@@ -4,11 +4,8 @@ import { useState, useEffect, useCallback } from "react";
 import type {
   NodeInfo,
   NodeStatus,
-  SharesInfo,
   NodeConfig,
   NodeEvent,
-  TreasuryStatus,
-  GhostPayStatus,
 } from "@/types/api";
 import * as api from "@/lib/api";
 
@@ -59,24 +56,6 @@ export function useNodeStatus() {
   return { data, loading, error, refresh };
 }
 
-export function useShares() {
-  const [data, setData] = useState<SharesInfo | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<Error | null>(null);
-
-  useEffect(() => {
-    api.getShares()
-      .then((newData) => {
-        setData(newData);
-        setError(null);
-      })
-      .catch(setError)
-      .finally(() => setLoading(false));
-  }, []);
-
-  return { data, loading, error };
-}
-
 export function useConfig() {
   const [data, setData] = useState<NodeConfig | null>(null);
   const [loading, setLoading] = useState(true);
@@ -114,57 +93,6 @@ export function useConfig() {
   return { data, loading, error, refresh, setGhostMode, setArchiveMode };
 }
 
-export function useTreasury() {
-  const [data, setData] = useState<TreasuryStatus | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<Error | null>(null);
-
-  const refresh = useCallback(() => {
-    api.getTreasury()
-      .then((newData) => {
-        setData(newData);
-        setError(null);
-      })
-      .catch((err) => {
-        setError(err);
-      })
-      .finally(() => setLoading(false));
-  }, []);
-
-  useEffect(() => {
-    queueMicrotask(refresh);
-    const interval = setInterval(refresh, 60000); // Refresh every minute
-    return () => clearInterval(interval);
-  }, [refresh]);
-
-  return { data, loading, error, refresh };
-}
-
-export function useGhostPayStatus() {
-  const [data, setData] = useState<GhostPayStatus | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<Error | null>(null);
-
-  const refresh = useCallback(() => {
-    api.getGhostPayStatus()
-      .then((newData) => {
-        setData(newData);
-        setError(null);
-      })
-      .catch((err) => {
-        setError(err);
-      })
-      .finally(() => setLoading(false));
-  }, []);
-
-  useEffect(() => {
-    queueMicrotask(refresh);
-    const interval = setInterval(refresh, 10000);
-    return () => clearInterval(interval);
-  }, [refresh]);
-
-  return { data, loading, error, refresh };
-}
 
 export function useWebSocket(onEvent: (event: NodeEvent) => void) {
   useEffect(() => {

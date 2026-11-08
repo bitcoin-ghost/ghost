@@ -1,17 +1,11 @@
 "use client";
 
-import { useState } from "react";
-import { ChevronRight } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
-import { Badge } from "@/components/ui/Badge";
 import { useMiningCoinbase } from "@/hooks/queries/useMiningQueries";
 
 function btc(sat: number): string {
   const s = (sat / 1e8).toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
   return `${s === "" ? "0" : s} BTC`;
-}
-function truncMid(s: string, n = 10): string {
-  return s.length > 2 * n ? `${s.slice(0, n)}…${s.slice(-n)}` : s;
 }
 
 // A proportional horizontal share bar — mirrors the block-weight bar in
@@ -38,207 +32,99 @@ function ShareBar({ fraction }: { fraction: number }) {
   );
 }
 
-// One category row: label, BTC value + sat sub-label, and a proportional bar.
-// Optionally expandable (chevron toggles the detail body rendered below).
+// One category row: label, BTC value + sat sub-label, a proportional bar and a note.
 function CategoryRow({
   label,
   amount,
   total,
-  expandable,
-  expanded,
-  onToggle,
-  children,
+  note,
 }: {
   label: string;
-  amount: number;
+  amount: number | undefined;
   total: number;
-  expandable?: boolean;
-  expanded?: boolean;
-  onToggle?: () => void;
-  children?: React.ReactNode;
+  note?: string;
 }) {
-  const header = (
-    <div className="flex items-center justify-between gap-3 mb-1">
-      <div className="flex items-center gap-1.5 min-w-0">
-        {expandable && (
-          <ChevronRight
-            size={14}
-            strokeWidth={1.75}
-            style={{
-              color: "var(--dim)",
-              transition: "transform 0.15s",
-              transform: expanded ? "rotate(90deg)" : "none",
-              flexShrink: 0,
-            }}
-          />
-        )}
+  const known = typeof amount === "number";
+  return (
+    <div>
+      <div className="flex items-center justify-between gap-3 mb-1">
         <span className="t-label" style={{ color: "var(--fg)" }}>
           {label}
         </span>
-      </div>
-      <div className="text-right">
-        <div
-          className="t-label"
-          style={{ color: "var(--fg)", fontWeight: 600, fontVariantNumeric: "tabular-nums" }}
-        >
-          {btc(amount)}
+        <div className="text-right">
+          <div
+            className="t-label"
+            style={{ color: known ? "var(--fg)" : "var(--fainter)", fontWeight: 600, fontVariantNumeric: "tabular-nums" }}
+          >
+            {known ? btc(amount) : "unknown"}
+          </div>
+          {known && (
+            <div className="t-caption" style={{ color: "var(--fainter)", fontVariantNumeric: "tabular-nums" }}>
+              {amount.toLocaleString()} sat
+            </div>
+          )}
         </div>
-        <div className="t-caption" style={{ color: "var(--fainter)", fontVariantNumeric: "tabular-nums" }}>
-          {amount.toLocaleString()} sat
-        </div>
       </div>
-    </div>
-  );
-
-  return (
-    <div>
-      {expandable ? (
-        <button
-          type="button"
-          onClick={onToggle}
-          aria-expanded={expanded}
-          className="w-full text-left"
-          style={{ background: "transparent", border: "none", padding: 0, cursor: "pointer" }}
-        >
-          {header}
-        </button>
-      ) : (
-        header
+      <ShareBar fraction={known && total > 0 ? amount / total : 0} />
+      {note && (
+        <div className="t-caption mt-1" style={{ color: "var(--fainter)" }}>
+          {note}
+        </div>
       )}
-      <ShareBar fraction={total > 0 ? amount / total : 0} />
-      {expandable && expanded && children && <div className="mt-2">{children}</div>}
-    </div>
-  );
-}
-
-// One detail row in an expanded category: a mono identifier + its BTC amount.
-function DetailRow({ id, amount }: { id: string; amount: number }) {
-  return (
-    <div
-      className="flex items-center justify-between gap-3 py-1 t-caption"
-      style={{ color: "var(--dim)" }}
-    >
-      <span className="font-mono truncate" style={{ color: "var(--fainter)" }}>
-        {id}
-      </span>
-      <span style={{ color: "var(--dim)", fontVariantNumeric: "tabular-nums", flexShrink: 0 }}>
-        {btc(amount)}
-      </span>
     </div>
   );
 }
 
 /**
- * How the coinbase for the block currently being built splits across its
- * recipients — reads GET /api/v1/mining/coinbase. Four category rows (miners,
- * node rewards, treasury, finder's tx-fee share), each with a proportional
- * share bar; the miners and node-reward rows expand to their per-recipient
- * breakdown when the operator is authed. Polls every 5s.
+ * How the coinbase of the block currently being built splits: the treasury's base share
+ * (S/200), the miners' share (Rm), and every transaction fee to the finder. Reads
+ * GET /api/v1/mining/coinbase. Which balances Rm pays is decided per job by the finder's slot
+ * class (see the Miners page); what it cannot pay goes to the treasury on top of its base.
  */
 export function CoinbasePaymentsCard() {
-  const { data, isLoading } = useMiningCoinbase();
-  const [minersOpen, setMinersOpen] = useState(false);
-  const [nodesOpen, setNodesOpen] = useState(false);
+  const { data, isLoading, error } = useMiningCoinbase();
+  const total = data?.total_coinbase_sat ?? 0;
 
   return (
     <Card>
       <CardHeader
-        title="Coinbase payments"
-        subtitle="How the coinbase for the block above splits across recipients. Updates as the payout is agreed each round."
+        title="Coinbase split"
+        subtitle="How the coinbase of the block above splits between the treasury, miners' balances and the finder"
       />
       {isLoading ? (
         <div className="t-label" style={{ color: "var(--dim)" }}>
           Loading coinbase…
         </div>
+      ) : error ? (
+        <div className="t-label" style={{ color: "var(--red)" }}>
+          Coinbase unavailable: {error instanceof Error ? error.message : String(error)}
+        </div>
       ) : !data?.available ? (
         <div className="t-label" style={{ color: "var(--dim)" }}>
-          No coinbase payout agreed yet — the block currently pays subsidy only.
+          No block template yet, so there is no coinbase to show.
         </div>
       ) : (
         <div className="space-y-4">
-          <div className="flex items-center justify-between flex-wrap gap-2">
-            <div className="flex items-baseline gap-3">
-              <span
-                style={{ color: "var(--fg)", fontWeight: 700, fontSize: "1.75rem", fontVariantNumeric: "tabular-nums" }}
-              >
-                #{(data.height ?? 0).toLocaleString()}
-              </span>
-              <span className="t-caption" style={{ color: "var(--dim)" }}>
-                coinbase split
-              </span>
-            </div>
-            {data.round_id != null && <Badge variant="default">round {data.round_id}</Badge>}
+          <div className="flex items-baseline gap-3">
+            <span
+              style={{ color: "var(--fg)", fontWeight: 700, fontSize: "1.75rem", fontVariantNumeric: "tabular-nums" }}
+            >
+              #{typeof data.height === "number" ? data.height.toLocaleString() : "unknown"}
+            </span>
+            <span className="t-caption" style={{ color: "var(--dim)" }}>
+              coinbase split
+            </span>
           </div>
 
           <div className="space-y-3">
             <CategoryRow
-              label="Miners"
-              amount={data.miner_pool_sat ?? 0}
-              total={data.total_coinbase_sat ?? 0}
-              expandable
-              expanded={minersOpen}
-              onToggle={() => setMinersOpen((v) => !v)}
-            >
-              {data.addresses_redacted ? (
-                <div className="space-y-1">
-                  {data.miners && data.miners.length > 0 ? (
-                    data.miners.map((m, i) => (
-                      <DetailRow key={i} id={`miner ${i + 1}`} amount={m.amount_sat} />
-                    ))
-                  ) : (
-                    <div className="t-caption" style={{ color: "var(--dim)" }}>
-                      {(data.miner_count ?? 0).toLocaleString()} miners · {btc(data.miner_pool_sat ?? 0)}
-                    </div>
-                  )}
-                  <div className="t-caption" style={{ color: "var(--fainter)" }}>
-                    Addresses hidden — operator authentication required
-                  </div>
-                </div>
-              ) : data.miners && data.miners.length > 0 ? (
-                <div className="space-y-0.5">
-                  {data.miners.map((m, i) => (
-                    <DetailRow key={i} id={truncMid(m.address)} amount={m.amount_sat} />
-                  ))}
-                </div>
-              ) : (
-                <div className="t-caption" style={{ color: "var(--dim)" }}>
-                  No per-miner breakdown available.
-                </div>
-              )}
-            </CategoryRow>
-
-            <CategoryRow
-              label="Node rewards"
-              amount={data.node_reward_pool_sat ?? 0}
-              total={data.total_coinbase_sat ?? 0}
-              expandable
-              expanded={nodesOpen}
-              onToggle={() => setNodesOpen((v) => !v)}
-            >
-              {data.nodes && data.nodes.length > 0 ? (
-                <div className="space-y-0.5">
-                  {data.nodes.map((n, i) => (
-                    <DetailRow key={i} id={truncMid(n.node_id)} amount={n.amount_sat} />
-                  ))}
-                </div>
-              ) : (
-                <div className="t-caption" style={{ color: "var(--dim)" }}>
-                  {(data.node_count ?? 0).toLocaleString()} nodes · {btc(data.node_reward_pool_sat ?? 0)}
-                </div>
-              )}
-            </CategoryRow>
-
-            <CategoryRow
-              label="Treasury"
-              amount={data.treasury_sat ?? 0}
-              total={data.total_coinbase_sat ?? 0}
+              label="Miners' balances (Rm)"
+              amount={data.miner_pool_sat}
+              total={total}
+              note="Paid to owed balances, up to the finder's slot class; what it cannot pay goes to the treasury."
             />
-
-            <CategoryRow
-              label="TX fees → node"
-              amount={data.tx_fees_to_finder_sat ?? 0}
-              total={data.total_coinbase_sat ?? 0}
-            />
+            <CategoryRow label="Treasury base (S/200)" amount={data.treasury_base_sat} total={total} />
+            <CategoryRow label="TX fees to the finder" amount={data.tx_fees_to_finder_sat} total={total} />
           </div>
 
           <div
@@ -247,7 +133,7 @@ export function CoinbasePaymentsCard() {
           >
             <span>Total coinbase</span>
             <span style={{ color: "var(--fg)", fontWeight: 600, fontVariantNumeric: "tabular-nums" }}>
-              {btc(data.total_coinbase_sat ?? 0)}
+              {typeof data.total_coinbase_sat === "number" ? btc(data.total_coinbase_sat) : "unknown"}
             </span>
           </div>
         </div>

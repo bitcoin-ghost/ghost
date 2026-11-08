@@ -39,8 +39,7 @@ use ghost_common::constants::{ACTIVE_MINER_WINDOW_SECS, SV1_STRATUM_PORT, SV2_ST
 use ghost_common::rpc::MempoolFilterStats;
 
 use crate::auth::{verify_internal_auth, InternalAuth};
-use crate::challenge::*;
-use crate::server::{MeshNodeInfo, ShareBatch, ShareNotification, VerificationState};
+use crate::server::{ShareBatch, ShareNotification, VerificationState};
 use crate::websocket::{ws_handler, WsAuthQuery};
 use ghost_common::error::GhostError;
 
@@ -48,16 +47,6 @@ use ghost_common::error::GhostError;
 fn is_safe_proc_path(path: &str, allowed: &[String]) -> bool {
     allowed.iter().any(|a| a == path)
 }
-
-/// VF-H1: Validate hex hash format (block hash or txid)
-/// Must be exactly 64 hex characters (32 bytes)
-fn is_valid_hex_hash(s: &str) -> bool {
-    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-/// VF-H2: Maximum transaction hex size for policy verification (100KB)
-/// Standard Bitcoin nodes reject transactions > 100KB
-const MAX_TX_HEX_SIZE: usize = 200_000; // 100KB in hex = 200k chars
 
 /// Window for the miner-facing hashrate figures (#981).
 ///
@@ -185,20 +174,10 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         .route("/node-info", get(node_info_handler))
         // Informational endpoints
         .route("/peers", get(peers_handler))
-        // `/shares`, `/rounds` and `/payouts` used to sit here. They emit raw miner
-        // identities, payout addresses and txids, so they are now in `internal_router`.
-        .route("/consensus-state", get(consensus_state_handler))
-        // Verification challenges
-        .route("/verify/archive", get(archive_handler))
-        .route("/verify/policy", get(policy_handler))
-        .route("/verify/stratum", get(stratum_handler))
-        .route("/verify/ghostpay", get(ghostpay_handler))
-        .route("/verify/coordinator", get(coordinator_verify_handler))
         // API v1 routes for dashboard compatibility
         .route("/api/v1/node/status", get(api_node_status_handler))
         .route("/api/v1/node/info", get(api_node_info_handler))
         .route("/api/v1/node/blockchain", get(api_node_blockchain_handler))
-        .route("/api/v1/node/shares", get(api_node_shares_handler))
         .route("/api/v1/mining/status", get(api_mining_status_handler))
         .route("/api/v1/mining/template", get(api_mining_template_handler))
         .route("/api/v1/mining/coinbase", get(api_mining_coinbase_handler))
@@ -229,14 +208,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/pool/leaderboard",
             get(api_pool_leaderboard_handler),
         )
-        // "Next block payout" projection: current round's top miners,
-        // their work share, and projected sats from the 99% miner pool.
-        // Also reports the fee split (treasury + node reward pool) so the
-        // website can render the full breakdown. DB-only, no mesh.
-        .route(
-            "/api/v1/pool/next_payout",
-            get(api_pool_next_payout_handler),
-        )
         // Tail of recent shares for the live quasar visualisation. One
         // lightweight row per share — the caller polls with ?since=<ts>
         // and gets everything accepted since that watermark.
@@ -249,13 +220,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         // website render the node list from one node instead of a hard-coded
         // VM set, so new nodes appear automatically.
         .route("/api/v1/pool/mesh-nodes", get(api_pool_mesh_nodes_handler))
-        // Signed, verifiable snapshot of the public-mining node set — the blob a miner-side
-        // shim fetches for trustless decentralised discovery. 404 until a checkpoint is
-        // finalised (the gate is dormant on mainnet today).
-        .route(
-            "/api/v1/pool/mesh-node-list-checkpoint",
-            get(api_pool_mesh_node_list_checkpoint_handler),
-        )
         // Rolling server-side time-series of pool hashrate + connected miners,
         // sampled every 30s (24h retention). `?window=1h|24h`. Lets the pool
         // page chart real history instead of a client-side session buffer.
@@ -272,71 +236,33 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/pool/mesh-leaderboard",
             get(api_pool_mesh_leaderboard_handler),
         )
-        // Read-only decentralised-coordinator election view. Returns
-        // `{enabled:false}` unless the operator turns on
-        // `[coordinator] wraith_election_enabled`.
-        .route(
-            "/api/v1/pool/coordinator",
-            get(api_pool_coordinator_handler),
-        )
-        // Treasury + decentralisation-phase state for the Core page.
-        // Exposes balance / 21-BTC threshold / decay year / fee split so
-        // the website can render the Bootstrap → Decentralising →
-        // Sovereign journey against live pool state.
-        .route(
-            "/api/v1/pool/treasury_state",
-            get(api_pool_treasury_state_handler),
-        )
-        // Aggregate node metrics for the Core page. Returns pool-wide
-        // counts only — no per-node data, no clearnet/tor breakdown,
-        // no identifiers. Tor operators are counted as part of the
-        // aggregate and cannot be singled out.
-        .route("/api/v1/mesh/node_stats", get(api_mesh_node_stats_handler))
         // M-14: /api/v1/miners/stats moved to internal routes (requires HMAC auth)
         // Exposes individual miner work values, hashrates, and share history
         .route("/api/v1/network/peers", get(peers_handler))
         .route("/api/v1/network/pool", get(api_pool_status_handler))
-        .route("/api/v1/mesh/status", get(consensus_state_handler))
         .route("/api/v1/config", get(api_config_handler))
         .route("/api/v1/resources/status", get(api_resources_handler))
-        .route("/api/v1/ghostpay/status", get(api_ghostpay_status_handler))
         .route(
             "/api/v1/buds/capabilities",
             get(api_buds_capabilities_handler),
         )
         // Additional dashboard endpoints
         .route("/api/v1/swarm", get(api_swarm_handler))
-        .route("/api/v1/network/treasury", get(api_treasury_handler))
-        .route(
-            "/api/v1/l2/fee-distribution-context",
-            get(api_l2_fee_distribution_context_handler),
-        )
-        .route("/api/v1/l2/tree-state", get(api_l2_tree_state_handler))
-        .route("/api/v1/rewards/current", get(api_rewards_current_handler))
-        .route("/api/v1/rewards/history", get(api_rewards_history_handler))
         // HIGH-4: /api/v1/logs endpoint REMOVED - exposed journalctl output (security risk)
-        .route("/api/v1/locks", get(api_locks_handler))
         .route("/api/v1/node/nickname", get(api_nickname_handler))
-        // Additional endpoints for dashboard compatibility
-        .route("/api/v1/rewards/full", get(api_rewards_full_handler))
-        .route(
-            "/api/v1/settlement/status",
-            get(api_settlement_status_handler),
-        )
         .route("/api/v1/swarm/nodes", get(api_swarm_nodes_handler))
         .route("/api/v1/watchdog/status", get(api_watchdog_status_handler))
         .route("/api/v1/system/version", get(api_system_version_handler))
         .route("/api/v1/system/mempool", get(api_system_mempool_handler))
-        .route("/api/v1/system/self-check", get(api_self_check_handler))
         .route("/api/v1/reaper/status", get(api_reaper_status_handler))
         .route(
             "/api/v1/filtering/activity",
             get(api_filtering_activity_handler),
         )
-        // `/api/v1/payments` moved to `internal_router` — it emits payout addresses and txids.
+        // The old payout reads (`/api/v1/payments`, `/payouts`, payout history) are gone with the
+        // old ledger: `node_pool_routes::removed_router` answers them 410, and a miner's payouts
+        // are `/api/v1/ledger/{address}`.
         .route("/api/v1/backup/history", get(api_backup_history_handler))
-        .route("/api/v1/wraith/sessions", get(api_wraith_sessions_handler))
-        .route("/api/v1/network/elder", get(api_network_elder_handler))
         .route(
             "/api/v1/network/public-nodes",
             get(api_public_nodes_handler),
@@ -350,28 +276,9 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/mining/best-hash",
             get(api_mining_best_hash_handler),
         )
-        // `/api/v1/network/payout-history` and `/api/v1/ghostpay/payout-history` moved to
-        // `internal_router` — they emit recipient addresses, destinations and L1 txids.
-        .route(
-            "/api/v1/rewards/node-history",
-            get(api_rewards_node_history_handler),
-        )
-        .route(
-            "/api/v1/rewards/node-payout-events",
-            get(api_rewards_node_payout_events_handler),
-        )
-        .route(
-            "/api/v1/payout/checkpoint",
-            get(api_payout_checkpoint_handler),
-        )
-        .route(
-            "/api/v1/qualification/scoped-set",
-            get(api_qualification_scoped_set_handler),
-        )
         // Config endpoints (GET only - reading is public, POST requires auth via internal router)
         // CRIT-6: POST handlers moved to internal_router to require authentication
-        // `/api/v1/config/full` moved to `internal_router` — it carries `payout.address` and
-        // `payout.ghostpay_address`.
+        // `/api/v1/config/full` moved to `internal_router` — it carries `payout.address`.
         .route(
             "/api/v1/config/archive_mode",
             get(api_config_archive_mode_handler),
@@ -379,10 +286,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         .route(
             "/api/v1/config/ghost_mode",
             get(api_config_ghost_mode_handler),
-        )
-        .route(
-            "/api/v1/config/public_mining",
-            get(api_config_public_mining_handler),
         )
         .route("/api/v1/config/reaper", get(api_config_reaper_handler))
         .route("/api/v1/config/daemon", get(api_config_daemon_handler))
@@ -393,56 +296,9 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             get(api_config_backup_schedule_handler),
         )
         .route(
-            "/api/v1/config/ghost_pay",
-            get(api_config_ghost_pay_handler),
-        )
-        .route("/api/v1/config/wraith", get(api_config_wraith_handler))
-        .route("/api/v1/config/elder", get(api_config_elder_handler))
-        .route(
             "/api/v1/config/operator_window",
             get(api_config_operator_window_handler),
         )
-        // Mining endpoints
-        .route(
-            "/api/v1/mining/payout_address",
-            get(api_mining_payout_address_handler),
-        )
-        .route("/api/v1/mining/private", get(api_mining_private_handler))
-        .route("/api/v1/mining/public", get(api_mining_public_handler))
-        // Ghost Pay endpoints
-        .route(
-            "/api/v1/ghost-pay/pruning",
-            get(api_ghostpay_pruning_handler),
-        )
-        // Settings endpoints
-        .route(
-            "/api/v1/settings/ghostpay_payout_address",
-            get(api_settings_ghostpay_payout_address_handler),
-        )
-        // L2 read endpoints (public)
-        // MPC ceremony endpoints
-        .route("/api/v1/mpc/params", get(api_mpc_params_handler))
-        .route(
-            "/api/v1/mpc/payout-params",
-            get(api_mpc_payout_params_handler),
-        )
-        .route(
-            "/api/v1/mpc/unshield-params",
-            get(api_mpc_unshield_params_handler),
-        )
-        .route(
-            "/api/v1/mpc/params/manifest",
-            get(api_mpc_params_manifest_handler),
-        )
-        .route("/api/v1/mpc/status", get(api_mpc_status_handler))
-        .route(
-            "/api/v1/mpc/contributors",
-            get(api_mpc_contributors_handler),
-        )
-        // Stage C: per-position contribution (WITH proof) + retained approve
-        // votes, so a catching-up node can re-verify proofs and check the
-        // retained BFT quorum (the contributors list above omits both).
-        .route("/api/v1/mpc/votes/:position", get(api_mpc_votes_handler))
         // Ghost Haze & Shroud endpoints
         .route("/api/v1/haze/status", get(api_haze_status_handler))
         .route("/api/v1/haze/legal-pack", get(api_haze_legal_pack_handler))
@@ -465,7 +321,11 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         // Auth endpoint (returns empty token for dashboard compatibility)
         .route("/auth/token", get(api_auth_token_handler))
         // Prometheus metrics endpoint
-        .route("/metrics", get(metrics_handler));
+        .route("/metrics", get(metrics_handler))
+        // The node pool's ledger and status (W2.11), forwarded to pool_sv2, and `410 Gone` for
+        // the routes of every feature the node pool removed.
+        .merge(crate::node_pool_routes::node_pool_router())
+        .merge(crate::node_pool_routes::removed_router());
 
     // Localhost-only endpoints: SRI Pool share webhook (no HMAC required)
     // SRI Pool runs on localhost and doesn't support HMAC auth headers.
@@ -475,7 +335,7 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         // authenticated `/api/ws` relay, which dials `127.0.0.1:8080` server-side (see
         // `dashboard/server.js` — `NEXT_PUBLIC_API_URL` defaults to loopback), so nothing
         // legitimate connects to this from off-box. No mesh peer uses it either; the
-        // peer-to-peer surface is `/health`, `/verify/*` and `/api/v1/mpc/*`.
+        // peer-to-peer surface is `/health` and `/verify/*`.
         .route(
             "/ws",
             get(
@@ -488,21 +348,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             ),
         )
         .route("/api/internal/pool-nodes", get(pool_nodes_handler))
-        // L2 mutation endpoints — localhost only (ghost-pay is colocated)
-        .route("/api/v1/l2/submit", post(api_l2_submit_handler))
-        .route(
-            "/api/v1/l2/sync-commitment",
-            post(api_l2_sync_commitment_handler),
-        )
-        // GhostGlyph relay endpoints — localhost only (ghost-pay is colocated)
-        .route(
-            "/api/v1/glyph/relay-claim",
-            post(api_glyph_relay_claim_handler),
-        )
-        .route(
-            "/api/v1/glyph/relay-registered",
-            post(api_glyph_relay_registered_handler),
-        )
         .layer(middleware::from_fn(localhost_only_middleware));
 
     // H-13: the share ingest lane. Separated from `localhost_router` because loopback is not an
@@ -535,16 +380,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         // peer-to-peer path, so mesh verification, discovery and gossip are untouched.
         .route("/shares", get(shares_handler))
         .route("/rounds", get(rounds_handler))
-        .route("/payouts", get(payouts_handler))
-        .route("/api/v1/payments", get(api_payments_handler))
-        .route(
-            "/api/v1/network/payout-history",
-            get(api_payout_history_handler),
-        )
-        .route(
-            "/api/v1/ghostpay/payout-history",
-            get(api_ghostpay_payout_history_handler),
-        )
         .route("/api/v1/config/full", get(api_config_full_handler))
         // maxconnections (#499). Both verbs are on the internal tier: the POST mutates node
         // config, and the GET exposes the node's peer-slot headroom — useful to an operator,
@@ -554,8 +389,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             get(api_config_maxconnections_handler).post(api_config_maxconnections_post_handler),
         )
         .route("/api/v1/config/alerts", get(api_config_alerts_handler))
-        // Admin endpoints for testing
-        .route("/admin/test-consensus", post(admin_test_consensus_handler))
         // Internal API for dashboard config updates (triggers graceful restart)
         .route(
             "/api/internal/config/update",
@@ -574,10 +407,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         .route(
             "/api/v1/config/ghost_mode_local_egress",
             post(api_config_ghost_mode_local_egress_post_handler),
-        )
-        .route(
-            "/api/v1/config/public_mining",
-            post(api_config_public_mining_post_handler),
         )
         .route(
             "/api/v1/config/policy_profile",
@@ -621,15 +450,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/alerts/internal/service-restart",
             post(api_alerts_service_restart_post_handler),
         )
-        .route(
-            "/api/v1/config/ghost_pay",
-            post(api_config_ghost_pay_post_handler),
-        )
-        .route(
-            "/api/v1/config/wraith",
-            post(api_config_wraith_post_handler),
-        )
-        .route("/api/v1/config/elder", post(api_config_elder_post_handler))
         // M-14: Miner stats endpoint moved here to require HMAC authentication
         // Exposes individual miner work values, hashrates, and share history
         .route("/api/v1/miners/stats", get(api_miner_stats_handler))
@@ -715,24 +535,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             "/api/v1/watchdog/clear-cache",
             get(api_watchdog_clear_cache_handler).post(api_watchdog_clear_cache_handler),
         )
-        // Dashboard: GhostPay payout address POST
-        .route(
-            "/api/v1/settings/ghostpay_payout_address",
-            post(api_settings_ghostpay_payout_address_post_handler),
-        )
-        // Dashboard: Mining POST handlers
-        .route(
-            "/api/v1/mining/private",
-            post(api_mining_private_post_handler),
-        )
-        .route(
-            "/api/v1/mining/public",
-            post(api_mining_public_post_handler),
-        )
-        .route(
-            "/api/v1/mining/payout_address",
-            post(api_mining_payout_address_post_handler),
-        )
         .route(
             "/api/v1/mining/pool_name",
             post(api_mining_pool_name_post_handler),
@@ -755,11 +557,9 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         )
         // Dashboard: Node restart
         .route("/api/v1/node/restart", post(api_node_restart_handler))
-        // L2 commitment sync (authenticated alternative to localhost-only sync-commitment)
-        .route(
-            "/api/internal/l2/sync-commitment",
-            post(api_l2_sync_commitment_handler),
-        );
+        // The pool's connected miners, by payout address (forwarded to pool_sv2). Signed
+        // requests only: it names every miner's address.
+        .merge(crate::node_pool_routes::operator_router());
 
     // H-3: Apply authentication middleware - ALWAYS required for internal endpoints
     let internal_router = if let Some(ref auth) = state.internal_auth {
@@ -1047,7 +847,6 @@ async fn node_info_handler(State(state): State<Arc<VerificationState>>) -> impl 
     Json(serde_json::json!({
         "node_id": health.node_id,
         "version": health.version,
-        "capabilities": health.capabilities,
         "uptime_secs": health.uptime_secs,
         "block_height": health.block_height,
         "round_id": health.round_id,
@@ -1191,575 +990,6 @@ async fn rounds_handler(State(state): State<Arc<VerificationState>>) -> impl Int
     }))
 }
 
-/// Payouts handler - returns payout history
-async fn payouts_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
-    // Query database for recent payouts if available
-    let (payouts, total_payouts) = if let Some(ref db) = state.database {
-        let total = db.get_payout_count().unwrap_or(0);
-        let payouts = match db.get_recent_payouts(50) {
-            Ok(payout_records) => payout_records
-                .iter()
-                .map(|p| {
-                    serde_json::json!({
-                        "round_id": p.round_id,
-                        "recipient_id": p.recipient_id,
-                        "recipient_type": p.recipient_type.as_str(),
-                        "address": p.address,
-                        "amount_sats": p.amount_sats,
-                        "txid": p.txid,
-                        "status": p.status.as_str(),
-                        "created_at": p.created_at
-                    })
-                })
-                .collect::<Vec<_>>(),
-            Err(e) => {
-                error!(error = %e, "Failed to query payouts");
-                vec![]
-            }
-        };
-        (payouts, total)
-    } else {
-        (vec![], 0)
-    };
-
-    Json(serde_json::json!({
-        "total_payouts": total_payouts,
-        "payouts": payouts
-    }))
-}
-
-/// Consensus state handler - returns current consensus status
-async fn consensus_state_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
-    let health = state.get_health().await;
-
-    // Query database for elder count and peer info
-    let (elder_count, burned_elder_count, peer_count) = if let Some(ref db) = state.database {
-        let elders = db.get_elder_count().unwrap_or(0);
-        let burned = db
-            .get_burned_positions()
-            .map(|v| v.len() as u32)
-            .unwrap_or(0);
-        let peers = db.get_active_peers(100).map(|p| p.len()).unwrap_or(0) as u32;
-        (elders, burned, peers)
-    } else {
-        (0, 0, health.peer_count)
-    };
-
-    // Determine consensus status based on peer connectivity
-    let consensus_status = if peer_count >= 3 {
-        "active"
-    } else if peer_count > 0 {
-        "degraded"
-    } else {
-        "isolated"
-    };
-
-    Json(serde_json::json!({
-        "round_id": health.round_id,
-        "block_height": health.block_height,
-        "peer_count": peer_count,
-        "miner_count": health.miner_count,
-        "consensus_status": consensus_status,
-        "elder_count": elder_count,
-        "elders_registered": elder_count,
-        "elders_burned": burned_elder_count,
-        "elders_cap": 101u32,
-        "bft_threshold": 0.67,
-        "quorum_reached": peer_count >= 3
-    }))
-}
-
-/// Archive verification query parameters
-#[derive(Debug, Deserialize)]
-pub struct ArchiveQuery {
-    /// Block hash to verify
-    pub block: Option<String>,
-    /// Transaction ID to verify
-    pub tx: Option<String>,
-    /// Minimum height to prove
-    pub min_height: Option<u64>,
-    /// Challenge nonce for signed response binding
-    pub nonce: Option<String>,
-    /// Explicitly disable signing (default: signed when possible)
-    pub unsigned: Option<bool>,
-}
-
-/// Archive verification handler
-///
-/// Returns ArchiveResponse wrapped in SignedResponse by default when signing
-/// identity is configured. Use `unsigned=true` to get unsigned response.
-async fn archive_handler(
-    State(state): State<Arc<VerificationState>>,
-    Query(query): Query<ArchiveQuery>,
-) -> impl IntoResponse {
-    debug!(
-        block = ?query.block,
-        tx = ?query.tx,
-        "Archive verification request"
-    );
-
-    // VF-H1: Validate input format before processing
-    // Block hashes and txids must be exactly 64 hex characters
-    if let Some(ref block) = query.block {
-        if !is_valid_hex_hash(block) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "signed": false,
-                    "response": ArchiveResponse {
-                        success: false,
-                        block_data: None,
-                        tx_data: None,
-                        error: Some("Invalid block hash: must be exactly 64 hex characters".to_string()),
-                    }
-                })),
-            );
-        }
-    }
-    if let Some(ref tx) = query.tx {
-        if !is_valid_hex_hash(tx) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "signed": false,
-                    "response": ArchiveResponse {
-                        success: false,
-                        block_data: None,
-                        tx_data: None,
-                        error: Some("Invalid txid: must be exactly 64 hex characters".to_string()),
-                    }
-                })),
-            );
-        }
-    }
-
-    let challenge = ArchiveChallenge {
-        challenge_type: if query.block.is_some() {
-            ChallengeType::ArchiveBlock
-        } else {
-            ChallengeType::ArchiveTx
-        },
-        block_hash: query.block,
-        txid: query.tx,
-        min_height: query.min_height,
-    };
-
-    let should_sign = !query.unsigned.unwrap_or(false);
-
-    match state.verify_archive(challenge).await {
-        Ok(response) => {
-            if should_sign && state.can_sign() {
-                if let Some(signed) = state.sign_response(response.clone(), query.nonce) {
-                    return (
-                        StatusCode::OK,
-                        Json(serde_json::json!({
-                            "signed": true,
-                            "response": signed
-                        })),
-                    );
-                }
-            }
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "signed": false,
-                    "response": response
-                })),
-            )
-        }
-        Err(e) => {
-            error!(error = %e, "Archive verification failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "signed": false,
-                    "response": ArchiveResponse {
-                        success: false,
-                        block_data: None,
-                        tx_data: None,
-                        error: Some(e.to_string()),
-                    }
-                })),
-            )
-        }
-    }
-}
-
-/// Policy verification query parameters
-#[derive(Debug, Deserialize)]
-pub struct PolicyQuery {
-    /// Raw transaction hex
-    pub tx: String,
-    /// Expected tier (optional)
-    pub expected_tier: Option<String>,
-    /// Challenge nonce for signed response binding
-    pub nonce: Option<String>,
-    /// Explicitly disable signing (default: signed when possible)
-    pub unsigned: Option<bool>,
-}
-
-/// Policy verification handler
-///
-/// Returns PolicyResponse wrapped in SignedResponse by default when signing
-/// identity is configured. Use `unsigned=true` to get unsigned response.
-///
-/// **Security**: Always prefer signed responses to prevent MITM/proxy attacks.
-async fn policy_handler(
-    State(state): State<Arc<VerificationState>>,
-    Query(query): Query<PolicyQuery>,
-) -> impl IntoResponse {
-    debug!(tx_len = query.tx.len(), unsigned = ?query.unsigned, "Policy verification request");
-
-    // VF-H2: Validate transaction hex size before processing
-    if query.tx.len() > MAX_TX_HEX_SIZE {
-        warn!(
-            tx_len = query.tx.len(),
-            max = MAX_TX_HEX_SIZE,
-            "Transaction hex too large"
-        );
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "signed": false,
-                "response": PolicyResponse {
-                    success: false,
-                    profile: "N/A".to_string(),
-                    classification: None,
-                    accepted: false,
-                    rejection_reason: Some("Input too large".to_string()),
-                    tx_txid: None,
-                    error: Some(format!(
-                        "Transaction hex too large: {} bytes (max {})",
-                        query.tx.len(),
-                        MAX_TX_HEX_SIZE
-                    )),
-                }
-            })),
-        );
-    }
-
-    let challenge = PolicyChallenge {
-        tx_hex: query.tx,
-        expected_tier: query.expected_tier,
-    };
-
-    // Sign by default unless explicitly disabled
-    let should_sign = !query.unsigned.unwrap_or(false);
-
-    match state.verify_policy(challenge).await {
-        Ok(response) => {
-            if should_sign && state.can_sign() {
-                if let Some(signed) = state.sign_response(response.clone(), query.nonce) {
-                    return (
-                        StatusCode::OK,
-                        Json(serde_json::json!({
-                            "signed": true,
-                            "response": signed
-                        })),
-                    );
-                }
-            }
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "signed": false,
-                    "response": response
-                })),
-            )
-        }
-        Err(e) => {
-            error!(error = %e, "Policy verification failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "signed": false,
-                    "response": PolicyResponse {
-                        success: false,
-                        profile: String::new(),
-                        classification: None,
-                        accepted: false,
-                        rejection_reason: None,
-                        tx_txid: None,
-                        error: Some(e.to_string()),
-                    }
-                })),
-            )
-        }
-    }
-}
-
-/// Stratum verification query parameters
-#[derive(Debug, Deserialize)]
-pub struct StratumQuery {
-    /// Port to check
-    pub port: Option<u16>,
-    /// Protocol (sv1 or sv2)
-    pub protocol: Option<String>,
-    /// Challenge nonce for signed response binding
-    pub nonce: Option<String>,
-    /// Explicitly disable signing (default: signed when possible)
-    pub unsigned: Option<bool>,
-}
-
-/// Stratum verification handler
-///
-/// Returns StratumResponse wrapped in SignedResponse by default when signing
-/// identity is configured. Use `unsigned=true` to get unsigned response.
-///
-/// **Security**: Always prefer signed responses to prevent MITM/proxy attacks.
-/// Query for `/verify/coordinator`.
-#[derive(Debug, serde::Deserialize)]
-pub struct CoordinatorVerifyQuery {
-    /// Challenge nonce, bound into the signature so a captured reply cannot be
-    /// replayed at a later challenge.
-    pub nonce: Option<String>,
-    /// Explicitly disable signing (default: signed when possible).
-    pub unsigned: Option<bool>,
-}
-
-/// What a node attests about its own Wraith coordinator role.
-///
-/// ⛔ **These facts are worth nothing unsigned, and not much on their own.**
-///
-/// Anything can serve this JSON — the whole point of #605's Stratum finding is
-/// that `nc -l 3333` passes a bare connect. What makes it evidence is the
-/// signature the handler wraps it in: bound to the challenger's nonce and made
-/// with the node's identity key, so a relay cannot answer for somebody else.
-///
-/// And even signed it proves only *what this node claims about itself*. The
-/// challenger must still dial `advertised_endpoint` and confirm a coordinator
-/// answers there. A signature without a probe proves a key exists; a probe
-/// without a signature proves something listens. The capability needs both.
-///
-/// ⚠ Deliberately NOT included: the election document (beacon, roster, tier
-/// leaders). It is derived from public inputs, so any node can compute a correct
-/// one without coordinating anything — including it would invite exactly the
-/// mistake #605 records against Archive, where every field was derivable from
-/// the public header and a pruned node passed.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CoordinatorAttestation {
-    /// Has this node turned the coordinator election on.
-    pub enabled: bool,
-    /// Whether this node runs a coordinator this epoch — true for every node on
-    /// its own roster, leading a tier or not, since the rest are the failover
-    /// path.
-    pub serving: bool,
-    /// Where this node says wallets should dial its coordinator. The address
-    /// the challenger must then probe — a claim, until it does. `None` when the
-    /// node is not serving.
-    pub advertised_endpoint: Option<String>,
-    /// The epoch this node currently computes, so a node stuck on a stale view
-    /// is visible rather than merely wrong.
-    pub epoch: Option<u64>,
-    /// The tiers this node leads this epoch. Informational: which node leads
-    /// what follows from public inputs, so it proves nothing about the node.
-    pub my_tiers: Vec<String>,
-}
-
-/// `GET /verify/coordinator` — a node's signed attestation about its Wraith
-/// coordinator role (#736).
-///
-/// Half of a proof. See [`CoordinatorAttestation`] for what the other half is
-/// and why this alone is not enough.
-async fn coordinator_verify_handler(
-    State(state): State<Arc<VerificationState>>,
-    Query(query): Query<CoordinatorVerifyQuery>,
-) -> impl IntoResponse {
-    let status = state.coordinator_status();
-    let attestation = CoordinatorAttestation {
-        enabled: status
-            .get("enabled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        // This node's OWN endpoint, as its election service reports it. Never
-        // the first entry in `coordinators`, or any other node's: that would
-        // have the challenger probe somebody else's coordinator and credit
-        // this node for it.
-        advertised_endpoint: status
-            .get("my_endpoint")
-            .and_then(|e| e.as_str())
-            .filter(|e| !e.is_empty())
-            .map(String::from),
-        serving: status
-            .get("my_endpoint")
-            .and_then(|e| e.as_str())
-            .is_some_and(|e| !e.is_empty()),
-        epoch: status.get("epoch").and_then(|e| e.as_u64()),
-        my_tiers: status
-            .get("my_tiers")
-            .and_then(|t| t.as_array())
-            .map(|t| {
-                t.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default(),
-    };
-
-    // Signed by default. An unsigned attestation is a diagnostic, never
-    // evidence — the caller has to ask for it.
-    if !query.unsigned.unwrap_or(false) && state.can_sign() {
-        if let Some(signed) = state.sign_response(attestation.clone(), query.nonce) {
-            return (
-                StatusCode::OK,
-                Json(serde_json::json!({ "signed": true, "response": signed })),
-            );
-        }
-    }
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "signed": false, "response": attestation })),
-    )
-}
-
-async fn stratum_handler(
-    State(state): State<Arc<VerificationState>>,
-    Query(query): Query<StratumQuery>,
-) -> impl IntoResponse {
-    let protocol = match query.protocol.as_deref() {
-        Some("sv1") => StratumProtocol::Sv1,
-        _ => StratumProtocol::Sv2,
-    };
-
-    let challenge = StratumChallenge {
-        port: query.port,
-        protocol,
-    };
-
-    debug!(port = ?query.port, protocol = ?protocol, unsigned = ?query.unsigned, "Stratum verification request");
-
-    // Sign by default unless explicitly disabled
-    let should_sign = !query.unsigned.unwrap_or(false);
-
-    match state.verify_stratum(challenge).await {
-        Ok(response) => {
-            if should_sign && state.can_sign() {
-                if let Some(signed) = state.sign_response(response.clone(), query.nonce) {
-                    return (
-                        StatusCode::OK,
-                        Json(serde_json::json!({
-                            "signed": true,
-                            "response": signed
-                        })),
-                    );
-                }
-            }
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "signed": false,
-                    "response": response
-                })),
-            )
-        }
-        Err(e) => {
-            error!(error = %e, "Stratum verification failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "signed": false,
-                    "response": StratumResponse {
-                        success: false,
-                        port: query.port.unwrap_or(34255),
-                        protocol,
-                        connected: false,
-                        latency_ms: None,
-                        error: Some(e.to_string()),
-                    }
-                })),
-            )
-        }
-    }
-}
-
-/// Ghost Pay verification query parameters
-#[derive(Debug, Deserialize)]
-pub struct GhostPayQuery {
-    /// Address to query balance
-    pub address: Option<String>,
-    /// Challenge nonce for signed response binding
-    pub nonce: Option<String>,
-    /// Explicitly disable signing (default: signed when possible)
-    pub unsigned: Option<bool>,
-    /// H-5: Challenge epoch to verify L2 state for (cryptographic verification)
-    pub challenge_epoch: Option<u64>,
-    /// VER-2: Challenge nonce for precomputation prevention
-    /// When provided, response must include nonce_bound_proof = SHA256(epoch_state_hash || challenge_nonce)
-    pub challenge_nonce: Option<String>,
-}
-
-/// Ghost Pay verification handler
-///
-/// Returns GhostPayResponse wrapped in SignedResponse by default when signing
-/// identity is configured. Use `unsigned=true` to get unsigned response.
-///
-/// **Security**: Always prefer signed responses to prevent MITM/proxy attacks.
-async fn ghostpay_handler(
-    State(state): State<Arc<VerificationState>>,
-    Query(query): Query<GhostPayQuery>,
-) -> impl IntoResponse {
-    debug!(address = ?query.address, unsigned = ?query.unsigned, "GhostPay verification request");
-
-    let challenge = GhostPayChallenge {
-        challenge_type: if query.address.is_some() {
-            ChallengeType::GhostPayBalance
-        } else {
-            ChallengeType::GhostPayTransfer
-        },
-        address: query.address,
-        challenge_epoch: query.challenge_epoch,
-        challenge_nonce: query.challenge_nonce,
-    };
-
-    // Sign by default unless explicitly disabled
-    let should_sign = !query.unsigned.unwrap_or(false);
-
-    match state.verify_ghostpay(challenge).await {
-        Ok(response) => {
-            if should_sign && state.can_sign() {
-                if let Some(signed) = state.sign_response(response.clone(), query.nonce) {
-                    return (
-                        StatusCode::OK,
-                        Json(serde_json::json!({
-                            "signed": true,
-                            "response": signed
-                        })),
-                    );
-                }
-            }
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "signed": false,
-                    "response": response
-                })),
-            )
-        }
-        Err(e) => {
-            error!(error = %e, "GhostPay verification failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "signed": false,
-                    "response": GhostPayResponse {
-                        success: false,
-                        l2_enabled: false,
-                        virtual_block: None,
-                        epoch: None,
-                        balance_sats: None,
-                        wraith_enabled: false,
-                        epoch_state_hash: None,
-                        epoch_tx_count: None,
-                        nonce_bound_proof: None,
-                        epoch_proof: None,
-                        error: Some(e.to_string()),
-                    }
-                })),
-            )
-        }
-    }
-}
-
 // ============================================================================
 // API v1 Handlers for Dashboard Compatibility
 // ============================================================================
@@ -1785,84 +1015,13 @@ async fn api_node_status_handler(State(state): State<Arc<VerificationState>>) ->
         "peer_count": health.peer_count,
         "miner_count": health.miner_count,
         "is_synced": true,
-        // Capability flags are public - used for verification challenges
         "archive_mode": config.archive_mode,
-        "ghost_pay": config.ghost_pay,
-        "public_mining": config.public_mining,
-        "private_mining": false,
+        "public_mining": true,
         "reaper": config.reaper,
         "ghost_mode": config.ghost_mode,
         "ghost_mode_local_egress": config.ghost_mode_local_egress,
         "tor_mode": config.tor_mode,
         "onion_address": config.onion_address
-    }))
-}
-
-/// API v1 node shares handler (5-4-3-2-1 system)
-async fn api_node_shares_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
-    let _health = state.get_health().await;
-    let config = state.dashboard_config.read();
-
-    // Check elder status from MPC database (authoritative source)
-    // The dashboard_config.elder flag can be stale; the DB knows the truth
-    let (is_elder, elder_slot) = if let Some(ref db) = state.database {
-        let elder = db.is_mpc_elder(&state.node_id).unwrap_or(false);
-        let slot = if elder {
-            db.get_mpc_elder_position(&state.node_id).unwrap_or(None)
-        } else {
-            None
-        };
-        (elder, slot)
-    } else {
-        (config.elder, config.elder_slot)
-    };
-
-    // Calculate total shares based on capabilities (5-4-3-2-1 system)
-    let mut total = 0;
-    if config.archive_mode {
-        total += 5;
-    }
-    if config.ghost_pay {
-        total += 4;
-    }
-    if config.public_mining {
-        total += 3;
-    }
-    if config.reaper {
-        total += 2;
-    }
-    if is_elder {
-        total += 1;
-    }
-
-    // Real trailing-7-day uptime for THIS node (the qualification gatekeeper
-    // metric), read from the self-recorded uptime samples via the same query
-    // the qualification layer uses. `uptime_qualified` reflects the true >=95%
-    // gate rather than an unconditional `true`. Falls back to null/false when
-    // no DB is attached (never a fabricated 99.9%).
-    let self_uptime_percent: Option<f64> = state.database.as_ref().and_then(|db| {
-        let since = chrono::Utc::now().timestamp()
-            - (ghost_common::constants::UPTIME_WINDOW_DAYS as i64 * 86_400);
-        db.get_uptime_percent(&state.node_id, since)
-            .ok()
-            .map(|ratio| ratio * 100.0)
-    });
-    let uptime_qualified = self_uptime_percent
-        .map(|p| p >= ghost_common::constants::UPTIME_GATEKEEPER_THRESHOLD)
-        .unwrap_or(false);
-
-    Json(serde_json::json!({
-        "total": total,
-        "max_shares": 15,
-        "uptime_qualified": uptime_qualified,
-        "uptime_percent": self_uptime_percent,
-        "archive_mode": config.archive_mode,
-        "ghost_pay": config.ghost_pay,
-        "public_mining": config.public_mining,
-        "reaper": config.reaper,
-        "elder": is_elder,
-        "elder_slot": elder_slot,
-        "estimated_reward_btc": 0.0
     }))
 }
 
@@ -1876,7 +1035,6 @@ async fn api_node_info_handler(State(state): State<Arc<VerificationState>>) -> i
         "node_id_short": node_id_short,
         "nickname": node_id_short,
         "version": health.version,
-        "capabilities": health.capabilities,
         "uptime_seconds": health.uptime_secs,
         "uptime_secs": health.uptime_secs,
         "sync_height": health.block_height,
@@ -1887,8 +1045,7 @@ async fn api_node_info_handler(State(state): State<Arc<VerificationState>>) -> i
         "peer_count": health.peer_count,
         "miner_count": health.miner_count,
         "archive_mode": config.archive_mode,
-        "ghost_pay": config.ghost_pay,
-        "public_mining": config.public_mining,
+        "public_mining": true,
         "reaper": config.reaper
     }))
 }
@@ -1982,12 +1139,11 @@ async fn api_mining_template_handler(
     }
 }
 
-/// Categorised coinbase breakdown for the block currently being built: the
-/// miner pool, node reward pool, treasury and finder tx-fees, plus per-recipient
-/// entries. Operator-authed callers (dashboard proxy signing over an empty body,
-/// same as `/api/v1/mining/miners`) see full recipient addresses; everyone else
-/// gets the amounts and counts with addresses stripped (`addresses_redacted`).
-/// `{ "available": false }` until a payout has been agreed for the round.
+/// The coinbase split of the block currently being built: subsidy, the treasury's base share,
+/// the miners' share and the transaction fees to the finder (ghost-mining's template). Which
+/// miners a block pays is decided per job by pool_sv2; see `/api/v1/node-pool/status`. Any
+/// per-recipient `miners`/`nodes` entries are stripped of addresses for callers without the
+/// operator signature (`addresses_redacted`). `{ "available": false }` until there is a template.
 async fn api_mining_coinbase_handler(
     State(state): State<Arc<VerificationState>>,
     headers: HeaderMap,
@@ -2109,20 +1265,16 @@ async fn api_mining_status_handler(
 
     // Stable count of miners active in the last 5 minutes — survives round
     // rotations that reset the round-scoped miner_count to zero. This is the
-    // local view; mesh_active_miners below is the deduplicated pool-wide count.
+    // This node's own view; the old mesh's pool-wide figures are gone with it.
     let active_miners = state
         .database
         .as_ref()
         .and_then(|db| db.count_active_miners(ACTIVE_MINER_WINDOW_SECS).ok())
         .unwrap_or(0);
-    let mesh_active_miners = state.mesh_active_miners().unwrap_or(active_miners);
-    // Pool-wide hashrate (sum of every node's own realized hashrate) is the
-    // figure operators expect: it stays put when the load balancer migrates a
-    // miner between nodes. Falls back to the node-local sum on older deploys
-    // without the mesh provider. `local_hashrate_th` shows this node's own
-    // contribution (the same windowed value it gossips), so the per-node and
-    // mesh figures reconcile.
-    let mesh_hashrate_th = state.mesh_total_hashrate().unwrap_or(total_hashrate_th);
+    // The `mesh_*` keys below keep their names for existing readers and carry this node's own
+    // figures: the old mesh that summed them across nodes was removed.
+    let mesh_active_miners = active_miners;
+    let mesh_hashrate_th = total_hashrate_th;
     let local_hashrate_th = state.local_hashrate().unwrap_or(total_hashrate_th);
 
     // SV2/Noise miners must pin the pool's authority public key to connect, and
@@ -2143,22 +1295,28 @@ async fn api_mining_status_handler(
         .and_then(|c| c.read().network.sv2_authority_public_key.clone())
         .filter(|k| !k.trim().is_empty());
 
-    // Source the operator's pool name and node-reward payout address from the
-    // REAL persisted config (pool.toml) so the dashboard round-trips the saved
-    // value across a restart. Fall back to the ephemeral mirror only when the
-    // full config is not loaded. (Non-async lock, safe alongside the dashboard
+    // Source the operator's pool name from the REAL persisted config (pool.toml) so the
+    // dashboard round-trips the saved value across a restart. Fall back to the ephemeral mirror
+    // only when the full config is not loaded. (Non-async lock, safe alongside the dashboard
     // config guard held above — no await points follow.)
-    let (real_pool_name, real_payout_address) = state
+    let real_pool_name = state
+        .full_node_config
+        .as_ref()
+        .map(|c| c.read().pool.pool_name.clone())
+        .unwrap_or_else(|| config.pool_name.clone());
+
+    // The stratum ports this node serves, from its own `[network]` (the dashboard's "Connect
+    // miners" page shows them). The compiled defaults are the installer's, and only a fallback
+    // when the full config is not loaded: a node configured on other ports must not tell its
+    // operator 3333 / 34255.
+    let (sv1_port, sv2_port) = state
         .full_node_config
         .as_ref()
         .map(|c| {
-            let cfg = c.read();
-            (
-                cfg.pool.pool_name.clone(),
-                cfg.pool.node_payout_address.clone(),
-            )
+            let c = c.read();
+            (c.network.sv1_port, c.network.sv2_port)
         })
-        .unwrap_or_else(|| (config.pool_name.clone(), config.payout_address.clone()));
+        .unwrap_or((SV1_STRATUM_PORT, SV2_STRATUM_PORT));
 
     Json(serde_json::json!({
         // Backend fields
@@ -2168,14 +1326,12 @@ async fn api_mining_status_handler(
         "round_id": health.round_id,
         "miner_count": health.miner_count,
         "total_hashrate": mesh_hashrate_th,
-        "shares_this_round": health.capabilities.total_shares,
         "difficulty": network_difficulty,
         "best_hash": null,
         "is_synced": true,
         // Dashboard-compatible aliases
         "enabled": true,
-        "private_mining": config.private_mining.unwrap_or(false),
-        "public_mining": health.capabilities.public_mining,
+        "public_mining": true,
         "hashrate_th": mesh_hashrate_th,
         "local_hashrate_th": local_hashrate_th,
         "connected_miners": mesh_active_miners,
@@ -2185,12 +1341,11 @@ async fn api_mining_status_handler(
         "shares_submitted": shares_submitted,
         "shares_accepted": shares_accepted,
         "shares_rejected": shares_submitted - shares_accepted,
-        "stratum_v1_port": SV1_STRATUM_PORT,
-        "stratum_v2_port": SV2_STRATUM_PORT,
+        "stratum_v1_port": sv1_port,
+        "stratum_v2_port": sv2_port,
         "authority_public_key": authority_public_key,
-        "stratum_v1_endpoint": format!("stratum+tcp://0.0.0.0:{}", SV1_STRATUM_PORT),
-        "stratum_v2_endpoint": format!("stratum+tcp://0.0.0.0:{}", SV2_STRATUM_PORT),
-        "payout_address": real_payout_address,
+        "stratum_v1_endpoint": format!("stratum+tcp://0.0.0.0:{sv1_port}"),
+        "stratum_v2_endpoint": format!("stratum+tcp://0.0.0.0:{sv2_port}"),
         "pool_name": real_pool_name,
         "blocks_found": state.database.as_ref()
             .and_then(|db| db.get_blocks_found_count().ok())
@@ -2546,11 +1701,6 @@ async fn api_miner_lookup_handler(
                     .unwrap_or_default()
                     .as_secs() as i64;
                 let active = (now - m.last_seen) < 600;
-                // Unpaid ledger side of the lookup: shares this miner has
-                // submitted that haven't been committed to a payout yet.
-                // Frontend sums across VMs (each node has its own ledger).
-                let (unpaid_shares, unpaid_work) =
-                    db.get_miner_unpaid_stats(&m.miner_id).unwrap_or((0, 0.0));
                 serde_json::json!({
                     "found": true,
                     "miner_id": m.miner_id,
@@ -2561,10 +1711,7 @@ async fn api_miner_lookup_handler(
                     "total_shares": m.total_shares,
                     "total_work": m.total_work,
                     "blocks_won": m.blocks_won,
-                    "total_payouts_sats": m.total_payouts_sats,
                     "avg_hashrate_ths": m.avg_hashrate_ths,
-                    "unpaid_shares": unpaid_shares,
-                    "unpaid_work": unpaid_work,
                 })
             }
             Ok(None) => serde_json::json!({
@@ -2588,300 +1735,6 @@ async fn api_miner_lookup_handler(
     };
 
     Json(result)
-}
-
-/// "Next block payout" — project each miner's share of the upcoming
-/// block. We take the max round_id currently present in shares (that's
-/// the round the template is building on), pull the top N miners by
-/// work within it, and compute projected sats = miner_work / total_work
-/// × miner_pool.
-///
-/// The miner pool is 99% of subsidy; the 1% pool fee is split 50/50
-/// between treasury and the node reward pool (constant pre-21-BTC).
-/// TX fees are paid to the node that builds the winning block, not to
-/// miners, so they're reported separately as a note.
-async fn api_pool_next_payout_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    // Pool economics: 1% fee from subsidy only, split 50/50 today.
-    // If this changes (post-21-BTC decay), it must also change in
-    // bins/ghost-pool/src/treasury.rs — keep the two in sync.
-    const POOL_FEE_BPS: u64 = 100; // 1.00%
-    const TREASURY_RATE_BPS: u64 = 5000; // 50% of pool fee
-    const NODE_RATE_BPS: u64 = 5000; // 50% of pool fee
-    const DUST_THRESHOLD_SATS: u64 = 546;
-    const LEDGER_CAP: u32 = 1000;
-
-    let health = state.get_health().await;
-    let block_height = health.block_height as u64;
-
-    // Bitcoin halving schedule: 50 BTC >> halvings, zero after halving 64
-    let subsidy_sats: u64 = {
-        let halvings = block_height / 210_000;
-        if halvings >= 64 {
-            0
-        } else {
-            5_000_000_000u64 >> halvings
-        }
-    };
-
-    let pool_fee_sats = subsidy_sats * POOL_FEE_BPS / 10_000;
-    let treasury_sats = pool_fee_sats * TREASURY_RATE_BPS / 10_000;
-    let node_reward_pool_sats = pool_fee_sats.saturating_sub(treasury_sats);
-    let miner_pool_sats = subsidy_sats.saturating_sub(pool_fee_sats);
-
-    let Some(ref db) = state.database else {
-        return Json(serde_json::json!({
-            "block_height": block_height,
-            "subsidy_sats": subsidy_sats,
-            "error": "Database not available",
-        }));
-    };
-
-    let now_s = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-
-    // Ledger snapshot: top N by accumulated unpaid work. Mirror of the
-    // block-found payout path — same query, same dust filter — so the
-    // projection the website shows matches what gets written into the
-    // coinbase when a block is actually found. Translator-proxy accounts
-    // are excluded from the display only; if shares from a real miner
-    // happen to be submitted under a system miner_id they'd still be
-    // paid on-chain but the public view doesn't need to surface them.
-    //
-    // Gate: post-PAYOUT_ADDRESS_GROUPING_HEIGHT we group by payout_address
-    // so the displayed top-N matches the post-gate coinbase behaviour
-    // (one slot per address, multi-rig users no longer monopolise).
-    // The constant is duplicated here rather than imported because
-    // ghost-verification doesn't depend on ghost-mining — keep the two
-    // in sync if the gate ever moves.
-    const PAYOUT_ADDRESS_GROUPING_HEIGHT: u64 = 946_743;
-
-    let top_rows: Vec<(String, f64)> = if block_height >= PAYOUT_ADDRESS_GROUPING_HEIGHT {
-        db.get_top_unpaid_addresses(now_s, LEDGER_CAP.saturating_mul(2))
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(addr, _, _)| !is_system_miner(addr))
-            .take(LEDGER_CAP as usize)
-            .map(|(addr, work, _miner_ids)| (addr, work))
-            .collect()
-    } else {
-        db.get_top_unpaid_miners(now_s, LEDGER_CAP.saturating_mul(2))
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(miner_id, _)| !is_system_miner(miner_id))
-            .take(LEDGER_CAP as usize)
-            .collect()
-    };
-    // Count distinct unpaid users (miners pre-gate, addresses post-gate)
-    // so the header tile matches what's actually shown in the table.
-    let total_unpaid_miners = if block_height >= PAYOUT_ADDRESS_GROUPING_HEIGHT {
-        db.get_top_unpaid_addresses(now_s, u32::MAX)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(addr, _, _)| !is_system_miner(addr))
-            .count() as u64
-    } else {
-        db.get_distinct_unpaid_miner_ids(now_s)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|id| !is_system_miner(id))
-            .count() as u64
-    };
-
-    // Iterative dust filter: drop miners whose projected payout < 546 sats,
-    // recompute total_work, repeat until stable. Converges quickly (each
-    // iteration strictly reduces the candidate set).
-    let mut surviving: Vec<(String, f64)> = top_rows;
-    loop {
-        let total_work: f64 = surviving.iter().map(|(_, w)| *w).sum();
-        if total_work <= 0.0 {
-            break;
-        }
-        let pre_len = surviving.len();
-        surviving.retain(|(_, work)| {
-            let projected = (miner_pool_sats as f64 * work / total_work) as u64;
-            projected >= DUST_THRESHOLD_SATS
-        });
-        if surviving.len() == pre_len {
-            break;
-        }
-    }
-
-    let total_work: f64 = surviving.iter().map(|(_, w)| *w).sum();
-    let paid_this_block = surviving.len() as u64;
-
-    let miners: Vec<_> = surviving
-        .into_iter()
-        .enumerate()
-        .map(|(i, (miner_id, work))| {
-            let share_pct = if total_work > 0.0 {
-                work / total_work * 100.0
-            } else {
-                0.0
-            };
-            let projected_sats = if total_work > 0.0 {
-                (miner_pool_sats as u128 * ((work * 1_000_000.0) as u128)
-                    / ((total_work * 1_000_000.0) as u128)) as u64
-            } else {
-                0
-            };
-            serde_json::json!({
-                "rank": i + 1,
-                "miner_id_redacted": redact_miner_id(&miner_id),
-                "unpaid_work": work,
-                "share_pct": share_pct,
-                "projected_sats": projected_sats,
-            })
-        })
-        .collect();
-
-    Json(serde_json::json!({
-        "block_height": block_height,
-        "subsidy_sats": subsidy_sats,
-        "pool_fee_bps": POOL_FEE_BPS,
-        "treasury_rate_bps": TREASURY_RATE_BPS,
-        "node_rate_bps": NODE_RATE_BPS,
-        "pool_fee_sats": pool_fee_sats,
-        "treasury_sats": treasury_sats,
-        "node_reward_pool_sats": node_reward_pool_sats,
-        "miner_pool_sats": miner_pool_sats,
-        "dust_threshold_sats": DUST_THRESHOLD_SATS,
-        "ledger_cap": LEDGER_CAP,
-        "total_work": total_work,
-        "total_unpaid_miners": total_unpaid_miners,
-        "paid_this_block": paid_this_block,
-        "notes": {
-            "model": "ledger",
-            "tx_fees_to_block_finder": true,
-            "dust_redistributed_to_node_pool": true,
-            "unpaid_shares_carry_forward": true,
-            "inactive_prune_days": 7,
-        },
-        "miners": miners,
-    }))
-}
-
-/// Aggregate node metrics for the Core page. Returns only pool-wide
-/// counts and a median — never per-node data — so Tor operators (and
-/// everyone else) remain individually invisible. No clearnet/tor
-/// breakdown exists on purpose; operators who run Tor nodes chose a
-/// privacy setting and we honour it by not publishing the split.
-async fn api_mesh_node_stats_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let Some(ref db) = state.database else {
-        return Json(serde_json::json!({
-            "error": "Database not available",
-        }));
-    };
-
-    let (total, active_7d, new_7d, median_uptime) = db.get_node_stats().unwrap_or((0, 0, 0, None));
-
-    Json(serde_json::json!({
-        "total_nodes": total,
-        "active_7d": active_7d,
-        "new_7d": new_7d,
-        "median_uptime_pct": median_uptime,
-    }))
-}
-
-/// Decentralisation-phase + treasury state for the public Core page.
-///
-/// The pool collects 0.5% of every block subsidy into the treasury
-/// until it reaches 21 BTC. At that point the treasury balance is
-/// frozen and the fee split begins a five-year linear decay from
-/// 50/50 (treasury/node-pool) to 0/100. The three phases:
-///
-///   * Bootstrap    — pre-threshold. Treasury filling.
-///   * Decentralising — post-threshold, during the 5-year decay.
-///   * Sovereign    — post-decay. 100% of pool fee → node reward pool.
-///
-/// Returns every field the Core page needs to render the journey
-/// stepper, progress bar, and current-split tiles in one round trip.
-async fn api_pool_treasury_state_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    // Mirror of the constants in ghost-reconciliation::fee_distribution —
-    // kept inline to avoid adding a new crate dependency for one endpoint.
-    // If either side moves, both need to move together.
-    const TREASURY_THRESHOLD_SATS: u64 = 21 * 100_000_000; // 21 BTC
-                                                           // (treasury_bps, node_bps) for year 0 (pre-threshold, then year 1…5).
-                                                           // Year 0 = pre-threshold initial split, same as the first decay row.
-    const DECAY_SCHEDULE_BPS: [(u64, u64); 6] = [
-        (5000, 5000), // pre-threshold / year 0
-        (4000, 6000), // year 1
-        (3000, 7000), // year 2
-        (2000, 8000), // year 3
-        (1000, 9000), // year 4
-        (0, 10000),   // year 5+
-    ];
-
-    let Some(ref db) = state.database else {
-        return Json(serde_json::json!({
-            "error": "Database not available",
-            "threshold_sats": TREASURY_THRESHOLD_SATS,
-        }));
-    };
-
-    let balance_sats = db.get_treasury_balance().unwrap_or(0);
-    let threshold_reached_ts = db.get_treasury_threshold_reached().unwrap_or(None);
-    let threshold_reached = threshold_reached_ts.is_some();
-
-    // Decay year: 0 pre-threshold, 1..=5 after. 365-day years, same as
-    // TreasuryState::years_since_threshold.
-    let decay_year: u32 = match threshold_reached_ts {
-        None => 0,
-        Some(ts) => {
-            let now_s = chrono::Utc::now().timestamp();
-            let elapsed_days = ((now_s - ts).max(0)) / 86_400;
-            ((elapsed_days / 365) as u32 + 1).min(5)
-        }
-    };
-
-    let idx = decay_year as usize;
-    let (treasury_bps, node_bps) = DECAY_SCHEDULE_BPS[idx.min(5)];
-
-    let phase = if !threshold_reached {
-        "Bootstrap"
-    } else if decay_year < 5 {
-        "Decentralising"
-    } else {
-        "Sovereign"
-    };
-
-    let progress_pct = if threshold_reached {
-        100.0
-    } else {
-        (balance_sats as f64 / TREASURY_THRESHOLD_SATS as f64 * 100.0).min(100.0)
-    };
-
-    // Cumulative totals paid into the node reward pool.
-    //   * Coinbase: authoritative sum across every approved PayoutProposal
-    //   * L2:       running kv_store accumulator bumped at Ghost Pay
-    //               broadcast-success time in bins/ghost-pay/src/main.rs
-    let node_rewards_coinbase = db.get_total_node_rewards_paid().unwrap_or(0);
-    let node_rewards_l2 = db.get_l2_node_rewards_paid().unwrap_or(0);
-    let node_rewards_total = node_rewards_coinbase.saturating_add(node_rewards_l2);
-
-    Json(serde_json::json!({
-        "phase": phase,
-        "balance_sats": balance_sats,
-        "threshold_sats": TREASURY_THRESHOLD_SATS,
-        "threshold_reached": threshold_reached,
-        "threshold_reached_at": threshold_reached_ts,
-        "progress_pct": progress_pct,
-        "decay_year": decay_year,
-        "decay_years_total": 5u32,
-        "treasury_rate_bps": treasury_bps,
-        "node_rate_bps": node_bps,
-        "pool_fee_bps": 100u32,
-        "node_rewards_paid_coinbase_sats": node_rewards_coinbase,
-        "node_rewards_paid_l2_sats": node_rewards_l2,
-        "node_rewards_paid_total_sats": node_rewards_total,
-    }))
 }
 
 /// Tail of recent valid shares for the quasar visualisation. Each
@@ -2961,99 +1814,15 @@ async fn api_pool_recent_shares_handler(
     }))
 }
 
-/// Shape one connected peer (`MeshNodeInfo`) into the public mesh-node JSON
-/// object. Self is shaped inline by the handler from local state, so this
-/// helper always renders a peer (`is_self = false`). Pulled out as a free
-/// function so the JSON contract is unit-testable without a live server.
+/// This node, in the shape of the old mesh node list (`nodes`, `total`).
 ///
-/// `is_registry_elder` is whether this node's `node_id` is present in the DB
-/// elder registry (the authoritative source the Elders & MPC page uses). A
-/// peer's own `elder`/`cap_elder` bits derive from its health-ping capability
-/// advertisement, which is `false` for peers whose elder status isn't gossiped
-/// (verification-gated), so the registry membership is OR-ed in — a genuine
-/// elder is never downgraded, and a registered elder is correctly reflected.
-fn mesh_node_to_json(node: &MeshNodeInfo, is_registry_elder: bool) -> serde_json::Value {
-    let elder = node.elder || is_registry_elder;
-    serde_json::json!({
-        "node_id": node.node_id,
-        "address": node.address,
-        "elder": elder,
-        "capabilities": {
-            "archive": node.cap_archive,
-            "ghost_pay": node.cap_ghost_pay,
-            "public_mining": node.cap_public_mining,
-            "reaper": node.cap_reaper,
-            "elder": elder,
-        },
-        "hashrate_th": node.hashrate_th,
-        "miner_count": node.miner_count,
-        "deduped_miner_count": node.deduped_miner_count,
-        // Peer's hardware-derived capacity ceiling (0 = not yet gossiped →
-        // the Capacity page renders it as "unknown", not a real ceiling).
-        "max_capacity": node.max_capacity,
-        // Swarm-page telemetry gossiped per peer. `None` serialises to JSON null,
-        // which the frontend renders as "—" (never a misleading 0).
-        "l1_height": node.l1_height,
-        "uptime_percent": node.uptime_percent,
-        "peer_count": node.peer_count,
-        "l2_height": node.l2_height,
-        "healthy": node.healthy,
-        "is_self": false,
-    })
-}
-
-/// The latest finalised, signed mesh node-list checkpoint — the verifiable blob a miner-side
-/// shim fetches for decentralised discovery: the public-mining node set plus the proposer
-/// signature and the ≥67% approver signatures, so the shim verifies it offline against its
-/// trusted signer set (never trusting DNS or this server). PUBLIC, no auth (the data is the
-/// same openly-gossiped node set as `mesh-nodes`, just BFT-signed). 404 until a checkpoint is
-/// finalised — the gate is dormant on mainnet, so this returns 404 today.
-async fn api_pool_mesh_node_list_checkpoint_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    match state.mesh_node_list_checkpoint() {
-        Some(blob) => (StatusCode::OK, Json(blob)).into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "no finalised mesh node-list checkpoint" })),
-        )
-            .into_response(),
-    }
-}
-
-/// Live mesh node list = this node (self) + every connected peer.
-///
-/// PUBLIC, no auth (same exposure level as `recent_shares`): every field
-/// returned is already gossiped openly in health pings. The website polls
-/// this on one bootstrap node and renders the whole mesh, so newly-joined
-/// nodes appear automatically without a hard-coded VM list or a per-node
-/// nginx proxy block.
-///
-/// Self is built from this node's local state (the same sources
-/// `/api/v1/mining/status` uses); peers come from the in-memory
-/// `PeerManager` via the `mesh_nodes` callback (no network calls). Results
-/// are deduplicated by `node_id` with self always included exactly once;
-/// a missing field on any one peer degrades to a default (`0`/`false`)
-/// rather than failing the whole response.
+/// PUBLIC, no auth (same exposure level as `recent_shares`). The old mesh that
+/// supplied the peers was removed, so the list holds this node only; the
+/// dashboard pages that read it are rebuilt for the node pool in W2.14.
 async fn api_pool_mesh_nodes_handler(
     State(state): State<Arc<VerificationState>>,
 ) -> impl IntoResponse {
     let health = state.get_health().await;
-
-    // Authoritative elder set = the DB elder registry (`nodes.is_elder`), the
-    // same source the Elders & MPC page reads. A peer's health-ping `elder`
-    // capability bit is verification-gated and reads `false` for registered
-    // elders that haven't gossiped it, so it can't be trusted to render the
-    // role — the registry can. Fetched once per request; keyed by the hex
-    // `node_id` (both `get_elders()` and the mesh `node_id`s are the lowercase
-    // hex of the 32-byte id via `hex::encode`). Degrades to an empty set when
-    // no DB is attached, preserving the previous (health-ping-only) behaviour.
-    let elder_ids: std::collections::HashSet<String> = state
-        .database
-        .as_ref()
-        .and_then(|db| db.get_elders().ok())
-        .map(|elders| elders.into_iter().map(|e| e.node_id).collect())
-        .unwrap_or_default();
 
     // Self address: the operator-configured public host (+ HTTP port when a
     // bare host was configured). Falls back to an empty string — never fails.
@@ -3069,28 +1838,14 @@ async fn api_pool_mesh_nodes_handler(
         }
     };
 
-    let self_caps = &health.capabilities;
-    // Same registry-OR-bit resolution used for peers, so self's role reflects
-    // the elder registry too (not only its own advertised capability bit).
-    let self_elder = self_caps.elder_status || elder_ids.contains(&health.node_id);
     let self_node = serde_json::json!({
         "node_id": health.node_id,
         "address": self_address,
-        "elder": self_elder,
-        "capabilities": {
-            "archive": self_caps.archive_mode,
-            "ghost_pay": self_caps.ghost_pay,
-            "public_mining": self_caps.public_mining,
-            "reaper": self_caps.reaper,
-            "elder": self_elder,
-        },
-        // This node's own realized hashrate (same windowed value it gossips);
-        // 0.0 on deploys without the local-hashrate provider wired.
+        // This node's own realized hashrate; 0.0 on deploys without the
+        // local-hashrate provider wired.
         "hashrate_th": state.local_hashrate().unwrap_or(0.0),
         "miner_count": health.miner_count,
-        // Deduped share attributed to this node (see `deduped_miner_counts`);
-        // self + peers sum to the deduped mesh-wide active-miner total.
-        "deduped_miner_count": state.self_deduped_miner_count(),
+        "deduped_miner_count": state.local_active_miners(),
         // This node's own hardware-derived capacity ceiling, so the Capacity
         // page can render self's utilisation from the same field it uses for
         // every peer.
@@ -3100,23 +1855,9 @@ async fn api_pool_mesh_nodes_handler(
         "is_self": true,
     });
 
-    let mut nodes = vec![self_node];
-    // Dedup by node_id; self is already in, so skip any peer that re-reports
-    // this node's id (e.g. a same-host placeholder).
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    seen.insert(health.node_id.clone());
-
-    for peer in state.mesh_nodes() {
-        if seen.insert(peer.node_id.clone()) {
-            let is_registry_elder = elder_ids.contains(&peer.node_id);
-            nodes.push(mesh_node_to_json(&peer, is_registry_elder));
-        }
-    }
-
-    let total = nodes.len();
     Json(serde_json::json!({
-        "nodes": nodes,
-        "total": total,
+        "nodes": [self_node],
+        "total": 1,
     }))
 }
 
@@ -3451,56 +2192,17 @@ async fn api_pool_records_handler(
         }
     };
 
-    // Candidate winner so far: the rarest `share_hash` seen, held in DISPLAY
-    // order (zeros at the front) so string `<` matches numeric order (smaller =
-    // rarer) — the local DB hash is INTERNAL order and is converted on ingest;
-    // peers already gossip DISPLAY order. `assigned_diff` is Some only for the
-    // local share.
-    let mut winning_hash: Option<String> = None;
-    let mut winning_redacted = String::new();
-    let mut winning_timestamp: i64 = 0;
-    let mut winning_assigned_diff: Option<f64> = None;
-
-    if let Some(best) = local_best {
-        winning_hash = Some(internal_hex_to_display_hex(&best.share_hash));
-        winning_redacted = redact_miner_id(&best.miner_id);
-        winning_timestamp = best.timestamp;
-        winning_assigned_diff = Some(best.difficulty);
-    }
-
-    // Mesh term: every connected peer's gossiped best for THIS window. The
-    // miner_id is already redacted at the source. A peer record beats the
-    // current winner only when its hash is strictly smaller (rarer).
-    if let Some(peer_records) = state.mesh_best_records() {
-        for rec in peer_records {
-            if rec.window != window_name || rec.share_hash.is_empty() {
-                continue;
-            }
-            let beats = winning_hash
-                .as_ref()
-                .map(|w| rec.share_hash < *w)
-                .unwrap_or(true);
-            if beats {
-                winning_hash = Some(rec.share_hash);
-                winning_redacted = rec.miner_id_redacted;
-                winning_timestamp = rec.timestamp;
-                // A peer's record carries no stored vardiff target.
-                winning_assigned_diff = None;
-            }
-        }
-    }
-
-    let Some(share_hash) = winning_hash else {
+    let Some(best) = local_best else {
         return Json(serde_json::json!({
             "window": window_name,
             "since_ts": since_ts,
             "found": false,
         }));
     };
+    // DISPLAY order (zeros at the front); the database holds INTERNAL order.
+    let share_hash = internal_hex_to_display_hex(&best.share_hash);
 
-    // Recompute the leading-zero presentation from the WINNING hash. `share_hash`
-    // is already DISPLAY order (zeros at the front) here, so counting leading '0'
-    // chars is correct. Each leading '0' hex char = 4 binary leading zeros — a
+    // Leading-zero presentation from the DISPLAY hash (zeros at the front). Each leading '0' hex char = 4 binary leading zeros — a
     // coarse signal; the hash itself is the definitive record but reads worse in
     // tiles.
     let leading_hex_zeros = share_hash.chars().take_while(|c| *c == '0').count();
@@ -3514,25 +2216,22 @@ async fn api_pool_records_handler(
             "share_hash": share_hash,
             "leading_zero_bits": leading_zero_bits,
             "leading_hex_zeros": leading_hex_zeros,
-            "miner_id_redacted": winning_redacted,
-            "timestamp": winning_timestamp,
+            "miner_id_redacted": redact_miner_id(&best.miner_id),
+            "timestamp": best.timestamp,
             // Achieved difficulty from the hash (the score), NOT the stored
-            // vardiff target. `share_hash` is DISPLAY order here, but
-            // `share_difficulty_from_hash_hex` expects INTERNAL order, so reverse
-            // it back. `assigned_difficulty` keeps the stored value for any
-            // consumer that wants the share's pool-credit work — null when a
-            // peer's record wins (peers don't gossip their vardiff target).
-            "difficulty": share_difficulty_from_hash_hex(&internal_hex_to_display_hex(&share_hash)),
-            "assigned_difficulty": winning_assigned_diff,
+            // vardiff target. `assigned_difficulty` keeps the stored value for any
+            // consumer that wants the share's pool-credit work.
+            "difficulty": share_difficulty_from_hash_hex(&best.share_hash),
+            "assigned_difficulty": best.difficulty,
         }
     }))
 }
 
 /// Rolling server-side time-series of pool hashrate + connected miners.
 ///
-/// The sampler task in `bins/ghost-pool` snapshots the same mesh accessors the
-/// mining-status endpoint uses (`mesh_total_hashrate` / `local_hashrate` /
-/// `mesh_active_miners`) every 30s into a bounded in-memory ring. This endpoint
+/// The sampler task in `bins/ghost-pool` snapshots this node's hashrate
+/// (`local_hashrate`) and active miners (`local_active_miners`) every 30s into
+/// a bounded in-memory ring. This endpoint
 /// returns the samples within the requested `window` (`1h` or `24h`, default
 /// `1h`), oldest first. Empty until the first sample lands after startup — the
 /// dashboard keeps its client-side session buffer as a fallback in that case.
@@ -3582,23 +2281,12 @@ async fn api_chain_health_handler(
     }))
 }
 
-/// Mesh-wide leaderboard for the pool page — aggregated across the whole mesh
-/// WITHOUT any new gossip, from data every node already holds:
+/// Leaderboard for the pool page, in the shape of the old mesh-wide one:
 ///
-/// * `nodes` — every mesh node (self + connected peers) ranked by realized
-///   hashrate. This is the mesh-wide replacement for the pool page's old
-///   this-node-only miner list.
-/// * `records` — the mesh-wide best (rarest) share per window (block/day/week/
-///   month), merging this node's local DB best with peers' gossiped
-///   `best_records` (already reduced to one winner per window), each attributed
-///   to its redacted miner id.
-///
-/// LIMIT: a true mesh-wide *per-miner top-N* leaderboard (every miner on every
-/// node ranked by hashrate or shares) is NOT computable from a single node
-/// without new gossip — peers gossip per-node aggregates and one best-share
-/// record per window, never their full per-miner tables. The public website
-/// builds that by fanning out to every node and merging client-side. `records`
-/// is the widest mesh-wide per-miner surface available server-side here.
+/// * `nodes` — this node, with its realized hashrate and active miners. The old
+///   mesh that supplied every other node was removed.
+/// * `records` — this node's best (rarest) share per window (block/day/week/
+///   month), attributed to its redacted miner id.
 async fn api_pool_mesh_leaderboard_handler(
     State(state): State<Arc<VerificationState>>,
 ) -> impl IntoResponse {
@@ -3618,63 +2306,20 @@ async fn api_pool_mesh_leaderboard_handler(
             .filter(|n| !n.trim().is_empty())
             .unwrap_or_else(|| mesh_node_name(&addr, &health.node_id))
     };
-    let self_caps = &health.capabilities;
-    let mut nodes = vec![serde_json::json!({
+    let nodes = vec![serde_json::json!({
         "node_id": health.node_id.clone(),
         "name": self_name,
         "hashrate_th": state.local_hashrate().unwrap_or(0.0),
-        // Deduped real-miner count (matches Capacity/Swarm/overview), not the
-        // raw share-ledger miner_count which double-counts (issue #281).
-        "miner_count": state.self_deduped_miner_count(),
-        "shares": mesh_capability_shares(
-            self_caps.archive_mode,
-            self_caps.ghost_pay,
-            self_caps.public_mining,
-            self_caps.reaper,
-            self_caps.elder_status,
-        ),
-        "elder": self_caps.elder_status,
+        // Active miners in the shared window, not the raw share-ledger
+        // miner_count which double-counts (issue #281).
+        "miner_count": state.local_active_miners(),
         "healthy": health.healthy,
         "is_self": true,
     })];
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    seen.insert(health.node_id.clone());
-    for peer in state.mesh_nodes() {
-        if !seen.insert(peer.node_id.clone()) {
-            continue;
-        }
-        nodes.push(serde_json::json!({
-            "node_id": peer.node_id,
-            "name": mesh_node_name(&peer.address, &peer.node_id),
-            "hashrate_th": peer.hashrate_th,
-            // Deduped real-miner count, consistent with the self row (issue #281).
-            "miner_count": peer.deduped_miner_count,
-            "shares": mesh_capability_shares(
-                peer.cap_archive,
-                peer.cap_ghost_pay,
-                peer.cap_public_mining,
-                peer.cap_reaper,
-                peer.cap_elder,
-            ),
-            "elder": peer.cap_elder,
-            "healthy": peer.healthy,
-            "is_self": false,
-        }));
-    }
-    // Rank by realized hashrate, highest first.
-    nodes.sort_by(|a, b| {
-        let ha = a.get("hashrate_th").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let hb = b.get("hashrate_th").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        hb.partial_cmp(&ha).unwrap_or(std::cmp::Ordering::Equal)
-    });
     let node_count = nodes.len();
 
-    // --- Mesh-wide best-share records per window ---
-    // Merge this node's local DB best with the peers' gossiped winners (already
-    // one per window). Same rarity rule as /api/v1/pool/records: fixed-width
-    // zero-padded hex, so string `<` matches numeric order (smaller = rarer).
+    // --- Best-share records per window ---
     let now_s = chrono::Utc::now().timestamp();
-    let mesh_records = state.mesh_best_records();
     let mut records = Vec::new();
     for (window_name, window_secs) in [
         ("block", 600i64),
@@ -3683,49 +2328,23 @@ async fn api_pool_mesh_leaderboard_handler(
         ("month", 2_592_000),
     ] {
         let since_ts = now_s - window_secs;
-        let mut winning_hash: Option<String> = None;
-        let mut winning_redacted = String::new();
-        let mut winning_timestamp: i64 = 0;
-
-        if let Some(ref db) = state.database {
-            if let Ok(Some(best)) = db.get_best_share_since(since_ts) {
-                // Local DB hash is INTERNAL order; hold the winner in DISPLAY
-                // order so `<` ranks by rarity and peers (already DISPLAY) merge.
-                winning_hash = Some(internal_hex_to_display_hex(&best.share_hash));
-                winning_redacted = redact_miner_id(&best.miner_id);
-                winning_timestamp = best.timestamp;
-            }
-        }
-        if let Some(ref recs) = mesh_records {
-            for rec in recs {
-                if rec.window != window_name || rec.share_hash.is_empty() {
-                    continue;
-                }
-                let beats = winning_hash
-                    .as_ref()
-                    .map(|w| rec.share_hash < *w)
-                    .unwrap_or(true);
-                if beats {
-                    winning_hash = Some(rec.share_hash.clone());
-                    winning_redacted = rec.miner_id_redacted.clone();
-                    winning_timestamp = rec.timestamp;
-                }
-            }
-        }
-
-        if let Some(share_hash) = winning_hash {
-            // `share_hash` is DISPLAY order (zeros at front): count is correct,
-            // and it is returned as-is for the website. Difficulty needs the
-            // INTERNAL form, so reverse it back.
+        let best = state
+            .database
+            .as_ref()
+            .and_then(|db| db.get_best_share_since(since_ts).ok().flatten());
+        if let Some(best) = best {
+            // The database holds INTERNAL order; the website gets DISPLAY order
+            // (zeros at the front), where the leading-zero count is read.
+            let share_hash = internal_hex_to_display_hex(&best.share_hash);
             let leading_hex_zeros = share_hash.chars().take_while(|c| *c == '0').count();
             records.push(serde_json::json!({
                 "window": window_name,
-                "share_hash": share_hash.clone(),
+                "share_hash": share_hash,
                 "leading_zero_bits": leading_hex_zeros * 4,
                 "leading_hex_zeros": leading_hex_zeros,
-                "miner_id_redacted": winning_redacted,
-                "timestamp": winning_timestamp,
-                "difficulty": share_difficulty_from_hash_hex(&internal_hex_to_display_hex(&share_hash)),
+                "miner_id_redacted": redact_miner_id(&best.miner_id),
+                "timestamp": best.timestamp,
+                "difficulty": share_difficulty_from_hash_hex(&best.share_hash),
             }));
         }
     }
@@ -3734,10 +2353,9 @@ async fn api_pool_mesh_leaderboard_handler(
         "nodes": nodes,
         "node_count": node_count,
         "records": records,
-        "limit_note": "Node-ranked leaderboard + mesh-wide best-share records \
-            per window, aggregated from existing mesh data (no new gossip). A \
-            per-miner top-N hashrate/shares leaderboard across the whole mesh \
-            requires client-side fan-out to every node.",
+        "limit_note": "This node only: the old mesh that aggregated every node was \
+            removed. A per-miner leaderboard across nodes requires client-side \
+            fan-out to every node.",
     }))
 }
 
@@ -4027,22 +2645,21 @@ async fn api_pool_status_handler(State(state): State<Arc<VerificationState>>) ->
         .as_ref()
         .and_then(|db| db.count_active_miners(ACTIVE_MINER_WINDOW_SECS).ok())
         .unwrap_or(0);
-    let mesh_active_miners = state.mesh_active_miners().unwrap_or(active_miners);
+    // `mesh_active_miners` keeps its name for existing readers; the old mesh that summed it
+    // across nodes was removed, so it is this node's count.
+    let mesh_active_miners = active_miners;
 
     // Seconds elapsed working the current template (round manager provides it;
     // None on older deploys without the callback wired).
     let current_round_duration_secs = state.round_elapsed_secs();
 
     // Expected time for THIS pool to find a block at its current aggregate
-    // hashrate. Pool hashrate is the deduplicated mesh-wide figure (TH/s),
-    // falling back to this node's own realized rate; converted to hashes/sec
+    // hashrate, this node's own realized rate (TH/s); converted to hashes/sec
     // for the estimator. Network difficulty comes straight from Ghost Core
     // (getmininginfo) — the round manager's copy is a static default, so we
     // read the live value here, mirroring the network-hashrate field on the
     // mining-status endpoint. `null` when either input is unavailable.
-    let pool_hashrate_th = state
-        .mesh_total_hashrate()
-        .or_else(|| state.local_hashrate());
+    let pool_hashrate_th = state.local_hashrate();
     let network_difficulty = if let Some(ref rpc) = state.rpc {
         tokio::time::timeout(std::time::Duration::from_secs(5), rpc.get_mining_info())
             .await
@@ -4062,13 +2679,12 @@ async fn api_pool_status_handler(State(state): State<Arc<VerificationState>>) ->
         "version": health.version,
         "block_height": health.block_height,
         "peer_count": health.peer_count,
-        "active_nodes": health.peer_count + 1,
+        "active_nodes": health.peer_count.map(|p| p + 1),
         "miner_count": health.miner_count,
         "active_miners": active_miners,
         "mesh_active_miners": mesh_active_miners,
         "round_id": health.round_id,
         "uptime_secs": health.uptime_secs,
-        "total_shares": health.capabilities.total_shares,
         "current_round_duration_secs": current_round_duration_secs,
         "estimated_time_to_block_secs": estimated_time_to_block_secs,
         // 4444 was hard-coded here and is NOT the SV2 port — it is the SV1 farm/rental tier
@@ -4086,8 +2702,7 @@ async fn api_config_handler(State(state): State<Arc<VerificationState>>) -> impl
     let config = state.dashboard_config.read();
     Json(serde_json::json!({
         "archive_mode": config.archive_mode,
-        "ghost_pay": config.ghost_pay,
-        "public_mining": config.public_mining,
+        "public_mining": true,
         "reaper": config.reaper,
         "ghost_mode": config.ghost_mode,
         "ghost_mode_local_egress": config.ghost_mode_local_egress
@@ -4170,12 +2785,9 @@ async fn api_resources_handler(State(state): State<Arc<VerificationState>>) -> i
         "disk_total_gb": disk_total_gb,
         "uptime_seconds": health.uptime_secs,
         "uptime_secs": health.uptime_secs,
-        // Deduplicated mesh-wide active-miner count (same source as
-        // /api/v1/network/pool), NOT the raw `miner_count` — the raw value is a
-        // load-balancer routing view that double-counts miners failing over
-        // between nodes, so the Watchdog was showing an inflated figure that
-        // could exceed the real distinct total. Falls back to raw if unavailable.
-        "connected_miners": state.mesh_active_miners().unwrap_or(health.miner_count),
+        // Active miners in the shared window (same source as
+        // /api/v1/network/pool), NOT the raw round `miner_count`.
+        "connected_miners": state.local_active_miners(),
         "estimated_capacity": 1000,
         "status": status,
         "last_redirect_count": 0,
@@ -4186,140 +2798,18 @@ async fn api_resources_handler(State(state): State<Arc<VerificationState>>) -> i
     }))
 }
 
-/// Ghost Pay L2 status result
-struct GhostPayLiveStatus {
-    epoch: u64,
-    virtual_block: u64,
-    wraith_enabled: bool,
-    sync_state: &'static str,
-}
-
-/// Query ghost-pay L2 status — tries in-process handler first, then HTTPS to localhost:8800.
-/// Returns a self-contained future (no borrows) so axum handlers stay Send.
-///
-/// ghost-pay serves identity-derived TLS on 8800 (cert pubkey == node_id).
-/// Loopback IPC under the same identity, so we skip cert-chain validation.
-async fn fetch_ghostpay_from_service() -> Option<GhostPayLiveStatus> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .ok()?;
-
-    let resp = client
-        .get("https://127.0.0.1:8800/verify/ghostpay?unsigned=true")
-        .send()
-        .await
-        .ok()?;
-    let json: serde_json::Value = resp.json().await.ok()?;
-    let inner = json.get("response")?;
-
-    let success = inner
-        .get("success")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if !success {
-        return None;
-    }
-
-    Some(GhostPayLiveStatus {
-        epoch: inner.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0),
-        virtual_block: inner
-            .get("virtual_block")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        wraith_enabled: inner
-            .get("wraith_enabled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        sync_state: "synced",
-    })
-}
-
-/// Check ghost-pay status from in-process handler (sync). Returns None if handler unavailable.
-fn check_ghostpay_local(state: &VerificationState) -> Option<GhostPayLiveStatus> {
-    let config = state.dashboard_config.read();
-    if !config.ghost_pay {
-        return Some(GhostPayLiveStatus {
-            epoch: 0,
-            virtual_block: 0,
-            wraith_enabled: false,
-            sync_state: "disabled",
-        });
-    }
-    drop(config);
-
-    state.get_ghostpay_status().map(|info| GhostPayLiveStatus {
-        epoch: info.epoch,
-        virtual_block: info.virtual_block,
-        wraith_enabled: info.wraith_enabled,
-        sync_state: "synced",
-    })
-}
-
-/// API v1 GhostPay status handler
-async fn api_ghostpay_status_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let health = state.get_health().await;
-
-    // Try in-process handler first (sync, no borrow issues)
-    let gp = match check_ghostpay_local(&state) {
-        Some(status) => status,
-        None => {
-            // Ghost-pay runs as separate service on port 8800 — query via spawned task
-            // 5s timeout prevents hanging when ghost-pay is unresponsive
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                tokio::spawn(fetch_ghostpay_from_service()),
-            )
-            .await
-            {
-                Ok(Ok(Some(status))) => status,
-                _ => GhostPayLiveStatus {
-                    epoch: 0,
-                    virtual_block: 0,
-                    wraith_enabled: false,
-                    sync_state: "unavailable",
-                },
-            }
-        }
-    };
-
-    Json(serde_json::json!({
-        "enabled": gp.sync_state != "disabled",
-        "node_id": health.node_id,
-        "protocol_version": 1,
-        "network": state.network.as_str(),
-        "l2_era": gp.epoch,
-        "virtual_block": gp.virtual_block,
-        "l2_height": gp.virtual_block,
-        "block_height": health.block_height,
-        "epoch": gp.epoch,
-        "peer_count": health.peer_count,
-        "uptime_secs": health.uptime_secs,
-        "sync_state": gp.sync_state,
-        // Operator's Wraith setting from config — the user-facing "is Wraith
-        // enabled on this node" flag the dashboard's L2 card reads. Sourced
-        // from `[ghost_pay] wraith_enabled`, NOT ghost-pay's internal host flag
-        // (`gp.wraith_enabled`), which is always false since mixing moved to
-        // the wraith-coordinator binary and would misreport the operator's choice.
-        "wraith_enabled": state.wraith_enabled,
-        // Retained internal signal: whether the ghost-pay process itself hosts
-        // CoinJoin sessions (always false post-wraith-coordinator split).
-        "ghostpay_hosts_mixing": gp.wraith_enabled,
-        "total_balances": 0
-    }))
-}
-
 /// API v1 BUDS capabilities handler
 async fn api_buds_capabilities_handler(
     State(state): State<Arc<VerificationState>>,
 ) -> impl IntoResponse {
-    let health = state.get_health().await;
+    let reaper = state
+        .full_node_config
+        .as_ref()
+        .map(|c| c.read().reaper.enabled)
+        .unwrap_or(false);
     Json(serde_json::json!({
-        "reaper": health.capabilities.reaper,
-        "allowed_tiers": if health.capabilities.reaper {
+        "reaper": reaper,
+        "allowed_tiers": if reaper {
             vec!["T0", "T1"]
         } else {
             vec!["T0", "T1", "T2"]
@@ -4328,24 +2818,6 @@ async fn api_buds_capabilities_handler(
         "allow_inscriptions": false,
         "allow_runes": false
     }))
-}
-
-/// API v1 Swarm handler - for multi-node management
-/// Capability shares (0-15) from the individual capability booleans.
-/// Mirrors `NodeCapabilities::total_shares()` for the mesh-gossiped flags
-/// (Archive +5, Ghost Pay +4, Public Mining +3, Reaper +2, Elder +1).
-fn mesh_capability_shares(
-    archive: bool,
-    ghost_pay: bool,
-    public_mining: bool,
-    reaper: bool,
-    elder: bool,
-) -> u32 {
-    (archive as u32) * 5
-        + (ghost_pay as u32) * 4
-        + (public_mining as u32) * 3
-        + (reaper as u32) * 2
-        + (elder as u32)
 }
 
 /// Display name for a mesh node: the host portion of its advertised address,
@@ -4361,19 +2833,8 @@ fn mesh_node_name(address: &str, node_id: &str) -> String {
 
 /// API v1 Swarm handler — the fleet view consumed by the dashboard Swarm page.
 ///
-/// Auto-discovered mesh peers are reported with their REAL, health-ping-gossiped
-/// state (online/capabilities/hashrate/miner count) that this node already holds
-/// in the in-memory `PeerManager` — the exact source `/api/v1/pool/mesh-nodes`
-/// uses. Previously this handler returned each peer stripped down to its mesh
-/// address (`:8555`) with no `online` flag, so the dashboard rendered every mesh
-/// peer as "Offline" with zeroed stats even though the mesh reports them healthy.
-///
-/// Fields that are NOT gossiped per peer (uptime %, mesh peer count, L1/L2 chain
-/// heights, node balance) are deliberately OMITTED rather than sent as `0`, so
-/// the dashboard can render them as "—" instead of a misleading zero. Each node
-/// carries `"source": "mesh"` so the frontend can distinguish auto-discovered
-/// peers (never poll-able from here, so never "offline" just because their
-/// loopback dashboard API is unreachable) from any manually-added swarm node.
+/// The old mesh that listed every peer was removed, so this reports this node
+/// only, in the same shape; the dashboard is rebuilt for the node pool in W2.14.
 async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
     let health = state.get_health().await;
 
@@ -4394,40 +2855,10 @@ async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl 
         (addr, name)
     };
 
-    let self_caps = &health.capabilities;
     let self_hashrate = state.local_hashrate().unwrap_or(0.0);
-    let self_shares = mesh_capability_shares(
-        self_caps.archive_mode,
-        self_caps.ghost_pay,
-        self_caps.public_mining,
-        self_caps.reaper,
-        self_caps.elder_status,
-    );
 
-    // THIS node's own L2 (Ghost Pay) virtual-block height. `check_ghostpay_local`
-    // reads the in-process handler, which production ghost-mining does NOT wire —
-    // ghost-pay runs as a separate service on :8800 — so it returns `None` and
-    // the self row's L2 showed "—". Mirror the ghostpay status endpoint: on that
-    // `None`, fall back to querying the local :8800 service. `Some(disabled)`
-    // (ghost-pay off) still resolves to `None` → "—", never a fabricated value.
-    let self_l2_height = match check_ghostpay_local(&state) {
-        Some(gp) if gp.sync_state == "disabled" => None,
-        Some(gp) => Some(gp.virtual_block),
-        None => match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tokio::spawn(fetch_ghostpay_from_service()),
-        )
-        .await
-        {
-            Ok(Ok(Some(status))) => Some(status.virtual_block),
-            _ => None,
-        },
-    };
-
-    // This node's own trailing-7-day uptime %, the qualification gatekeeper
-    // metric (>=95% before capabilities count). It's the exact figure the
-    // qualification layer reads (`get_uptime_percent`, GHOST-10 time-based
-    // denominator) over the self-recorded samples — the self-uptime task
+    // This node's own trailing-7-day uptime % (`get_uptime_percent`, GHOST-10
+    // time-based denominator) over the self-recorded samples — the self-uptime task
     // records under `identity.node_id_hex()`, which is `state.node_id` /
     // `health.node_id`. Returned as a percentage (0-100) to match the
     // peer-gossiped `uptime_percent` the frontend already renders. Left as
@@ -4451,71 +2882,14 @@ async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl 
         "version": health.version.clone(),
         "hashrate_th": self_hashrate,
         "miner_count": health.miner_count,
-        "shares": self_shares,
-        "max_shares": 15,
-        "archive_mode": self_caps.archive_mode,
-        "ghost_pay": self_caps.ghost_pay,
-        "public_mining": self_caps.public_mining,
-        "reaper": self_caps.reaper,
-        "elder": self_caps.elder_status,
-        // Locally-known stats the mesh doesn't gossip (fixes the self row's "—").
         "peer_count": health.peer_count,
         "l1_height": health.block_height,
-        "l2_height": self_l2_height,
         "uptime_percent": self_uptime_percent,
     });
 
-    let mut nodes = vec![self_node];
-    // Dedup by node_id; self is already in, so skip any peer that re-reports
-    // this node's id (e.g. a same-host placeholder).
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    seen.insert(health.node_id.clone());
-
-    let mut online_nodes: u32 = if health.healthy { 1 } else { 0 };
-    let mut combined_hashrate = self_hashrate;
-    let mut combined_shares = self_shares;
-
-    for peer in state.mesh_nodes() {
-        if !seen.insert(peer.node_id.clone()) {
-            continue;
-        }
-        let shares = mesh_capability_shares(
-            peer.cap_archive,
-            peer.cap_ghost_pay,
-            peer.cap_public_mining,
-            peer.cap_reaper,
-            peer.cap_elder,
-        );
-        if peer.healthy {
-            online_nodes += 1;
-        }
-        combined_hashrate += peer.hashrate_th;
-        combined_shares += shares;
-        nodes.push(serde_json::json!({
-            "node_id": peer.node_id,
-            "name": mesh_node_name(&peer.address, &peer.node_id),
-            "address": peer.address,
-            "online": peer.healthy,
-            "is_self": false,
-            "source": "mesh",
-            "hashrate_th": peer.hashrate_th,
-            "miner_count": peer.miner_count,
-            "shares": shares,
-            "max_shares": 15,
-            "archive_mode": peer.cap_archive,
-            "ghost_pay": peer.cap_ghost_pay,
-            "public_mining": peer.cap_public_mining,
-            "reaper": peer.cap_reaper,
-            "elder": peer.cap_elder,
-            // Gossiped Swarm telemetry — `None` → JSON null → "—" on the page,
-            // so a peer running an older build (that doesn't gossip these) shows
-            // a dash rather than a fabricated 0 until the fleet is updated.
-            "uptime_percent": peer.uptime_percent,
-            "peer_count": peer.peer_count,
-            "l1_height": peer.l1_height,
-            "l2_height": peer.l2_height,
-        }));
-    }
+    let nodes = vec![self_node];
+    let online_nodes: u32 = if health.healthy { 1 } else { 0 };
+    let combined_hashrate = self_hashrate;
 
     let total_nodes = nodes.len() as u32;
 
@@ -4527,8 +2901,7 @@ async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl 
             "name": self_name,
             "address": self_address,
             "version": health.version,
-            "capabilities": health.capabilities,
-        },
+            },
         "nodes": nodes,
         "total": total_nodes,
         "stats": {
@@ -4536,326 +2909,7 @@ async fn api_swarm_handler(State(state): State<Arc<VerificationState>>) -> impl 
             "online_nodes": online_nodes,
             "offline_nodes": total_nodes.saturating_sub(online_nodes),
             "combined_hashrate_th": combined_hashrate,
-            "combined_shares": combined_shares,
-            "max_combined_shares": total_nodes * 15,
         },
-    }))
-}
-
-/// API v1 Treasury handler
-async fn api_treasury_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
-    // ⛔ The treasury balance is read from the AUTHORITATIVE source, the same one
-    // `api_l2_fee_distribution_context_handler` uses one function below (#989).
-    //
-    // This handler used to sum `payouts` rows of type Treasury instead, which is not a balance:
-    // `record_payout_entries` writes those at ARM TIME on every round, whether or not a block is
-    // ever won, with `status = Approved` and `txid = NULL` — and nothing in the tree ever updates
-    // them. So it reported INTENTIONS as `total_fees_collected`.
-    //
-    // MEASURED on the live fleet while fixing this: the endpoint advertised 1.03 BTC accumulated
-    // and 4.9% progress toward the 21 BTC target, while `won_blocks`, `settled_blocks` and every
-    // miner's `total_payouts_sats` were 0 and the balance key was absent. A prospective miner
-    // reads that as evidence of an earning pool.
-    //
-    // ⚠ It was not even a stable figure: `get_recent_payouts(1000)` caps the window, so the
-    // "total" was whichever Treasury rows fell in the most recent 1000 — 66 rows / 1.03 BTC out
-    // of 2,622 rows / 41.04 BTC in the table, drifting as rows accumulate.
-    let (treasury_balance_sats, pending_payout_entries) = if let Some(ref db) = state.database {
-        let balance = db.get_treasury_balance().unwrap_or(0);
-        // Still worth reporting, but named for what it is: payout entries awaiting a txid, NOT
-        // money received.
-        //
-        // ⛔ Counted in SQL over the WHOLE table. This used to filter `get_recent_payouts(1000)`
-        // in Rust under a comment that already claimed it covered the whole table — the 1000-row
-        // cap WAS the arbitrary window the comment disowned, so the number drifted as rows
-        // accumulated and the comment made it look deliberate.
-        let pending = db.pending_treasury_payout_entry_count().unwrap_or(0) as usize;
-        (balance, pending)
-    } else {
-        (0, 0)
-    };
-    let total_fees = treasury_balance_sats;
-    let payout_count = pending_payout_entries;
-
-    // The configured address, rather than the empty-string stub this returned with a
-    // "Would come from config" comment.
-    let treasury_address = state
-        .full_node_config
-        .as_ref()
-        .map(|c| c.read().pool.treasury_address.clone())
-        .unwrap_or_default();
-
-    // Calculate progress towards 21 BTC target
-    let accumulated_btc = total_fees as f64 / 100_000_000.0;
-    let target_btc = 21.0;
-    let progress = (accumulated_btc / target_btc * 100.0).min(100.0);
-
-    // Determine phase based on progress
-    let phase = if accumulated_btc >= target_btc {
-        "decay"
-    } else {
-        "bootstrap"
-    };
-
-    Json(serde_json::json!({
-        "treasury_address": treasury_address,
-        "treasury_balance_sats": treasury_balance_sats,
-        "fee_percent": 1.0,
-        // Fees actually RECEIVED. Zero until a block is won and settled — see #989 for why this
-        // used to report summed payout intentions instead.
-        "total_fees_collected": treasury_balance_sats,
-        // Payout entries of type Treasury still awaiting a txid. NOT money paid.
-        "pending_treasury_payout_entries": pending_payout_entries,
-        "total_payouts": payout_count,
-        "phase": phase,
-        "decay_year": if phase == "decay" { Some(2026) } else { None },
-        "decay_started": phase == "decay",
-        "accumulated_btc": accumulated_btc,
-        "target_btc": target_btc,
-        "progress_percent": progress,
-        "treasury_percent": 50.0,
-        "node_pool_percent": 50.0
-    }))
-}
-
-/// L2 fee distribution context for ghost-pay settlement loop.
-/// Returns treasury state and qualified Ghost Pay nodes for fee distribution.
-async fn api_l2_fee_distribution_context_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let db = match state.database.as_ref() {
-        Some(db) => db,
-        None => {
-            return Json(serde_json::json!({
-                "error": "Database not available"
-            }));
-        }
-    };
-
-    // Get treasury balance
-    let treasury_balance_sats = db.get_treasury_balance().unwrap_or(0);
-
-    // Get treasury threshold timestamp
-    let threshold_reached_at: Option<i64> = db.get_treasury_threshold_reached().unwrap_or(None);
-
-    // Get nodes with Ghost Pay capability and their shares.
-    // Uses the nodes table which is updated by health pings. Filter for recently-seen
-    // nodes (last_seen within 5 min) that have ghost_pay in their capabilities JSON.
-    let now = chrono::Utc::now().timestamp();
-    let recent_cutoff = now - 300; // 5 minutes
-    let ghost_pay_nodes: Vec<serde_json::Value> = match db.get_top_nodes_by_shares(200) {
-        Ok(nodes) => nodes
-            .into_iter()
-            .filter(|node| node.last_seen >= recent_cutoff)
-            .filter_map(|node| {
-                // Parse "key:value,key:value" format stored by health_handler
-                let cap_map: std::collections::HashMap<&str, bool> = node
-                    .capabilities
-                    .split(',')
-                    .filter_map(|pair| {
-                        let (k, v) = pair.split_once(':')?;
-                        Some((k.trim(), v.trim() == "true"))
-                    })
-                    .collect();
-
-                if !cap_map.get("ghost_pay").copied().unwrap_or(false) {
-                    return None;
-                }
-                // Compute total shares from capabilities
-                let archive = if cap_map.get("archive").copied().unwrap_or(false) {
-                    5i32
-                } else {
-                    0
-                };
-                let ghost_pay_shares = 4i32;
-                let public_mining = if cap_map.get("public_mining").copied().unwrap_or(false) {
-                    3
-                } else {
-                    0
-                };
-                let reaper = if cap_map.get("reaper").copied().unwrap_or(false) {
-                    2
-                } else {
-                    0
-                };
-                let elder = if node.is_elder { 1 } else { 0 };
-                let total_shares = archive + ghost_pay_shares + public_mining + reaper + elder;
-
-                // Get payout address from node record or fall back to public_address
-                let address = db
-                    .get_node_payout_address(&node.node_id)
-                    .ok()
-                    .flatten()
-                    .or_else(|| node.public_address.clone())
-                    .unwrap_or_default();
-
-                Some(serde_json::json!({
-                    "node_id": node.node_id,
-                    "address": address,
-                    "shares": total_shares,
-                }))
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-
-    Json(serde_json::json!({
-        "treasury_balance_sats": treasury_balance_sats,
-        "threshold_reached_at": threshold_reached_at,
-        "ghost_pay_nodes": ghost_pay_nodes,
-    }))
-}
-
-/// L2 commitment tree state for health monitoring.
-/// Exposes live in-memory tree root, checkpoint root, and finalization status.
-async fn api_l2_tree_state_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let tree_state_fn = match &state.l2_tree_state_fn {
-        Some(f) => f.clone(),
-        None => {
-            return Json(serde_json::json!({
-                "error": "L2 tree state not configured"
-            }));
-        }
-    };
-
-    let info = match tree_state_fn() {
-        Ok(info) => info,
-        Err(e) => {
-            return Json(serde_json::json!({
-                "error": format!("Failed to get tree state: {}", e)
-            }));
-        }
-    };
-
-    let db = match state.database.as_ref() {
-        Some(db) => db,
-        None => {
-            return Json(serde_json::json!({
-                "error": "Database not available"
-            }));
-        }
-    };
-
-    let checkpoint = db.get_latest_l2_checkpoint().unwrap_or(None);
-    let (checkpoint_root, checkpoint_tx_count, checkpoint_height) = match &checkpoint {
-        Some(cp) => (hex::encode(cp.commitment_root), cp.tx_count, cp.height),
-        None => ("0".repeat(64), 0, 0),
-    };
-
-    let recent_finalizations = db.count_recent_l2_finalizations(100).unwrap_or(0);
-    let active_finalizations = db.count_recent_active_l2_finalizations(100).unwrap_or(0);
-
-    let tree_root_hex = hex::encode(info.tree_root);
-    let roots_match = tree_root_hex == checkpoint_root;
-
-    Json(serde_json::json!({
-        "epoch": info.epoch,
-        "tree_root": tree_root_hex,
-        "checkpoint_height": checkpoint_height,
-        "checkpoint_root": checkpoint_root,
-        "checkpoint_tx_count": checkpoint_tx_count,
-        "note_count": info.note_count,
-        "recent_finalizations": recent_finalizations,
-        "active_finalizations": active_finalizations,
-        "roots_match": roots_match
-    }))
-}
-
-/// API v1 Rewards current handler
-async fn api_rewards_current_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let health = state.get_health().await;
-    let config = state.dashboard_config.read();
-
-    // Get node reward entry from database
-    let (balance_sats, total_credits, last_round) = if let Some(ref db) = state.database {
-        match db.get_or_create_node_reward(&health.node_id) {
-            Ok(entry) => (
-                entry.balance_sats,
-                entry.total_credits_sats,
-                entry.last_credited_round,
-            ),
-            Err(e) => {
-                error!(error = %e, "Failed to query node rewards");
-                (0, 0, 0)
-            }
-        }
-    } else {
-        (0, 0, 0)
-    };
-
-    // Calculate node shares based on capabilities
-    let mut node_shares = 0u32;
-    if config.archive_mode {
-        node_shares += 5;
-    }
-    if config.ghost_pay {
-        node_shares += 4;
-    }
-    if config.public_mining {
-        node_shares += 3;
-    }
-    if config.reaper {
-        node_shares += 2;
-    }
-    if config.elder {
-        node_shares += 1;
-    }
-
-    Json(serde_json::json!({
-        "round_id": health.round_id,
-        "block_height": health.block_height,
-        "pending_rewards_sats": balance_sats,
-        "total_earned_sats": total_credits,
-        "last_credited_round": last_round,
-        "estimated_share": if node_shares > 0 { node_shares as f64 / 15.0 } else { 0.0 },
-        "node_shares": node_shares,
-        "total_network_shares": 15,
-        "message": "Current round reward estimation"
-    }))
-}
-
-/// API v1 Rewards history handler
-async fn api_rewards_history_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    // Query payouts to this node as reward history
-    let health = state.get_health().await;
-
-    let (rewards, total_sats) = if let Some(ref db) = state.database {
-        // Get payouts where this node was the recipient
-        let payouts = db.get_recent_payouts(100).unwrap_or_default();
-        let node_payouts: Vec<_> = payouts
-            .iter()
-            .filter(|p| p.recipient_id == health.node_id)
-            .map(|p| {
-                serde_json::json!({
-                    "round_id": p.round_id,
-                    "amount_sats": p.amount_sats,
-                    "txid": p.txid,
-                    "status": format!("{:?}", p.status),
-                    "created_at": p.created_at
-                })
-            })
-            .collect();
-        let total: u64 = payouts
-            .iter()
-            .filter(|p| p.recipient_id == health.node_id)
-            .map(|p| p.amount_sats)
-            .sum();
-        (node_payouts, total)
-    } else {
-        (vec![], 0)
-    };
-
-    Json(serde_json::json!({
-        "rewards": rewards,
-        "total_rewards": rewards.len(),
-        "total_earned_sats": total_sats,
-        "total_earned_btc": total_sats as f64 / 100_000_000.0
     }))
 }
 
@@ -4869,58 +2923,6 @@ async fn api_rewards_history_handler(
 // The endpoint has been completely removed rather than adding authentication
 // because even authenticated access to logs is a security concern.
 
-/// API v1 Locks handler (Ghost Lock state channels)
-async fn api_locks_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
-    let health = state.get_health().await;
-    let config = state.dashboard_config.read();
-
-    // Query Ghost Locks for this node from database
-    let (locks, active_count, total_locked) = if let Some(ref db) = state.database {
-        // Get all locks owned by this node's ghost ID
-        let ghost_id = format!("ghost{}", &health.node_id[..8.min(health.node_id.len())]);
-        match db.get_ghost_locks_by_owner(&ghost_id) {
-            Ok(lock_records) => {
-                let active: Vec<_> = lock_records
-                    .iter()
-                    .filter(|l| l.state == ghost_storage::models::GhostLockState::Active)
-                    .collect();
-                let total: u64 = active.iter().map(|l| l.amount_sats).sum();
-                let locks_json: Vec<_> = lock_records
-                    .iter()
-                    .map(|l| {
-                        serde_json::json!({
-                            "lock_id": l.lock_id,
-                            "denomination": l.denomination,
-                            "amount_sats": l.amount_sats,
-                            "state": format!("{:?}", l.state),
-                            "timelock_tier": l.timelock_tier,
-                            "creation_height": l.creation_height,
-                            "recovery_height": l.recovery_height,
-                            "funding_txid": l.funding_txid,
-                            "next_jump_height": l.next_jump_height,
-                            "created_at": l.created_at
-                        })
-                    })
-                    .collect();
-                (locks_json, active.len(), total)
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to query ghost locks");
-                (vec![], 0, 0)
-            }
-        }
-    } else {
-        (vec![], 0, 0)
-    };
-
-    Json(serde_json::json!({
-        "enabled": config.ghost_pay,
-        "active_locks": active_count,
-        "total_locked_sats": total_locked,
-        "locks": locks
-    }))
-}
-
 /// API v1 Nickname handler
 async fn api_nickname_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
     let health = state.get_health().await;
@@ -4932,147 +2934,6 @@ async fn api_nickname_handler(State(state): State<Arc<VerificationState>>) -> im
         .unwrap_or_else(|| health.node_id.chars().take(8).collect());
     Json(serde_json::json!({
         "nickname": nickname
-    }))
-}
-
-/// API v1 Rewards full handler
-async fn api_rewards_full_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let health = state.get_health().await;
-    let config = state.dashboard_config.read();
-
-    // Get node reward entry from database
-    let (balance_sats, total_credits, total_withdrawals, last_round) =
-        if let Some(ref db) = state.database {
-            match db.get_or_create_node_reward(&health.node_id) {
-                Ok(entry) => (
-                    entry.balance_sats,
-                    entry.total_credits_sats,
-                    entry.total_withdrawals_sats,
-                    entry.last_credited_round,
-                ),
-                Err(e) => {
-                    error!(error = %e, "Failed to query node rewards");
-                    (0, 0, 0, 0)
-                }
-            }
-        } else {
-            (0, 0, 0, 0)
-        };
-
-    // Get payout history
-    let (rewards_history, last_payout) = if let Some(ref db) = state.database {
-        let payouts = db.get_recent_payouts(20).unwrap_or_default();
-        let node_payouts: Vec<_> = payouts
-            .iter()
-            .filter(|p| p.recipient_id == health.node_id)
-            .map(|p| {
-                serde_json::json!({
-                    "round_id": p.round_id,
-                    "amount_sats": p.amount_sats,
-                    "txid": p.txid,
-                    "status": format!("{:?}", p.status),
-                    "created_at": p.created_at
-                })
-            })
-            .collect();
-        let last = payouts
-            .iter()
-            .find(|p| p.recipient_id == health.node_id)
-            .map(|p| {
-                serde_json::json!({
-                    "round_id": p.round_id,
-                    "amount_sats": p.amount_sats,
-                    "txid": p.txid,
-                    "created_at": p.created_at
-                })
-            });
-        (node_payouts, last)
-    } else {
-        (vec![], None)
-    };
-
-    // Calculate node shares
-    let mut node_shares = 0u32;
-    if config.archive_mode {
-        node_shares += 5;
-    }
-    if config.ghost_pay {
-        node_shares += 4;
-    }
-    if config.public_mining {
-        node_shares += 3;
-    }
-    if config.reaper {
-        node_shares += 2;
-    }
-    if config.elder {
-        node_shares += 1;
-    }
-
-    Json(serde_json::json!({
-        "round_id": health.round_id,
-        "block_height": health.block_height,
-        "node_shares": node_shares,
-        "total_network_shares": 15,
-        "estimated_reward_sats": 0,
-        "lifetime_rewards_sats": total_credits,
-        "pending_payout_sats": balance_sats,
-        "total_withdrawals_sats": total_withdrawals,
-        "last_credited_round": last_round,
-        "last_payout": last_payout,
-        "rewards_history": rewards_history
-    }))
-}
-
-/// API v1 Settlement status handler
-async fn api_settlement_status_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    // Query pending reconciliation batches
-    let (pending_count, last_settlement, total_settled) = if let Some(ref db) = state.database {
-        let pending = db.get_pending_reconciliation_batches().unwrap_or_default();
-        let pending_count = pending.len();
-
-        // Get the most recent finalized batch
-        let all_pending = db.get_pending_reconciliation_batches().unwrap_or_default();
-        let last = all_pending
-            .iter()
-            .find(|b| b.finalized_at.is_some())
-            .map(|b| {
-                serde_json::json!({
-                    "batch_id": b.batch_id,
-                    "total_amount_sats": b.total_amount_sats,
-                    "l1_txid": b.l1_txid,
-                    "finalized_at": b.finalized_at
-                })
-            });
-
-        let total: u64 = all_pending
-            .iter()
-            .filter(|b| b.finalized_at.is_some())
-            .map(|b| b.total_amount_sats)
-            .sum();
-
-        (pending_count, last, total)
-    } else {
-        (0, None, 0)
-    };
-
-    let status = if pending_count > 0 {
-        "processing"
-    } else {
-        "idle"
-    };
-
-    Json(serde_json::json!({
-        "status": status,
-        "pending_settlements": pending_count,
-        "pending_count": pending_count,
-        "batches_24h": 0,
-        "last_settlement": last_settlement,
-        "total_settled_sats": total_settled
     }))
 }
 
@@ -5119,8 +2980,8 @@ async fn api_public_nodes_handler(
 
     let mut nodes = Vec::new();
 
-    // Add self if public mining is enabled
-    if config.public_mining {
+    // Every node is a pool node, so self is always listed.
+    {
         let host = config
             .stratum_host
             .clone()
@@ -5160,13 +3021,6 @@ async fn api_node_public_info_handler(
 ) -> impl IntoResponse {
     let health = state.get_health().await;
     let config = state.dashboard_config.read();
-
-    if !config.public_mining {
-        return Json(serde_json::json!({
-            "public_mining": false,
-            "message": "This node does not accept public miners"
-        }));
-    }
 
     // Determine status based on miner count vs capacity
     let status = if health.miner_count >= config.max_miners {
@@ -5231,57 +3085,6 @@ async fn api_watchdog_status_handler(
         })
     };
 
-    // Check ghost-pay L2 service status
-    let gp = match check_ghostpay_local(&state) {
-        Some(status) => status,
-        None => match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tokio::spawn(fetch_ghostpay_from_service()),
-        )
-        .await
-        {
-            Ok(Ok(Some(status))) => status,
-            _ => GhostPayLiveStatus {
-                epoch: 0,
-                virtual_block: 0,
-                wraith_enabled: false,
-                sync_state: "unavailable",
-            },
-        },
-    };
-    let ghost_pay_status = match gp.sync_state {
-        "synced" => serde_json::json!({
-            "status": "running",
-            "epoch": gp.epoch,
-            "virtual_block": gp.virtual_block
-        }),
-        "disabled" => serde_json::json!({
-            "status": "not_enabled",
-            "message": "Ghost Pay not configured"
-        }),
-        _ => serde_json::json!({
-            "status": "error",
-            "message": "Ghost Pay not responding"
-        }),
-    };
-
-    // Check GSP (Ghost Service Protocol) status for light wallet support
-    let gsp_status = if let Some(gsp_info) = state.get_gsp_info() {
-        serde_json::json!({
-            "status": "running",
-            "protocol_version": gsp_info.protocol_version,
-            "network": gsp_info.network,
-            "connections": gsp_info.connections,
-            "sync_status": gsp_info.sync_status,
-            "registered_wallets": gsp_info.registered_wallets
-        })
-    } else {
-        serde_json::json!({
-            "status": "not_enabled",
-            "message": "GSP light wallet server not configured"
-        })
-    };
-
     // Build services list for dashboard compatibility
     let services_list = vec![
         serde_json::json!({
@@ -5293,16 +3096,6 @@ async fn api_watchdog_status_handler(
             "name": "ghost-core",
             "status": ghost_core_status.get("status").and_then(|s| s.as_str()).unwrap_or("unknown"),
             "details": ghost_core_status
-        }),
-        serde_json::json!({
-            "name": "ghost-pay",
-            "status": ghost_pay_status.get("status").and_then(|s| s.as_str()).unwrap_or("not_enabled"),
-            "details": ghost_pay_status
-        }),
-        serde_json::json!({
-            "name": "gsp",
-            "status": gsp_status.get("status").and_then(|s| s.as_str()).unwrap_or("not_enabled"),
-            "details": gsp_status
         }),
     ];
 
@@ -5322,15 +3115,6 @@ async fn api_watchdog_status_handler(
             "name": "ghost-core",
             "port": 8332,
             "status": if ghost_core_status.get("status").and_then(|s| s.as_str()) == Some("running") { "ok" } else { "error" },
-            "last_check": std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-        }),
-        serde_json::json!({
-            "name": "ghost-pay",
-            "port": 8800,
-            "status": if ghost_pay_status.get("status").and_then(|s| s.as_str()) == Some("running") { "ok" } else { "down" },
             "last_check": std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -5621,40 +3405,6 @@ async fn api_system_version_handler(
     }))
 }
 
-/// API v1 Payments handler
-async fn api_payments_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
-    // Query database for recent payouts (payments are derived from payouts)
-    let (payments, total) = if let Some(ref db) = state.database {
-        let payout_records = db.get_recent_payouts(50).unwrap_or_default();
-        let total = db.get_payout_count().unwrap_or(0);
-        let payments_json: Vec<_> = payout_records
-            .iter()
-            .map(|p| {
-                serde_json::json!({
-                    "id": format!("{}-{}", p.round_id, p.recipient_id),
-                    "round_id": p.round_id,
-                    "recipient": p.recipient_id,
-                    "recipient_type": format!("{:?}", p.recipient_type),
-                    "amount_sats": p.amount_sats,
-                    "address": p.address,
-                    "txid": p.txid,
-                    "status": format!("{:?}", p.status),
-                    "type": "payout",
-                    "created_at": p.created_at
-                })
-            })
-            .collect();
-        (payments_json, total)
-    } else {
-        (vec![], 0)
-    };
-
-    Json(serde_json::json!({
-        "payments": payments,
-        "total": total
-    }))
-}
-
 /// API v1 Backup history handler
 async fn api_backup_history_handler(
     State(state): State<Arc<VerificationState>>,
@@ -5792,93 +3542,6 @@ async fn api_backup_history_handler(
         "backups": backups,
         "total": total,
         "backup_dir": canonical_backup_dir.to_string_lossy()
-    }))
-}
-
-/// API v1 Wraith sessions handler (Ghost Pay sessions)
-async fn api_wraith_sessions_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    // Query database for active wraith rounds if available
-    let (sessions, active_count, total_participants) = if let Some(ref db) = state.database {
-        let rounds = db.get_active_wraith_rounds().unwrap_or_default();
-        let active = rounds.len();
-        let participants: u32 = rounds.iter().map(|r| r.participant_count).sum();
-        let sessions_json: Vec<_> = rounds
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "round_id": r.round_id,
-                    "denomination": r.denomination,
-                    "amount_sats": r.amount_sats,
-                    "participant_count": r.participant_count,
-                    "phase": format!("{:?}", r.phase),
-                    "registration_deadline": r.registration_deadline
-                })
-            })
-            .collect();
-        (sessions_json, active, participants)
-    } else {
-        (vec![], 0, 0)
-    };
-
-    Json(serde_json::json!({
-        "sessions": sessions,
-        "total": sessions.len(),
-        "active": active_count,
-        "active_sessions": active_count,
-        "sessions_completed": 0,
-        "total_sessions": sessions.len(),
-        "sessions_expired": 0,
-        "total_participants": total_participants
-    }))
-}
-
-/// API v1 Network elder handler
-async fn api_network_elder_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let health = state.get_health().await;
-    let max_elders = ghost_common::constants::MAX_ELDERS;
-
-    // Use MPC contributions as authoritative source for elder status
-    let (elders, total_elders, is_elder, elder_slot) = if let Some(ref db) = state.database {
-        let mpc_elders = db.get_all_mpc_elders().unwrap_or_default();
-        let total = mpc_elders.len() as u32;
-        let self_entry = mpc_elders.iter().find(|(nid, _)| *nid == health.node_id);
-        let is_self_elder = self_entry.is_some();
-        let slot = self_entry.map(|(_, pos)| *pos as u64);
-        let elders_json: Vec<_> = mpc_elders
-            .iter()
-            .map(|(node_id, position)| {
-                serde_json::json!({
-                    "node_id": node_id,
-                    "display_name": null,
-                    "elder_order": position,
-                    "first_seen": null,
-                    "last_seen": null,
-                    "is_self": *node_id == health.node_id
-                })
-            })
-            .collect();
-        (elders_json, total, is_self_elder, slot)
-    } else {
-        (vec![], 0, false, None)
-    };
-
-    let spots_remaining = max_elders.saturating_sub(total_elders);
-
-    Json(serde_json::json!({
-        "elders": elders,
-        "total_elders": total_elders,
-        "active_elders": total_elders,
-        "max_elders": max_elders,
-        "spots_remaining": spots_remaining,
-        "is_elder": is_elder,
-        "elder_slot": elder_slot,
-        "registered_at": null,
-        "downtime_warning": false,
-        "consecutive_downtime_days": 0
     }))
 }
 
@@ -6186,376 +3849,6 @@ async fn api_mining_best_hash_handler(
     }))
 }
 
-/// API v1 Network payout history handler
-async fn api_payout_history_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    // Query database for recent payouts if available
-    let (payouts, total) = if let Some(ref db) = state.database {
-        let payout_records = db.get_recent_payouts(100).unwrap_or_default();
-        let total = db.get_payout_count().unwrap_or(0);
-        let payouts_json: Vec<_> = payout_records
-            .iter()
-            .map(|p| {
-                serde_json::json!({
-                    "round_id": p.round_id,
-                    "recipient_id": p.recipient_id,
-                    "recipient_type": format!("{:?}", p.recipient_type),
-                    "amount_sats": p.amount_sats,
-                    "address": p.address,
-                    "txid": p.txid,
-                    "status": format!("{:?}", p.status),
-                    "created_at": p.created_at
-                })
-            })
-            .collect();
-        (payouts_json, total)
-    } else {
-        (vec![], 0)
-    };
-
-    Json(serde_json::json!({
-        "payouts": payouts,
-        "total": total
-    }))
-}
-
-/// API v1 Ghost Pay payout history handler
-async fn api_ghostpay_payout_history_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let health = state.get_health().await;
-    let ghost_id = format!("ghost{}", &health.node_id[..8.min(health.node_id.len())]);
-
-    // Query withdrawals as GhostPay payouts
-    let (payouts, total) = if let Some(ref db) = state.database {
-        let withdrawals = db.get_pending_withdrawals(&ghost_id).unwrap_or_default();
-        let payouts_json: Vec<_> = withdrawals
-            .iter()
-            .map(|w| {
-                serde_json::json!({
-                    "id": w.id,
-                    "lock_id": w.lock_id,
-                    "destination": w.destination_address,
-                    "amount_sats": w.amount_sats,
-                    "fee_sats": w.fee_sats,
-                    "status": format!("{:?}", w.status),
-                    "batch_id": w.batch_id,
-                    "l1_txid": w.l1_txid,
-                    "created_at": w.created_at
-                })
-            })
-            .collect();
-        let total = payouts_json.len();
-        (payouts_json, total)
-    } else {
-        (vec![], 0)
-    };
-
-    Json(serde_json::json!({
-        "payouts": payouts,
-        "total": total
-    }))
-}
-
-/// API v1 Rewards node history handler
-/// Optional `?time_filter=7d|30d|all` window for history endpoints.
-#[derive(Debug, Deserialize)]
-struct TimeFilterQuery {
-    time_filter: Option<String>,
-}
-
-async fn api_rewards_node_history_handler(
-    State(state): State<Arc<VerificationState>>,
-    Query(query): Query<TimeFilterQuery>,
-) -> impl IntoResponse {
-    let health = state.get_health().await;
-
-    // Honour the requested time window (default 7d; `all` disables). Previously
-    // this was ignored, so a node last credited months ago still surfaced under
-    // the dashboard's "recent payouts (last 7 days)" table.
-    let cutoff: Option<i64> = match query.time_filter.as_deref().unwrap_or("7d") {
-        "all" | "" => None,
-        f => {
-            let days: i64 = f.trim_end_matches('d').parse().unwrap_or(7);
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-            Some(now - days.max(0) * 86_400)
-        }
-    };
-
-    // Get all nodes with rewards and their history
-    let (history, total) = if let Some(ref db) = state.database {
-        // Get nodes with balance
-        let nodes = db.get_nodes_with_balance(0).unwrap_or_default();
-        let history_json: Vec<_> = nodes
-            .iter()
-            .filter(|n| cutoff.is_none_or(|c| n.updated_at >= c))
-            .map(|n| {
-                serde_json::json!({
-                    "node_id": n.node_id,
-                    "balance_sats": n.balance_sats,
-                    "last_credited_round": n.last_credited_round,
-                    "total_credits_sats": n.total_credits_sats,
-                    "total_withdrawals_sats": n.total_withdrawals_sats,
-                    "is_self": n.node_id == health.node_id,
-                    "created_at": n.created_at,
-                    "updated_at": n.updated_at
-                })
-            })
-            .collect();
-        let total = history_json.len();
-        (history_json, total)
-    } else {
-        (vec![], 0)
-    };
-
-    Json(serde_json::json!({
-        "history": history,
-        "total": total
-    }))
-}
-
-/// API v1 per-event NODE payout history.
-///
-/// Unlike `node-history` (which returns the `node_rewards` running-balance
-/// ledger, one row per node), this returns individual per-round node payout
-/// EVENTS from the `payouts` table — the real "when was this node credited, how
-/// much, in which round, confirmed on-chain yet" history. Honours the same time
-/// window (default 7d; `all` disables). Each event is flagged `is_self` when its
-/// recipient is this node.
-async fn api_rewards_node_payout_events_handler(
-    State(state): State<Arc<VerificationState>>,
-    Query(query): Query<TimeFilterQuery>,
-) -> impl IntoResponse {
-    let health = state.get_health().await;
-
-    let cutoff: Option<i64> = match query.time_filter.as_deref().unwrap_or("7d") {
-        "all" | "" => None,
-        f => {
-            let days: i64 = f.trim_end_matches('d').parse().unwrap_or(7);
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-            Some(now - days.max(0) * 86_400)
-        }
-    };
-
-    // Cap the result set so a long-lived node can't return an unbounded history.
-    const MAX_EVENTS: u32 = 500;
-
-    let (events, total) = if let Some(ref db) = state.database {
-        let rows = db
-            .get_node_payout_events(cutoff, MAX_EVENTS)
-            .unwrap_or_default();
-        let events_json: Vec<_> = rows
-            .iter()
-            .map(|p| {
-                serde_json::json!({
-                    "round_id": p.round_id,
-                    "recipient_id": p.recipient_id,
-                    "amount_sats": p.amount_sats,
-                    "txid": p.txid,
-                    "status": p.status.as_str(),
-                    "created_at": p.created_at,
-                    "confirmed_at": p.confirmed_at,
-                    "is_self": p.recipient_id == health.node_id,
-                })
-            })
-            .collect();
-        let total = events_json.len();
-        (events_json, total)
-    } else {
-        (vec![], 0)
-    };
-
-    Json(serde_json::json!({
-        "events": events,
-        "total": total
-    }))
-}
-
-/// Read-only pre-gate proof for payout-ledger finalisation.
-///
-/// Each node reports its OWN latest BFT-finalised `PayoutLedgerCheckpoint`. The
-/// coinbase gate (`coinbase_fee_split_height`) is off until we can watch the fleet
-/// finalise identically: an operator polls this endpoint on every node and checks
-/// they agree on `(height, ledger_root)`. Agreement across the fleet is exactly the
-/// property the gate depends on, so this endpoint is how we earn confidence to flip
-/// it. It exposes nothing that isn't already public (the checkpoint is gossiped).
-async fn api_payout_checkpoint_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let checkpoint = state
-        .database
-        .as_ref()
-        .and_then(|db| db.get_latest_payout_ledger_checkpoint().ok().flatten());
-
-    match checkpoint {
-        Some(cp) => Json(serde_json::json!({
-            "finalising": true,
-            "checkpoint": {
-                "height": cp.height,
-                "cutoff_ts": cp.cutoff_ts,
-                "ledger_root": hex::encode(cp.ledger_root),
-                "proposer_id": cp.proposer_id,
-                "active_node_count": cp.active_node_count,
-            }
-        })),
-        None => Json(serde_json::json!({
-            "finalising": false,
-            "checkpoint": serde_json::Value::Null,
-        })),
-    }
-}
-
-/// Convergence proof for arming `VOTER_SET_QUALIFICATION` (and, later, the other
-/// qualification-scoped gates). Computes the node-reward qualified set at the latest
-/// finalised checkpoint's cutoff — BOTH the A-2 **scoped** view (`voter_set_scoped=true`:
-/// voter-set membership + /24 subnet dedup) and the current unscoped view — and returns a
-/// hash of each. Because every node uses the SAME cutoff (the fleet-agreed checkpoint) and
-/// the resolver is deterministic, an identical `voter_set_scoped.hash` across all nodes is a
-/// DIRECT proof the scoped set converges — the check to run before flipping the gate off
-/// `u64::MAX`. Read-only and independent of the gate's own height (forces the scoped path
-/// regardless), so it works while the gate is still dormant.
-///
-/// `assignment_scoped=false` here: A-2b (`CHALLENGER_ASSIGNMENT`) is a separate gate and its
-/// draw needs the block-hash oracle; this endpoint proves only the A-2 voter-set/subnet layer.
-///
-/// The derivation is synchronous database work costing seconds (4-6s on the fleet, MEASURED
-/// 2026-10-10), so it runs on the blocking pool, one at a time — see [`crate::single_flight`].
-async fn api_qualification_scoped_set_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let for_task = Arc::clone(&state);
-    match state
-        .scoped_set_flight
-        .run(move || qualification_scoped_set_report(&for_task))
-        .await
-    {
-        Ok(report) => Json(report).into_response(),
-        Err(e) => {
-            warn!(error = %e, "scoped-set: derivation task failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "scoped-set derivation failed" })),
-            )
-                .into_response()
-        }
-    }
-}
-
-/// The body of `/api/v1/qualification/scoped-set`. Synchronous and slow by nature: call it from
-/// the blocking pool, never from an async worker.
-fn qualification_scoped_set_report(state: &VerificationState) -> serde_json::Value {
-    use sha2::{Digest, Sha256};
-    let Some(db) = state.database.as_ref() else {
-        return serde_json::json!({ "error": "no database configured" });
-    };
-    let Some(cp) = db.get_latest_payout_ledger_checkpoint().ok().flatten() else {
-        return serde_json::json!({ "error": "no finalised checkpoint yet" });
-    };
-    let cutoff = cp.cutoff_ts;
-    // `Database` is a cheap Clone (shares an inner `Arc<DatabaseInner>`); the provider
-    // wants an owned `Arc<Database>`, so wrap a clone — same underlying connection.
-    // Attach the block-hash oracle if present so the assignment-scoped (A-2b) draw can run.
-    let mut qp = crate::QualifiedCapabilityProvider::new(Arc::new(db.clone()));
-    if let Some(oracle) = state.block_hash_oracle.as_ref() {
-        qp = qp.with_block_hash_oracle(Arc::clone(oracle));
-    }
-
-    // Deterministic hash of a qualified set: sort by node id, then fold in (id ‖ shares_le).
-    let hash_set = |set: &[([u8; 32], i32)]| -> String {
-        let mut v = set.to_vec();
-        v.sort_by_key(|a| a.0);
-        let mut h = Sha256::new();
-        for (id, shares) in &v {
-            h.update(id);
-            h.update(shares.to_le_bytes());
-        }
-        hex::encode(h.finalize())
-    };
-
-    let unscoped = qp.get_all_qualified_nodes_at_cutoff_from_db(cutoff, false, false);
-    let scoped = qp.get_all_qualified_nodes_at_cutoff_from_db(cutoff, true, false);
-    // A-2b assignment-scoped: only meaningful with the oracle wired in (else the draw
-    // has no block-hash seeds). `has_oracle` tells the reviewer whether this hash is real.
-    let has_oracle = state.block_hash_oracle.is_some();
-    let assignment = qp.get_all_qualified_nodes_at_cutoff_from_db(cutoff, true, true);
-    // FEE convergence: hash of the FEE-armed node-reward split (adopted node_shares over a
-    // normalised pool). Identical across all nodes = the FEE coinbase node-split converges —
-    // the check to run before arming COINBASE_FEE_SPLIT. `has_fn` reports whether it's wired.
-    let fee_node_split = state.fee_node_split_fn.as_ref().and_then(|f| f(cp.height));
-    // ACTIVE_VOTER_SET convergence: the checkpoint-path voter set consensus WOULD use once the
-    // gate is armed (active-qualified set floored to a superset of the elders), hashed over its
-    // sorted node ids. Identical across all nodes = the payout voter set converges — the check
-    // to run before arming ACTIVE_VOTER_SET. `floored` = the elder floor engaged this block.
-    let checkpoint_voter_set = state
-        .checkpoint_voter_set_fn
-        .as_ref()
-        .and_then(|f| f(cutoff, cp.height));
-    // FEE coinbase reward-split convergence: hash of the GO-LIVE split (miners 99% of
-    // subsidy+fees; treasury/node the decaying 1%) from this node's treasury_state at the
-    // checkpoint cutoff. Identical across all nodes = the coinbase split converges — the check
-    // before arming COINBASE_FEE_SPLIT.
-    let fee_split = state
-        .fee_split_fn
-        .as_ref()
-        .and_then(|f| f(cutoff, cp.height));
-    // MESH_NODE_LIST convergence: the node-list checkpoint this node would propose, with the
-    // gate ignored. Identical `list_root`, `advert_root`, `coordinator_roster_root` AND
-    // `signer_set_root` on all nodes = #402's acceptance criterion met — the check to run BEFORE arming MESH_NODE_LIST_CHECKPOINT_HEIGHT, which
-    // could not be run at all until now (#625: nothing is proposed below the gate).
-    let mesh_node_list = state
-        .mesh_node_list_fn
-        .as_ref()
-        .and_then(|f| f(cutoff, cp.height));
-    serde_json::json!({
-        "cutoff_ts": cutoff,
-        "checkpoint_height": cp.height,
-        "unscoped": { "count": unscoped.len(), "hash": hash_set(&unscoped) },
-        "voter_set_scoped": { "count": scoped.len(), "hash": hash_set(&scoped) },
-        "assignment_scoped": {
-            "count": assignment.len(),
-            "hash": hash_set(&assignment),
-            "has_oracle": has_oracle,
-        },
-        "fee_node_split": {
-            "hash": fee_node_split,
-            "has_fn": state.fee_node_split_fn.is_some(),
-        },
-        "checkpoint_voter_set": {
-            "count": checkpoint_voter_set.as_ref().map(|(c, _, _)| *c),
-            "hash": checkpoint_voter_set.as_ref().map(|(_, h, _)| h.clone()),
-            "floored": checkpoint_voter_set.as_ref().map(|(_, _, f)| *f),
-            "has_fn": state.checkpoint_voter_set_fn.is_some(),
-        },
-        "fee_split": {
-            "hash": fee_split,
-            "has_fn": state.fee_split_fn.is_some(),
-        },
-        "mesh_node_list": {
-            "listed": mesh_node_list.as_ref().map(|c| c.listed),
-            "list_root": mesh_node_list.as_ref().map(|c| c.list_root.clone()),
-            "advert_root": mesh_node_list.as_ref().map(|c| c.advert_root.clone()),
-            // ⛔ EVERY root the vote path can reject on. With only some of them, this endpoint
-            // could report "converged" while a root every vote compares was never looked at, and
-            // a fleet agreeing on three of four finalises nothing at all, silently (#943).
-            "coordinator_roster_root": mesh_node_list
-                .as_ref()
-                .map(|c| c.coordinator_roster_root.clone()),
-            "signer_set_root": mesh_node_list.as_ref().map(|c| c.signer_set_root.clone()),
-            // Empty = full coverage. Non-empty names who has not advertised, which is the
-            // only reason a fleet that agrees on everything else still cannot checkpoint.
-            "missing_adverts": mesh_node_list.as_ref().map(|c| c.missing_adverts.clone()),
-            "has_fn": state.mesh_node_list_fn.is_some(),
-        },
-    })
-}
-
 // ============================================================================
 // Config Endpoints
 // ============================================================================
@@ -6567,7 +3860,6 @@ fn qualification_scoped_set_report(state: &VerificationState) -> serde_json::Val
 /// (pool.toml) — NOT the ephemeral `dashboard_config` mirror — so a
 /// POST→`save_atomic`→GET round-trips the value from disk:
 ///   * `payout.address`           ← `pool.node_payout_address`
-///   * `payout.ghostpay_address`   ← `ghost_pay.payout_address`
 ///   * `public_mining`            ← `network.mining_mode == PublicPool`
 ///   * `pool_name`                ← `pool.pool_name`
 ///   * `archive_mode`             ← `storage.archive_mode`
@@ -6584,64 +3876,44 @@ async fn api_config_full_handler(State(state): State<Arc<VerificationState>>) ->
     // Read the persisted operator settings from the real config (pool.toml).
     // The read guard is held only across this synchronous block — no await
     // points follow — so the !Send parking_lot guard is safe here.
-    let (payout, public_mining, pool_name, archive_mode, pruning) =
-        if let Some(ref full) = state.full_node_config {
-            let cfg = full.read();
-            (
-                serde_json::json!({
-                    "address": cfg.pool.node_payout_address,
-                    "ghostpay_address": cfg
-                        .ghost_pay
-                        .as_ref()
-                        .and_then(|gp| gp.payout_address.clone()),
-                }),
-                matches!(
-                    cfg.network.mining_mode,
-                    ghost_common::config::MiningMode::PublicPool
-                ),
-                cfg.pool.pool_name.clone(),
-                cfg.storage.archive_mode,
-                serde_json::json!({
-                    // VW/OW/AW model. VW is the mandatory Bitcoin Core prune floor
-                    // (read-only consensus constant); OW is the one editable depth
-                    // knob = `storage.prune_height` (blocks to keep, 0 = keep all);
-                    // AW = `storage.archive_mode`.
-                    "vw_blocks": ghost_common::config::VALIDATOR_WINDOW_BLOCKS,
-                    "ow_blocks": cfg.storage.prune_height,
-                    "archive_mode": cfg.storage.archive_mode,
-                    // One-shot pruned→archive resync still in flight.
-                    "reindex_pending": cfg.storage.reindex_pending,
-                }),
-            )
-        } else {
-            // No full config loaded (e.g. tests / minimal startup): fall back to
-            // the mirror so the dashboard still renders something coherent.
-            (
-                serde_json::json!({
-                    "address": serde_json::Value::Null,
-                    "ghostpay_address": serde_json::Value::Null,
-                }),
-                config.public_mining,
-                config.pool_name.clone(),
-                config.archive_mode,
-                serde_json::json!({
-                    "vw_blocks": ghost_common::config::VALIDATOR_WINDOW_BLOCKS,
-                    "ow_blocks": 0,
-                    "archive_mode": config.archive_mode,
-                    "reindex_pending": false,
-                }),
-            )
-        };
+    let (pool_name, archive_mode, pruning) = if let Some(ref full) = state.full_node_config {
+        let cfg = full.read();
+        (
+            cfg.pool.pool_name.clone(),
+            cfg.storage.archive_mode,
+            serde_json::json!({
+                // VW/OW/AW model. VW is the mandatory Bitcoin Core prune floor
+                // (read-only consensus constant); OW is the one editable depth
+                // knob = `storage.prune_height` (blocks to keep, 0 = keep all);
+                // AW = `storage.archive_mode`.
+                "vw_blocks": ghost_common::config::VALIDATOR_WINDOW_BLOCKS,
+                "ow_blocks": cfg.storage.prune_height,
+                "archive_mode": cfg.storage.archive_mode,
+                // One-shot pruned→archive resync still in flight.
+                "reindex_pending": cfg.storage.reindex_pending,
+            }),
+        )
+    } else {
+        // No full config loaded (e.g. tests / minimal startup): fall back to
+        // the mirror so the dashboard still renders something coherent.
+        (
+            config.pool_name.clone(),
+            config.archive_mode,
+            serde_json::json!({
+                "vw_blocks": ghost_common::config::VALIDATOR_WINDOW_BLOCKS,
+                "ow_blocks": 0,
+                "archive_mode": config.archive_mode,
+                "reindex_pending": false,
+            }),
+        )
+    };
 
     Json(serde_json::json!({
         "archive_mode": archive_mode,
-        "ghost_pay": config.ghost_pay,
-        "public_mining": public_mining,
         "reaper": config.reaper,
         "ghost_mode": config.ghost_mode,
         "ghost_mode_local_egress": config.ghost_mode_local_egress,
         "pruning": pruning,
-        "payout": payout,
         "pool_name": pool_name,
         "policy": policy,
         "block_priority": block_priority_key(&state),
@@ -6735,17 +4007,6 @@ async fn api_config_ghost_mode_handler(
     }))
 }
 
-/// API v1 Config public mining handler
-async fn api_config_public_mining_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let config = state.dashboard_config.read();
-    Json(serde_json::json!({
-        "enabled": config.public_mining,
-        "message": "Public mining configuration"
-    }))
-}
-
 /// API v1 Config reaper handler — returns the per-vector reaper configuration
 /// from the full node config (pool.toml `[reaper]`).
 async fn api_config_reaper_handler(
@@ -6801,17 +4062,6 @@ async fn api_config_daemon_handler(
         // Terminal result of the last automatic ghostd apply.
         "ghostd_apply": apply,
         "message": "ghostd daemon launch settings (restart-required)",
-    }))
-}
-
-/// API v1 Config ghost pay handler
-async fn api_config_ghost_pay_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let config = state.dashboard_config.read();
-    Json(serde_json::json!({
-        "enabled": config.ghost_pay,
-        "message": "Ghost Pay configuration"
     }))
 }
 
@@ -6994,20 +4244,16 @@ async fn api_config_ghost_mode_post_handler(
 ) -> impl IntoResponse {
     let enabled = payload.enabled;
 
-    // Mutual exclusion with Public Mining. A Ghost Mode node suppresses the
-    // peer transaction-relay path, so its mempool never fills and the blocks it
-    // builds are near-empty — the operator forfeits all transaction-fee income
-    // (fees accrue to the node operator; miners are paid from the subsidy less
-    // the pool fee). Enabling Ghost Mode while Public Mining is active is
-    // therefore self-harming and is refused. Turning Ghost Mode OFF is always
-    // allowed, so this only guards the enable path. No state is mutated on
-    // rejection.
-    if enabled && state.dashboard_config.read().public_mining {
+    // A Ghost Mode node suppresses the peer transaction-relay path, so its mempool never fills
+    // and the blocks it builds are near-empty — the node forfeits all transaction-fee income,
+    // which goes to the node whose miner finds the block. Every node is a pool node, so enabling
+    // Ghost Mode is refused. Turning it OFF is always allowed. No state is mutated on rejection.
+    if enabled {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "success": false,
-                "error": "Public Mining is active. Disable it before enabling Ghost Mode — a Ghost Mode node builds empty blocks and forfeits all transaction-fee income."
+                "error": "Ghost Mode cannot be enabled on a pool node — a Ghost Mode node builds empty blocks and forfeits all transaction-fee income."
             })),
         );
     }
@@ -7131,34 +4377,6 @@ async fn api_config_ghost_mode_local_egress_post_handler(
             "Ghost mode local egress updated (RPC sync unavailable)"
         }
     }))
-}
-
-/// API v1 Config public_mining POST handler
-///
-/// Persists to the REAL config: toggles `network.mining_mode` between
-/// `PublicPool` and a private mode via `save_atomic`, preserving the Ghost-Mode
-/// mutual exclusion and rejecting invalid mode transitions (see
-/// [`apply_public_mining`]). Requests a graceful restart to apply.
-async fn api_config_public_mining_post_handler(
-    State(state): State<Arc<VerificationState>>,
-    Json(payload): Json<ToggleRequest>,
-) -> impl IntoResponse {
-    match apply_public_mining(&state, payload.enabled) {
-        Ok(changed) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "success": true,
-                "enabled": payload.enabled,
-                "restart_pending": changed,
-                "message": if changed {
-                    "Public mining updated. ghost-mining will restart to apply the new mining mode."
-                } else {
-                    "Public mining already in the requested state."
-                }
-            })),
-        ),
-        Err((code, body)) => (code, Json(body)),
-    }
 }
 
 /// Resolve the `ghost-setup` binary used to apply the ghostd mempool-reaper
@@ -8914,256 +6132,9 @@ async fn api_alerts_service_restart_post_handler(
     Json(serde_json::json!({ "success": true, "dispatched": dispatched })).into_response()
 }
 
-/// API v1 Config ghost_pay POST handler
-async fn api_config_ghost_pay_post_handler(
-    State(state): State<Arc<VerificationState>>,
-    Json(payload): Json<ToggleRequest>,
-) -> impl IntoResponse {
-    let mut config = state.dashboard_config.write();
-    config.ghost_pay = payload.enabled;
-    Json(serde_json::json!({
-        "success": true,
-        "enabled": payload.enabled,
-        "message": "Ghost Pay updated"
-    }))
-}
-
-/// API v1 Config wraith GET handler — reports the operator's Wraith-mixing
-/// on/off choice (`[ghost_pay] wraith_enabled`). Prefers the persisted node
-/// config and falls back to the in-memory mirror surfaced by the status
-/// endpoints.
-async fn api_config_wraith_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let enabled = state
-        .full_node_config
-        .as_ref()
-        .map(|c| c.read().wraith_enabled())
-        .unwrap_or(state.wraith_enabled);
-    Json(serde_json::json!({
-        "enabled": enabled,
-        "message": "Wraith mixing configuration"
-    }))
-}
-
-/// API v1 Config wraith POST handler — sets `[ghost_pay] wraith_enabled` in the
-/// node config (pool.toml) and persists it, mirroring the reaper/ghost_pay
-/// toggles. The wraith flag is read at startup, so a ghost-mining restart applies
-/// the change. Enabling lets any L2 participant initiate a CoinJoin session;
-/// disabling means this node won't participate in mixing.
-async fn api_config_wraith_post_handler(
-    State(state): State<Arc<VerificationState>>,
-    Json(payload): Json<ToggleRequest>,
-) -> impl IntoResponse {
-    let mut persisted = false;
-    if let Some(ref full) = state.full_node_config {
-        let mut cfg = full.write();
-        cfg.ghost_pay
-            .get_or_insert_with(Default::default)
-            .wraith_enabled = payload.enabled;
-        if let Some(ref path) = state.full_node_config_path {
-            match cfg.save_atomic(path) {
-                Ok(()) => persisted = true,
-                Err(e) => error!(error = %e, "Failed to persist wraith config"),
-            }
-        }
-    }
-    // The wraith flag is read from config at startup; a restart applies it.
-    if persisted {
-        state.request_restart();
-    }
-    Json(serde_json::json!({
-        "success": true,
-        "persisted": persisted,
-        "enabled": payload.enabled,
-        "restart_required": true,
-        "message": if persisted {
-            "Wraith mixing updated; ghost-mining will restart to apply."
-        } else {
-            "Wraith setting received but no node config path is configured — changes were not persisted."
-        },
-    }))
-}
-
-/// API v1 Config elder handler (READ-ONLY status).
-///
-/// Elder status is NOT operator-set: the Elder capability (+1 share) is earned
-/// by registration order (MPC contributor position, first 101 nodes) and
-/// verified by the mesh. This endpoint therefore reports the node's REAL
-/// elder status from its verified capability set (`capabilities.elder_status`,
-/// derived from the MPC elder position at startup — `main.rs`), NOT a writable
-/// dashboard toggle.
-async fn api_config_elder_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let health = state.get_health().await;
-    Json(serde_json::json!({
-        "enabled": health.capabilities.elder_status,
-        // Elder status is mesh-assigned and cannot be operator-set.
-        "read_only": true,
-        "message": "Elder status is mesh-assigned (MPC registration order) and read-only"
-    }))
-}
-
-/// API v1 Config elder POST handler — NEUTERED.
-///
-/// Elder status is mesh-assigned (registration order, verified by the mesh), so
-/// it must NOT be operator-set: writing an operator-chosen elder flag into
-/// config would let a node falsely claim the +1 share and desync from mesh
-/// reality. This handler intentionally does NOT mutate any state and returns a
-/// 403 explaining that elder status is read-only.
-async fn api_config_elder_post_handler(
-    State(_state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    (
-        StatusCode::FORBIDDEN,
-        Json(serde_json::json!({
-            "success": false,
-            "error": "Elder status is mesh-assigned by registration order and cannot be set by the operator.",
-            "code": "ELDER_READ_ONLY"
-        })),
-    )
-}
-
 // ============================================================================
 // Mining Endpoints
 // ============================================================================
-
-/// API v1 Mining payout address handler
-///
-/// Reports the operator's node-reward payout address from the REAL persisted
-/// config (`[pool] node_payout_address` in pool.toml), NOT the ephemeral
-/// dashboard mirror. This is the address node-reward (5-4-3-2-1 capability
-/// share) payouts are sent to, loaded into the DB at startup (`main.rs`).
-async fn api_mining_payout_address_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let address = state
-        .full_node_config
-        .as_ref()
-        .and_then(|c| c.read().pool.node_payout_address.clone());
-
-    let message = if address.is_some() {
-        "Node-reward payout address"
-    } else {
-        "No payout address configured"
-    };
-
-    Json(serde_json::json!({
-        "address": address,
-        "message": message
-    }))
-}
-
-/// API v1 Mining private handler
-async fn api_mining_private_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let config = state.dashboard_config.read();
-
-    // Private mining is the opposite of public mining
-    let enabled = !config.public_mining;
-
-    // In private mode, we don't expose miner details for privacy
-    Json(serde_json::json!({
-        "enabled": enabled,
-        "miners": [], // Private miners are not enumerated
-        "total": 0,
-        "message": if enabled { "Private mining mode active - miner details hidden" } else { "Public mining enabled" }
-    }))
-}
-
-/// API v1 Mining public handler
-async fn api_mining_public_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let health = state.get_health().await;
-
-    // Query miners from current round
-    let (miners, total) = if let Some(ref db) = state.database {
-        match db.get_round_miners(health.round_id) {
-            Ok(miner_work) => {
-                let miners_json: Vec<_> = miner_work
-                    .iter()
-                    .map(|(miner_id, work)| {
-                        serde_json::json!({
-                            "miner_id": miner_id,
-                            "work": work,
-                            "type": "public"
-                        })
-                    })
-                    .collect();
-                let total = miners_json.len();
-                (miners_json, total)
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to query public miners");
-                (vec![], 0)
-            }
-        }
-    } else {
-        (vec![], 0)
-    };
-
-    Json(serde_json::json!({
-        "enabled": health.capabilities.public_mining,
-        "miners": miners,
-        "total": total
-    }))
-}
-
-// ============================================================================
-// Ghost Pay Endpoints
-// ============================================================================
-
-/// API v1 Ghost Pay pruning handler
-///
-/// Reports the L2 (ghost-pay) lock-pruning status. L2 lock pruning is not an
-/// operator-configurable setting: there is no persisted config field for it, so
-/// this returns a stable "disabled" default (no locks pruned by threshold). This
-/// is deliberately decoupled from L1 block pruning (`storage.prune_height`) —
-/// block-storage pruning and L2 lock retention are unrelated concerns.
-async fn api_ghostpay_pruning_handler(
-    State(_state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    Json(serde_json::json!({
-        "enabled": false,
-        "threshold_sats": 0,
-        "last_prune": null
-    }))
-}
-
-// ============================================================================
-// Settings Endpoints
-// ============================================================================
-
-/// API v1 Settings ghostpay payout address handler
-///
-/// Reports the GhostPay L2 payout address from the REAL persisted config
-/// (`[ghost_pay] payout_address` in pool.toml), NOT the ephemeral dashboard
-/// mirror. This is the address GhostPay L2 transaction-fee distributions settle
-/// to.
-async fn api_settings_ghostpay_payout_address_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let address = state.full_node_config.as_ref().and_then(|c| {
-        c.read()
-            .ghost_pay
-            .as_ref()
-            .and_then(|gp| gp.payout_address.clone())
-    });
-
-    let message = if address.is_some() {
-        "Ghost Pay payout address"
-    } else {
-        "No Ghost Pay payout address configured"
-    };
-
-    Json(serde_json::json!({
-        "address": address,
-        "message": message
-    }))
-}
 
 // ============================================================================
 // Swarm Endpoints
@@ -9764,36 +6735,6 @@ async fn api_auth_token_handler() -> impl IntoResponse {
     }))
 }
 
-/// Admin endpoint to trigger a test consensus proposal (for BFT testing)
-async fn admin_test_consensus_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    match state.trigger_test_proposal() {
-        Ok(Some(hash)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "success": true,
-                "proposal_hash": hex::encode(hash),
-                "message": "Test proposal broadcast to peers"
-            })),
-        ),
-        Ok(None) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "success": false,
-                "error": "Test proposal handler not configured"
-            })),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "success": false,
-                "error": format!("Failed to trigger test proposal: {}", e)
-            })),
-        ),
-    }
-}
-
 // =============================================================================
 // CONFIG UPDATE API
 // =============================================================================
@@ -9801,19 +6742,11 @@ async fn admin_test_consensus_handler(
 /// Request to update mutable configuration settings
 ///
 /// All fields are optional - only specified fields will be updated.
-/// Immutable settings (treasury_address, internal_api_secret, etc.) are rejected.
+/// Immutable settings (internal_api_secret, etc.) are rejected.
 #[derive(Debug, Deserialize)]
 pub struct ConfigUpdateRequest {
-    /// Mining mode: "public_pool", "private_pool", or "private_solo"
-    pub mining_mode: Option<String>,
-    /// Password for private mining modes (required when switching to private modes)
-    pub private_mining_password: Option<String>,
-    /// Payout address for PrivateSolo mode (required when mining_mode = private_solo)
-    pub solo_payout_address: Option<String>,
     /// Policy profile: "bitcoin_pure", "permissive", "full_open", or "custom"
     pub policy_profile: Option<String>,
-    /// Enable/disable Ghost Pay L2
-    pub ghost_pay_enabled: Option<bool>,
 }
 
 /// Response from config update API
@@ -9880,137 +6813,6 @@ where
     })
 }
 
-/// Apply a public-mining on/off request to the REAL `network.mining_mode`.
-///
-/// The legacy `public_mining` bool was removed from the config — `mining_mode`
-/// is the single source of truth — so "public mining on/off" maps to:
-/// `enable` → `PublicPool`; `disable` → the operator's existing private mode if
-/// already private, else `PrivatePool`.
-///
-/// It preserves the Ghost-Mode mutual-exclusion (409) and — critically —
-/// validates the *resulting* config before writing it. A mode transition that
-/// would leave the config invalid (e.g. switching to PublicPool without a
-/// `signing_key`, or to a private mode without a `private_mining_password`) is
-/// rejected with 400 rather than persisted: startup exits on any validation
-/// error (`main.rs`), so persisting an invalid mode would brick the node in a
-/// restart loop. On success it persists via `save_atomic`, mirrors the flag for
-/// in-session display, and requests a restart (mining_mode is read at startup).
-///
-/// Returns `Ok(true)` when a transition was persisted, `Ok(false)` when the
-/// node was already in the requested state (no-op), or `Err((status, body))`.
-fn apply_public_mining(
-    state: &Arc<VerificationState>,
-    enable: bool,
-) -> Result<bool, (StatusCode, serde_json::Value)> {
-    use ghost_common::config::MiningMode;
-
-    let Some(ref full) = state.full_node_config else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            serde_json::json!({
-                "success": false,
-                "error": "Config update API not available: full node config not loaded",
-            }),
-        ));
-    };
-    let Some(ref path) = state.full_node_config_path else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            serde_json::json!({
-                "success": false,
-                "error": "Config update API not available: no node config path configured",
-            }),
-        ));
-    };
-
-    let mut cfg = full.write();
-
-    // Ghost-Mode mutual exclusion: a Ghost Mode node builds near-empty blocks
-    // and forfeits all transaction-fee income, so it must not also accept
-    // public miners. Refuse to ENABLE Public Mining while Ghost Mode is active;
-    // disabling is always allowed.
-    if enable && cfg.network.ghost_mode {
-        return Err((
-            StatusCode::CONFLICT,
-            serde_json::json!({
-                "success": false,
-                "error": "Ghost Mode is active. Disable it before enabling Public Mining."
-            }),
-        ));
-    }
-
-    // No-op if already in the requested public/private state.
-    let currently_public = matches!(cfg.network.mining_mode, MiningMode::PublicPool);
-    if currently_public == enable {
-        return Ok(false);
-    }
-
-    // Resolve the target mode.
-    let target = if enable {
-        MiningMode::PublicPool
-    } else {
-        match cfg.network.mining_mode {
-            MiningMode::PrivatePool | MiningMode::PrivateSolo => cfg.network.mining_mode,
-            MiningMode::PublicPool => MiningMode::PrivatePool,
-        }
-    };
-
-    // Validate a candidate BEFORE writing: only persist a mode the node can
-    // actually boot with. Since the running config already validated at
-    // startup, any error surfaced here is one the mode change introduced.
-    let mut candidate = cfg.clone();
-    candidate.network.mining_mode = target;
-    let validation = candidate.validate();
-    if !validation.is_valid() {
-        let detail = validation
-            .errors
-            .iter()
-            .map(|e| format!("{}: {}", e.field, e.message))
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err((
-            StatusCode::BAD_REQUEST,
-            serde_json::json!({
-                "success": false,
-                "error": format!("Cannot switch mining mode: {detail}"),
-                "code": "INVALID_MODE_TRANSITION",
-            }),
-        ));
-    }
-
-    cfg.network.mining_mode = target;
-    if let Err(e) = cfg.save_atomic(path) {
-        error!(error = %e, "Failed to persist mining mode");
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            serde_json::json!({
-                "success": false,
-                "error": format!("Failed to persist mining mode: {e}"),
-            }),
-        ));
-    }
-    drop(cfg);
-
-    // Mirror for in-session display; mining_mode is resolved at startup so a
-    // graceful restart is required to actually apply it.
-    state.dashboard_config.write().public_mining = enable;
-    state.request_restart();
-    Ok(true)
-}
-
-/// Validate a mining mode string
-fn validate_mining_mode(mode: &str) -> Result<ghost_common::config::MiningMode, String> {
-    match mode.to_lowercase().as_str() {
-        "public_pool" | "publicpool" => Ok(ghost_common::config::MiningMode::PublicPool),
-        "private_pool" | "privatepool" => Ok(ghost_common::config::MiningMode::PrivatePool),
-        "private_solo" | "privatesolo" => Ok(ghost_common::config::MiningMode::PrivateSolo),
-        _ => Err(format!(
-            "Invalid mining_mode '{}'. Valid values: public_pool, private_pool, private_solo",
-            mode
-        )),
-    }
-}
-
 /// Validate a policy profile string
 fn validate_policy_profile(profile: &str) -> Result<ghost_common::config::PolicyProfile, String> {
     match profile.to_lowercase().as_str() {
@@ -10022,16 +6824,6 @@ fn validate_policy_profile(profile: &str) -> Result<ghost_common::config::Policy
             "Invalid policy_profile '{}'. Valid values: bitcoin_pure, permissive, full_open, custom",
             profile
         )),
-    }
-}
-
-/// Validate bech32 address prefix for a network
-fn validate_address_prefix(address: &str, network: ghost_common::config::BitcoinNetwork) -> bool {
-    match network {
-        ghost_common::config::BitcoinNetwork::Mainnet => address.starts_with("bc1"),
-        ghost_common::config::BitcoinNetwork::Signet
-        | ghost_common::config::BitcoinNetwork::Testnet => address.starts_with("tb1"),
-        ghost_common::config::BitcoinNetwork::Regtest => address.starts_with("bcrt1"),
     }
 }
 
@@ -10048,11 +6840,7 @@ fn validate_address_prefix(address: &str, network: ghost_common::config::Bitcoin
 /// is signaled. The node will exit with code 100, and systemd will restart it.
 ///
 /// # Mutable Settings
-/// - mining_mode: PublicPool/PrivatePool/PrivateSolo
-/// - private_mining_password: required for private modes
-/// - solo_payout_address: required for PrivateSolo
 /// - policy_profile: bitcoin_pure/permissive/full_open/custom
-/// - ghost_pay_enabled: toggle L2 on/off
 async fn api_config_update_handler(
     State(state): State<Arc<VerificationState>>,
     Json(request): Json<ConfigUpdateRequest>,
@@ -10073,129 +6861,7 @@ async fn api_config_update_handler(
             .into_response();
     };
 
-    // Get current config for validation
     let mut config = full_config_lock.write();
-    let network = config.bitcoin.network;
-
-    // Validate and apply mining_mode
-    if let Some(ref mode_str) = request.mining_mode {
-        match validate_mining_mode(mode_str) {
-            Ok(new_mode) => {
-                // Check if switching to private mode without password
-                if matches!(
-                    new_mode,
-                    ghost_common::config::MiningMode::PrivatePool
-                        | ghost_common::config::MiningMode::PrivateSolo
-                ) {
-                    // Need password either in request or already configured
-                    let has_password = request.private_mining_password.is_some()
-                        || config.network.private_mining_password.is_some();
-                    if !has_password {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(ConfigUpdateError {
-                                success: false,
-                                error: format!(
-                                    "private_mining_password required when switching to {}",
-                                    mode_str
-                                ),
-                                code: "MISSING_PASSWORD".to_string(),
-                            }),
-                        )
-                            .into_response();
-                    }
-                }
-
-                // Check if switching to PrivateSolo without solo_payout_address
-                if matches!(new_mode, ghost_common::config::MiningMode::PrivateSolo) {
-                    let has_address = request.solo_payout_address.is_some()
-                        || config.network.solo_payout_address.is_some();
-                    if !has_address {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(ConfigUpdateError {
-                                success: false,
-                                error: "solo_payout_address required for private_solo mode"
-                                    .to_string(),
-                                code: "MISSING_SOLO_ADDRESS".to_string(),
-                            }),
-                        )
-                            .into_response();
-                    }
-                }
-
-                config.network.mining_mode = new_mode;
-                updated_fields.push("mining_mode".to_string());
-            }
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ConfigUpdateError {
-                        success: false,
-                        error: e,
-                        code: "INVALID_MINING_MODE".to_string(),
-                    }),
-                )
-                    .into_response();
-            }
-        }
-    }
-
-    // Validate and apply private_mining_password
-    // L-17: Enforce minimum password length of 8 characters with an error, not just a warning
-    // Weak passwords expose private mining endpoints to brute-force attacks
-    if let Some(ref password) = request.private_mining_password {
-        if password.len() < 8 {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ConfigUpdateError {
-                    success: false,
-                    error: format!(
-                        "L-17: Password must be at least 8 characters (got {}). \
-                         Weak passwords expose private mining to brute-force attacks.",
-                        password.len()
-                    ),
-                    code: "PASSWORD_TOO_SHORT".to_string(),
-                }),
-            )
-                .into_response();
-        }
-        config.network.private_mining_password = Some(password.clone());
-        updated_fields.push("private_mining_password".to_string());
-    }
-
-    // Validate and apply solo_payout_address
-    if let Some(ref address) = request.solo_payout_address {
-        if address.is_empty() {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ConfigUpdateError {
-                    success: false,
-                    error: "solo_payout_address cannot be empty".to_string(),
-                    code: "EMPTY_SOLO_ADDRESS".to_string(),
-                }),
-            )
-                .into_response();
-        }
-
-        if !validate_address_prefix(address, network) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ConfigUpdateError {
-                    success: false,
-                    error: format!(
-                        "Invalid address prefix for {:?} network. Address: {}",
-                        network, address
-                    ),
-                    code: "INVALID_ADDRESS_PREFIX".to_string(),
-                }),
-            )
-                .into_response();
-        }
-
-        config.network.solo_payout_address = Some(address.clone());
-        updated_fields.push("solo_payout_address".to_string());
-    }
 
     // Validate and apply policy_profile
     if let Some(ref profile_str) = request.policy_profile {
@@ -10215,26 +6881,6 @@ async fn api_config_update_handler(
                 )
                     .into_response();
             }
-        }
-    }
-
-    // Apply ghost_pay_enabled
-    if let Some(enabled) = request.ghost_pay_enabled {
-        if let Some(ref mut gp) = config.ghost_pay {
-            gp.enabled = enabled;
-            updated_fields.push("ghost_pay_enabled".to_string());
-        } else if enabled {
-            // Can't enable ghost_pay if not configured at all
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ConfigUpdateError {
-                    success: false,
-                    error: "Cannot enable ghost_pay: [ghost_pay] section not configured in config"
-                        .to_string(),
-                    code: "GHOST_PAY_NOT_CONFIGURED".to_string(),
-                }),
-            )
-                .into_response();
         }
     }
 
@@ -10410,527 +7056,6 @@ async fn metrics_handler(State(state): State<Arc<VerificationState>>) -> impl In
             "# No metrics available\n".to_string(),
         )
     }
-}
-
-// ============================================================================
-// MPC Ceremony Endpoints
-// ============================================================================
-
-/// MPC params handler - serves current MPC parameters file for P2P sync
-/// POST /api/v1/l2/submit — Accept L2 NoteSpend transaction for mesh broadcast
-///
-/// Called by ghost-pay after verifying a NoteSpend proof. Forwards the transaction
-/// to the consensus mesh via the l2_submit_fn callback.
-async fn api_l2_submit_handler(
-    State(state): State<Arc<VerificationState>>,
-    body: axum::body::Bytes,
-) -> impl IntoResponse {
-    let submit_fn = match &state.l2_submit_fn {
-        Some(f) => f.clone(),
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "L2 submission not configured"})),
-            );
-        }
-    };
-
-    match submit_fn(body.to_vec()) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "submitted"})),
-        ),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("{}", e)})),
-        ),
-    }
-}
-
-/// POST /api/v1/l2/sync-commitment — Sync a commitment to the L2 tree
-///
-/// Called by ghost-pay after shielding a note or applying a transfer.
-/// Inserts the commitment into the ghost-mining epoch tree and broadcasts to mesh.
-async fn api_l2_sync_commitment_handler(
-    State(state): State<Arc<VerificationState>>,
-    Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let sync_fn = match &state.l2_sync_commitment_fn {
-        Some(f) => f.clone(),
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "L2 commitment sync not configured"})),
-            );
-        }
-    };
-
-    let commitment_hex = body["commitment"].as_str().unwrap_or_default();
-    let note_index = body["note_index"].as_u64().unwrap_or(0);
-    let block_height = body["block_height"].as_u64().unwrap_or(0);
-
-    let commitment = match hex::decode(commitment_hex) {
-        Ok(bytes) if bytes.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&bytes);
-            arr
-        }
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid commitment hex (need 32 bytes)"})),
-            );
-        }
-    };
-
-    match sync_fn(commitment, note_index, block_height) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "synced"})),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("{}", e)})),
-        ),
-    }
-}
-
-/// POST /api/v1/glyph/relay-claim — Relay a glyph claim to the mesh
-///
-/// Called by ghost-pay after validating and storing a glyph claim locally.
-/// Forwards to the consensus mesh via the glyph_claim_relay_fn callback.
-async fn api_glyph_relay_claim_handler(
-    State(state): State<Arc<VerificationState>>,
-    body: axum::body::Bytes,
-) -> impl IntoResponse {
-    let relay_fn = match &state.glyph_claim_relay_fn {
-        Some(f) => f.clone(),
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "Glyph relay not configured"})),
-            );
-        }
-    };
-
-    match relay_fn(body.to_vec()) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "relayed"})),
-        ),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("{}", e)})),
-        ),
-    }
-}
-
-/// POST /api/v1/glyph/relay-registered — Relay a glyph registration to the mesh
-///
-/// Called by ghost-pay after completing glyph registration (lock funded).
-/// Forwards to the consensus mesh via the glyph_registered_relay_fn callback.
-async fn api_glyph_relay_registered_handler(
-    State(state): State<Arc<VerificationState>>,
-    body: axum::body::Bytes,
-) -> impl IntoResponse {
-    let relay_fn = match &state.glyph_registered_relay_fn {
-        Some(f) => f.clone(),
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "Glyph relay not configured"})),
-            );
-        }
-    };
-
-    match relay_fn(body.to_vec()) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "relayed"})),
-        ),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("{}", e)})),
-        ),
-    }
-}
-
-/// Optional query for the note-spend params endpoint.
-///
-/// A BFT voter fetching a specific CANDIDATE (un-applied) parameter set passes
-/// `?new_hash=<64-hex>` — the candidate's lineage hash. Absent (the self-heal /
-/// refresh / manifest callers), the endpoint serves the applied current head.
-#[derive(Debug, Default, Deserialize)]
-pub struct MpcParamsQuery {
-    /// Hex of the candidate lineage `new_params_hash` to serve, if any.
-    #[serde(default)]
-    pub new_hash: Option<String>,
-}
-
-/// Resolve which note-spend parameter file the params endpoint should serve.
-///
-/// When `requested_hash` is a well-formed 32-byte hex lineage hash AND the
-/// matching CANDIDATE file exists, serve the candidate (so a voter gets the
-/// un-applied params it must cryptographically verify). Otherwise — no / blank /
-/// malformed hash, or no such candidate on disk — serve the active
-/// `note_spend_params_current.bin` (applied head), preserving the self-heal /
-/// refresh / manifest behaviour. The hash is decoded and re-encoded through the
-/// shared `ghost_common::mpc` helper, so a malicious `new_hash` can never escape
-/// the params directory (no path traversal).
-fn resolve_mpc_note_spend_path(
-    base_dir: &std::path::Path,
-    requested_hash: Option<&str>,
-) -> std::path::PathBuf {
-    if let Some(h) = requested_hash.filter(|h| !h.is_empty()) {
-        if let Some(bytes) = hex::decode(h).ok().filter(|b| b.len() == 32) {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&bytes);
-            let candidate = base_dir.join(ghost_common::mpc::candidate_note_spend_filename(&arr));
-            if candidate.exists() {
-                return candidate;
-            }
-        }
-    }
-    base_dir.join("note_spend_params_current.bin")
-}
-
-// NOTE: `pub` so the cross-process MPC ceremony harness
-// (`crates/mpc-xproc-harness`) can mount this EXACT production handler in a
-// minimal router and prove the `?new_hash=` candidate-vs-current serving works
-// across real OS process boundaries. Behaviour is unchanged.
-pub async fn api_mpc_params_handler(
-    State(_state): State<Arc<VerificationState>>,
-    Query(query): Query<MpcParamsQuery>,
-) -> impl IntoResponse {
-    // Get MPC params dir from home directory, then resolve to the applied head
-    // or — when a voter asks by `new_hash` — the matching candidate file.
-    let base_dir =
-        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()))
-            .join(".ghost/mpc_params");
-    let params_path = resolve_mpc_note_spend_path(&base_dir, query.new_hash.as_deref());
-
-    if !params_path.exists() {
-        return (
-            StatusCode::NOT_FOUND,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({"error": "MPC params not available"})
-                .to_string()
-                .into_bytes(),
-        );
-    }
-
-    match std::fs::read(&params_path) {
-        Ok(data) => {
-            debug!(size = data.len(), "Serving MPC params");
-            (
-                StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-                data,
-            )
-        }
-        Err(e) => {
-            warn!(error = %e, "Failed to read MPC params file");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [(axum::http::header::CONTENT_TYPE, "application/json")],
-                serde_json::json!({"error": "Failed to read params"})
-                    .to_string()
-                    .into_bytes(),
-            )
-        }
-    }
-}
-
-/// MPC payout params handler - serves current MPC payout parameters file for P2P sync
-async fn api_mpc_payout_params_handler(
-    State(_state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let params_path =
-        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()))
-            .join(".ghost/mpc_params/payout_params_current.bin");
-
-    if !params_path.exists() {
-        return (
-            StatusCode::NOT_FOUND,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({"error": "MPC payout params not available"})
-                .to_string()
-                .into_bytes(),
-        );
-    }
-
-    match std::fs::read(&params_path) {
-        Ok(data) => {
-            debug!(size = data.len(), "Serving MPC payout params");
-            (
-                StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-                data,
-            )
-        }
-        Err(e) => {
-            warn!(error = %e, "Failed to read MPC payout params file");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [(axum::http::header::CONTENT_TYPE, "application/json")],
-                serde_json::json!({"error": "Failed to read payout params"})
-                    .to_string()
-                    .into_bytes(),
-            )
-        }
-    }
-}
-
-async fn api_mpc_unshield_params_handler(
-    State(_state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    let params_path =
-        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()))
-            .join(".ghost/mpc_params/unshield_params_current.bin");
-
-    if !params_path.exists() {
-        return (
-            StatusCode::NOT_FOUND,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({"error": "MPC unshield params not available"})
-                .to_string()
-                .into_bytes(),
-        );
-    }
-
-    match std::fs::read(&params_path) {
-        Ok(data) => {
-            debug!(size = data.len(), "Serving MPC unshield params");
-            (
-                StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-                data,
-            )
-        }
-        Err(e) => {
-            warn!(error = %e, "Failed to read MPC unshield params file");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [(axum::http::header::CONTENT_TYPE, "application/json")],
-                serde_json::json!({"error": "Failed to read unshield params"})
-                    .to_string()
-                    .into_bytes(),
-            )
-        }
-    }
-}
-
-/// MPC params manifest handler - returns SHA-256 hashes of all param files
-///
-/// Clients download this manifest first (small), then verify each param file
-/// against its hash after download. Prevents MITM from serving malicious params.
-async fn api_mpc_params_manifest_handler(
-    State(_state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    use sha2::{Digest, Sha256};
-
-    let base_path =
-        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()))
-            .join(".ghost/mpc_params");
-
-    let files = [
-        ("note_spend_params_current.bin", "note_spend"),
-        ("payout_params_current.bin", "consolidation"),
-        ("unshield_params_current.bin", "unshield"),
-    ];
-
-    let mut manifest = serde_json::Map::new();
-
-    for (filename, key) in &files {
-        let path = base_path.join(filename);
-        match std::fs::read(&path) {
-            Ok(data) => {
-                let hash = hex::encode(Sha256::digest(&data));
-                manifest.insert(
-                    key.to_string(),
-                    serde_json::json!({
-                        "filename": filename,
-                        "sha256": hash,
-                        "size": data.len(),
-                    }),
-                );
-            }
-            Err(_) => {
-                manifest.insert(
-                    key.to_string(),
-                    serde_json::json!({
-                        "filename": filename,
-                        "available": false,
-                    }),
-                );
-            }
-        }
-    }
-
-    (
-        StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        serde_json::to_string(&manifest)
-            .unwrap_or_else(|_| "{}".to_string())
-            .into_bytes(),
-    )
-}
-
-/// MPC status handler - returns ceremony status
-async fn api_mpc_status_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
-    // Get contribution count from database if available
-    let (contribution_count, is_ossified) = if let Some(ref db) = state.database {
-        let count = db.get_mpc_elder_count().unwrap_or(0);
-        (count, count >= 101)
-    } else {
-        (0, false)
-    };
-
-    // Check if this node is an elder (has contributed to MPC)
-    let (is_elder, elder_slot) = if let Some(ref db) = state.database {
-        let pos = db.get_mpc_elder_position(&state.node_id).unwrap_or(None);
-        (pos.is_some(), pos)
-    } else {
-        (false, None)
-    };
-
-    // Determine ceremony phase
-    let phase = if is_ossified {
-        "ossified"
-    } else if contribution_count > 0 {
-        "contributing"
-    } else {
-        "initializing"
-    };
-
-    // Check if params file exists
-    let params_path =
-        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()))
-            .join(".ghost/mpc_params/note_spend_params_current.bin");
-    let has_params = params_path.exists();
-
-    Json(serde_json::json!({
-        "contribution_count": contribution_count,
-        "max_contributors": 101,
-        "is_ossified": is_ossified,
-        "is_elder": is_elder,
-        "elder_slot": elder_slot,
-        "phase": phase,
-        "has_params": has_params,
-        "node_id": state.node_id
-    }))
-}
-
-/// MPC contributors handler - returns list of MPC contributors (elders)
-/// Used by new nodes to sync the contributor list during startup
-async fn api_mpc_contributors_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    // Get contributors from database
-    let contributors = if let Some(ref db) = state.database {
-        // Get all MPC contributions and return full records for sync
-        let mut contributors = Vec::new();
-        for position in 1..=101u32 {
-            if let Ok(Some(record)) = db.get_mpc_contribution(position) {
-                // Return all fields needed for MpcContributionRecord
-                contributors.push(serde_json::json!({
-                    "position": position,
-                    "node_id": record.contributor_node_id,
-                    "prev_params_hash": hex::encode(record.prev_params_hash),
-                    "new_params_hash": hex::encode(record.new_params_hash),
-                    "epoch": record.epoch,
-                    "created_at": record.created_at,
-                }));
-            } else {
-                break; // No more contributions
-            }
-        }
-        contributors
-    } else {
-        Vec::new()
-    };
-
-    Json(serde_json::json!({
-        "contributors": contributors,
-        "count": contributors.len()
-    }))
-}
-
-/// Stage C: per-position contribution + retained votes handler.
-///
-/// Serves, for a single ceremony position: the FULL contribution record —
-/// including the (non-empty) `contribution_proof`, which the `/contributors`
-/// list deliberately omits — AND every retained verification vote (voter,
-/// approve, signature). This is exactly the data a catching-up node needs to
-/// (a) re-run `verify_contribution` on the fetched proof and (b) re-check the
-/// retained BFT quorum at startup, without keeping historical params blobs.
-async fn api_mpc_votes_handler(
-    State(state): State<Arc<VerificationState>>,
-    Path(position): Path<u32>,
-) -> impl IntoResponse {
-    let Some(ref db) = state.database else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "no database" })),
-        );
-    };
-
-    let contribution = match db.get_mpc_contribution(position) {
-        Ok(Some(rec)) => serde_json::json!({
-            "position": rec.elder_position,
-            "node_id": rec.contributor_node_id,
-            "prev_params_hash": hex::encode(rec.prev_params_hash),
-            "new_params_hash": hex::encode(rec.new_params_hash),
-            // Hex-encoded serialized ContributionProof — the field the
-            // contributors endpoint drops. Empty string if not retained.
-            "contribution_proof": hex::encode(&rec.contribution_proof),
-            "epoch": rec.epoch,
-            "created_at": rec.created_at,
-        }),
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(
-                    serde_json::json!({ "error": "no contribution at position", "position": position }),
-                ),
-            );
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            );
-        }
-    };
-
-    let votes = match db.get_mpc_votes(position) {
-        Ok(v) => v
-            .into_iter()
-            .map(|vote| {
-                serde_json::json!({
-                    "voter_node_id": vote.voter_node_id,
-                    "approve": vote.approve,
-                    "signature": hex::encode(vote.signature),
-                    "voted_at": vote.voted_at,
-                })
-            })
-            .collect::<Vec<_>>(),
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            );
-        }
-    };
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "contribution": contribution,
-            "votes": votes,
-            "vote_count": votes.len(),
-        })),
-    )
 }
 
 // =============================================================================
@@ -11571,7 +7696,7 @@ struct LogsQuery {
 /// event into the buffer so each entry carries the real structured message,
 /// target and level, with no host log daemon or elevated privileges required.
 ///
-/// Any other allowlisted binary (ghostd / ghost-pay / dashboard / SV2 stack) is
+/// Any other allowlisted binary (ghostd / dashboard / SV2 stack) is
 /// read from the systemd journal via `crate::journal`. The client sends only a
 /// LOGICAL key, which is resolved through a strict compile-time allowlist to a
 /// hard-coded unit string; `journalctl` is then exec'd with an explicit argv, so
@@ -12149,8 +8274,7 @@ async fn api_swarm_update_all_post_handler(
 /// Compared AFTER [`crate::journal::canonical_service`], so a dashboard still sending the
 /// pre-#1018 name is served rather than refused, and systemd is only ever asked for the
 /// current one.
-const WATCHDOG_ALLOWED_SERVICES: &[&str] =
-    &[crate::journal::NODE_SERVICE, "ghost-core", "ghost-pay"];
+const WATCHDOG_ALLOWED_SERVICES: &[&str] = &[crate::journal::NODE_SERVICE, "ghost-core"];
 
 /// Watchdog service control: start
 async fn api_watchdog_start_handler(
@@ -12220,192 +8344,6 @@ async fn watchdog_service_control(service: &str, action: &str) -> axum::response
         )
             .into_response(),
     }
-}
-
-/// GhostPay payout address body
-#[derive(Debug, Deserialize)]
-struct GhostPayAddressBody {
-    address: Option<String>,
-}
-
-/// API v1 Settings: Set GhostPay payout address (POST)
-///
-/// Persists the operator's GhostPay L2 payout address to the REAL config
-/// (`[ghost_pay] payout_address` in pool.toml) via `save_atomic`, so it survives
-/// a restart and is read by the L2 settlement path. A null/empty address clears
-/// the setting. Non-empty addresses are validated against the node's network
-/// prefix so a typo can't silently redirect L2 fee distributions.
-async fn api_settings_ghostpay_payout_address_post_handler(
-    State(state): State<Arc<VerificationState>>,
-    Json(body): Json<GhostPayAddressBody>,
-) -> impl IntoResponse {
-    // Normalise: trim and treat empty as "clear" (None).
-    let new_address: Option<String> = match body.address {
-        Some(ref a) if !a.trim().is_empty() => Some(a.trim().to_string()),
-        _ => None,
-    };
-
-    // Validate non-empty addresses against the node's network prefix.
-    if let Some(ref addr) = new_address {
-        if !validate_address_prefix(addr, state.network) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "success": false,
-                    "error": format!(
-                        "Invalid address prefix for {} network",
-                        state.network.as_str()
-                    ),
-                })),
-            )
-                .into_response();
-        }
-    }
-
-    // Persist to pool.toml. GhostPayConfig is optional; create a default when the
-    // operator sets an address before ghost-pay is otherwise configured.
-    let persist = persist_full_config(&state, |cfg| match cfg.ghost_pay {
-        Some(ref mut gp) => gp.payout_address = new_address.clone(),
-        None => {
-            cfg.ghost_pay = Some(ghost_common::config::GhostPayConfig {
-                payout_address: new_address.clone(),
-                ..Default::default()
-            });
-        }
-    });
-    if let Err((code, msg)) = persist {
-        error!(error = %msg, "Failed to persist GhostPay payout address");
-        return (
-            code,
-            Json(serde_json::json!({"success": false, "error": msg})),
-        )
-            .into_response();
-    }
-
-    Json(serde_json::json!({
-        "success": true,
-        "address": new_address,
-        "message": "GhostPay payout address saved."
-    }))
-    .into_response()
-}
-
-/// Mining toggle body
-#[derive(Debug, Deserialize)]
-struct MiningToggleBody {
-    enabled: Option<bool>,
-}
-
-/// API v1 Mining: Set private mining mode (POST)
-async fn api_mining_private_post_handler(
-    State(state): State<Arc<VerificationState>>,
-    Json(body): Json<MiningToggleBody>,
-) -> impl IntoResponse {
-    if let Some(enabled) = body.enabled {
-        let mut config = state.dashboard_config.write();
-        config.private_mining = Some(enabled);
-    }
-    // Return current mining status
-    api_mining_status_handler(State(state))
-        .await
-        .into_response()
-}
-
-/// API v1 Mining: Set public mining mode (POST)
-///
-/// Persists to the REAL config via [`apply_public_mining`] (toggles
-/// `network.mining_mode`), preserving the Ghost-Mode mutual exclusion and
-/// rejecting invalid mode transitions. Returns the refreshed mining status,
-/// which now reflects the persisted mode.
-async fn api_mining_public_post_handler(
-    State(state): State<Arc<VerificationState>>,
-    Json(body): Json<MiningToggleBody>,
-) -> impl IntoResponse {
-    if let Some(enabled) = body.enabled {
-        if let Err((code, body)) = apply_public_mining(&state, enabled) {
-            return (code, Json(body)).into_response();
-        }
-    }
-    api_mining_status_handler(State(state))
-        .await
-        .into_response()
-}
-
-/// Payout address body
-#[derive(Debug, Deserialize)]
-struct PayoutAddressBody {
-    address: String,
-}
-
-/// API v1 Mining: Set payout address (POST)
-///
-/// Persists the operator's node-reward payout address to the REAL config
-/// (`[pool] node_payout_address` in pool.toml) via `save_atomic`, then applies
-/// it live to the DB (`update_node_payout_address`) so node-reward payouts pick
-/// it up without a restart (startup also reloads it from config). Validates the
-/// address minimally against the node's network prefix.
-async fn api_mining_payout_address_post_handler(
-    State(state): State<Arc<VerificationState>>,
-    Json(body): Json<PayoutAddressBody>,
-) -> impl IntoResponse {
-    let address = body.address.trim().to_string();
-
-    // Minimal validation: reject empty and wrong-network prefixes so a typo
-    // can't silently redirect node rewards into an unspendable address.
-    if address.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"success": false, "error": "Payout address cannot be empty"})),
-        )
-            .into_response();
-    }
-    if !validate_address_prefix(&address, state.network) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "success": false,
-                "error": format!(
-                    "Invalid address prefix for {} network",
-                    state.network.as_str()
-                ),
-            })),
-        )
-            .into_response();
-    }
-
-    // Persist to pool.toml. Fail-closed if the full config isn't loaded.
-    if let Err((code, msg)) = persist_full_config(&state, |cfg| {
-        cfg.pool.node_payout_address = Some(address.clone());
-    }) {
-        error!(error = %msg, "Failed to persist node payout address");
-        return (
-            code,
-            Json(serde_json::json!({"success": false, "error": msg})),
-        )
-            .into_response();
-    }
-
-    // Apply live to the DB so node-reward payouts use the new address without a
-    // restart. A failure here is non-fatal: the config is already persisted, so
-    // the next startup reconciles the DB from it.
-    if let Some(ref db) = state.database {
-        if let Err(e) = db.update_node_payout_address(&state.node_id, &address) {
-            warn!(error = %e, "Persisted payout address but failed to apply to DB; a restart will reconcile it");
-        }
-    }
-
-    // Keep the mirror in sync for immediate in-session display.
-    {
-        let mut config = state.dashboard_config.write();
-        config.payout_address = Some(address.clone());
-    }
-
-    Json(serde_json::json!({
-        "success": true,
-        "address": address,
-        "message": "Node-reward payout address saved."
-    }))
-    .into_response()
 }
 
 /// Pool name body
@@ -12675,12 +8613,12 @@ async fn pool_nodes_handler(State(state): State<Arc<VerificationState>>) -> impl
         "this_node": {
             "miner_count": state.miner_count(),
             "max_capacity": state.max_capacity(),
-            // Deduped share attributed to this node; `this_node` + every peer's
-            // `deduped_miner_count` sum to the deduped `mesh_active_miners`.
-            "deduped_miner_count": state.self_deduped_miner_count(),
+            "deduped_miner_count": state.local_active_miners(),
             "core_healthy": core_healthy,
         },
-        "peers": state.pool_peers(),
+        // Always empty: the peers came from the old mesh, which was removed, so the
+        // translator's balancer keeps every miner on this node.
+        "peers": [],
     }))
 }
 
@@ -12789,29 +8727,6 @@ fn filtering_activity_json(
             "rejected_txs": total_rejected_txs,
         },
     })
-}
-
-/// Return the capability self-check snapshot (per-capability
-/// claimed/passed/reason) computed by the background loop in ghost-mining. The
-/// dashboard reads this to warn an operator when they have CLAIMED a capability
-/// (e.g. `public_mining`) whose prerequisite is missing (e.g. no stratum
-/// listening on port 3333), so they don't silently fail to earn its shares.
-/// Read-only: hands back the last snapshot; no probing happens in the request
-/// path. Returns `null` on older deploys where the provider isn't wired.
-async fn api_self_check_handler(State(state): State<Arc<VerificationState>>) -> impl IntoResponse {
-    Json(state.self_check())
-}
-
-/// Read-only decentralised-coordinator election view
-/// (`tasks/plan_decentralised_coordinators.md`). Returns
-/// `{enabled, epoch, tiers, coordinators, my_tiers, my_endpoint, beacon, roster, …}`
-/// when the operator has turned on `[coordinator] wraith_election_enabled`,
-/// else `{enabled:false}`.
-/// This endpoint activates nothing — it only reports the public election draw.
-async fn api_pool_coordinator_handler(
-    State(state): State<Arc<VerificationState>>,
-) -> impl IntoResponse {
-    Json(state.coordinator_status())
 }
 
 /// Detect whether the operator has installed the per-node mempool.space stack
@@ -13075,16 +8990,11 @@ mod tests {
     #[tokio::test]
     async fn swarm_update_all_handler_does_not_fabricate_success() {
         use axum::response::IntoResponse;
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
+
         use http_body_util::BodyExt;
 
-        let state = crate::server::VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            PolicyProfile::default(),
-            NodeCapabilities::default(),
-        );
+        let state =
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string());
 
         let resp = api_swarm_update_all_post_handler(
             axum::extract::State(std::sync::Arc::new(state)),
@@ -13122,15 +9032,12 @@ mod tests {
     #[tokio::test]
     async fn swarm_update_version_is_refused_by_design_not_unimplemented() {
         use axum::response::IntoResponse;
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
+
         use http_body_util::BodyExt;
 
         let state = std::sync::Arc::new(crate::server::VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            PolicyProfile::default(),
-            NodeCapabilities::default(),
         ));
         let resp = api_swarm_node_update_version_handler(
             axum::extract::State(state),
@@ -13164,8 +9071,7 @@ mod tests {
         use super::super::*;
         use axum::response::IntoResponse;
         use ed25519_dalek::{Signer, SigningKey};
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
+
         use http_body_util::BodyExt;
         use serde_json::json;
 
@@ -13186,17 +9092,13 @@ mod tests {
                 let dir = tempfile::tempdir().unwrap();
                 let path = dir.path().join("pool.toml");
                 std::fs::write(&path, include_str!("../../../config/mainnet.toml")).unwrap();
-                let mut state = crate::server::VerificationState::new(
-                    NODE.to_string(),
-                    "1.0.0".to_string(),
-                    PolicyProfile::default(),
-                    NodeCapabilities::default(),
-                )
-                .with_pool_config_path(path.clone())
-                .with_full_node_config(
-                    toml::from_str(include_str!("../../../config/mainnet.toml")).unwrap(),
-                    path.clone(),
-                );
+                let mut state =
+                    crate::server::VerificationState::new(NODE.to_string(), "1.0.0".to_string())
+                        .with_pool_config_path(path.clone())
+                        .with_full_node_config(
+                            toml::from_str(include_str!("../../../config/mainnet.toml")).unwrap(),
+                            path.clone(),
+                        );
                 state.fleet_auth = Arc::new(crate::fleet_auth::FleetAuth::new(
                     NODE.to_string(),
                     with_key.then(|| operator().verifying_key().to_bytes()),
@@ -13469,15 +9371,12 @@ mod tests {
     #[tokio::test]
     async fn swarm_refresh_serves_live_status_for_this_node_only() {
         use axum::response::IntoResponse;
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
+
         use http_body_util::BodyExt;
 
         let state = std::sync::Arc::new(crate::server::VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            PolicyProfile::default(),
-            NodeCapabilities::default(),
         ));
 
         // Addressed to this node: a real status body, not a 501.
@@ -13590,48 +9489,6 @@ mod tests {
         assert!(estimated_time_to_block_secs(0.0, 1e12).is_none());
         assert!(estimated_time_to_block_secs(-1.0, 1e12).is_none());
         assert!(estimated_time_to_block_secs(f64::NAN, 1e12).is_none());
-    }
-
-    #[test]
-    fn test_resolve_mpc_note_spend_path_serves_candidate_then_current() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path();
-        let current = base.join("note_spend_params_current.bin");
-        std::fs::write(&current, b"applied-head").unwrap();
-
-        let new_hash = [0xABu8; 32];
-        let candidate = base.join(ghost_common::mpc::candidate_note_spend_filename(&new_hash));
-        let hash_hex = hex::encode(new_hash);
-
-        // No hash → always the applied current head.
-        assert_eq!(resolve_mpc_note_spend_path(base, None), current);
-        assert_eq!(resolve_mpc_note_spend_path(base, Some("")), current);
-
-        // A by-hash request BEFORE the candidate exists falls back to current
-        // (never a 404 that would break the applied-params refresh path).
-        assert_eq!(resolve_mpc_note_spend_path(base, Some(&hash_hex)), current);
-
-        // Once the contributor has written the candidate, the by-hash request
-        // resolves to the candidate — while a bare request still serves current.
-        std::fs::write(&candidate, b"un-applied-candidate").unwrap();
-        assert_eq!(
-            resolve_mpc_note_spend_path(base, Some(&hash_hex)),
-            candidate
-        );
-        assert_eq!(resolve_mpc_note_spend_path(base, None), current);
-
-        // A request for a DIFFERENT candidate hash (none on disk) → current.
-        let other = hex::encode([0x01u8; 32]);
-        assert_eq!(resolve_mpc_note_spend_path(base, Some(&other)), current);
-
-        // Malformed / traversal attempts can never escape the params dir.
-        for bad in ["../../etc/passwd", "zz", "not-hex", "%2e%2e", "ab/cd"] {
-            assert_eq!(
-                resolve_mpc_note_spend_path(base, Some(bad)),
-                current,
-                "malformed new_hash {bad:?} must fall back to current"
-            );
-        }
     }
 
     #[test]
@@ -13785,52 +9642,6 @@ mod tests {
         assert_eq!(internal_hex_to_display_hex("not-hex"), "not-hex");
     }
 
-    #[test]
-    fn test_archive_query() {
-        let query = ArchiveQuery {
-            block: Some("abc123".to_string()),
-            tx: None,
-            min_height: Some(100),
-            nonce: None,
-            unsigned: None,
-        };
-
-        assert!(query.block.is_some());
-        assert!(query.tx.is_none());
-    }
-
-    #[test]
-    fn test_archive_query_defaults_to_signed() {
-        // Default behavior: signing is enabled (unsigned is None or false)
-        let query = ArchiveQuery {
-            block: Some("abc123".to_string()),
-            tx: None,
-            min_height: Some(100),
-            nonce: Some("deadbeef".to_string()),
-            unsigned: None,
-        };
-
-        // Should sign by default (unsigned is false when None)
-        let should_sign = !query.unsigned.unwrap_or(false);
-        assert!(should_sign);
-        assert_eq!(query.nonce, Some("deadbeef".to_string()));
-    }
-
-    #[test]
-    fn test_archive_query_explicit_unsigned() {
-        // Explicitly disable signing
-        let query = ArchiveQuery {
-            block: Some("abc123".to_string()),
-            tx: None,
-            min_height: Some(100),
-            nonce: None,
-            unsigned: Some(true),
-        };
-
-        let should_sign = !query.unsigned.unwrap_or(false);
-        assert!(!should_sign);
-    }
-
     // ===========================================================================
     // CRIT-6: Config POST Authentication Tests
     // ===========================================================================
@@ -13849,251 +9660,18 @@ mod tests {
         secret
     }
 
-    /// A node whose own endpoint is listed SECOND, after another node's.
-    fn coordinator_state(
-        my_endpoint: Option<&'static str>,
-    ) -> Arc<crate::server::VerificationState> {
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
-
-        let state = crate::server::VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            PolicyProfile::default(),
-            NodeCapabilities::default(),
-        )
-        .with_coordinator_status(move || {
-            serde_json::json!({
-                "enabled": true,
-                "epoch": 6709,
-                "my_endpoint": my_endpoint,
-                "my_tiers": if my_endpoint.is_some() { vec!["100m_sats"] } else { vec![] },
-                "coordinators": [
-                    { "node_id": "aa", "endpoint": "10.0.0.1:9100", "leads": ["100k_sats"] },
-                    { "node_id": "bb", "endpoint": "10.0.0.2:9100", "leads": ["100m_sats"] },
-                ],
-            })
-        });
-        Arc::new(state)
-    }
-
-    /// #1014: a node with GhostPay disabled in its config reported `ghost_pay: true` and counted
-    /// the +4, so the fleet's dashboards said 10 shares on nodes ratified at 6.
-    #[tokio::test]
-    async fn node_shares_counts_ghostpay_only_when_the_node_config_enables_it() {
-        use ghost_common::config::NodeConfig as FullNodeConfig;
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
-
-        async fn shares(cfg: FullNodeConfig) -> serde_json::Value {
-            let state = Arc::new(
-                crate::server::VerificationState::new(
-                    "test_node".to_string(),
-                    "1.0.0".to_string(),
-                    PolicyProfile::default(),
-                    NodeCapabilities::default(),
-                )
-                .with_full_node_config(cfg, std::path::PathBuf::from("/nonexistent/pool.toml")),
-            );
-            let resp = api_node_shares_handler(axum::extract::State(state))
-                .await
-                .into_response();
-            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .expect("body");
-            serde_json::from_slice(&body).expect("json")
-        }
-
-        // What every fleet node carries: a `[ghost_pay]` block that is present and disabled.
-        let disabled = FullNodeConfig {
-            ghost_pay: Some(ghost_common::config::GhostPayConfig {
-                enabled: false,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let off = shares(disabled).await;
-        assert_eq!(off["ghost_pay"], false);
-
-        let enabled = FullNodeConfig {
-            ghost_pay: Some(ghost_common::config::GhostPayConfig {
-                enabled: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let on = shares(enabled).await;
-        assert_eq!(on["ghost_pay"], true);
-
-        // The +4 is the whole difference between the two, so it is counted exactly when claimed.
-        let total = |v: &serde_json::Value| v["total"].as_i64().expect("total");
-        assert_eq!(total(&on) - total(&off), 4, "off={off} on={on}");
-    }
-
-    /// #1002: the scoped-set derivation is seconds of synchronous database work, so it must not
-    /// run on the thread that is serving requests. On a current-thread runtime that thread is
-    /// this test's, which makes "ran somewhere else" directly observable.
-    #[tokio::test]
-    async fn the_scoped_set_derivation_runs_off_the_async_worker() {
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
-        use ghost_storage::queries::PayoutLedgerCheckpointRecord;
-
-        let db = ghost_storage::Database::in_memory().expect("db");
-        db.upsert_payout_ledger_checkpoint(&PayoutLedgerCheckpointRecord {
-            height: 970_500,
-            cutoff_ts: 1_760_000_000,
-            ledger_root: [7u8; 32],
-            proposer_id: "aa".repeat(32),
-            active_node_count: 8,
-            miner_payouts: Vec::new(),
-            node_shares: Vec::new(),
-        })
-        .expect("checkpoint");
-
-        let ran_on = Arc::new(parking_lot::Mutex::new(None));
-        let seen = Arc::clone(&ran_on);
-        let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_database(db)
-            .with_fee_split_fn(Arc::new(move |cutoff, height| {
-                *seen.lock() = Some(std::thread::current().id());
-                Some(format!("{cutoff}:{height}"))
-            })),
-        );
-
-        let resp = api_qualification_scoped_set_handler(axum::extract::State(state))
-            .await
-            .into_response();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("body");
-        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
-
-        // The report is the real one, derived from the checkpoint that was stored.
-        assert_eq!(json["checkpoint_height"], 970_500);
-        assert_eq!(json["fee_split"]["hash"], "1760000000:970500");
-        assert_eq!(json["unscoped"]["count"], 0);
-
-        let ran_on = ran_on
-            .lock()
-            .expect("the derivation never reached the fee-split closure");
-        assert_ne!(
-            ran_on,
-            std::thread::current().id(),
-            "the derivation ran on the async worker"
-        );
-    }
-
-    /// A node must attest to ITS OWN endpoint.
-    ///
-    /// Reporting the first coordinator in the list, or any other node's, would
-    /// have the challenger probe somebody else's coordinator and credit this
-    /// node for it — a capability that passes by pointing at a working
-    /// neighbour.
-    #[tokio::test]
-    async fn the_attestation_names_this_nodes_own_endpoint() {
-        let state = coordinator_state(Some("10.0.0.2:9100"));
-        let resp = coordinator_verify_handler(
-            axum::extract::State(state),
-            axum::extract::Query(CoordinatorVerifyQuery {
-                nonce: None,
-                unsigned: Some(true),
-            }),
-        )
-        .await
-        .into_response();
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("body");
-        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
-        assert_eq!(v["signed"], false, "unsigned was explicitly requested");
-        assert_eq!(v["response"]["serving"], true);
-        assert_eq!(
-            v["response"]["advertised_endpoint"], "10.0.0.2:9100",
-            "10.0.0.1 is listed first and belongs to another node"
-        );
-        assert_eq!(v["response"]["my_tiers"], serde_json::json!(["100m_sats"]));
-        assert_eq!(v["response"]["epoch"], 6709);
-    }
-
-    /// A node that is not serving advertises no endpoint. Returning one anyway
-    /// would invite the challenger to probe a coordinator this node does not run.
-    #[tokio::test]
-    async fn a_node_not_serving_advertises_nothing_to_probe() {
-        let state = coordinator_state(None);
-        let resp = coordinator_verify_handler(
-            axum::extract::State(state),
-            axum::extract::Query(CoordinatorVerifyQuery {
-                nonce: None,
-                unsigned: Some(true),
-            }),
-        )
-        .await
-        .into_response();
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("body");
-        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
-        assert!(v["response"]["advertised_endpoint"].is_null());
-        assert_eq!(v["response"]["serving"], false);
-    }
-
-    /// With nothing wired the node says so, rather than defaulting to a claim.
-    #[tokio::test]
-    async fn a_node_with_no_coordinator_wired_attests_disabled() {
-        let state = create_test_state_with_auth();
-        let resp = coordinator_verify_handler(
-            axum::extract::State(state),
-            axum::extract::Query(CoordinatorVerifyQuery {
-                nonce: None,
-                unsigned: Some(true),
-            }),
-        )
-        .await
-        .into_response();
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("body");
-        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
-        assert_eq!(v["response"]["enabled"], false);
-    }
-
     fn create_test_state_with_auth() -> Arc<crate::server::VerificationState> {
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
-
         let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
-        let state = crate::server::VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            PolicyProfile::default(),
-            NodeCapabilities::default(),
-        )
-        .with_internal_auth(auth);
+        let state =
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_internal_auth(auth);
 
         Arc::new(state)
     }
 
     fn create_test_state_without_auth() -> Arc<crate::server::VerificationState> {
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
-
-        let mut state = crate::server::VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            PolicyProfile::default(),
-            NodeCapabilities::default(),
-        );
+        let mut state =
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string());
 
         // Set require_internal_auth to false so we can test the reject-all fallback
         state.require_internal_auth = false;
@@ -14128,8 +9706,6 @@ mod tests {
     #[tokio::test]
     async fn test_status_reports_configured_network() {
         use ghost_common::config::BitcoinNetwork;
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
 
         async fn network_field(state: Arc<crate::server::VerificationState>) -> String {
             let app = super::create_router(state);
@@ -14153,13 +9729,8 @@ mod tests {
 
         let make_state = |network| {
             Arc::new(
-                crate::server::VerificationState::new(
-                    "test_node".to_string(),
-                    "1.0.0".to_string(),
-                    PolicyProfile::default(),
-                    NodeCapabilities::default(),
-                )
-                .with_network(network),
+                crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                    .with_network(network),
             )
         };
 
@@ -14177,92 +9748,8 @@ mod tests {
         let default_state = Arc::new(crate::server::VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            PolicyProfile::default(),
-            NodeCapabilities::default(),
         ));
         assert_eq!(network_field(default_state).await, "signet");
-    }
-
-    /// Regression: the ghostpay status endpoint's `wraith_enabled` must reflect
-    /// the operator's `[ghost_pay] wraith_enabled` config choice, not ghost-pay's
-    /// internal "hosts CoinJoin sessions" flag (always false since mixing moved
-    /// to wraith-coordinator). Nodes with wraith_enabled = true were reporting
-    /// false, so the dashboard L2 card showed Wraith "Not enabled" when it was.
-    #[tokio::test]
-    async fn test_ghostpay_status_reports_configured_wraith() {
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
-
-        async fn wraith_field(state: Arc<crate::server::VerificationState>) -> serde_json::Value {
-            let app = super::create_router(state);
-            let response = app
-                .oneshot(
-                    Request::builder()
-                        .method("GET")
-                        .uri("/api/v1/ghostpay/status")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let bytes = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
-                .await
-                .unwrap();
-            serde_json::from_slice(&bytes).unwrap()
-        }
-
-        let make_state = |wraith_enabled| {
-            let state = crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_wraith_enabled(wraith_enabled);
-            // Force the fast in-process path (no ghostpay handler wired in tests)
-            // so the handler does not fall through to the 8800 network probe.
-            state.dashboard_config.write().ghost_pay = false;
-            Arc::new(state)
-        };
-
-        // Operator enabled Wraith → status must report true.
-        let enabled = wraith_field(make_state(true)).await;
-        assert_eq!(
-            enabled["wraith_enabled"].as_bool(),
-            Some(true),
-            "config wraith_enabled = true must surface as wraith_enabled: true"
-        );
-        // The internal host-mixing signal stays distinct and false.
-        assert_eq!(
-            enabled["ghostpay_hosts_mixing"].as_bool(),
-            Some(false),
-            "ghost-pay no longer hosts mixing; host flag must stay false"
-        );
-
-        // Operator disabled Wraith → status must report false.
-        let disabled = wraith_field(make_state(false)).await;
-        assert_eq!(
-            disabled["wraith_enabled"].as_bool(),
-            Some(false),
-            "config wraith_enabled = false must surface as wraith_enabled: false"
-        );
-
-        // Default (no with_wraith_enabled) preserves the historical off value.
-        let default_state = {
-            let state = crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            );
-            state.dashboard_config.write().ghost_pay = false;
-            Arc::new(state)
-        };
-        assert_eq!(
-            wraith_field(default_state).await["wraith_enabled"].as_bool(),
-            Some(false)
-        );
     }
 
     /// The reaper config POST must auto-apply the ghostd mempool reaper: it
@@ -14276,8 +9763,6 @@ mod tests {
     #[serial]
     async fn test_config_reaper_post_auto_applies_ghostd() {
         use ghost_common::config::NodeConfig as FullNodeConfig;
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
 
         // Poll the shared apply record until it leaves the "applying" state.
         async fn settle(state: &Arc<crate::server::VerificationState>) -> String {
@@ -14332,14 +9817,9 @@ mod tests {
             let path = dir.path().join("pool.toml");
             let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
             let state = Arc::new(
-                crate::server::VerificationState::new(
-                    "test_node".to_string(),
-                    "1.0.0".to_string(),
-                    PolicyProfile::default(),
-                    NodeCapabilities::default(),
-                )
-                .with_internal_auth(auth.clone())
-                .with_full_node_config(FullNodeConfig::default(), path.clone()),
+                crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                    .with_internal_auth(auth.clone())
+                    .with_full_node_config(FullNodeConfig::default(), path.clone()),
             );
             // Keep `dir` alive for the state's lifetime by leaking it (test-only).
             std::mem::forget(dir);
@@ -14389,13 +9869,8 @@ mod tests {
         // --- Not persisted: no config path → skipped, no restart, no ghostd. ---
         let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
         let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth.clone()),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_internal_auth(auth.clone()),
         );
         let resp = post_reaper(Arc::clone(&state), auth, true).await;
         assert_eq!(resp["persisted"].as_bool(), Some(false));
@@ -14443,8 +9918,6 @@ mod tests {
     #[serial]
     async fn test_config_post_with_valid_auth_succeeds() {
         use ghost_common::config::NodeConfig as FullNodeConfig;
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
 
         // The archive_mode POST persists to pool.toml + regenerates the ghostd
         // drop-in, so it fail-closes without a loaded config. Provide one (and the
@@ -14454,14 +9927,9 @@ mod tests {
         let path = dir.path().join("pool.toml");
         let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
         let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth.clone())
-            .with_full_node_config(FullNodeConfig::default(), path.clone()),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_internal_auth(auth.clone())
+                .with_full_node_config(FullNodeConfig::default(), path.clone()),
         );
         let app = super::create_router(state);
 
@@ -14494,76 +9962,6 @@ mod tests {
         std::env::remove_var("GHOST_REAPER_APPLY_TEST_MODE");
     }
 
-    /// The wraith toggle POST must persist `[ghost_pay] wraith_enabled` to the
-    /// node config on disk so the operator's choice survives a restart. Mirrors
-    /// the reaper toggle's persistence path.
-    #[tokio::test]
-    async fn test_config_wraith_post_persists_to_node_config() {
-        use ghost_common::config::NodeConfig as FullNodeConfig;
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pool.toml");
-
-        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
-        let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth.clone())
-            .with_full_node_config(FullNodeConfig::default(), path.clone()),
-        );
-
-        let post_wraith = |enabled: bool| {
-            let app = super::create_router(Arc::clone(&state));
-            let auth = auth.clone();
-            async move {
-                let body = format!(r#"{{"enabled": {enabled}}}"#);
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                let signature = auth.sign(timestamp, body.as_bytes());
-                let response = app
-                    .oneshot(
-                        Request::builder()
-                            .method("POST")
-                            .uri("/api/v1/config/wraith")
-                            .header("Content-Type", "application/json")
-                            .header("X-Ghost-Signature", signature)
-                            .header("X-Ghost-Timestamp", timestamp.to_string())
-                            .body(Body::from(body))
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(response.status(), StatusCode::OK);
-                let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-                    .await
-                    .unwrap();
-                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
-            }
-        };
-
-        // Disable → persisted to disk and reflected in the loaded config.
-        let off = post_wraith(false).await;
-        assert_eq!(off["persisted"].as_bool(), Some(true));
-        assert_eq!(off["enabled"].as_bool(), Some(false));
-        let reloaded = FullNodeConfig::load(&path).unwrap();
-        assert!(!reloaded.wraith_enabled(), "disable must persist to disk");
-
-        // Re-enable → persisted true.
-        let on = post_wraith(true).await;
-        assert_eq!(on["persisted"].as_bool(), Some(true));
-        assert_eq!(on["enabled"].as_bool(), Some(true));
-        let reloaded = FullNodeConfig::load(&path).unwrap();
-        assert!(reloaded.wraith_enabled(), "enable must persist to disk");
-    }
-
     /// The policy_profile POST is the real lever for mined BUDS tiers: without
     /// HMAC it must 401, and with a valid signature it must persist
     /// `[policy].profile` to pool.toml and request a graceful restart.
@@ -14572,22 +9970,15 @@ mod tests {
     async fn test_config_policy_profile_post_persists_and_restarts() {
         use ghost_common::config::NodeConfig as FullNodeConfig;
         use ghost_common::config::PolicyProfile as CfgProfile;
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.toml");
 
         let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
         let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth.clone())
-            .with_full_node_config(FullNodeConfig::default(), path.clone()),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_internal_auth(auth.clone())
+                .with_full_node_config(FullNodeConfig::default(), path.clone()),
         );
 
         // Without auth → 401.
@@ -14681,22 +10072,15 @@ mod tests {
     async fn test_config_block_priority_post_persists_and_restarts() {
         use ghost_common::config::BlockPriority;
         use ghost_common::config::NodeConfig as FullNodeConfig;
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.toml");
 
         let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
         let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth.clone())
-            .with_full_node_config(FullNodeConfig::default(), path.clone()),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_internal_auth(auth.clone())
+                .with_full_node_config(FullNodeConfig::default(), path.clone()),
         );
 
         // Default is MaxFee before any write.
@@ -14797,22 +10181,15 @@ mod tests {
     async fn test_config_policy_custom_post_persists_and_restarts() {
         use ghost_common::config::NodeConfig as FullNodeConfig;
         use ghost_common::config::{BudsTier, PolicyProfile as CfgProfile};
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.toml");
 
         let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
         let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth.clone())
-            .with_full_node_config(FullNodeConfig::default(), path.clone()),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_internal_auth(auth.clone())
+                .with_full_node_config(FullNodeConfig::default(), path.clone()),
         );
 
         // A representative custom body: T0+T1 only, all data off, tight limits.
@@ -14935,8 +10312,6 @@ mod tests {
     async fn test_config_full_surfaces_policy() {
         use ghost_common::config::NodeConfig as FullNodeConfig;
         use ghost_common::config::{BudsTier, CustomPolicyConfig, PolicyProfile as CfgProfile};
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.toml");
@@ -14956,14 +10331,9 @@ mod tests {
         });
 
         let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_full_node_config(cfg, path.clone())
-            .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap()),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_full_node_config(cfg, path.clone())
+                .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap()),
         );
 
         // `/api/v1/config/full` carries the operator's payout addresses, so it is served from
@@ -15003,38 +10373,23 @@ mod tests {
     /// persisted config (pool.toml), not the ephemeral dashboard mirror.
     #[tokio::test]
     async fn test_config_full_reads_real_config() {
-        use ghost_common::config::{MiningMode, NodeConfig as FullNodeConfig};
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
+        use ghost_common::config::NodeConfig as FullNodeConfig;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.toml");
 
         let mut cfg = FullNodeConfig::default();
-        cfg.pool.node_payout_address = Some("tb1qexamplepayoutaddr".to_string());
         cfg.pool.pool_name = Some("SatoshiPool".to_string());
         cfg.storage.archive_mode = true;
         cfg.storage.prune_height = 5000;
-        cfg.network.mining_mode = MiningMode::PublicPool;
-        cfg.ghost_pay = Some(ghost_common::config::GhostPayConfig {
-            payout_address: Some("tb1qghostpayaddr".to_string()),
-            ..Default::default()
-        });
 
         let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_full_node_config(cfg, path.clone())
-            .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap()),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_full_node_config(cfg, path.clone())
+                .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap()),
         );
 
-        // This test asserts the response carries `node_payout_address` and the Ghost Pay
-        // payout address — which is precisely why the route is no longer public. Sign the
-        // read the way the dashboard proxy does.
+        // The route is internal; sign the read the way the dashboard proxy does.
         let (signature, timestamp) = operator_get_signature();
         let response = super::create_router(Arc::clone(&state))
             .oneshot(
@@ -15053,18 +10408,8 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            json["payout"]["address"].as_str(),
-            Some("tb1qexamplepayoutaddr")
-        );
-        // GhostPay payout address now surfaces from the real config (Group C).
-        assert_eq!(
-            json["payout"]["ghostpay_address"].as_str(),
-            Some("tb1qghostpayaddr")
-        );
         assert_eq!(json["pool_name"].as_str(), Some("SatoshiPool"));
         assert_eq!(json["archive_mode"].as_bool(), Some(true));
-        assert_eq!(json["public_mining"].as_bool(), Some(true));
         // VW/OW/AW model: OW = prune_height, VW = the read-only floor, AW mirrors
         // archive_mode. The old `prune_profile`/`operator_window` fakes are gone.
         assert_eq!(json["pruning"]["ow_blocks"].as_u64(), Some(5000));
@@ -15083,21 +10428,14 @@ mod tests {
     #[tokio::test]
     async fn test_pool_name_post_persists_and_restarts() {
         use ghost_common::config::NodeConfig as FullNodeConfig;
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.toml");
         let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
         let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth.clone())
-            .with_full_node_config(FullNodeConfig::default(), path.clone()),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_internal_auth(auth.clone())
+                .with_full_node_config(FullNodeConfig::default(), path.clone()),
         );
 
         let body = r#"{"name": "SatoshiPool"}"#;
@@ -15132,190 +10470,19 @@ mod tests {
         assert!(state.restart_requested());
     }
 
-    /// Group B: Mining payout POST persists `[pool] node_payout_address` and
-    /// rejects a wrong-network address prefix.
-    #[tokio::test]
-    async fn test_payout_address_post_persists_and_validates() {
-        use ghost_common::config::NodeConfig as FullNodeConfig;
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pool.toml");
-        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
-        // Default network is Signet, so a `bc1` (mainnet) address must be rejected
-        // and a `tb1` address accepted.
-        let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth.clone())
-            .with_full_node_config(FullNodeConfig::default(), path.clone()),
-        );
-
-        let post = |body: &'static str| {
-            let state = Arc::clone(&state);
-            let auth = auth.clone();
-            async move {
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                let signature = auth.sign(timestamp, body.as_bytes());
-                super::create_router(state)
-                    .oneshot(
-                        Request::builder()
-                            .method("POST")
-                            .uri("/api/v1/mining/payout_address")
-                            .header("Content-Type", "application/json")
-                            .header("X-Ghost-Signature", signature)
-                            .header("X-Ghost-Timestamp", timestamp.to_string())
-                            .body(Body::from(body))
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap()
-            }
-        };
-
-        // Wrong-network prefix → 400, nothing persisted.
-        let bad = post(r#"{"address": "bc1qmainnetaddress"}"#).await;
-        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
-
-        // Correct signet prefix → 200 and persisted to disk.
-        let good = post(r#"{"address": "tb1qsignetpayoutaddress"}"#).await;
-        assert_eq!(good.status(), StatusCode::OK);
-        let reloaded = FullNodeConfig::load(&path).unwrap();
-        assert_eq!(
-            reloaded.pool.node_payout_address.as_deref(),
-            Some("tb1qsignetpayoutaddress")
-        );
-    }
-
-    /// Group C: GhostPay payout POST persists `[ghost_pay] payout_address`,
-    /// rejects a wrong-network prefix, and the dedicated GET reads it back.
-    #[tokio::test]
-    async fn test_ghostpay_payout_address_post_persists_and_reads_back() {
-        use ghost_common::config::NodeConfig as FullNodeConfig;
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pool.toml");
-        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
-        let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth.clone())
-            .with_full_node_config(FullNodeConfig::default(), path.clone()),
-        );
-
-        let post = |body: &'static str| {
-            let state = Arc::clone(&state);
-            let auth = auth.clone();
-            async move {
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                let signature = auth.sign(timestamp, body.as_bytes());
-                super::create_router(state)
-                    .oneshot(
-                        Request::builder()
-                            .method("POST")
-                            .uri("/api/v1/settings/ghostpay_payout_address")
-                            .header("Content-Type", "application/json")
-                            .header("X-Ghost-Signature", signature)
-                            .header("X-Ghost-Timestamp", timestamp.to_string())
-                            .body(Body::from(body))
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap()
-            }
-        };
-
-        // Wrong-network (mainnet) prefix on a Signet node → 400, nothing persisted
-        // (the config is unchanged; no file is written on the rejected path).
-        let bad = post(r#"{"address": "bc1qmainnetaddress"}"#).await;
-        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
-        assert!(state
-            .full_node_config
-            .as_ref()
-            .unwrap()
-            .read()
-            .ghost_pay
-            .as_ref()
-            .and_then(|gp| gp.payout_address.as_ref())
-            .is_none());
-
-        // Correct signet prefix → 200 and persisted to disk (ghost_pay created).
-        let good = post(r#"{"address": "tb1qsignetghostpayaddr"}"#).await;
-        assert_eq!(good.status(), StatusCode::OK);
-        let reloaded = FullNodeConfig::load(&path).unwrap();
-        assert_eq!(
-            reloaded
-                .ghost_pay
-                .as_ref()
-                .and_then(|gp| gp.payout_address.as_deref()),
-            Some("tb1qsignetghostpayaddr")
-        );
-
-        // The dedicated GET reads the persisted value back (not a hardcoded null).
-        let get_resp = super::create_router(Arc::clone(&state))
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/api/v1/settings/ghostpay_payout_address")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(get_resp.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(get_resp.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["address"].as_str(), Some("tb1qsignetghostpayaddr"));
-
-        // Clearing with an empty address resets the field to None.
-        let cleared = post(r#"{"address": ""}"#).await;
-        assert_eq!(cleared.status(), StatusCode::OK);
-        assert!(FullNodeConfig::load(&path)
-            .unwrap()
-            .ghost_pay
-            .and_then(|gp| gp.payout_address)
-            .is_none());
-    }
-
     /// Group C: Operator Window POST persists `storage.prune_height` and clamps a
     /// non-zero depth up to the Validator Window floor (0 = keep all is allowed).
     #[tokio::test]
     async fn test_operator_window_post_persists_and_clamps() {
         use ghost_common::config::{NodeConfig as FullNodeConfig, VALIDATOR_WINDOW_BLOCKS};
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.toml");
         let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
         let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth.clone())
-            .with_full_node_config(FullNodeConfig::default(), path.clone()),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_internal_auth(auth.clone())
+                .with_full_node_config(FullNodeConfig::default(), path.clone()),
         );
 
         let post = |body: &'static str| {
@@ -15370,195 +10537,6 @@ mod tests {
         assert_eq!(FullNodeConfig::load(&path).unwrap().storage.prune_height, 0);
     }
 
-    /// Group B: Public Mining POST must NOT persist an invalid mode transition
-    /// (switching to a private mode with no password would brick startup).
-    #[tokio::test]
-    async fn test_public_mining_invalid_transition_rejected() {
-        use ghost_common::config::{MiningMode, NodeConfig as FullNodeConfig};
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pool.toml");
-        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
-        // Default mining_mode is PublicPool; disabling it targets PrivatePool,
-        // which has no password → the resulting config is invalid.
-        let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth.clone())
-            .with_full_node_config(FullNodeConfig::default(), path.clone()),
-        );
-
-        let body = r#"{"enabled": false}"#;
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let signature = auth.sign(timestamp, body.as_bytes());
-        let response = super::create_router(Arc::clone(&state))
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/config/public_mining")
-                    .header("Content-Type", "application/json")
-                    .header("X-Ghost-Signature", signature)
-                    .header("X-Ghost-Timestamp", timestamp.to_string())
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        // Mode unchanged in memory, no restart requested, nothing written.
-        assert!(matches!(
-            state
-                .full_node_config
-                .as_ref()
-                .unwrap()
-                .read()
-                .network
-                .mining_mode,
-            MiningMode::PublicPool
-        ));
-        assert!(!state.restart_requested());
-        assert!(
-            !path.exists(),
-            "an invalid transition must not write pool.toml"
-        );
-    }
-
-    /// Group B: Public Mining POST preserves the Ghost-Mode mutual exclusion.
-    #[tokio::test]
-    async fn test_public_mining_ghost_mode_conflict_409() {
-        use ghost_common::config::NodeConfig as FullNodeConfig;
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pool.toml");
-        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
-        let mut cfg = FullNodeConfig::default();
-        cfg.network.ghost_mode = true;
-        let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth.clone())
-            .with_full_node_config(cfg, path.clone()),
-        );
-
-        let body = r#"{"enabled": true}"#;
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let signature = auth.sign(timestamp, body.as_bytes());
-        let response = super::create_router(Arc::clone(&state))
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/config/public_mining")
-                    .header("Content-Type", "application/json")
-                    .header("X-Ghost-Signature", signature)
-                    .header("X-Ghost-Timestamp", timestamp.to_string())
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-    }
-
-    /// Group E: Elder GET reports the REAL mesh-assigned status from the
-    /// verified capability set and is flagged read-only.
-    #[tokio::test]
-    async fn test_elder_get_read_only_from_capabilities() {
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
-
-        let caps = NodeCapabilities {
-            elder_status: true,
-            ..Default::default()
-        };
-        let state = Arc::new(crate::server::VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            PolicyProfile::default(),
-            caps,
-        ));
-
-        let response = super::create_router(Arc::clone(&state))
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/api/v1/config/elder")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["enabled"].as_bool(), Some(true));
-        assert_eq!(json["read_only"].as_bool(), Some(true));
-    }
-
-    /// Group E: Elder POST is neutered — even with valid auth it must NOT
-    /// mutate state and returns 403 (elder is mesh-assigned, not operator-set).
-    #[tokio::test]
-    async fn test_elder_post_neutered() {
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
-
-        let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
-        let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth.clone()),
-        );
-
-        let body = r#"{"enabled": true, "slot": 1}"#;
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let signature = auth.sign(timestamp, body.as_bytes());
-        let response = super::create_router(Arc::clone(&state))
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/config/elder")
-                    .header("Content-Type", "application/json")
-                    .header("X-Ghost-Signature", signature)
-                    .header("X-Ghost-Timestamp", timestamp.to_string())
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["code"].as_str(), Some("ELDER_READ_ONLY"));
-    }
-
     /// CRIT-6: Test that all config POST endpoints require auth
     #[tokio::test]
     async fn test_all_config_post_endpoints_require_auth() {
@@ -15571,11 +10549,7 @@ mod tests {
             "/api/v1/config/ghost_mode_local_egress",
             "/api/v1/config/policy_profile",
             "/api/v1/config/policy_custom",
-            "/api/v1/config/public_mining",
             "/api/v1/config/reaper",
-            "/api/v1/config/ghost_pay",
-            "/api/v1/config/wraith",
-            "/api/v1/config/elder",
             "/api/v1/config/operator_window",
         ];
 
@@ -15588,7 +10562,6 @@ mod tests {
                     r#"{"allow_t0": true, "allow_t1": true, "allow_t2": false, "allow_t3": false, "allow_inscriptions": false, "allow_runes": false, "allow_brc20": false, "max_op_return_size": 40, "max_witness_per_input": 500, "max_tx_outputs": 8, "max_tx_size": 90000, "min_fee_rate": 1.0}"#
                 }
                 "/api/v1/config/operator_window" => r#"{"blocks": 2016}"#,
-                "/api/v1/config/elder" => r#"{"enabled": true, "slot": 1}"#,
                 _ => r#"{"enabled": true}"#,
             };
 
@@ -15625,23 +10598,17 @@ mod tests {
         Arc<crate::server::VerificationState>,
         Arc<std::sync::atomic::AtomicUsize>,
     ) {
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let recorded = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&recorded);
-        let state = crate::server::VerificationState::new(
-            "test_node".to_string(),
-            "1.0.0".to_string(),
-            PolicyProfile::default(),
-            NodeCapabilities::default(),
-        )
-        .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap())
-        .with_share_recorder(move |_| {
-            counter.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        });
+        let state =
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap())
+                .with_share_recorder(move |_| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                });
         (Arc::new(state), recorded)
     }
 
@@ -15819,20 +10786,13 @@ mod tests {
     async fn the_singular_lane_answers_4xx_for_a_share_it_refuses() {
         use bitcoin::hashes::{sha256d, Hash};
         use ghost_accounting::DifficultyCalculator;
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
 
         let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap())
-            .with_share_recorder(|_| Ok(()))
-            .with_callbacks(|| 960_000, || 1, || 1, || 1)
-            .with_share_pow_verify_height(959_030),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap())
+                .with_share_recorder(|_| Ok(()))
+                .with_callbacks(|| 960_000, || 1, || 1)
+                .with_share_pow_verify_height(959_030),
         );
 
         let header = [0u8; 80];
@@ -15899,13 +10859,8 @@ mod tests {
 
         // A genuine node fault is still 5xx: no recorder wired at all.
         let broken = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap()),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_internal_auth(crate::auth::InternalAuth::new(&test_secret()).unwrap()),
         );
         assert_eq!(
             post(&broken, 1024.0, &"ef".repeat(32), None).await,
@@ -15923,14 +10878,9 @@ mod tests {
     /// fallback cannot be reintroduced by a refactor that never touches startup.)
     #[tokio::test]
     async fn share_ingest_fails_closed_when_no_secret_is_configured() {
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
-
         let state = Arc::new(crate::server::VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            PolicyProfile::default(),
-            NodeCapabilities::default(),
         ));
         assert!(
             state.require_internal_auth,
@@ -15993,10 +10943,6 @@ mod tests {
         let locked_endpoints = [
             "/shares",
             "/rounds",
-            "/payouts",
-            "/api/v1/payments",
-            "/api/v1/network/payout-history",
-            "/api/v1/ghostpay/payout-history",
             "/api/v1/config/full",
             "/api/v1/config/alerts",
         ];
@@ -16031,7 +10977,7 @@ mod tests {
     async fn test_payout_identity_get_endpoints_accept_operator_signature() {
         let state = create_test_state_with_auth();
 
-        for endpoint in ["/payouts", "/api/v1/config/full"] {
+        for endpoint in ["/shares", "/api/v1/config/full"] {
             let app = super::create_router(Arc::clone(&state));
             let (signature, timestamp) = operator_get_signature();
 
@@ -16121,32 +11067,6 @@ mod tests {
     // ===========================================================================
 
     #[test]
-    fn test_valid_hex_hash_64_chars() {
-        let hash = "a".repeat(64);
-        assert!(is_valid_hex_hash(&hash));
-    }
-
-    #[test]
-    fn test_valid_hex_hash_too_short() {
-        let hash = "a".repeat(62);
-        assert!(!is_valid_hex_hash(&hash));
-    }
-
-    #[test]
-    fn test_valid_hex_hash_too_long() {
-        let hash = "a".repeat(66);
-        assert!(!is_valid_hex_hash(&hash));
-    }
-
-    #[test]
-    fn test_valid_hex_hash_non_hex() {
-        // 'z' is not a valid hex character
-        let mut hash = "a".repeat(63);
-        hash.push('z');
-        assert!(!is_valid_hex_hash(&hash));
-    }
-
-    #[test]
     fn test_safe_proc_path_allowed() {
         let allowed = vec!["/proc/meminfo".to_string(), "/proc/cpuinfo".to_string()];
         assert!(is_safe_proc_path("/proc/meminfo", &allowed));
@@ -16156,215 +11076,6 @@ mod tests {
     fn test_safe_proc_path_traversal() {
         let allowed = vec!["/proc/meminfo".to_string(), "/proc/cpuinfo".to_string()];
         assert!(!is_safe_proc_path("/proc/../etc/passwd", &allowed));
-    }
-
-    #[test]
-    fn test_mesh_node_to_json_shape() {
-        let node = MeshNodeInfo {
-            node_id: "deadbeef".to_string(),
-            address: "1.2.3.4:8080".to_string(),
-            elder: true,
-            cap_archive: true,
-            cap_ghost_pay: false,
-            cap_public_mining: true,
-            cap_reaper: false,
-            cap_elder: true,
-            hashrate_th: 12.5,
-            miner_count: 3,
-            deduped_miner_count: 2,
-            max_capacity: 500,
-            healthy: true,
-            l1_height: Some(912_345),
-            uptime_percent: Some(99.7),
-            peer_count: Some(3),
-            l2_height: Some(4_567),
-        };
-
-        let v = mesh_node_to_json(&node, false);
-        assert_eq!(v["node_id"], "deadbeef");
-        assert_eq!(v["address"], "1.2.3.4:8080");
-        assert_eq!(v["elder"], true);
-        assert_eq!(v["hashrate_th"], 12.5);
-        assert_eq!(v["miner_count"], 3);
-        assert_eq!(v["deduped_miner_count"], 2);
-        assert_eq!(v["max_capacity"], 500);
-        assert_eq!(v["healthy"], true);
-        // Gossiped Swarm telemetry surfaces on the peer JSON.
-        assert_eq!(v["l1_height"], 912_345);
-        assert_eq!(v["uptime_percent"], 99.7);
-        assert_eq!(v["peer_count"], 3);
-        assert_eq!(v["l2_height"], 4_567);
-        // Peers are never self.
-        assert_eq!(v["is_self"], false);
-        // Capabilities are nested exactly as the website expects.
-        assert_eq!(v["capabilities"]["archive"], true);
-        assert_eq!(v["capabilities"]["ghost_pay"], false);
-        assert_eq!(v["capabilities"]["public_mining"], true);
-        assert_eq!(v["capabilities"]["reaper"], false);
-        assert_eq!(v["capabilities"]["elder"], true);
-    }
-
-    #[test]
-    fn test_mesh_node_to_json_defaults_for_bare_peer() {
-        // A peer that has only just been discovered (no gossiped metrics yet)
-        // must still serialize to a complete object with safe defaults rather
-        // than dropping fields or failing.
-        let node = MeshNodeInfo {
-            node_id: "00ff".to_string(),
-            address: String::new(),
-            elder: false,
-            cap_archive: false,
-            cap_ghost_pay: false,
-            cap_public_mining: false,
-            cap_reaper: false,
-            cap_elder: false,
-            hashrate_th: 0.0,
-            miner_count: 0,
-            deduped_miner_count: 0,
-            max_capacity: 0,
-            healthy: false,
-            l1_height: None,
-            uptime_percent: None,
-            peer_count: None,
-            l2_height: None,
-        };
-
-        let v = mesh_node_to_json(&node, false);
-        assert_eq!(v["address"], "");
-        assert_eq!(v["hashrate_th"], 0.0);
-        assert_eq!(v["miner_count"], 0);
-        assert_eq!(v["deduped_miner_count"], 0);
-        assert_eq!(v["max_capacity"], 0);
-        assert_eq!(v["healthy"], false);
-        // Unreported telemetry serialises to JSON null → "—" on the page, never
-        // a fabricated 0.
-        assert!(v["l1_height"].is_null());
-        assert!(v["uptime_percent"].is_null());
-        assert!(v["peer_count"].is_null());
-        assert!(v["l2_height"].is_null());
-        assert!(v["capabilities"].is_object());
-    }
-
-    #[test]
-    fn test_mesh_node_to_json_registry_elder_promotes() {
-        // Reproduces the Geo/mesh-nodes role bug: a peer that IS a registered
-        // elder but whose health-ping elder bit reads `false` (verification-
-        // gated / not gossiped) must still render as an elder because the DB
-        // registry — the authoritative source — says so.
-        let node = MeshNodeInfo {
-            node_id: "aa".repeat(32),
-            address: "5.6.7.8:8080".to_string(),
-            elder: false,
-            cap_archive: false,
-            cap_ghost_pay: false,
-            cap_public_mining: true,
-            cap_reaper: false,
-            cap_elder: false,
-            hashrate_th: 1.0,
-            miner_count: 1,
-            deduped_miner_count: 1,
-            max_capacity: 100,
-            healthy: true,
-            l1_height: Some(1),
-            uptime_percent: Some(99.0),
-            peer_count: Some(2),
-            l2_height: None,
-        };
-
-        // Registry says this node_id is an elder → elder=true everywhere.
-        let promoted = mesh_node_to_json(&node, true);
-        assert_eq!(promoted["elder"], true);
-        assert_eq!(promoted["capabilities"]["elder"], true);
-        // Other capabilities are untouched.
-        assert_eq!(promoted["capabilities"]["public_mining"], true);
-        assert_eq!(promoted["capabilities"]["archive"], false);
-
-        // Not in the registry and no advertised bit → stays a plain node.
-        let not_elder = mesh_node_to_json(&node, false);
-        assert_eq!(not_elder["elder"], false);
-        assert_eq!(not_elder["capabilities"]["elder"], false);
-    }
-
-    #[test]
-    fn test_mesh_capability_shares() {
-        // Full stack: 5 + 4 + 3 + 2 + 1 = 15.
-        assert_eq!(mesh_capability_shares(true, true, true, true, true), 15);
-        // None: 0.
-        assert_eq!(mesh_capability_shares(false, false, false, false, false), 0);
-        // Ghost Pay (+4) + Public Mining (+3) + Reaper (+2) + Elder (+1) = 10,
-        // matching the observed production self-node total.
-        assert_eq!(mesh_capability_shares(false, true, true, true, true), 10);
-        // Individual weights.
-        assert_eq!(mesh_capability_shares(true, false, false, false, false), 5);
-        assert_eq!(mesh_capability_shares(false, false, false, false, true), 1);
-    }
-
-    /// The weighting exists TWICE — here for the dashboard, and in
-    /// `NodeCapabilities::total_shares()` for the payout path — so pin them
-    /// together across every combination.
-    ///
-    /// ⛔ This matters most for a change nobody has made yet. #736 moves the +4
-    /// off GhostPay when that service is removed, and a reweight that lands in
-    /// one of these and not the other does not fail loudly: nodes get paid on
-    /// one number while the dashboard shows another, and the disagreement
-    /// surfaces as an operator asking why their earnings do not match their
-    /// screen. This test makes that a red build instead.
-    #[test]
-    fn the_dashboard_and_payout_weightings_agree() {
-        use ghost_common::types::NodeCapabilities;
-
-        for bits in 0u8..32 {
-            let archive = bits & 1 != 0;
-            let ghost_pay = bits & 2 != 0;
-            let public_mining = bits & 4 != 0;
-            let reaper = bits & 8 != 0;
-            let elder = bits & 16 != 0;
-
-            let caps = NodeCapabilities {
-                archive_mode: archive,
-                ghost_pay,
-                public_mining,
-                reaper,
-                elder_status: elder,
-                coordinator: false,
-            };
-            assert_eq!(
-                mesh_capability_shares(archive, ghost_pay, public_mining, reaper, elder) as i32,
-                caps.total_shares(),
-                "the dashboard and the payout path disagree for \
-                 archive={archive} ghost_pay={ghost_pay} mining={public_mining} \
-                 reaper={reaper} elder={elder}"
-            );
-        }
-    }
-
-    /// The coordinator flag earns the mixing service fee, not 5-4-3-2-1 shares,
-    /// and is excluded from the total on purpose — it is self-reported in a
-    /// health ping, so paying for it would pay for an assertion.
-    ///
-    /// Pinned because #736 intends to change exactly this. When the +4 moves to
-    /// a VERIFIED coordinator capability, this test should fail and be updated
-    /// deliberately — rather than the exclusion being dropped by accident and
-    /// nobody noticing that an unverified boolean started paying.
-    #[test]
-    fn the_coordinator_flag_earns_no_shares_yet() {
-        use ghost_common::types::NodeCapabilities;
-
-        let mut caps = NodeCapabilities {
-            archive_mode: false,
-            ghost_pay: false,
-            public_mining: false,
-            reaper: false,
-            elder_status: false,
-            coordinator: false,
-        };
-        assert_eq!(caps.total_shares(), 0);
-        caps.coordinator = true;
-        assert_eq!(
-            caps.total_shares(),
-            0,
-            "the coordinator flag is self-reported; it must not pay until it is verified (#736)"
-        );
     }
 
     #[test]
@@ -16382,170 +11093,9 @@ mod tests {
         assert_eq!(mesh_node_name(":8555", "abcdef0123456789"), "node-abcdef01");
     }
 
-    /// Stage C task 3 — sync endpoint round-trip:
-    /// a "server" node persists a chain (contributions WITH real proof + votes),
-    /// serves position 2 over `GET /api/v1/mpc/votes/2`, and a "fresh" node parses
-    /// the response, persists the non-empty proof + votes, and the genesis-anchored
-    /// startup quorum check then PASSES on the fresh node.
-    #[tokio::test]
-    async fn test_mpc_votes_endpoint_roundtrip() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use ghost_common::identity::NodeIdentity;
-        use ghost_common::mpc::{contribution_hash, vote_signing_message};
-        use ghost_storage::queries::{MpcContributionRecord, MpcVerificationVote};
-        use ghost_storage::Database;
-        use tower::ServiceExt;
-
-        let anchor = [0xC9u8; 32];
-        let id1 = NodeIdentity::generate(); // contributor at position 1 (elder #1)
-        let id2 = NodeIdentity::generate(); // contributor at position 2
-        let new1 = [0x11u8; 32];
-        let new2 = [0x22u8; 32];
-
-        // Real (non-empty) proof bytes for each position. Their CONTENT is opaque
-        // to the quorum check (which binds votes to new_params_hash), so arbitrary
-        // non-empty bytes suffice to prove the proof survives the round-trip.
-        let proof1 = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let proof2 = vec![0x01, 0x02, 0x03, 0x04, 0x05];
-
-        // --- server DB ---
-        let server_db = Database::in_memory().unwrap();
-        server_db
-            .save_mpc_contribution(&MpcContributionRecord {
-                elder_position: 1,
-                contributor_node_id: hex::encode(id1.node_id()),
-                prev_params_hash: anchor,
-                new_params_hash: new1,
-                contribution_proof: proof1.clone(),
-                epoch: 0,
-                created_at: 100,
-            })
-            .unwrap();
-        server_db
-            .save_mpc_contribution(&MpcContributionRecord {
-                elder_position: 2,
-                contributor_node_id: hex::encode(id2.node_id()),
-                prev_params_hash: new1,
-                new_params_hash: new2,
-                contribution_proof: proof2.clone(),
-                epoch: 0,
-                created_at: 200,
-            })
-            .unwrap();
-        // Position 2's approve vote from elder #1 (the only then-eligible elder).
-        let ch2 = contribution_hash(&id2.node_id(), 2, &new2);
-        let approve_msg = vote_signing_message(&ch2, true);
-        let sig = id1.sign(&approve_msg);
-        server_db
-            .save_mpc_vote(&MpcVerificationVote {
-                contribution_position: 2,
-                voter_node_id: hex::encode(id1.node_id()),
-                approve: true,
-                signature: sig.to_vec(),
-                voted_at: 200,
-            })
-            .unwrap();
-
-        // --- serve position 2 over HTTP ---
-        let state = {
-            use ghost_common::types::NodeCapabilities;
-            use ghost_policy::PolicyProfile;
-            Arc::new(
-                crate::server::VerificationState::new(
-                    hex::encode(id1.node_id()),
-                    "1.0.0".to_string(),
-                    PolicyProfile::default(),
-                    NodeCapabilities::default(),
-                )
-                .with_database(server_db),
-            )
-        };
-        let app = super::create_router(state);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/api/v1/mpc/votes/2")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
-            .await
-            .unwrap();
-        let data: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-
-        // The served proof is non-empty (the bug this endpoint fixes).
-        let served_proof_hex = data["contribution"]["contribution_proof"].as_str().unwrap();
-        assert_eq!(served_proof_hex, hex::encode(&proof2));
-        assert!(!served_proof_hex.is_empty());
-        assert_eq!(data["vote_count"].as_u64().unwrap(), 1);
-
-        // --- fresh node: parse + persist, then the quorum check passes ---
-        let fresh_db = Database::in_memory().unwrap();
-        // Position 1 (genesis) is anchored, no votes needed; persist its row.
-        fresh_db
-            .save_mpc_contribution(&MpcContributionRecord {
-                elder_position: 1,
-                contributor_node_id: hex::encode(id1.node_id()),
-                prev_params_hash: anchor,
-                new_params_hash: new1,
-                contribution_proof: proof1.clone(),
-                epoch: 0,
-                created_at: 100,
-            })
-            .unwrap();
-        // Persist position 2 exactly as the sync path would, from the served JSON.
-        let c = &data["contribution"];
-        let proof_bytes = hex::decode(c["contribution_proof"].as_str().unwrap()).unwrap();
-        assert!(
-            !proof_bytes.is_empty(),
-            "fresh node must persist a real proof"
-        );
-        fresh_db
-            .save_mpc_contribution(&MpcContributionRecord {
-                elder_position: c["position"].as_u64().unwrap() as u32,
-                contributor_node_id: c["node_id"].as_str().unwrap().to_string(),
-                prev_params_hash: hex::decode(c["prev_params_hash"].as_str().unwrap())
-                    .unwrap()
-                    .try_into()
-                    .unwrap(),
-                new_params_hash: hex::decode(c["new_params_hash"].as_str().unwrap())
-                    .unwrap()
-                    .try_into()
-                    .unwrap(),
-                contribution_proof: proof_bytes,
-                epoch: 0,
-                created_at: c["created_at"].as_u64().unwrap(),
-            })
-            .unwrap();
-        for v in data["votes"].as_array().unwrap() {
-            fresh_db
-                .save_mpc_vote(&MpcVerificationVote {
-                    contribution_position: 2,
-                    voter_node_id: v["voter_node_id"].as_str().unwrap().to_string(),
-                    approve: v["approve"].as_bool().unwrap(),
-                    signature: hex::decode(v["signature"].as_str().unwrap()).unwrap(),
-                    voted_at: v["voted_at"].as_u64().unwrap(),
-                })
-                .unwrap();
-        }
-
-        // The fresh node's genesis-anchored startup verification now passes.
-        let verified = fresh_db
-            .verify_mpc_genesis_anchored_lineage(&anchor, Some(&new2))
-            .expect("fresh node startup quorum check must pass after sync");
-        assert_eq!(verified, 2);
-    }
-
     /// Build a state with operator auth + an in-memory DB holding one recent
     /// `<addr>.<worker>` share, for the miner-details endpoint tests.
     fn miner_details_state() -> Arc<crate::server::VerificationState> {
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
         use ghost_storage::Database;
 
         let db = Database::in_memory().unwrap();
@@ -16568,14 +11118,9 @@ mod tests {
 
         let auth = crate::auth::InternalAuth::new(&test_secret()).unwrap();
         Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_internal_auth(auth)
-            .with_database(db),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_internal_auth(auth)
+                .with_database(db),
         )
     }
 
@@ -16830,8 +11375,6 @@ mod tests {
     #[tokio::test]
     async fn test_mining_status_exposes_authority_key() {
         use ghost_common::config::NodeConfig as FullNodeConfig;
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
 
         async fn authority(state: Arc<crate::server::VerificationState>) -> serde_json::Value {
             let app = super::create_router(state);
@@ -16862,8 +11405,6 @@ mod tests {
         let default_state = Arc::new(crate::server::VerificationState::new(
             "test_node".to_string(),
             "1.0.0".to_string(),
-            PolicyProfile::default(),
-            NodeCapabilities::default(),
         ));
         assert_eq!(
             authority(default_state).await,
@@ -16876,13 +11417,8 @@ mod tests {
         let mut blank_cfg = FullNodeConfig::default();
         blank_cfg.network.sv2_authority_public_key = Some("   ".to_string());
         let blank_state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_full_node_config(blank_cfg, dir_blank.path().join("pool.toml")),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_full_node_config(blank_cfg, dir_blank.path().join("pool.toml")),
         );
         assert_eq!(
             authority(blank_state).await,
@@ -16896,13 +11432,8 @@ mod tests {
         let mut cfg = FullNodeConfig::default();
         cfg.network.sv2_authority_public_key = Some("customAuthorityKey123".to_string());
         let override_state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_full_node_config(cfg, path),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_full_node_config(cfg, path),
         );
         assert_eq!(
             authority(override_state).await,
@@ -16911,87 +11442,52 @@ mod tests {
         );
     }
 
-    /// The self-check endpoint must serialise a FAILING snapshot so the
-    /// dashboard can warn the operator (e.g. public_mining claimed but no
-    /// stratum listening). Wire a provider that returns a failing capability
-    /// and assert the endpoint reflects claimed/passed/reason verbatim.
+    /// `/api/v1/mining/status` reports the stratum ports this node is configured on, not the
+    /// compiled defaults: the dashboard's "Connect miners" page tells the operator these.
     #[tokio::test]
-    async fn test_self_check_endpoint_serialises_failure() {
-        use ghost_common::types::NodeCapabilities;
-        use ghost_policy::PolicyProfile;
+    async fn test_mining_status_reports_the_configured_ports() {
+        use ghost_common::config::NodeConfig as FullNodeConfig;
 
+        async fn ports(state: Arc<crate::server::VerificationState>) -> serde_json::Value {
+            let response = super::create_router(state)
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/api/v1/mining/status")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
+                .await
+                .unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = FullNodeConfig::default();
+        cfg.network.sv1_port = 43030;
+        cfg.network.sv2_port = 43020;
         let state = Arc::new(
-            crate::server::VerificationState::new(
-                "test_node".to_string(),
-                "1.0.0".to_string(),
-                PolicyProfile::default(),
-                NodeCapabilities::default(),
-            )
-            .with_self_check(|| {
-                serde_json::json!({
-                    "public_mining": {
-                        "claimed": true,
-                        "passed": false,
-                        "reason": "SV1 stratum (port 3333) not listening — start sri-translator",
-                        "last_checked_unix": 1_700_000_000_i64,
-                    },
-                    "archive": { "claimed": false, "passed": false, "reason": null, "last_checked_unix": 1_700_000_000_i64 },
-                    "ghost_pay": { "claimed": false, "passed": false, "reason": null, "last_checked_unix": 1_700_000_000_i64 },
-                    "reaper": { "claimed": false, "passed": false, "reason": null, "last_checked_unix": 1_700_000_000_i64 },
-                })
-            }),
+            crate::server::VerificationState::new("test_node".to_string(), "1.0.0".to_string())
+                .with_full_node_config(cfg, dir.path().join("pool.toml")),
         );
-        let app = super::create_router(state);
+        let d = ports(state).await;
+        assert_eq!(d["stratum_v1_port"], 43030);
+        assert_eq!(d["stratum_v2_port"], 43020);
+        assert_eq!(d["stratum_v1_endpoint"], "stratum+tcp://0.0.0.0:43030");
+        assert_eq!(d["stratum_v2_endpoint"], "stratum+tcp://0.0.0.0:43020");
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/api/v1/system/self-check")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["public_mining"]["claimed"], true);
-        assert_eq!(json["public_mining"]["passed"], false);
-        assert!(json["public_mining"]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("port 3333"));
-    }
-
-    /// Pre-bounce safety: when the provider isn't wired (older deploy), the
-    /// endpoint must still respond 200 with a JSON `null` body so the frontend
-    /// can treat "absent/ok" as "render nothing".
-    #[tokio::test]
-    async fn test_self_check_endpoint_null_when_unwired() {
-        let state = create_test_state_without_auth();
-        let app = super::create_router(state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/api/v1/system/self-check")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(json.is_null());
+        // No full config loaded: the installer's defaults.
+        let bare = Arc::new(crate::server::VerificationState::new(
+            "test_node".to_string(),
+            "1.0.0".to_string(),
+        ));
+        let d = ports(bare).await;
+        assert_eq!(d["stratum_v1_port"], SV1_STRATUM_PORT);
+        assert_eq!(d["stratum_v2_port"], SV2_STRATUM_PORT);
     }
 
     /// The watchdog's `unit` reaches an operator's inbox verbatim, so it is the one

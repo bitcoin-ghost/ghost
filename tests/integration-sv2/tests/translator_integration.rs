@@ -38,8 +38,15 @@ use stratum_apps::stratum_core::{
 #[tokio::test]
 async fn translate_sv1_to_sv2_successfully() {
     start_tracing();
-    let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
-    let (pool, pool_addr, _) = start_pool(sv2_tp_config(tp_addr), vec![], vec![], false).await;
+    let (tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
+    let (pool, pool_addr, _) = start_pool(
+        sv2_tp_config(tp_addr),
+        tp.bitcoin_core(),
+        vec![],
+        vec![],
+        false,
+    )
+    .await;
     let (pool_translator_sniffer, pool_translator_sniffer_addr) =
         start_sniffer("0", pool_addr, false, vec![], None);
     let (translator, tproxy_addr, _) = start_sv2_translator(
@@ -94,9 +101,23 @@ async fn translate_sv1_to_sv2_successfully() {
 #[tokio::test]
 async fn test_translator_fallback_on_setup_connection_error() {
     start_tracing();
-    let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
-    let (pool_1, pool_addr_1, _) = start_pool(sv2_tp_config(tp_addr), vec![], vec![], false).await;
-    let (pool_2, pool_addr_2, _) = start_pool(sv2_tp_config(tp_addr), vec![], vec![], false).await;
+    let (tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
+    let (pool_1, pool_addr_1, _) = start_pool(
+        sv2_tp_config(tp_addr),
+        tp.bitcoin_core(),
+        vec![],
+        vec![],
+        false,
+    )
+    .await;
+    let (pool_2, pool_addr_2, _) = start_pool(
+        sv2_tp_config(tp_addr),
+        tp.bitcoin_core(),
+        vec![],
+        vec![],
+        false,
+    )
+    .await;
 
     let random_error_code = "Something went wrong".to_string();
 
@@ -179,9 +200,23 @@ async fn test_translator_fallback_on_setup_connection_error() {
 #[tokio::test]
 async fn test_translator_fallback_on_open_mining_message_error() {
     start_tracing();
-    let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
-    let (pool_1, pool_addr_1, _) = start_pool(sv2_tp_config(tp_addr), vec![], vec![], false).await;
-    let (pool_2, pool_addr_2, _) = start_pool(sv2_tp_config(tp_addr), vec![], vec![], false).await;
+    let (tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
+    let (pool_1, pool_addr_1, _) = start_pool(
+        sv2_tp_config(tp_addr),
+        tp.bitcoin_core(),
+        vec![],
+        vec![],
+        false,
+    )
+    .await;
+    let (pool_2, pool_addr_2, _) = start_pool(
+        sv2_tp_config(tp_addr),
+        tp.bitcoin_core(),
+        vec![],
+        vec![],
+        false,
+    )
+    .await;
 
     let random_error_code = "Something went wrong".to_string();
 
@@ -272,8 +307,15 @@ async fn test_translator_fallback_on_open_mining_message_error() {
 #[tokio::test]
 async fn test_translator_keepalive_job_sent_and_share_received_by_pool() {
     start_tracing();
-    let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::High);
-    let (pool, pool_addr, _) = start_pool(sv2_tp_config(tp_addr), vec![], vec![], false).await;
+    let (tp, tp_addr) = start_template_provider(None, DifficultyLevel::High);
+    let (pool, pool_addr, _) = start_pool(
+        sv2_tp_config(tp_addr),
+        tp.bitcoin_core(),
+        vec![],
+        vec![],
+        false,
+    )
+    .await;
     let (pool_translator_sniffer, pool_translator_sniffer_addr) =
         start_sniffer("0", pool_addr, false, vec![], None);
 
@@ -347,8 +389,14 @@ async fn non_aggregated_translator_correctly_deals_with_group_channels() {
         None,
     );
 
-    let (pool, pool_addr, _) =
-        start_pool(sv2_tp_config(sniffer_pool_tp_addr), vec![], vec![], false).await;
+    let (pool, pool_addr, _) = start_pool(
+        sv2_tp_config(sniffer_pool_tp_addr),
+        tp.bitcoin_core(),
+        vec![],
+        vec![],
+        false,
+    )
+    .await;
 
     // ignore SubmitSharesSuccess messages, so we can keep the assertion flow simple
     let ignore_submit_shares_success = IgnoreMessage::new(
@@ -1258,8 +1306,15 @@ async fn translator_does_not_shutdown_on_missing_downstream_channel() {
 #[tokio::test]
 async fn pool_does_not_hang_on_no_handshake() {
     start_tracing();
-    let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
-    let (pool, pool_addr, _) = start_pool(sv2_tp_config(tp_addr), vec![], vec![], false).await;
+    let (tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
+    let (pool, pool_addr, _) = start_pool(
+        sv2_tp_config(tp_addr),
+        tp.bitcoin_core(),
+        vec![],
+        vec![],
+        false,
+    )
+    .await;
     let ephemeral_stream = TcpStream::connect(pool_addr).await.unwrap();
     tokio::time::sleep(Duration::from_secs(1)).await;
 

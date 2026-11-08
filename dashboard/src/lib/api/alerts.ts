@@ -5,8 +5,6 @@ import { fetchApi } from "./client";
 
 // Which node events fire an alert. Keys mirror the Rust `AlertEvents` fields.
 export interface AlertEvents {
-  node_offline: boolean;
-  capability_drift: boolean;
   low_disk: boolean;
   restart_needed: boolean;
   peer_count_drop: boolean;
@@ -87,8 +85,6 @@ export const ALERTS_DEFAULTS: AlertsConfig = {
     telegram: { enabled: false, chat_id: "", bot_token: "", bot_token_set: false },
   },
   events: {
-    node_offline: true,
-    capability_drift: true,
     low_disk: true,
     restart_needed: true,
     peer_count_drop: true,

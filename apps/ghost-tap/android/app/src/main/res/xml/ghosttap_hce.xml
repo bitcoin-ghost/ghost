@@ -1,7 +1,0 @@
-<host-apdu-service xmlns:android="http://schemas.android.com/apk/res/android"
-    android:description="@string/app_name"
-    android:requireDeviceUnlock="true">
-    <aid-group android:category="other" android:description="@string/app_name">
-        <aid-filter android:name="F0474854415000"/>
-    </aid-group>
-</host-apdu-service>

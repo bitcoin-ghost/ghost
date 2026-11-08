@@ -6,8 +6,7 @@
 # For full options with documentation, see mainnet.toml
 #
 # Required environment variables:
-#   BITCOIN_RPC_PASSWORD, PUBLIC_ADDRESS, TREASURY_ADDRESS,
-#   SIGNING_KEY, INTERNAL_API_SECRET
+#   BITCOIN_RPC_PASSWORD, PUBLIC_ADDRESS, SIGNING_KEY, INTERNAL_API_SECRET
 #
 # =============================================================================
 
@@ -30,24 +29,8 @@ sv2_port = 34255
 sv1_port = 3333
 http_port = 8080
 max_miners = 10000
-# NOTE: there is no `public_mining` key. It was removed from the config — `mining_mode`
-# is the single source of truth for whether this node is publicly discoverable.
-# Setting `public_mining` here does nothing: unknown keys are silently ignored.
-mining_mode = "public_pool"
 signing_key = "${SIGNING_KEY}"
 internal_api_secret = "${INTERNAL_API_SECRET}"
-noise_enabled = true
-seed_nodes = []
-
-[network.p2p]
-share_propagation = 8555
-block_announcement = 8556
-consensus_voting = 8557
-health_monitoring = 8558
-discovery = 8559
-elder_management = 8560
-payout_proposal = 8561
-payout_transaction = 8562
 
 [policy]
 profile = "bitcoin_pure"
@@ -59,12 +42,3 @@ archive_mode = true
 prune_height = 0
 
 [pool]
-treasury_address = "${TREASURY_ADDRESS}"
-min_payout_sats = 100000
-payout_interval_blocks = 100
-
-[ghost_pay]
-enabled = true
-virtual_block_secs = 10
-epoch_blocks = 2160
-wraith_enabled = true

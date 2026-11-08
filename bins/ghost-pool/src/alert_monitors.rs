@@ -22,6 +22,15 @@
 //!   baseline. Rate-limited to `FEE_SPIKE_ALERT_MIN_INTERVAL` so sustained
 //!   high fees don't spam.
 //!
+//! * **Relay peers** — the share-chain relay's peer count, read from pool_sv2's
+//!   `/api/v1/node-pool/status` every `RELAY_PEERS_CHECK_INTERVAL` and published as
+//!   `/health` `peer_count`. `PeerCountDrop` fires, rate-limited, when the count
+//!   falls, and edge-triggered when it reaches zero (a node with no relay peers
+//!   neither hears shares nor has its own relayed).
+//! * **Low-disk** — free space on the data partition falls below
+//!   `LOW_DISK_MIN_FREE_BYTES`, with a second, independent edge at
+//!   `CRITICAL_DISK_MIN_FREE_BYTES`. Edge-triggered.
+//!
 //! All dispatch off the hot path (their own spawned tasks) and honour the
 //! operator's per-event enable flag + master switch inside the dispatcher.
 
@@ -94,11 +103,18 @@ pub fn evaluate_behind_tip(
     None
 }
 
-/// Parse a dotted version ("1.10.20", "v1.2", "1.2.3-rc1") into its numeric
-/// components, ignoring any `-prerelease`/`+build` metadata and any non-digit
-/// suffix on a segment. Missing components compare as 0.
+/// Parse a dotted version ("1.10.20", "v1.2", "1.2.3-rc1", "np-v1.2.3") into its
+/// numeric components, ignoring any `-prerelease`/`+build` metadata and any non-digit
+/// suffix on a segment. Missing components compare as 0. `np-` is the node pool
+/// release channel's tag prefix: the updater records `np-v1.2.3` as the latest
+/// version on a node pool node, and without the strip it parsed as 0 and the alert
+/// never fired.
 fn parse_version(v: &str) -> Vec<u64> {
-    let v = v.trim().trim_start_matches(['v', 'V']);
+    let v = v.trim();
+    let v = v
+        .strip_prefix("np-")
+        .unwrap_or(v)
+        .trim_start_matches(['v', 'V']);
     let core = v.split(['-', '+']).next().unwrap_or(v);
     core.split('.')
         .map(|seg| {
@@ -523,8 +539,206 @@ pub fn spawn_fee_spike_monitor(
     });
 }
 
+/// Free-space floor for the LowDisk operator alert on the data partition. A node needs headroom
+/// for the growing SQLite DB + WAL; dropping below this warrants operator attention.
+const LOW_DISK_MIN_FREE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+/// Second, much lower floor for the SAME LowDisk event, fired under its own edge key.
+///
+/// ⚠ Edge-triggered alerts latch. A node parked just under the warning threshold has already
+/// fired and stays `active`, so the drop that actually matters raises nothing. Measured on
+/// ghost-vm8 on 2026-08-24: it sat at 5,282 MB against a 5 GiB (5,368 MB) threshold — just
+/// below — so when free space collapsed to **21 MB**, filling the disk, truncating
+/// `settings.json` to zero bytes and crash-looping ghostd 260 times over 2h15m, `fire_edge`
+/// correctly concluded nothing had changed and stayed silent.
+///
+/// A second, independent edge at 1 GiB fires on that collapse even while the 5 GiB warning is
+/// latched. Two tiers rather than removing the latch: un-latching would re-alert every tick for
+/// as long as the condition holds, which is how a channel becomes something people mute.
+const CRITICAL_DISK_MIN_FREE_BYTES: u64 = 1024 * 1024 * 1024;
+/// How often the data partition's free space is sampled.
+const LOW_DISK_TICK: Duration = Duration::from_secs(30);
+
+/// Spawn the low-disk monitor over the partition holding `db_path`.
+pub fn spawn_low_disk_monitor(db_path: std::path::PathBuf, alerts: Arc<AlertDispatcher>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(LOW_DISK_TICK);
+        loop {
+            interval.tick().await;
+            fire_low_disk_alert(&alerts, &db_path).await;
+        }
+    });
+}
+
+/// Fire a LowDisk alert when free space on the data partition drops below
+/// [`LOW_DISK_MIN_FREE_BYTES`]. Edge-triggered: one alert on crossing the
+/// threshold, re-armed when free space recovers. A stat failure is treated as
+/// "unknown" (no alert either way) to avoid false positives.
+async fn fire_low_disk_alert(alerts: &Arc<AlertDispatcher>, db_path: &std::path::Path) {
+    let probe_path = data_probe_path(db_path);
+    let Some(free) = free_bytes(&probe_path) else {
+        return;
+    };
+    let active = free < LOW_DISK_MIN_FREE_BYTES;
+    let detail = format!(
+        "Low disk space: only {} GiB free at {} (alert threshold {} GiB).",
+        free / (1024 * 1024 * 1024),
+        probe_path.display(),
+        LOW_DISK_MIN_FREE_BYTES / (1024 * 1024 * 1024)
+    );
+    alerts
+        .fire_edge(AlertEvent::LowDisk, "data_dir", active, &detail)
+        .await;
+
+    // Separate edge key, so this latches independently of the warning above and still fires when
+    // a node that was already below 5 GiB falls off a cliff. Reports MiB, because at this point
+    // "0 GiB free" is the only thing the warning above could have said.
+    let critical = free < CRITICAL_DISK_MIN_FREE_BYTES;
+    let critical_detail = format!(
+        "CRITICAL disk space: only {} MiB free at {} (critical threshold {} MiB). \
+         A full data partition corrupts state files and crash-loops ghostd.",
+        free / (1024 * 1024),
+        probe_path.display(),
+        CRITICAL_DISK_MIN_FREE_BYTES / (1024 * 1024)
+    );
+    alerts
+        .fire_edge(
+            AlertEvent::LowDisk,
+            "data_dir_critical",
+            critical,
+            &critical_detail,
+        )
+        .await;
+}
+
+/// Resolve a stat-able path for the data partition: the configured `db_path`
+/// if it exists, else its parent (the DB may not be created yet), else `/`.
+fn data_probe_path(configured: &std::path::Path) -> std::path::PathBuf {
+    if configured.exists() {
+        configured.to_path_buf()
+    } else {
+        configured
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("/"))
+    }
+}
+
+#[cfg(unix)]
+fn free_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path_cstr = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(path_cstr.as_ptr(), &mut stat) };
+    if rc != 0 {
+        return None;
+    }
+    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+fn free_bytes(_path: &std::path::Path) -> Option<u64> {
+    None
+}
+
+/// Cadence of the relay-peers check.
+pub const RELAY_PEERS_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Minimum interval between relay-peer-drop alerts.
+pub const RELAY_PEERS_DROP_MIN_INTERVAL: Duration = Duration::from_secs(300);
+
+/// What a relay peer reading means for the alerts: `(none_active, drop_detail)`.
+///
+/// `none_active` drives the edge-triggered "no relay peers" alert and is only judged on a real
+/// reading: an unanswered status (`now = None`) is unknown, not zero. `drop_detail` is set when a
+/// reading is lower than the previous real one.
+pub fn relay_peer_alerts(prev: Option<u32>, now: Option<u32>) -> (Option<bool>, Option<String>) {
+    let Some(n) = now else {
+        return (None, None);
+    };
+    let drop = match prev {
+        Some(p) if n < p => Some(format!("Share-chain relay peers dropped from {p} to {n}.")),
+        _ => None,
+    };
+    (Some(n == 0), drop)
+}
+
+/// Read `peers` from pool_sv2's node pool status, `None` if it does not answer with one.
+async fn fetch_relay_peers(client: &reqwest::Client, base: &str) -> Option<u32> {
+    let url = format!("{}/api/v1/node-pool/status", base.trim_end_matches('/'));
+    let v: serde_json::Value = client.get(url).send().await.ok()?.json().await.ok()?;
+    v.get("peers")?.as_u64().and_then(|n| u32::try_from(n).ok())
+}
+
+/// Spawn the relay-peers monitor (see the module docs). Runs until `shutdown` fires.
+pub fn spawn_relay_peers_monitor(
+    alerts: Arc<AlertDispatcher>,
+    state: Arc<ghost_verification::VerificationState>,
+    mut shutdown: broadcast::Receiver<()>,
+) {
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+        let mut interval = tokio::time::interval(RELAY_PEERS_CHECK_INTERVAL);
+        let mut last: Option<u32> = None;
+        info!("Relay-peers monitor started");
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let now = fetch_relay_peers(&client, &state.node_pool_api).await;
+                    state.set_relay_peers(now);
+                    let (none, drop) = relay_peer_alerts(last, now);
+                    if let Some(detail) = drop {
+                        alerts
+                            .fire_rate_limited(
+                                AlertEvent::PeerCountDrop,
+                                RELAY_PEERS_DROP_MIN_INTERVAL,
+                                &detail,
+                            )
+                            .await;
+                    }
+                    if let Some(active) = none {
+                        alerts
+                            .fire_edge(
+                                AlertEvent::PeerCountDrop,
+                                "no-relay-peers",
+                                active,
+                                "This node has no share-chain relay peers: it neither hears \
+                                 other nodes' shares nor has its own relayed.",
+                            )
+                            .await;
+                    }
+                    if now.is_some() {
+                        last = now;
+                    }
+                }
+                _ = shutdown.recv() => break,
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relay_peer_alerts_judge_only_real_readings() {
+        // Unanswered is unknown: no alert either way.
+        assert_eq!(relay_peer_alerts(Some(3), None), (None, None));
+        // First reading of zero: the none-alert is active, nothing to drop from.
+        assert_eq!(relay_peer_alerts(None, Some(0)), (Some(true), None));
+        // A fall is a drop; a fall to zero is both.
+        let (none, drop) = relay_peer_alerts(Some(3), Some(1));
+        assert_eq!(none, Some(false));
+        assert!(drop.unwrap().contains("from 3 to 1"));
+        let (none, drop) = relay_peer_alerts(Some(2), Some(0));
+        assert_eq!(none, Some(true));
+        assert!(drop.is_some());
+        // Steady or rising: no drop, and the none-alert re-arms.
+        assert_eq!(relay_peer_alerts(Some(2), Some(2)), (Some(false), None));
+        assert_eq!(relay_peer_alerts(Some(0), Some(4)), (Some(false), None));
+    }
+
     use super::*;
 
     #[test]
@@ -610,6 +824,14 @@ mod tests {
         assert!(version_is_newer("1.11.0-rc1", "1.10.20"));
         // Same numeric core, one prerelease: numeric core equal → not "newer".
         assert!(!version_is_newer("1.10.20-rc1", "1.10.20"));
+    }
+
+    #[test]
+    fn version_newer_reads_node_pool_tags() {
+        assert!(version_is_newer("np-v1.11.47", "1.11.46"));
+        assert!(version_is_newer("np-v1.12.0", "np-v1.11.46"));
+        assert!(!version_is_newer("np-v1.11.46", "1.11.46"));
+        assert!(!version_is_newer("np-v1.11.46-rc1", "1.11.46"));
     }
 
     #[test]

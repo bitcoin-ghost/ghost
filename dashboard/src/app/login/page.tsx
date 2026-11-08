@@ -41,7 +41,7 @@ function LoginForm() {
       <div className="w-full max-w-sm p-8 space-y-6">
         <div className="flex flex-col items-center space-y-2">
           <Ghost size={48} strokeWidth={1.75} style={{ color: "var(--accent)" }} aria-hidden="true" />
-          <h1 className="text-xl font-semibold text-gray-100">Ghost Node</h1>
+          <h1 className="text-xl font-semibold text-gray-100">Ghost Pool node</h1>
           <p className="text-sm text-gray-400">Enter your password</p>
         </div>
 
@@ -74,14 +74,15 @@ function LoginForm() {
             <p>
               There is no web reset — that would let anyone who can reach this
               page bypass the password. Recovery requires access to the node
-              itself. On the node (over SSH or locally), run as root:
+              itself. The installer generated the password and keeps it there; on
+              the node (over SSH or locally), run:
             </p>
             <pre className="overflow-x-auto rounded bg-gray-950 px-3 py-2 text-xs text-gray-300">
-              <code>sudo scripts/agathion-reset-password.sh</code>
+              <code>sudo grep DASHBOARD_PASSWORD /etc/ghost/dashboard.env</code>
             </pre>
             <p>
-              It sets a fresh password, prints it, and restarts the dashboard.
-              Then sign in here with the new password.
+              To change it, edit that file (root only), then run{" "}
+              <code>sudo systemctl restart ghost-dashboard</code>.
             </p>
           </div>
         </details>

@@ -29,12 +29,14 @@ tracing = { version = "0.1" }
 clap = { version = "4.5.39", features = ["derive"] }
 ghost-build-info.workspace = true
 bitcoin_core_sv2 = { path = "../../crates/bitcoin-core-sv2" }
-jd_server_sv2 = { path = "../jd-server-sv2" }
 hex = "0.4.3"
 hotpath = "0.14.0"
 
 [features]
 default = ["monitoring"]
 monitoring = ["stratum-apps/monitoring"]
-hotpath = ["hotpath/hotpath", "jd_server_sv2/hotpath"]
-hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "jd_server_sv2/hotpath-alloc"]
+hotpath = ["hotpath/hotpath"]
+# The end-to-end harness's hostile build (scripts/regtest-solo/): GHOST_SOLO_FAULT=skim-treasury
+# pays every job's treasury output to the operator. Never enabled in a release.
+solo-fault-injection = []
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]

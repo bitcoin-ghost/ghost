@@ -389,7 +389,6 @@ config_gate_failures() {
     fi
     [ "$parse" = "ok" ] || echo "pool.toml does NOT parse with the incoming binary — the node would not come back from its next restart"
     [ -z "$dead" ] || echo "config carries key(s) for removed features: $dead"
-    [ -n "$mode" ] || echo "mining_mode is not set — resolved from MiningMode::default(), which decides whether payouts go through BFT"
 }
 
 # Conditions worth saying out loud that must NOT stop a deploy.
@@ -400,8 +399,7 @@ config_gate_failures() {
 #
 # A missing `[tdp]` means template distribution runs on compiled defaults. That is the status quo
 # and breaks nothing; it is unconverged config, not a node that fails to start. Blocking belongs to
-# "this binary will not come back": a config that does not parse, keys for deleted features, an
-# unset `mining_mode`. Convergence is #759's job and wants its own change, not a release hostage.
+# "this binary will not come back": a config that does not parse, or keys for deleted features. Convergence is #759's job and wants its own change, not a release hostage.
 config_gate_warnings() {
     local tdp="${1:-}"
     [ "${tdp:-0}" -gt 0 ] 2>/dev/null || echo "TDP runs on compiled defaults (the sri-pool unit passes no --tdp-port). NOT fixable in pool.toml: [tdp] is not a NodeConfig section and adding it fails deny_unknown_fields (#759, #761)"
@@ -955,7 +953,7 @@ if [ "$BINARY" = "ghost-mining" ]; then
         timeout 30 ssh "${SSH_OPTS[@]}" "$NODE" "rm -f /tmp/$BINARY.new" 2>/dev/null || true
         exit 2
     fi
-    info "config gate: parses with the incoming binary, no dead keys, mining_mode set"
+    info "config gate: parses with the incoming binary, no dead keys"
 fi
 
 # ------------------------------------------------------- ops script convergence (#759)
@@ -1126,7 +1124,9 @@ echo BACKUP \$dest ver=\$(sudo -u ghost sqlite3 \"file:\$dest?mode=ro\" 'PRAGMA 
 " 2>&1)" || die "pre-migration backup FAILED on $NODE — refusing to migrate without one:
 $(printf '%s\n' "$BK_OUT" | sed 's/^/        /')"
 
-            BK_VER="$(printf '%s\n' "$BK_OUT" | sed -nE 's/.*ver=([0-9]+) .*/\1/p' | head -1)"
+            # The copy's raw user_version; from v65 it is stored negated (`-65`), so drop the sign
+            # to compare it with the gate's decoded live version.
+            BK_VER="$(printf '%s\n' "$BK_OUT" | sed -nE 's/.*ver=-?([0-9]+) .*/\1/p' | head -1)"
             if [ "${BK_VER:-}" != "$2" ]; then
                 die "the pre-migration backup on $NODE reports user_version='${BK_VER:-}' but the live
 database is at v$2. A backup that does not round-trip its own schema version is not a backup:

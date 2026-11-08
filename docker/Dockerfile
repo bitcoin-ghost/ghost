@@ -24,9 +24,7 @@ COPY bins ./bins
 # Build release binaries
 RUN cargo build --release \
     --bin ghost-mining \
-    --bin translator \
-    --bin ghost-pay \
-    --bin ghost-coordinator
+    --bin translator
 
 # ============================================================================
 # Runtime Stage - ghost-pool
@@ -59,7 +57,7 @@ USER ghost
 WORKDIR /var/lib/ghost
 
 # Expose ports
-EXPOSE 34255 3333 8080 8555-8562
+EXPOSE 34255 3333 8080
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
@@ -87,61 +85,3 @@ USER ghost
 EXPOSE 3333 34265
 
 ENTRYPOINT ["/usr/local/bin/translator"]
-
-# ============================================================================
-# Runtime Stage - ghost-pay
-# ============================================================================
-FROM debian:bookworm-slim AS ghost-pay
-
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    libssl3 \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN useradd -r -s /bin/false ghost
-RUN mkdir -p /etc/ghost /var/lib/ghost/data \
-    && chown -R ghost:ghost /etc/ghost /var/lib/ghost
-
-COPY --from=builder /build/target/release/ghost-pay /usr/local/bin/ghost-pay
-COPY docker/config/ghost-pay.toml /etc/ghost/config.toml
-RUN chown ghost:ghost /etc/ghost/config.toml
-
-USER ghost
-WORKDIR /var/lib/ghost
-
-EXPOSE 8081
-
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD curl -f http://localhost:8081/api/v1/health || exit 1
-
-ENTRYPOINT ["/usr/local/bin/ghost-pay"]
-CMD ["--config", "/etc/ghost/config.toml"]
-
-# ============================================================================
-# Runtime Stage - ghost-coordinator
-# ============================================================================
-FROM debian:bookworm-slim AS ghost-coordinator
-
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    libssl3 \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN useradd -r -s /bin/false ghost
-RUN mkdir -p /etc/ghost /var/lib/ghost \
-    && chown -R ghost:ghost /etc/ghost /var/lib/ghost
-
-COPY --from=builder /build/target/release/ghost-coordinator /usr/local/bin/ghost-coordinator
-COPY docker/config/ghost-coordinator.toml /etc/ghost/config.toml
-RUN chown ghost:ghost /etc/ghost/config.toml
-
-USER ghost
-WORKDIR /var/lib/ghost
-
-EXPOSE 8333
-
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD curl -f http://localhost:8333/api/v1/health || exit 1
-
-ENTRYPOINT ["/usr/local/bin/ghost-coordinator"]
-CMD ["--config", "/etc/ghost/config.toml"]

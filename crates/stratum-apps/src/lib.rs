@@ -14,8 +14,6 @@
 //!
 //! ### Role-Specific Feature Bundles
 //! - `pool` - Everything needed for pool applications
-//! - `jd_client` - Everything needed for JD client applications
-//! - `jd_server` - Everything needed for JD server applications (includes RPC)
 //! - `translator` - Everything needed for translator applications (includes SV1)
 //! - `mining_device` - Everything needed for mining device applications
 //!

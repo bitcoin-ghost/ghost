@@ -16,9 +16,8 @@ STATE_DIR="${HOME}/.ghost-deploy"
 mkdir -p "$STATE_DIR"
 cd "$REPO_ROOT"
 
-# Tauri GUI crates are excluded exactly as CI excludes them: they need a sidecar binary
-# that isn't built here, and their absence is not a code failure.
-EXCLUDES="--exclude wraith-wallet-gui --exclude ghost-tap-desktop"
+# Kept empty: CI excludes nothing from the workspace now that the Tauri crates are gone.
+EXCLUDES=""
 
 [ -z "$(git status --porcelain)" ] || { echo "REFUSED: dirty tree — the record must describe a commit" >&2; exit 1; }
 
@@ -34,10 +33,6 @@ echo "==> inlined installer copies"
 ./scripts/check-inlined-copies.sh || { echo "FAILED: inlined copies drifted" >&2; exit 1; }
 ./scripts/check-heredoc-comments-are-inert.sh || { echo "FAILED: an unquoted heredoc would run its own text" >&2; exit 1; }
 
-# Every Shard message type must be dispatched by some handler. Four times on 2026-08-16 a piece of
-# ghost-consensus was complete, unit-tested, and wired to nothing — the tests could not see it
-# because the layer being tested and the layer being wired are different layers.
-./scripts/check-wiring.sh || { echo "FAILED: a message type has no dispatch arm" >&2; exit 1; }
 
 echo "==> stratum config agreement"
 ./scripts/check-stratum-config-agreement.sh || { echo "FAILED: stratum config sources disagree" >&2; exit 1; }
@@ -144,7 +139,7 @@ run_gate() {
 #
 #     cargo clippy $WORKSPACE_EXCLUDES --all-targets --all-features -- -D warnings -A ...
 #
-# so feature-gated code (`zk-consensus`, `mpc-ceremony`, `zk-production`) was never linted
+# so feature-gated code was never linted
 # locally, and without `-D warnings` clippy exited 0 on warnings — `run_gate` recorded success
 # on a commit CI would reject, and the deploy gate passed it as tested.
 #
@@ -181,33 +176,6 @@ if grep -qE "FAILED" <<<"$test_out"; then
     echo "$test_out" | grep -E "FAILED|panicked at|assertion|left ==|right ==|left:|right:" \
         | head -40 >&2
     echo "FAILED: test failures" >&2
-    exit 1
-fi
-
-# Feature-gated consensus modules. `--lib --bins` above does NOT compile these, because
-# ghost-consensus has `default = []` and gates two modules behind features:
-#
-#   #[cfg(feature = "zk-consensus")]  pub mod nullifier_route_handler;   <- L2 tree sync
-#   #[cfg(feature = "mpc-ceremony")]  pub mod mpc_handler;
-#
-# Without them the run reports ~286 tests while ~71 more are not even compiled — including
-# every test for the L2 tree-sync and nullifier-routing code that is live on all 8 production
-# nodes. CI has run these since #530; this gate did not, so a commit could fail CI's
-# feature-gated job and still be recorded here as deployable. Mirrors ci.yml exactly.
-#
-# NOT `--all-features`, deliberately, for the same reasons ci.yml gives: that would also enable
-# ghost-verification's `allow-insecure` (changing what the security tests assert) and
-# `zk-production` (which needs trusted-setup params).
-echo "==> tests (feature-gated consensus modules)"
-feat_out="$(cargo test -p ghost-consensus --lib --features zk-consensus,mpc-ceremony 2>&1)" || {
-    echo "$feat_out" | grep -E "FAILED|^error|panicked at|assertion|left ==|right ==|left:|right:" \
-        | head -40 >&2
-    echo "FAILED: feature-gated consensus tests" >&2; exit 1; }
-grep -E "^test result" <<<"$feat_out" | tail -2
-if grep -qE "FAILED" <<<"$feat_out"; then
-    echo "$feat_out" | grep -E "FAILED|panicked at|assertion|left ==|right ==|left:|right:" \
-        | head -40 >&2
-    echo "FAILED: feature-gated consensus test failures" >&2
     exit 1
 fi
 

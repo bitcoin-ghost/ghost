@@ -7,11 +7,8 @@
 //! - Pool configuration
 //! - Policy configuration
 //! - Storage configuration
-//! - Ghost Pay configuration
-//! - Coordinator configuration
 
 use ghost_common::config::*;
-use ghost_common::types::TreasuryAddress;
 
 // =============================================================================
 // CONFIG LOADING TESTS (Tests 86-90)
@@ -24,15 +21,11 @@ fn test_086_default_config_has_sensible_values() {
     // Network defaults
     assert_eq!(config.network.sv2_port, 34255);
     assert_eq!(config.network.sv1_port, 3333);
-    assert!(matches!(config.network.mining_mode, MiningMode::PublicPool));
     assert!(config.network.signing_key.is_none());
 
     // Bitcoin defaults
     assert_eq!(config.bitcoin.rpc_host, "127.0.0.1");
     assert_eq!(config.bitcoin.network, BitcoinNetwork::Signet);
-
-    // Pool defaults
-    assert!(config.pool.treasury_address.is_empty());
 }
 
 #[test]
@@ -127,36 +120,8 @@ fn test_093_valid_port_range_accepted() {
 }
 
 #[test]
-fn test_094_public_mining_requires_signing_key() {
-    let mut config = NodeConfig::default();
-    config.network.mining_mode = MiningMode::PublicPool;
-    config.network.signing_key = None;
-
-    let result = config.validate();
-    assert!(!result.is_valid());
-    assert!(result
-        .errors
-        .iter()
-        .any(|e| e.field == "network.signing_key" && e.message.contains("REQUIRED")));
-}
-
-#[test]
-fn test_095_missing_signing_key_produces_error() {
-    let mut config = NodeConfig::default();
-    config.network.mining_mode = MiningMode::PublicPool;
-    config.network.signing_key = None;
-
-    let result = config.validate();
-    assert!(result
-        .errors
-        .iter()
-        .any(|e| e.field == "network.signing_key"));
-}
-
-#[test]
 fn test_096_invalid_signing_key_length_rejected() {
     let mut config = NodeConfig::default();
-    config.network.mining_mode = MiningMode::PublicPool;
     config.network.signing_key = Some("0123456789abcdef".to_string()); // Only 16 chars
 
     let result = config.validate();
@@ -170,7 +135,6 @@ fn test_096_invalid_signing_key_length_rejected() {
 #[test]
 fn test_097_invalid_signing_key_chars_rejected() {
     let mut config = NodeConfig::default();
-    config.network.mining_mode = MiningMode::PublicPool;
     // Contains 'g', 'h', 'i', 'j' which are not hex
     config.network.signing_key =
         Some("ghij456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string());
@@ -186,7 +150,6 @@ fn test_097_invalid_signing_key_chars_rejected() {
 #[test]
 fn test_098_valid_signing_key_accepted() {
     let mut config = NodeConfig::default();
-    config.network.mining_mode = MiningMode::PublicPool;
     config.network.signing_key =
         Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string());
 
@@ -196,60 +159,6 @@ fn test_098_valid_signing_key_accepted() {
         .errors
         .iter()
         .any(|e| e.field == "network.signing_key" && e.message.contains("REQUIRED")));
-}
-
-#[test]
-fn test_099_private_mining_doesnt_require_signing_key() {
-    let mut config = NodeConfig::default();
-    config.network.mining_mode = MiningMode::PrivatePool;
-    config.network.signing_key = None;
-
-    let result = config.validate();
-    assert!(!result
-        .errors
-        .iter()
-        .any(|e| e.field == "network.signing_key"));
-}
-
-#[test]
-fn test_100_seed_nodes_http_remote_rejected() {
-    let mut config = NodeConfig::default();
-    config.network.seed_nodes = vec!["http://192.168.1.100:8080".to_string()];
-
-    let result = config.validate();
-    assert!(!result.is_valid());
-    assert!(result
-        .errors
-        .iter()
-        .any(|e| e.field.contains("seed_nodes") && e.message.contains("Insecure HTTP")));
-}
-
-#[test]
-fn test_101_seed_nodes_https_accepted() {
-    let mut config = NodeConfig::default();
-    config.network.seed_nodes = vec!["https://seed.example.com:8080".to_string()];
-
-    let result = config.validate();
-    // Should not have seed_nodes error for HTTPS
-    assert!(!result
-        .errors
-        .iter()
-        .any(|e| e.field.contains("seed_nodes") && e.message.contains("Insecure HTTP")));
-}
-
-#[test]
-fn test_102_seed_nodes_localhost_http_warning() {
-    let mut config = NodeConfig::default();
-    config.network.seed_nodes = vec!["http://127.0.0.1:8080".to_string()];
-
-    let result = config.validate();
-    // Should be a warning, not an error
-    assert!(result
-        .warnings
-        .iter()
-        .any(|e| e.field.contains("seed_nodes") && e.message.contains("localhost")));
-    // Should NOT be an error
-    assert!(!result.errors.iter().any(|e| e.field.contains("seed_nodes")));
 }
 
 // =============================================================================
@@ -341,74 +250,6 @@ fn test_109_zmq_endpoints_valid() {
 // POOL CONFIG TESTS (Tests 113-120)
 // =============================================================================
 
-#[test]
-fn test_113_empty_treasury_address_warning() {
-    let mut config = NodeConfig::default();
-    config.pool.treasury_address = TreasuryAddress::Single(String::new());
-
-    let result = config.validate();
-    assert!(result
-        .warnings
-        .iter()
-        .any(|e| e.field == "pool.treasury_address"));
-}
-
-#[test]
-fn test_114_invalid_treasury_address_prefix_rejected() {
-    let mut config = NodeConfig::default();
-    config.bitcoin.network = BitcoinNetwork::Mainnet;
-    config.pool.treasury_address =
-        TreasuryAddress::single("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"); // testnet address
-
-    let result = config.validate();
-    assert!(!result.is_valid());
-    assert!(result
-        .errors
-        .iter()
-        .any(|e| e.field == "pool.treasury_address" && e.message.contains("prefix")));
-}
-
-#[test]
-fn test_115_treasury_address_matches_mainnet() {
-    let mut config = NodeConfig::default();
-    config.bitcoin.network = BitcoinNetwork::Mainnet;
-    config.pool.treasury_address =
-        TreasuryAddress::single("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
-
-    let result = config.validate();
-    assert!(!result
-        .errors
-        .iter()
-        .any(|e| e.field == "pool.treasury_address" && e.message.contains("prefix")));
-}
-
-#[test]
-fn test_116_treasury_address_matches_testnet() {
-    let mut config = NodeConfig::default();
-    config.bitcoin.network = BitcoinNetwork::Testnet;
-    config.pool.treasury_address =
-        TreasuryAddress::single("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx");
-
-    let result = config.validate();
-    assert!(!result
-        .errors
-        .iter()
-        .any(|e| e.field == "pool.treasury_address" && e.message.contains("prefix")));
-}
-
-#[test]
-fn test_120_min_payout_below_dust_rejected() {
-    let mut config = NodeConfig::default();
-    config.pool.min_payout_sats = 100; // Below 546 dust limit
-
-    let result = config.validate();
-    assert!(!result.is_valid());
-    assert!(result
-        .errors
-        .iter()
-        .any(|e| e.field == "pool.min_payout_sats" && e.message.contains("dust")));
-}
-
 // =============================================================================
 // STORAGE CONFIG TESTS (Tests 129-131)
 // =============================================================================
@@ -443,114 +284,5 @@ fn test_131_wal_mode_defaults_enabled() {
 }
 
 // =============================================================================
-// GHOST PAY CONFIG TESTS (Tests 132-135)
-// =============================================================================
-
-#[test]
-fn test_132_zero_virtual_block_secs_rejected() {
-    let config = NodeConfig {
-        ghost_pay: Some(GhostPayConfig {
-            enabled: true,
-            virtual_block_secs: 0,
-            ..GhostPayConfig::default()
-        }),
-        ..NodeConfig::default()
-    };
-
-    let result = config.validate();
-    assert!(!result.is_valid());
-    assert!(result
-        .errors
-        .iter()
-        .any(|e| e.field == "ghost_pay.virtual_block_secs"));
-}
-
-#[test]
-fn test_133_zero_epoch_blocks_rejected() {
-    let config = NodeConfig {
-        ghost_pay: Some(GhostPayConfig {
-            enabled: true,
-            epoch_blocks: 0,
-            ..GhostPayConfig::default()
-        }),
-        ..NodeConfig::default()
-    };
-
-    let result = config.validate();
-    assert!(!result.is_valid());
-    assert!(result
-        .errors
-        .iter()
-        .any(|e| e.field == "ghost_pay.epoch_blocks"));
-}
-
-// =============================================================================
 // POOL CONFIG VALIDATE METHOD TESTS
 // =============================================================================
-
-#[test]
-fn test_pool_config_validate_empty_treasury() {
-    let config = PoolConfig {
-        // Operator-specific; unset means `--status` skips the in-DNS check.
-        mining_dns_name: None,
-        treasury_address: TreasuryAddress::Single(String::new()),
-        ..PoolConfig::default()
-    };
-
-    let result = config.validate();
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_pool_config_validate_zero_min_payout_via_struct() {
-    let config = PoolConfig {
-        // Operator-specific; unset means `--status` skips the in-DNS check.
-        mining_dns_name: None,
-        treasury_address: TreasuryAddress::single("bc1qtest"),
-        min_payout_sats: 0,
-        ..PoolConfig::default()
-    };
-
-    let result = config.validate();
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_pool_config_validate_zero_min_payout() {
-    let config = PoolConfig {
-        // Operator-specific; unset means `--status` skips the in-DNS check.
-        mining_dns_name: None,
-        treasury_address: TreasuryAddress::single("bc1qtest"),
-        min_payout_sats: 0,
-        ..PoolConfig::default()
-    };
-
-    let result = config.validate();
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_pool_config_validate_success() {
-    let config = PoolConfig {
-        // Operator-specific; unset means `--status` skips the in-DNS check.
-        mining_dns_name: None,
-        treasury_address: TreasuryAddress::single("bc1qtest"),
-        min_payout_sats: 10000,
-        payout_interval_blocks: 100,
-        // WP-5 share-batch chain: dark unless a node opts in.
-        // Share shard (docs/SHARE_SHARD.md): same precedent, dark unless a node opts in.
-        share_shard: false,
-        // Stage 5 genesis ceremony: dark until the operator runs it deliberately.
-        shard_arm_genesis: false,
-        shard_coinbase: false,
-        node_payout_address: None,
-        pool_name: None,
-        coinbase_extra: None,
-        genesis_password: None,
-        block_priority: Default::default(),
-        template_refresh_secs: None,
-    };
-
-    let result = config.validate();
-    assert!(result.is_ok());
-}

@@ -23,11 +23,9 @@ import { SettingsSection, ToggleRow } from "../shared";
 
 // Human labels + descriptions for each watched event.
 const EVENT_META: { key: keyof AlertEvents; label: string; description: string }[] = [
-  { key: "node_offline", label: "Node offline / unhealthy", description: "The node stopped responding or failed its health checks." },
-  { key: "capability_drift", label: "Capability drift", description: "A verified capability regressed from qualified to failing." },
   { key: "low_disk", label: "Low disk space", description: "Free disk fell below the safe threshold." },
   { key: "restart_needed", label: "Restart needed", description: "A change or update needs a node restart to apply." },
-  { key: "peer_count_drop", label: "Peer count drop", description: "Connected mesh peers were lost (possible partition)." },
+  { key: "peer_count_drop", label: "Relay peers dropped", description: "The old node pool relay's peers were lost. Ghost Pool has no relay, so this alert has nothing to watch." },
   { key: "block_found", label: "Block found", description: "This node found a block." },
   { key: "reorg_detected", label: "Chain reorg detected", description: "A Bitcoin block was disconnected from the tip (chain reorganisation)." },
   { key: "behind_tip", label: "Node behind tip", description: "The node fell behind the network — a stale tip or a lagging local height." },

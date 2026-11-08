@@ -1,3 +1,6 @@
+use crate::sv1::sv1_server::{
+    GHOST_AGENT_EXTENSION_TYPE, GHOST_AGENT_FIELD_TYPE, GHOST_PAYEE_FIELD_TYPE,
+};
 use crate::{
     error::{self, TproxyError, TproxyErrorKind, TproxyResult},
     is_aggregated,
@@ -495,10 +498,31 @@ impl ChannelManager {
                     open_channel_msg
                 );
 
+                // The Ghost agent TLV (node pool slot-class sensing) goes only to an upstream
+                // that negotiated it; anything else gets the plain frame, exactly as before.
+                let agent_tlv = tlv_fields.and_then(|tlvs| {
+                    tlvs.into_iter().find(|t| {
+                        t.r#type.extension_type == GHOST_AGENT_EXTENSION_TYPE
+                            && t.r#type.field_type == GHOST_AGENT_FIELD_TYPE
+                    })
+                });
+                let agent_negotiated = self
+                    .negotiated_extensions
+                    .super_safe_lock(|data| data.contains(&GHOST_AGENT_EXTENSION_TYPE));
                 let message = Mining::OpenExtendedMiningChannel(open_channel_msg);
-                let sv2_frame: Sv2Frame = AnyMessage::Mining(message)
-                    .try_into()
-                    .map_err(TproxyError::shutdown)?;
+                let sv2_frame: Sv2Frame = match agent_tlv.filter(|_| agent_negotiated) {
+                    Some(tlv) => {
+                        let bytes = TlvList::from_slice(&[tlv])
+                            .and_then(|list| list.build_frame_bytes_with_tlvs(message))
+                            .map_err(TproxyError::shutdown)?;
+                        StandardSv2Frame::from_bytes(bytes.into()).map_err(|_| {
+                            TproxyError::shutdown(framing_sv2::Error::ExpectedSv2Frame)
+                        })?
+                    }
+                    None => AnyMessage::Mining(message)
+                        .try_into()
+                        .map_err(TproxyError::shutdown)?,
+                };
                 self.channel_state
                     .upstream_sender
                     .send(sv2_frame)
@@ -692,11 +716,38 @@ impl ChannelManager {
                     "Sending UpdateChannel message to upstream for channel_id: {}",
                     m.channel_id
                 );
-                // Forward UpdateChannel message to upstream
+                // Forward UpdateChannel message to upstream. One that binds a provisional
+                // channel's payee carries the Ghost payee TLV, to an upstream that negotiated
+                // the Ghost extension only.
+                let payee_tlv = tlv_fields.and_then(|tlvs| {
+                    tlvs.into_iter().find(|t| {
+                        t.r#type.extension_type == GHOST_AGENT_EXTENSION_TYPE
+                            && t.r#type.field_type == GHOST_PAYEE_FIELD_TYPE
+                    })
+                });
+                let agent_negotiated = self
+                    .negotiated_extensions
+                    .super_safe_lock(|data| data.contains(&GHOST_AGENT_EXTENSION_TYPE));
+                if payee_tlv.is_some() && !agent_negotiated {
+                    warn!(
+                        "a provisional channel's payee cannot reach the pool: the upstream did not \
+                         negotiate the Ghost extension 0x4748"
+                    );
+                }
                 let message = Mining::UpdateChannel(m);
-                let sv2_frame: Sv2Frame = AnyMessage::Mining(message)
-                    .try_into()
-                    .map_err(TproxyError::shutdown)?;
+                let sv2_frame: Sv2Frame = match payee_tlv.filter(|_| agent_negotiated) {
+                    Some(tlv) => {
+                        let bytes = TlvList::from_slice(&[tlv])
+                            .and_then(|list| list.build_frame_bytes_with_tlvs(message))
+                            .map_err(TproxyError::shutdown)?;
+                        StandardSv2Frame::from_bytes(bytes.into()).map_err(|_| {
+                            TproxyError::shutdown(framing_sv2::Error::ExpectedSv2Frame)
+                        })?
+                    }
+                    None => AnyMessage::Mining(message)
+                        .try_into()
+                        .map_err(TproxyError::shutdown)?,
+                };
 
                 self.channel_state
                     .upstream_sender

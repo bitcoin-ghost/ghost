@@ -6,11 +6,25 @@
 # strict no-op unless the operator has opted in via /etc/ghost/auto-update.conf
 # (AUTO_UPDATE=true). When opted in, it resolves the latest published release,
 # and — ONLY if it is newer than what is installed — downloads the signed
-# release tarball (which now bundles ghostd alongside ghost-mining/ghost-pay),
+# release tarball (which now bundles ghostd alongside ghost-mining),
 # verifies the detached GPG signature against the pinned release key and the
 # tarball's SHA256, backs up the current binaries, swaps them with a
 # stop→verify-inactive→swap→start sequence, health-checks, and rolls back on any
 # failure.
+#
+# On a node pool node the node dashboard (/opt/ghost/dashboard) moves with the release too: the
+# release's `bitcoin-ghost-<tag>-dashboard.tar.gz`, checked against the same signed SHA256SUMS.txt,
+# replaces the tree once the node's own health checks have passed, and ghost-dashboard restarts on
+# it. A dashboard that then does not answer is put back by itself; it never rolls back the node.
+# A release without a dashboard leaves the installed one as it is.
+#
+# ⛔ Two release channels share one GitHub repository. Which one a node follows is decided by
+# /etc/ghost/release-channel, written by the node pool installer:
+#   * `node-pool`  — the newest published `np-vX.Y.Z` release, picked from the release LIST.
+#                    Node pool releases are pre-releases and never `latest`.
+#   * no marker    — the old network: `releases/latest`, exactly as before the channel existed.
+#                    An install running an `np-` build without the marker is refused.
+#   * anything else — refused.
 #
 # ⛔ The SV2 stratum stack (`pool_sv2` under sri-pool, `translator_sv2` under
 # sri-translator) is swapped in the SAME set as ghost-mining (#1044). Share-batch
@@ -44,8 +58,13 @@ RELEASES_API_URL="${GHOST_RELEASES_API_URL:-https://api.github.com/repos/bitcoin
 # NOTE: ghostd is no longer fetched from a standalone URL — it ships inside the
 # signed release tarball (below), so the old GHOSTD_URL side-channel is gone.
 # Release tarball base. When GHOST_RELEASE_BASE is set it is used verbatim;
-# otherwise it is constructed per-version from the GitHub releases download URL.
+# otherwise it is constructed per-version as <download URL>/<tag>, GitHub's layout.
 RELEASE_BASE_OVERRIDE="${GHOST_RELEASE_BASE:-}"
+# The download URL that tags hang off. Overridable, like the anchors above, only for a local test
+# mirror laid out the same way (the install rehearsal; install-node.sh writes these into a
+# `test-release-mirror.conf` drop-in of ghost-auto-update.service when installed against one).
+RELEASE_DOWNLOAD_URL="${GHOST_RELEASE_DOWNLOAD_URL:-https://github.com/bitcoin-ghost/ghost/releases/download}"
+PRODUCTION_GPG_KEY_FP="777FE81F8CC077FD3D08055E852C2B3190F5B928"
 
 # ───────────────────────────── managed paths ─────────────────────────────────
 CONF_FILE="${GHOST_AUTOUPDATE_CONF:-/etc/ghost/auto-update.conf}"
@@ -54,6 +73,8 @@ STATUS_FILE="${GHOST_AUTOUPDATE_STATUS:-/var/lib/ghost/auto-update.status}"
 BIN_DIR="${GHOST_BIN_DIR:-/opt/ghost/bin}"
 BITCOIN_CONF="${GHOST_BITCOIN_CONF:-/etc/bitcoin/bitcoin.conf}"
 SYSTEMCTL="${GHOST_SYSTEMCTL:-systemctl}"
+DASHBOARD_DIR="${GHOST_DASHBOARD_DIR:-/opt/ghost/dashboard}"
+DASHBOARD_URL="${GHOST_DASHBOARD_URL:-http://127.0.0.1:3000/login}"
 
 # ──────────────────────────────── options ────────────────────────────────────
 DRY_RUN="${GHOST_AUTOUPDATE_DRYRUN:-false}"
@@ -99,7 +120,8 @@ write_status() {
   "result": "${result}",
   "message": "${message//\"/\'}",
   "installed_version": "${installed}",
-  "latest_version": "${latest}"
+  "latest_version": "${latest}",
+  "channel": "${CHANNEL:-}"
 }
 EOF
   chmod 644 "$STATUS_FILE" 2>/dev/null || true
@@ -107,8 +129,63 @@ EOF
 
 # ─────────────────────────────── helpers ─────────────────────────────────────
 
-# Normalise a version string for comparison: strip a leading 'v'.
-normver() { local v="$1"; echo "${v#v}"; }
+# >>> NP_RELEASE_CHANNEL
+# The node pool release channel. Node pool releases are tagged `np-vMAJOR.MINOR.PATCH` and are
+# published as GitHub PRE-releases, so GitHub can never make one the repository's `latest`: the
+# old network's nodes resolve `releases/latest` and must never be handed a node pool build. A node
+# pool node therefore never asks for `latest`; it lists the releases and picks the newest
+# `np-v` tag itself. The same block is in scripts/install-node.sh, which resolves
+# GHOST_VERSION=np-latest with it; scripts/test-release-channel.sh keeps the copies identical.
+NP_RELEASES_API_URL="${GHOST_NP_RELEASES_API_URL:-https://api.github.com/repos/bitcoin-ghost/ghost/releases?per_page=100}"
+# The marker the node pool installer writes. Present and saying `node-pool`: this node follows the
+# np- channel. Absent: an install from before the channel existed, which keeps the old channel.
+# Anything else is refused, never guessed.
+NP_CHANNEL_FILE="${GHOST_RELEASE_CHANNEL_FILE:-/etc/ghost/release-channel}"
+
+# np_tag_ok TAG — an exact node pool release tag, final or with a suffix (np-v1.2.3-rc1).
+np_tag_ok() { [[ "$1" =~ ^np-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; }
+# np_tag_final TAG — a final node pool release: the only kind np-latest ever picks.
+np_tag_final() { [[ "$1" =~ ^np-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+
+# np_latest_tag — reads a GitHub "list releases" JSON array on stdin and prints the highest final
+# np- tag of a PUBLISHED release. Drafts, tags of any other shape (the old network's v1.11.x,
+# np-v…-rc1) and anything else are skipped. Exit 1 when there is none, 2 when the JSON does not
+# have the shape this expects (each release carries one tag_name and one draft), so a changed API
+# fails closed instead of picking something. The prerelease flag is not used: every node pool
+# release carries it, which is what keeps them out of `latest`.
+np_latest_tag() {
+  local tok key val tag="" draft="" cands=""
+  while IFS= read -r tok; do
+    key="${tok#\"}"; key="${key%%\"*}"
+    val="${tok#*:}"; val="${val#"${val%%[![:space:]]*}"}"; val="${val//\"/}"
+    case "$key" in
+      tag_name) [[ -z "$tag" ]] || return 2; tag="$val" ;;
+      draft)    [[ -z "$draft" ]] || return 2; draft="$val" ;;
+    esac
+    if [[ -n "$tag" && -n "$draft" ]]; then
+      if [[ "$draft" == false ]] && np_tag_final "$tag"; then cands+="${tag#np-v}"$'\n'; fi
+      tag=""; draft=""
+    fi
+  done < <(grep -oE '"(tag_name|draft)"[[:space:]]*:[[:space:]]*("[^"]*"|true|false)' || true)
+  [[ -z "$tag" && -z "$draft" ]] || return 2
+  [[ -n "$cands" ]] || return 1
+  echo "np-v$(printf '%s' "$cands" | sort -V | tail -1)"
+}
+
+# np_channel — prints this node's release channel: `node-pool` or `old-network`. Fails, printing
+# why on stderr, when the marker exists but says anything else.
+np_channel() {
+  [[ -e "$NP_CHANNEL_FILE" ]] || { echo old-network; return 0; }
+  local v
+  v="$(grep -vE '^[[:space:]]*(#|$)' "$NP_CHANNEL_FILE" 2>/dev/null | head -1 | tr -d '[:space:]')"
+  [[ "$v" == node-pool ]] || { echo "release channel marker $NP_CHANNEL_FILE says '${v}', expected 'node-pool'" >&2; return 1; }
+  echo node-pool
+}
+# <<< NP_RELEASE_CHANNEL
+
+# Normalise a version string for comparison: strip a leading 'np-' (the node pool channel's tag
+# prefix) and then a leading 'v'.
+normver() { local v="${1#np-}"; echo "${v#v}"; }
 
 # Installed version: prefer the file we write on update, fall back to parsing
 # `ghost-mining --version` (clap prints "ghost-mining <semver>").
@@ -166,8 +243,8 @@ unit_present() {
   $SYSTEMCTL list-unit-files "$unit" >/dev/null 2>&1
 }
 
-# unit_in_use — present and not masked. ghost-pay is masked on nodes that keep its unit file;
-# starting or health-checking it there fails by design and would roll back every update.
+# unit_in_use — present and not masked. A masked unit is one the operator switched off; starting
+# or health-checking it would fail by design and roll back every update.
 unit_in_use() {
   unit_present "$1" || return 1
   [[ "$($SYSTEMCTL is-enabled "$1" 2>/dev/null || true)" != masked ]]
@@ -196,18 +273,26 @@ health_ghostd() {
   return 1
 }
 
+# ghost-mining's /health block_height: present whenever ghost-mining answers. Empty when it does not.
+read_node_height() {
+  curl -fsS --max-time 8 "http://127.0.0.1:8080/health?unsigned=true" 2>/dev/null \
+    | grep -oE '"block_height"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1 || true
+}
+
+# ghost-mining answers /health. ⛔ Not its peer_count any more: that was the node pool's share-chain
+# relay peers, which no Ghost Pool node has, so it stays null and would roll back every update.
+# pool_sv2 and the translator are checked by health_stratum (their listening ports).
 health_ghost_pool() {
-  local resp pc
+  local h=""
   for _ in $(seq 1 30); do
-    resp="$(curl -fsS --max-time 8 "http://127.0.0.1:8080/health?unsigned=true" 2>/dev/null || true)"
-    pc="$(echo "$resp" | grep -oE '"peer_count"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1 || true)"
-    if [[ -n "$pc" && "$pc" -gt 0 ]]; then
-      log "health: ghost-mining /health peer_count=$pc"
+    h="$(read_node_height)"
+    if [[ -n "$h" ]]; then
+      log "health: ghost-mining /health answers (block_height=$h)"
       return 0
     fi
     sleep 2
   done
-  err "health: ghost-mining /health peer_count not > 0 (last='${pc:-none}')"
+  err "health: ghost-mining /health does not answer: ghost-mining is not up"
   return 1
 }
 
@@ -230,39 +315,23 @@ health_stratum() {
   return 0
 }
 
-health_ghost_pay() {
-  # Only meaningful when ghost-pay is installed. It serves TLS with an
-  # identity-derived cert, so -k (we are localhost, integrity is the binary swap
-  # we just verified, not the transport).
-  unit_in_use ghost-pay.service || { log "health: ghost-pay not installed or masked — skipped"; return 0; }
-  local code
-  for _ in $(seq 1 30); do
-    code="$(curl -k -s -o /dev/null -w '%{http_code}' --max-time 8 "https://127.0.0.1:8800/health" 2>/dev/null || true)"
-    if [[ "$code" == "200" ]]; then
-      log "health: ghost-pay /health=200"
-      return 0
-    fi
-    sleep 2
-  done
-  err "health: ghost-pay /health != 200 (last='${code:-none}')"
-  return 1
-}
-
 run_health_checks() {
   # GHOST_HEALTHCHECK_OVERRIDE lets an operator substitute a custom post-update
   # probe (and is the seam the test harness uses to drive the swap/rollback
-  # paths offline). Unset in production → the real ghostd/pool/pay probes run.
+  # paths offline). Unset in production → the real ghostd/pool/stratum probes run.
   if [[ -n "${GHOST_HEALTHCHECK_OVERRIDE:-}" ]]; then
     log "health: running override probe"
     bash -c "$GHOST_HEALTHCHECK_OVERRIDE"
     return $?
   fi
-  health_ghostd && health_ghost_pool && health_ghost_pay && health_stratum
+  health_ghostd && health_ghost_pool && health_stratum
 }
 
 # The node's units, in START order. Stops run this list backwards. Same order as the boot
 # gate (wait-for-ghostd-sync.sh): the stratum stack has nothing to serve until the node is up.
-START_ORDER=(ghostd.service ghost-mining.service ghost-pay.service sri-pool.service sri-translator.service)
+# Ghost Pay is retired and not in the list: a host that still has its unit keeps it as it is —
+# not stopped, swapped, started or health-checked by an update.
+START_ORDER=(ghostd.service ghost-mining.service sri-pool.service sri-translator.service)
 
 # stop_all — reverse start order, each verified inactive. Returns non-zero naming the first
 # unit that would not stop; units the node does not have are skipped by stop_and_wait.
@@ -283,12 +352,64 @@ start_all() {
       *) unit_in_use "$u" || continue ;;
     esac
     if ! $SYSTEMCTL start "$u"; then
-      # As in the boot gate: ghost-pay's failure is not the node's.
-      [[ "$u" == ghost-pay.service ]] && { warn "ghost-pay did not start — continuing"; continue; }
       START_FAILED="$u"; return 1
     fi
     [[ "$u" == ghostd.service ]] && sleep 3
   done
+  return 0
+}
+
+# ─────────────────────────────── dashboard ───────────────────────────────────
+
+# health_dashboard — the dashboard answers its login page. GHOST_DASHBOARD_HEALTH_OVERRIDE stands in
+# for it in tests, as GHOST_HEALTHCHECK_OVERRIDE does for the node.
+health_dashboard() {
+  if [[ -n "${GHOST_DASHBOARD_HEALTH_OVERRIDE:-}" ]]; then
+    bash -c "$GHOST_DASHBOARD_HEALTH_OVERRIDE"
+    return $?
+  fi
+  local code
+  for _ in $(seq 1 30); do
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$DASHBOARD_URL" 2>/dev/null || true)"
+    [[ "$code" == 200 ]] && { log "health: dashboard answers ($DASHBOARD_URL)"; return 0; }
+    sleep 2
+  done
+  err "health: dashboard does not answer $DASHBOARD_URL (last='${code:-none}')"
+  return 1
+}
+
+# swap_dashboard NEW_TREE STAMP — replace the dashboard tree, restart it, and put the previous tree
+# back if it does not answer. Prints the outcome for the status line. Never fails the update.
+swap_dashboard() {
+  local new="$1" ts="$2" bak="${DASHBOARD_DIR}.bak.$2"
+  $SYSTEMCTL stop ghost-dashboard.service >/dev/null 2>&1 || true
+  rm -rf "${DASHBOARD_DIR}.new"
+  if ! cp -a "$new" "${DASHBOARD_DIR}.new" || ! mv "$DASHBOARD_DIR" "$bak" || ! mv "${DASHBOARD_DIR}.new" "$DASHBOARD_DIR"; then
+    err "dashboard: could not put the new tree in place — keeping the installed one"
+    [[ -d "$DASHBOARD_DIR" ]] || mv "$bak" "$DASHBOARD_DIR" 2>/dev/null || true
+    rm -rf "${DASHBOARD_DIR}.new"
+    $SYSTEMCTL start ghost-dashboard.service >/dev/null 2>&1 || true
+    echo "dashboard kept (swap failed)"; return 0
+  fi
+  if [[ "$(id -u)" -eq 0 ]]; then
+    chown -R root:root "$DASHBOARD_DIR" 2>/dev/null || true
+    install -d -o ghost -g ghost -m 0755 "$DASHBOARD_DIR/.next/cache" 2>/dev/null || true
+  fi
+  log "swapped $DASHBOARD_DIR (previous tree: $bak)"
+  $SYSTEMCTL start ghost-dashboard.service >/dev/null 2>&1 || true
+  if health_dashboard; then
+    # One previous tree is kept for a manual rollback; older ones go (each is a whole build).
+    local old
+    for old in "${DASHBOARD_DIR}".bak.*; do
+      [[ -d "$old" && "$old" != "$bak" ]] && rm -rf "$old"
+    done
+    echo "dashboard updated"; return 0
+  fi
+  err "dashboard: the new one does not answer — putting the previous one back"
+  $SYSTEMCTL stop ghost-dashboard.service >/dev/null 2>&1 || true
+  rm -rf "$DASHBOARD_DIR" && mv "$bak" "$DASHBOARD_DIR"
+  $SYSTEMCTL start ghost-dashboard.service >/dev/null 2>&1 || true
+  echo "dashboard rolled back"
   return 0
 }
 
@@ -307,17 +428,54 @@ main() {
     exit 0
   fi
   log "auto-update enabled${DRY_RUN:+ }$([[ "$DRY_RUN" == "true" ]] && echo '(dry-run)')"
+  if [[ "$GPG_KEY_FP" != "$PRODUCTION_GPG_KEY_FP" ]]; then
+    warn "TEST RELEASE MIRROR: releases are verified against ${GPG_KEY_FP}, not the release key — this node is not following real releases"
+  fi
 
   # 2. Resolve installed + latest versions.
   local installed latest install_sh
   installed="$(read_installed_version || true)"
   [[ -n "$installed" ]] || { err "could not determine installed version"; write_status "error" "installed version unknown"; exit 1; }
 
-  # Resolve the latest published release directly from the GitHub releases API
-  # (the same source install.sh auto-tracks). Robust to install.sh's format.
-  latest="$(curl -fsSL --max-time 30 "$RELEASES_API_URL" 2>/dev/null | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1 || true)"
-  [[ -n "$latest" ]] || { err "could not resolve latest release from $RELEASES_API_URL"; write_status "error" "latest version unresolved"; exit 1; }
-  [[ "$latest" == v* ]] || latest="v${latest}"
+  # 2a. Which release channel this node follows. The node pool installer writes the marker; an
+  #     install without it is an old-network node and keeps tracking `releases/latest` exactly as
+  #     before. A node running a node pool build with no marker is refused rather than "updated"
+  #     to the old network's latest, which has no node pool in it.
+  CHANNEL="$(np_channel)" || { err "unreadable release channel marker — refusing to pick a channel"; CHANNEL=""; write_status "error" "release channel marker invalid"; exit 1; }
+  if [[ "$CHANNEL" == old-network && "$installed" == np-* ]]; then
+    err "installed $installed is a node pool release but $NP_CHANNEL_FILE is missing — refusing to track the old network's releases"
+    write_status "error" "node pool install without its channel marker"
+    exit 1
+  fi
+  log "release channel: $CHANNEL"
+
+  if [[ "$CHANNEL" == node-pool ]]; then
+    # The newest np- release, picked from the list. Never `releases/latest`: that is the old
+    # network's, and node pool releases are pre-releases precisely so it never points at one.
+    local releases rc=0
+    releases="$(curl -fsSL --max-time 30 "$NP_RELEASES_API_URL" 2>/dev/null)" \
+      || { err "could not fetch the release list from $NP_RELEASES_API_URL"; write_status "error" "latest node pool version unresolved"; exit 1; }
+    latest="$(np_latest_tag <<<"$releases")" || rc=$?
+    if [[ $rc -ne 0 || -z "$latest" ]]; then
+      case "$rc" in
+        1) err "no published node pool release (np-v*) at $NP_RELEASES_API_URL" ;;
+        *) err "the release list at $NP_RELEASES_API_URL is not in the expected shape (rc=$rc) — refusing to pick" ;;
+      esac
+      write_status "error" "latest node pool version unresolved"; exit 1
+    fi
+  else
+    # Resolve the latest published release directly from the GitHub releases API
+    # (the same source install.sh auto-tracks). Robust to install.sh's format.
+    latest="$(curl -fsSL --max-time 30 "$RELEASES_API_URL" 2>/dev/null | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1 || true)"
+    [[ -n "$latest" ]] || { err "could not resolve latest release from $RELEASES_API_URL"; write_status "error" "latest version unresolved"; exit 1; }
+    # A node pool release can never be `latest` (it is a pre-release). If one ever is, it is not
+    # for this node: refuse rather than move an old-network node onto the node pool.
+    if [[ "$latest" == np-* ]]; then
+      err "releases/latest is a node pool release ($latest) — not for an old-network node, refusing"
+      write_status "error" "latest release is on the node pool channel" "$latest"; exit 1
+    fi
+    [[ "$latest" == v* ]] || latest="v${latest}"
+  fi
 
   log "installed=$installed latest=$latest"
   if ! is_newer "$installed" "$latest"; then
@@ -342,7 +500,7 @@ main() {
   if [[ -n "$RELEASE_BASE_OVERRIDE" ]]; then
     release_base="$RELEASE_BASE_OVERRIDE"
   else
-    release_base="https://github.com/bitcoin-ghost/ghost/releases/download/${latest}"
+    release_base="${RELEASE_DOWNLOAD_URL}/${latest}"
   fi
   tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
   gnupg="$tmp/gnupg"; mkdir -m700 "$gnupg"
@@ -387,25 +545,43 @@ main() {
   # 5. Unpack the verified tarball and locate the binaries it carries (ghostd is
   #    now bundled in the tarball, so it is covered by the checks above).
   tar -xzf "$tmp/$tarball" -C "$tmp"
-  local new_pool new_pay new_cli new_admin new_ghostd new_pool_sv2 new_translator
+  local new_pool new_cli new_admin new_ghostd new_pool_sv2 new_translator new_audit
   new_pool="$(find "$tmp" -name ghost-mining -type f | head -1 || true)"
-  new_pay="$(find "$tmp" -name ghost-pay -type f | head -1 || true)"
   new_cli="$(find "$tmp" -name ghost-cli -type f | head -1 || true)"
   new_admin="$(find "$tmp" -name ghost-admin -type f | head -1 || true)"
   new_ghostd="$(find "$tmp" -name ghostd -type f | head -1 || true)"
   new_pool_sv2="$(find "$tmp" -name pool_sv2 -type f | head -1 || true)"
   new_translator="$(find "$tmp" -name translator_sv2 -type f | head -1 || true)"
+  new_audit="$(find "$tmp" -name ghost-audit -type f | head -1 || true)"
   [[ -n "$new_pool" ]] || { err "verified tarball did not contain ghost-mining"; write_status "error" "tarball missing ghost-mining" "$latest"; exit 1; }
   [[ -n "$new_ghostd" ]] || { err "verified tarball did not contain ghostd (release predates the unified build?)"; write_status "error" "tarball missing ghostd" "$latest"; exit 1; }
 
-  # Build the swap plan: (dest <- src), only for binaries currently installed
-  # (so we never introduce ghost-pay onto a node that opted out of it).
+  # 5a. The node dashboard (node pool channel, and only where one is installed). Verified against
+  #     the same signed manifest before anything is stopped; a mismatch stops the whole update.
+  local new_dash="" dash_tar="bitcoin-ghost-${latest}-dashboard.tar.gz"
+  if [[ "$CHANNEL" == node-pool && -d "$DASHBOARD_DIR" ]]; then
+    if grep -q " ${dash_tar}\$" "$tmp/SHA256SUMS.txt"; then
+      curl -fsSL --max-time 600 "${release_base}/${dash_tar}" -o "$tmp/$dash_tar" \
+        || { err "download $dash_tar failed"; write_status "error" "dashboard download failed" "$latest"; exit 1; }
+      if ! ( cd "$tmp" && grep " ${dash_tar}\$" SHA256SUMS.txt | sha256sum -c - >/dev/null 2>&1 ); then
+        err "VERIFY FAILED: dashboard SHA256 mismatch — ABORTING, nothing touched."
+        write_status "verify-failed" "dashboard checksum mismatch for $latest" "$latest"
+        exit 1
+      fi
+      log "VERIFY ok: dashboard checksum matches SHA256SUMS.txt"
+      mkdir -p "$tmp/dash" && tar -xzf "$tmp/$dash_tar" -C "$tmp/dash"
+      [[ -f "$tmp/dash/ghost-dashboard/server.js" ]] \
+        || { err "$dash_tar does not carry ghost-dashboard/server.js"; write_status "error" "dashboard archive malformed" "$latest"; exit 1; }
+      new_dash="$tmp/dash/ghost-dashboard"
+    else
+      warn "release $latest ships no dashboard — the installed one is left as it is"
+    fi
+  fi
+
+  # Build the swap plan: (dest <- src), only for binaries currently installed.
   local -a SWAP_DEST=() SWAP_SRC=()
   SWAP_DEST+=("$BIN_DIR/ghostd");     SWAP_SRC+=("$new_ghostd")
   SWAP_DEST+=("$BIN_DIR/ghost-mining"); SWAP_SRC+=("$new_pool")
-  if [[ -x "$BIN_DIR/ghost-pay" && -n "$new_pay" ]]; then
-    SWAP_DEST+=("$BIN_DIR/ghost-pay"); SWAP_SRC+=("$new_pay")
-  fi
   # ghost-cli is the Core RPC client. A release up to v1.11.45 carries the admin tool under
   # that name; swapping it in would replace a working RPC client with a different program, so
   # the installed one is kept and the tarball's is treated as the admin tool it is.
@@ -420,6 +596,10 @@ main() {
   fi
   if [[ -x "$BIN_DIR/ghost-admin" && -n "$new_admin" ]]; then
     SWAP_DEST+=("$BIN_DIR/ghost-admin"); SWAP_SRC+=("$new_admin")
+  fi
+  # ghost-audit (a miner's job check; nothing runs it) is swapped with the rest.
+  if [[ -x "$BIN_DIR/ghost-audit" && -n "$new_audit" ]]; then
+    SWAP_DEST+=("$BIN_DIR/ghost-audit"); SWAP_SRC+=("$new_audit")
   fi
   # The SV2 stack moves with ghost-mining or the update does not happen (#1044). An installed
   # binary the release does not carry would be left at the old version under a new ghost-mining
@@ -440,6 +620,7 @@ main() {
     log "DRY-RUN: verification PASSED for $latest. Would back up + swap:"
     local k
     for k in "${!SWAP_DEST[@]}"; do log "DRY-RUN:   ${SWAP_DEST[$k]} <- ${SWAP_SRC[$k]}"; done
+    [[ -z "$new_dash" ]] || log "DRY-RUN:   $DASHBOARD_DIR <- $dash_tar"
     log "DRY-RUN: would then restart services + health-check, rolling back on failure."
     write_status "dry-run" "verification passed; swap skipped (dry-run) for $latest" "$latest"
     exit 0
@@ -470,7 +651,7 @@ main() {
     return 0  # never let the rollback's last status trip `set -e` in the caller
   }
 
-  # 7. Stop services (reverse start order: translator, pool, pay, ghost-mining, ghostd), each
+  # 7. Stop services (reverse start order: translator, pool, ghost-mining, ghostd), each
   #    verified inactive. Nothing has been swapped yet, so a refusal rolls back to a no-op.
   local STOP_FAILED="" START_FAILED=""
   stop_all || { err "$STOP_FAILED would not stop — rolling back"; rollback; write_status "rolled-back" "$STOP_FAILED failed to stop" "$latest"; exit 1; }
@@ -491,14 +672,16 @@ main() {
     fi
   done
 
-  # 9. Start services (start order: ghostd, ghost-mining, pay, pool, translator).
+  # 9. Start services (start order: ghostd, ghost-mining, pool, translator).
   start_all || { err "$START_FAILED failed to start — rolling back"; rollback; write_status "rolled-back" "$START_FAILED failed to start" "$latest"; exit 1; }
 
   # 10. Health-check; roll back on any failure.
   if run_health_checks; then
     echo "$latest" > "$VERSION_FILE"; chmod 644 "$VERSION_FILE" 2>/dev/null || true
-    log "UPDATE COMPLETE: now running $latest (backups: *.bak.${ts})"
-    write_status "updated" "updated $installed -> $latest" "$latest"
+    local dash_note=""
+    [[ -z "$new_dash" ]] || dash_note="; $(swap_dashboard "$new_dash" "$ts")"
+    log "UPDATE COMPLETE: now running $latest (backups: *.bak.${ts})${dash_note}"
+    write_status "updated" "updated $installed -> $latest${dash_note}" "$latest"
     exit 0
   else
     err "health checks FAILED after swap — rolling back"

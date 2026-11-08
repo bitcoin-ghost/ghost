@@ -32,7 +32,7 @@
 #![deny(unreachable_pub)]
 
 pub mod atomic_file;
-pub mod batch_two_phase;
+
 pub mod circuit_breaker;
 pub mod clock;
 pub mod coinbase_tags;
@@ -42,28 +42,22 @@ pub mod constants;
 pub mod error;
 pub mod identity;
 pub mod identity_rotation;
-pub mod instant;
 pub mod internal_auth;
-pub mod key_rotation;
 pub mod metrics;
-pub mod mpc;
+
 pub mod rpc;
 
 pub mod sanitize;
 pub mod serde_hex;
 pub mod setup;
 
-/// Proving a share was mined to the node that claims it.
-pub mod share_binding;
+/// Ghost Solo: the coinbase rule every job pays (treasury, miner, witness commitment).
+pub mod solo;
 
-/// Share shard: the network shard's deterministic core (two grow-only quantities, max-merge,
-/// signed epoch summaries, table root).
-pub mod share_shard;
 pub mod signer;
 pub mod template_verifier;
 pub mod tls;
 pub mod types;
-pub mod work_fold;
 /// Bitcoin Core ZMQ subscriber. Gated behind the default `zmq` feature: it
 /// depends on the UNIX-only `tmq` crate, so wallet builds targeting Windows
 /// disable it via `default-features = false`.
@@ -75,8 +69,6 @@ pub use constants::*;
 pub use error::*;
 pub use identity::*;
 pub use identity_rotation::*;
-pub use instant::*;
-pub use key_rotation::*;
 pub use sanitize::{sanitize_for_log, sanitize_for_log_with_len};
 pub use signer::*;
 pub use types::*;

@@ -60,8 +60,10 @@ open_channel_on_subscribe = true
 # must list it under `supported_extensions` — check-stratum-config-agreement.sh enforces that
 # pairing, because a translator requiring an extension the pool does not support fails the
 # handshake, and the reverse silently drops attribution.
+# The Ghost agent extension (0x4748) carries each SV1 miner's user agent to pool_sv2's slot-class
+# sensing loop; without it every SV1 miner is sensed as an unknown agent (smallest class).
 supported_extensions = []
-required_extensions = [0x0002]
+required_extensions = [0x0002, 0x4748]
 
 # Monitoring endpoint
 monitoring_address = "0.0.0.0:9092"
@@ -116,16 +118,10 @@ enable_vardiff = true
 # Keepalive interval for downstream miners (seconds)
 job_keepalive_interval_secs = 60
 
-# Quantise every assigned difficulty to a power-of-two tier (SHARE_TIER_BIND).
-# ⚠ DORMANT: leave this OFF (absent/false) until the release that arms
-# `SHARE_TIER_BIND_HEIGHT` in ghost-mining — the translator has no chain view, so
-# this flag IS its half of that gate and must flip in the SAME release as
-# ghost-mining's height AND pool_sv2's `[share_tier_binding]` section
-# (pool-config.toml). pool_sv2 logs a SHARE_TIER_BIND DESYNC error if the halves
-# disagree. When armed, vardiff targets snap down to the tier below (2^n,
-# floored at 2^10 = 1024) so a share's coinbase can commit to the tier it was
-# assigned.
-quantise_to_tiers = true
+# Off: power-of-two difficulty tiers were the share chain's. A solo pool credits no shares, so
+# plain vardiff targets are right. check-stratum-config-agreement.sh holds this file and
+# scripts/install-node.sh to one value.
+quantise_to_tiers = false
 
 # Upstream SRI Pool connection
 [[upstreams]]
