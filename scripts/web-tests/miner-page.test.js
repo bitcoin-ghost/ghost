@@ -228,5 +228,66 @@ test('the node list could not be loaded', () => {
   assert(strip(out.tiles).includes('node list could not be loaded'));
 });
 
+// The live miner list under the lookup box: /api/v1/pool/miners from every node, as pool_sv2
+// serves it (solo_api.rs `miners`).
+const ADDR2 = 'bc1q7zvdh3uza6u52uemd3c60g0h0eu9g9yvm2y492';
+const listEntry = (address, h, extra) => Object.assign({
+  address, connected: true, workers: 2, online: 2, idle: 0, offline: 0, hashrate_hs: rates(h),
+  shares_24h: counts(), last_share_at: NOW - 30, best_share: { ever: 5e6, '24h': 5e6 }, blocks_found: 0
+}, extra || {});
+const lists = () => [
+  { node: 'a', ok: true, status: 200, body: { network: 'mainnet', miners: [listEntry(ADDR2, 8e13), listEntry(ADDR, 6e11, { last_share_at: NOW - 90 })] } },
+  { node: 'b', ok: true, status: 200, body: { network: 'mainnet', miners: [listEntry(ADDR2, 7e11, { workers: 3, online: 2, best_share: { ever: 9e8, '24h': 9e8 } })] } }
+];
+
+test('live list: one row per address over every node, the most hashrate first', () => {
+  const m = MP.mergeMinerLists(lists());
+  assert.deepStrictEqual(m.answered, ['a', 'b']);
+  assert.strictEqual(m.miners.length, 2);
+  assert.strictEqual(m.miners[0].address, ADDR2);
+  assert.strictEqual(m.miners[0].hashrate, 8e13 + 7e11);
+  assert.strictEqual(m.miners[0].workers, 5);
+  assert.strictEqual(m.miners[0].online, 4);
+  assert.strictEqual(m.miners[0].best, 9e8);
+  assert.deepStrictEqual(m.miners[0].nodes, ['a', 'b']);
+  assert.strictEqual(m.miners[1].address, ADDR);
+});
+
+test('live list: any part of an address, any case, narrows it', () => {
+  const m = MP.mergeMinerLists(lists()).miners;
+  assert.strictEqual(MP.filterMiners(m, '').length, 2);
+  assert.deepStrictEqual(MP.filterMiners(m, '7ZVDH').map((x) => x.address), [ADDR2]);
+  assert.deepStrictEqual(MP.filterMiners(m, 'm2y492 ').map((x) => x.address), [ADDR2]);
+  assert.deepStrictEqual(MP.filterMiners(m, 'bc1q').length, 2);
+  assert.deepStrictEqual(MP.filterMiners(m, 'zzzz'), []);
+});
+
+test('live list: renders rows that link to each miner, with a count', () => {
+  const m = MP.mergeMinerLists(lists());
+  const all = MP.minerListHtml(m, '', NOW);
+  noJunk(all, 'list');
+  assert(all.includes('?address=' + ADDR2));
+  assert(strip(all).includes('2 miners'));
+  const one = MP.minerListHtml(m, '7zvdh', NOW);
+  noJunk(one, 'filtered');
+  assert(!one.includes('?address=' + ADDR + '"'));
+  assert(strip(one).includes('1 of 2 miners match'));
+  const none = MP.minerListHtml(m, '<b>x', NOW);
+  assert(strip(none).includes('No live miner'));
+  assert(!none.includes('<b>x'), 'the typed text is escaped');
+});
+
+test('live list: a node down is named, none answering says unavailable, empty says so', () => {
+  const r = lists(); r[1] = { node: 'b', ok: false, status: 0, body: null };
+  const part = MP.minerListHtml(MP.mergeMinerLists(r), '', NOW);
+  noJunk(part, 'partial');
+  assert(strip(part).includes('Not answering: b'));
+  const down = MP.minerListHtml(MP.mergeMinerLists([{ node: 'a', ok: false, status: 503, body: null }]), '', NOW);
+  assert(strip(down).includes('unavailable'));
+  const empty = MP.minerListHtml(MP.mergeMinerLists([{ node: 'a', ok: true, status: 200, body: { miners: [] } }]), '', NOW);
+  assert(strip(empty).includes('No miners are connected'));
+  assert(strip(MP.minerListHtml(null, '', NOW)).includes('Loading'));
+});
+
 if (failures) { console.log(failures + ' failed'); process.exit(1); }
 console.log('all passed');

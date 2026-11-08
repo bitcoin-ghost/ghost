@@ -5,6 +5,7 @@
  *
  *   /api/v1/miner/{address}                     workers, hashrate, shares, best share, blocks found
  *   /api/v1/miner/{address}/history?window=...  the same over time
+ *   /api/v1/pool/miners                          every live miner (the list under the lookup box)
  *
  * and adds the answers up (a worker is shown on the node it is connected to). The expected time
  * to a block is worked out again from the summed hashrate: network difficulty x 2^32 / hashrate.
@@ -480,6 +481,106 @@
 
   // ---------------------------------------------------------------- browser
 
+  // ---------------------------------------------------------------- the live miner list
+
+  // results: [{ node, ok, body }] from each node's /api/v1/pool/miners. One row per address, its
+  // workers and hashrate added up over the nodes it is connected to, the most hashrate first.
+  function mergeMinerLists(results) {
+    var out = { answered: [], failed: [], miners: [] };
+    var by = {};
+    (results || []).forEach(function (r) {
+      var list = r.ok && r.body && Array.isArray(r.body.miners) ? r.body.miners : null;
+      if (!list) { out.failed.push(r.node); return; }
+      out.answered.push(r.node);
+      list.forEach(function (e) {
+        if (!e || typeof e.address !== 'string' || !e.address) return;
+        var m = by[e.address];
+        if (!m) {
+          m = by[e.address] = { address: e.address, nodes: [], workers: 0, online: 0,
+                                hashrate: null, best: null, last_share_at: null, blocks: 0 };
+          out.miners.push(m);
+        }
+        m.nodes.push(r.node);
+        m.workers += isNum(e.workers) ? e.workers : 0;
+        m.online += isNum(e.online) ? e.online : 0;
+        var h = e.hashrate_hs || {};
+        m.hashrate = addOrNull(m.hashrate, isNum(h['15m']) ? h['15m'] : null);
+        m.best = maxOrNull(m.best, e.best_share ? e.best_share.ever : null);
+        m.last_share_at = maxOrNull(m.last_share_at, e.last_share_at);
+        m.blocks += isNum(e.blocks_found) ? e.blocks_found : 0;
+      });
+    });
+    out.miners.sort(function (a, b) {
+      return (b.hashrate || 0) - (a.hashrate || 0) || (a.address < b.address ? -1 : 1);
+    });
+    return out;
+  }
+
+  // The miners whose address contains `text` (any part of it, any case).
+  function filterMiners(miners, text) {
+    var t = String(text || '').trim().toLowerCase();
+    if (!t) return miners;
+    return miners.filter(function (m) { return m.address.toLowerCase().indexOf(t) >= 0; });
+  }
+
+  function shortAddress(a) { return a.length > 20 ? a.slice(0, 10) + '…' + a.slice(-8) : a; }
+
+  function minerListHtml(merged, text, now) {
+    if (!merged) return '<div class="chart-empty">Loading the live miners…</div>';
+    if (!merged.answered.length) return '<div class="chart-empty">The live miner list is unavailable: no node answered.</div>';
+    var missing = merged.failed.length ? '<p class="note">Not answering: ' + esc(merged.failed.join(', ')) + '. Miners connected there are missing from this list.</p>' : '';
+    if (!merged.miners.length) return '<div class="chart-empty">No miners are connected right now.</div>' + missing;
+    var shown = filterMiners(merged.miners, text);
+    if (!shown.length) return '<div class="chart-empty">No live miner\'s address contains “' + esc(String(text).trim()) + '”. Enter the whole address to look it up anyway.</div>' + missing;
+    var total = merged.miners.reduce(function (s, m) { return s + (m.hashrate || 0); }, 0);
+    var rows = shown.map(function (m) {
+      return '<tr>' +
+        '<td><a class="mono" href="' + esc(queryString({ address: m.address })) + '" title="' + esc(m.address) + '">' + esc(shortAddress(m.address)) + '</a></td>' +
+        '<td class="num">' + esc(fmtInt(m.online)) + ' / ' + esc(fmtInt(m.workers)) + '</td>' +
+        '<td class="num">' + (hashrateHtml(m.hashrate) || '—') + '</td>' +
+        '<td class="num opt">' + (isNum(m.best) && m.best > 0 ? esc(fmtDifficulty(m.best)) : '—') + '</td>' +
+        '<td class="num opt">' + esc(ago(m.last_share_at, now)) + '</td>' +
+        '</tr>';
+    }).join('');
+    var count = shown.length === merged.miners.length
+      ? plural(merged.miners.length, 'miner') + ', ' + (P.hashrateText(total) || '0 H/s') + ' in all.'
+      : fmtInt(shown.length) + ' of ' + plural(merged.miners.length, 'miner') + ' match.';
+    return '<div class="table-wrap"><table class="table miner-list">' +
+      '<thead><tr><th>Address</th><th class="num">Workers</th><th class="num" title="Averaged over the last 15 minutes">Hashrate</th><th class="num opt">Best share</th><th class="num opt">Last share</th></tr></thead>' +
+      '<tbody>' + rows + '</tbody></table></div><p class="note">' + esc(count) + '</p>' + missing;
+  }
+
+  function startMinerList(doc, win) {
+    var input = doc.getElementById('lookup-input');
+    var box = doc.getElementById('ml-list');
+    var merged = null, last = null, loading = false;
+    function paint() {
+      var html = minerListHtml(merged, input.value, Date.now() / 1000);
+      if (html !== last) { last = html; box.innerHTML = html; }
+    }
+    function load() {
+      if (loading) return;
+      loading = true;
+      P.loadNodes().then(function (nodes) {
+        return nodes.length ? P.askAll(nodes, '/api/v1/pool/miners') : [];
+      }).then(function (r) {
+        loading = false;
+        var m = mergeMinerLists(r);
+        if (m.answered.length || !merged) merged = m;
+        paint();
+      });
+    }
+    input.addEventListener('input', paint);
+    paint();
+    load();
+    setInterval(function () { if (!doc.hidden) load(); }, REFRESH_MS);
+    // Submitting part of an address that only one live miner has opens that miner.
+    return function (v) {
+      var hits = merged ? filterMiners(merged.miners, v) : [];
+      return hits.length === 1 ? hits[0].address : v;
+    };
+  }
+
   function startBrowser(doc, win) {
     var q = parseQuery(win.location.search);
     var $ = function (id) { return doc.getElementById(id); };
@@ -492,13 +593,19 @@
     }
     function show(id, on) { var el = $(id); if (el) el.hidden = !on; }
 
+    var resolve = function (v) { return v; };
     $('lookup-form').addEventListener('submit', function (e) {
       e.preventDefault();
-      var v = $('lookup-input').value.trim();
+      var v = resolve($('lookup-input').value.trim());
       if (v) win.location.search = queryString(parseQuery('?address=' + encodeURIComponent(v)));
     });
 
-    if (!q.address) { show('lookup-mode', true); return; }
+    if (!q.address) {
+      show('lookup-mode', true);
+      show('list-mode', true);
+      resolve = startMinerList(doc, win);
+      return;
+    }
 
     var state = { query: q, miners: null, history: null, now: Date.now() / 1000, names: {} };
     var loading = false;
@@ -581,7 +688,8 @@
 
   var api = {
     parseQuery: parseQuery, queryString: queryString, mergeMiners: mergeMiners, mergeHistories: mergeHistories,
-    expectedWait: expectedWait, chartSvg: chartSvg, renderAll: renderAll
+    expectedWait: expectedWait, chartSvg: chartSvg, renderAll: renderAll,
+    mergeMinerLists: mergeMinerLists, filterMiners: filterMiners, minerListHtml: minerListHtml
   };
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = api;

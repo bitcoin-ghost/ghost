@@ -556,10 +556,7 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
             post(api_shroud_configure_handler),
         )
         // Dashboard: Node restart
-        .route("/api/v1/node/restart", post(api_node_restart_handler))
-        // The pool's connected miners, by payout address (forwarded to pool_sv2). Signed
-        // requests only: it names every miner's address.
-        .merge(crate::node_pool_routes::operator_router());
+        .route("/api/v1/node/restart", post(api_node_restart_handler));
 
     // H-3: Apply authentication middleware - ALWAYS required for internal endpoints
     let internal_router = if let Some(ref auth) = state.internal_auth {

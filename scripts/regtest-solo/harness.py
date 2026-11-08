@@ -863,28 +863,27 @@ def api(h):
                       f"accepted {v['summary']['shares_24h']['accepted']}, hashrate 15m {rates.get('15m')}, "
                       f"best {v['summary']['best_share']['ever']:.3g}, workers {names}"
                       + ("" if good else "  <-- WRONG"))
-        # The operator list: every miner of this node, by address, with its workers.
+        # The miner list: every miner of this node, by address, with its workers.
         lst = {e["address"]: e for e in n.miner_list()["miners"]}
         missing = [m.name for m in n.miners if m.address not in lst or lst[m.address]["workers"] < 1]
         if missing:
             ok = False
             ev.append(f"node{n.i} /api/v1/pool/miners misses {missing}")
-        # Forwarded by ghost-mining: the public routes to anyone, the miner list to signed requests only.
+        # Forwarded by ghost-mining to anyone, the miner list included.
         code_pub, body = http(f"http://127.0.0.1:{n.http}/api/v1/pool/status")
-        code_unsigned, _ = http(f"http://127.0.0.1:{n.http}/api/v1/pool/miners")
-        code_signed, signed = n.signed_get("/api/v1/pool/miners")
+        code_list, listed = http(f"http://127.0.0.1:{n.http}/api/v1/pool/miners")
         code_miner, _ = http(f"http://127.0.0.1:{n.http}/api/v1/miner/{n.miners[0].address}")
         fwd_ok = (code_pub == 200 and body and body.get("network") == "regtest" and code_miner == 200
-                  and code_unsigned == 401 and code_signed == 200
-                  and {e["address"] for e in signed["miners"]} == set(lst))
+                  and code_list == 200 and listed
+                  and {e["address"] for e in listed["miners"]} == set(lst))
         if not fwd_ok:
             ok = False
         ev.append(f"node{n.i} ghost-mining :{n.http}: /pool/status {code_pub}, /miner {code_miner}, "
-                  f"/pool/miners unsigned {code_unsigned}, signed {code_signed} ({len(lst)} addresses)"
+                  f"/pool/miners {code_list} ({len(lst)} addresses)"
                   + ("" if fwd_ok else "  <-- WRONG"))
     result("API: /api/v1/pool/status, /api/v1/miner/<addr> and /api/v1/pool/miners report the blocks, best "
-           "share, hashrate, workers, the SV2 key and the other node's reachability; ghost-mining serves the "
-           "miner list to signed requests only", "PASS" if ok else "FAIL", ev)
+           "share, hashrate, workers, the SV2 key and the other node's reachability; ghost-mining forwards "
+           "all three", "PASS" if ok else "FAIL", ev)
 
 
 def audit_honest(h):
