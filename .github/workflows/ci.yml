@@ -602,6 +602,23 @@ jobs:
       - name: Build
         run: cargo build $WORKSPACE_EXCLUDES --all-targets
 
+      # `--lib` includes integration_tests_sv2's own unit tests, and
+      # `template_provider::tests::test_create_mempool_transaction` starts a real template
+      # provider, which downloads sv2-tp from github.com on first use. Uncached, a GitHub release
+      # outage turned this job red twice on 2026-11-08 (504 on all five attempts) while the SV2 job,
+      # reading the same file from this cache, stayed green. Same key and path as the SV2 job, so
+      # the two share one cache entry.
+      - name: Cache the harness tarballs
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: /tmp/sv2-tarballs
+          key: sv2-tarballs-${{ runner.os }}-${{ hashFiles('tests/integration-sv2/lib/template_provider.rs') }}
+      - name: Prefetch the harness tarballs
+        if: runner.os == 'Linux'
+        timeout-minutes: 12
+        run: .github/scripts/prefetch-sv2-tp-tarballs.sh
+
       # Run unit tests
       - name: Run unit tests
         run: cargo test $WORKSPACE_EXCLUDES --lib --bins
