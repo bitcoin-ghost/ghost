@@ -5,13 +5,13 @@
     {
       "id": "a",
       "name": "Node A",
-      "stratum_host": "pool-a.bitcoinghost.org",
+      "stratum_host": "209.50.50.67",
       "sv2_authority_key": null
     },
     {
       "id": "b",
       "name": "Node B",
-      "stratum_host": "pool-b.bitcoinghost.org",
+      "stratum_host": "5.22.219.246",
       "sv2_authority_key": null
     }
   ]

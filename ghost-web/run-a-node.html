@@ -72,10 +72,10 @@
     <p class="section-label">install</p>
     <h2>One command.</h2>
     <p class="section-lead">Ubuntu 22.04 or newer, 4 GB of RAM, and at least 25 GB of disk for a pruned mainnet node (800 GB for a full archive). The first sync of the Bitcoin chain takes from several hours to a few days.</p>
-<pre><code>curl -fsSLO https://raw.githubusercontent.com/bitcoin-ghost/ghost/ghost-solo/scripts/install-node.sh
+<pre><code>curl -fsSL https://get.bitcoinghost.org/install.sh -o install-node.sh
 less install-node.sh            # read what it does first
-sudo GHOST_VERSION=np-latest bash install-node.sh</code></pre>
-    <p class="note">Run it with no flags on a terminal for a guided setup, or <code>bash install-node.sh --help</code> for every option. Every binary it downloads is checked against the project's GPG release signature before it is installed. The installer is <a href="https://github.com/bitcoin-ghost/ghost/blob/ghost-solo/scripts/install-node.sh">scripts/install-node.sh</a> in the source repository.</p>
+sudo bash install-node.sh</code></pre>
+    <p class="note">Run it with no flags on a terminal for a guided setup, or <code>bash install-node.sh --help</code> for every option. Every binary it downloads is checked against the project's GPG release signature before it is installed. The installer is <a href="https://github.com/bitcoin-ghost/ghost/blob/main/scripts/install-node.sh">scripts/install-node.sh</a> in the source repository.</p>
     <h3>Two nodes backing each other up</h3>
 <pre><code># on node A
 sudo GHOST_VERSION=np-latest bash install-node.sh --peer-node &lt;node B's IP&gt; --submit-auth &lt;B's rpcuser:rpcpassword&gt;
