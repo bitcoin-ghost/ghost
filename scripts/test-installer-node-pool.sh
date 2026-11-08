@@ -23,6 +23,8 @@ is() { if [ "$2" = "$3" ]; then printf "  [ok ] %s\n" "$1"; pass=$((pass+1));
        else printf "  [BAD] %s\n        wanted: %s\n        got:    %s\n" "$1" "$2" "$3"; fail=$((fail+1)); fi; }
 has() { if $G -qF -- "$2" <<<"$3"; then printf "  [ok ] %s\n" "$1"; pass=$((pass+1));
         else printf "  [BAD] %s\n        wanted a line with: %s\n        in:\n%s\n" "$1" "$2" "$3"; fail=$((fail+1)); fi; }
+like() { if $G -qE -- "$2" <<<"$3"; then printf "  [ok ] %s\n" "$1"; pass=$((pass+1));
+         else printf "  [BAD] %s\n        wanted /%s/ in: %s\n" "$1" "$2" "$3"; fail=$((fail+1)); fi; }
 hasnt() { if $G -qF -- "$2" <<<"$3"; then printf "  [BAD] %s\n        unwanted: %s\n" "$1" "$2"; fail=$((fail+1));
           else printf "  [ok ] %s\n" "$1"; pass=$((pass+1)); fi; }
 
@@ -299,17 +301,17 @@ is "it does not ask for a treasury" 0 "$(printf '%s\n' "$wiz" | $G -ci treasury 
 echo "7. validation and re-runs"
 validate="$(awk '/^np_hrp "\$NETWORK" >\/dev\/null \|\| err/{on=1} on{print} on&&/^POOL_TARBALL=/{exit}' "$INSTALLER")"
 is "the validation step is present" yes "$([ -n "$validate" ] && echo yes)"
-old="$TMP/pool-config.toml"; oldbc="$TMP/bitcoin.conf"; auth="$TMP/solo-submit-rpc.auth"
+old="$TMP/pool-config.toml"; oldbc="$TMP/bitcoin.conf"; auth="$TMP/solo-submit-rpc.auth"; oldnode="$TMP/pool.toml"
 eval "$($G '^_trim() ' "$INSTALLER")"
 # The release constants the validation step reads (production values; no test mirror in the env).
 unset GHOST_TEST_RELEASE_MIRROR GHOST_TEST_RELEASE_KEY_FP
 eval "$($G -E '^(GPG_KEY_FP|RELEASE_KEY_URL|RELEASE_DOWNLOAD_URL|TEST_RELEASE_MIRROR|TEST_RELEASE_KEY_FP)=' "$INSTALLER")"
 pf_resolve_ip() { case "$1" in b.example) echo 192.0.2.7;; *.invalid) ;; *) echo "$1";; esac; }
-localize() { local v="${1//\/etc\/ghost\/pool-config.toml/$old}"; v="${v//\/etc\/bitcoin\/bitcoin.conf/$oldbc}"; printf '%s' "${v//\/etc\/ghost\/solo-submit-rpc.auth/$auth}"; }
+localize() { local v="${1//\/etc\/ghost\/pool-config.toml/$old}"; v="${v//\/etc\/bitcoin\/bitcoin.conf/$oldbc}"; v="${v//\/etc\/ghost\/pool.toml/$oldnode}"; printf '%s' "${v//\/etc\/ghost\/solo-submit-rpc.auth/$auth}"; }
 validated_vars() {   # PEER_NODES SUBMIT_FLAGS BITCOIN_PEERS [NETWORK]
     ( log() { :; }; err() { echo "ERR $*"; exit 1; }; usage() { :; }; np_preflight() { :; }
       NETWORK="${4:-mainnet}" PEER_NODES="$1" SUBMIT_FLAGS="$2" BITCOIN_PEERS="$3" RPC_ALLOW="" SUBMIT_AUTH=""
-      SIGNET_CHALLENGE="" PREFLIGHT_ONLY=false SYNC_MODE=ibd ARCHIVE=false GHOST_VERSION=np-v9.9.9 AUTO_UPDATE=false
+      SIGNET_CHALLENGE="" ALERT_WEBHOOK="${ALERT_WEBHOOK:-}" ALERT_TOPIC="${ALERT_TOPIC:-}" PREFLIGHT_ONLY=false SYNC_MODE=ibd ARCHIVE=false GHOST_VERSION=np-v9.9.9 AUTO_UPDATE=false
       eval "$(localize "$validate")"
       echo "$BITCOIN_PEERS|$SUBMIT_NODES|$RPC_ALLOW|$SUBMIT_AUTH_PRESENT|${OLD_RELAY_PORT:-}" ) 2>&1 | tail -1
 }
@@ -341,11 +343,32 @@ rm -f "$oldbc" "$auth"
 is "an upgrade from the node pool: its relay port is noted (to close it), its peers are not targets" "|||false|9566" \
    "$(validated_vars '' '' '')"
 rm -f "$old"
+# Alerts on a re-run (2026-11-08): pool.toml is rewritten every run, so the channel the last install
+# or the dashboard set must be kept, and no node may sit on the old shared public topic.
+alerts_vars() {   # ALERT_WEBHOOK ALERT_TOPIC
+    ( log() { :; }; err() { echo "ERR $*"; exit 1; }; usage() { :; }; np_preflight() { :; }
+      NETWORK=mainnet PEER_NODES="" SUBMIT_FLAGS="" BITCOIN_PEERS="" RPC_ALLOW="" SUBMIT_AUTH=""
+      SIGNET_CHALLENGE="" PREFLIGHT_ONLY=false SYNC_MODE=ibd ARCHIVE=false GHOST_VERSION=np-v9.9.9 AUTO_UPDATE=false
+      ALERT_WEBHOOK="$1" ALERT_TOPIC="$2"
+      eval "$(localize "$validate")"
+      echo "$ALERT_WEBHOOK|$ALERT_TOPIC" ) 2>&1 | tail -1
+}
+push_toml() { printf '[alerts]\nenabled = true\n\n[alerts.channels.push]\nenabled = true\nwebhook_url = "%s"\ntopic = "%s"\n\n[other]\ntopic = "not-this"\n' "$1" "$2" > "$oldnode"; }
+rm -f "$oldnode"
+is "no webhook and no earlier install: alerts stay off" "|" "$(alerts_vars '' '')"
+like "a webhook with no topic gets a random private topic, never a shared one" '^https://ntfy\.sh\|ghostpool-[0-9a-f]{12}$' "$(alerts_vars https://ntfy.sh '')"
+is "a webhook and a topic given are used as given" "https://n.example|mine" "$(alerts_vars https://n.example mine)"
+push_toml https://ntfy.sh ghostpool-0123456789ab
+is "a re-run without flags keeps the webhook and topic the last install wrote" "https://ntfy.sh|ghostpool-0123456789ab" "$(alerts_vars '' '')"
+is "... and a topic given this time wins" "https://ntfy.sh|other" "$(alerts_vars '' other)"
+push_toml https://ntfy.sh ghost-node
+like "a re-run on the old shared topic 'ghost-node' moves to a random one" '^https://ntfy\.sh\|ghostpool-[0-9a-f]{12}$' "$(alerts_vars '' '')"
+rm -f "$oldnode"
 validated() {
     ( log() { :; }; err() { echo "ERR $*"; exit 1; }; usage() { :; }
       np_preflight() { echo "PREFLIGHT"; }
       NETWORK="${1:-mainnet}" PEER_NODES="" SUBMIT_FLAGS="" BITCOIN_PEERS="" RPC_ALLOW="" SUBMIT_AUTH=""
-      SIGNET_CHALLENGE="" PREFLIGHT_ONLY=true SYNC_MODE=ibd ARCHIVE=false
+      SIGNET_CHALLENGE="" ALERT_WEBHOOK="${ALERT_WEBHOOK:-}" ALERT_TOPIC="${ALERT_TOPIC:-}" PREFLIGHT_ONLY=true SYNC_MODE=ibd ARCHIVE=false
       eval "$(localize "$validate")"
       echo "never" ) 2>&1 | $G -v PREFLIGHT | tr '\n' ' ' | sed 's/ $//'
 }
@@ -355,13 +378,15 @@ is "an unknown network is refused" "ERR --network must be mainnet, signet or reg
 pinned() {
     ( log() { echo "LOG $*"; }; err() { echo "ERR $*"; exit 1; }; usage() { :; }; np_preflight() { :; }
       NETWORK=mainnet PEER_NODES="" SUBMIT_FLAGS="" BITCOIN_PEERS="" RPC_ALLOW="" SUBMIT_AUTH=""
-      SIGNET_CHALLENGE="" PREFLIGHT_ONLY=false SYNC_MODE=ibd ARCHIVE=false
+      SIGNET_CHALLENGE="" ALERT_WEBHOOK="${ALERT_WEBHOOK:-}" ALERT_TOPIC="${ALERT_TOPIC:-}" PREFLIGHT_ONLY=false SYNC_MODE=ibd ARCHIVE=false
       GHOST_VERSION="$1" AUTO_UPDATE="$2"
       eval "$(localize "$validate")"
       echo "AUTO_UPDATE=$AUTO_UPDATE GHOST_VERSION=$GHOST_VERSION TARBALL=$POOL_TARBALL" ) 2>&1 | tr '\n' ' '
 }
 # The channel itself (np-latest against a release list, the marker, the updater) is
 # scripts/test-release-channel.sh; here, only that the install step uses it.
+is "an unset GHOST_VERSION means np-latest (the published one-liner names none)" "np-latest" \
+   "$(env -u GHOST_VERSION bash -c "$($G -m1 '^GHOST_VERSION=' "$INSTALLER")"'; echo "$GHOST_VERSION"')"
 has "an unpinned release is refused (latest is the old network's)" "Name the Ghost Pool release to install" "$(pinned '' false)"
 has "... and stops the install" "ERR GHOST_VERSION='' refused" "$(pinned '' false)"
 has "an exact tag of the channel proceeds" "GHOST_VERSION=np-v9.9.9" "$(pinned np-v9.9.9 false)"
@@ -379,7 +404,7 @@ echo "7c. a custom signet survives a re-run"
 signet_vars() {   # CHALLENGE_FLAG PEERS_FLAG: validation against $oldbc, prints challenge|peers
     ( log() { :; }; err() { echo "ERR $*"; exit 1; }; usage() { :; }; np_preflight() { :; }
       NETWORK=signet PEER_NODES="" SUBMIT_FLAGS="" RPC_ALLOW="" SUBMIT_AUTH="" PREFLIGHT_ONLY=false SYNC_MODE=ibd
-      ARCHIVE=false GHOST_VERSION=np-v9.9.9 AUTO_UPDATE=false SIGNET_CHALLENGE="$1" BITCOIN_PEERS="$2"
+      ARCHIVE=false GHOST_VERSION=np-v9.9.9 AUTO_UPDATE=false SIGNET_CHALLENGE="$1" BITCOIN_PEERS="$2" ALERT_WEBHOOK="" ALERT_TOPIC=""
       eval "$(localize "$validate")"
       echo "$SIGNET_CHALLENGE|$BITCOIN_PEERS" ) 2>&1 | tail -1
 }
@@ -472,7 +497,7 @@ TFP=0123456789ABCDEF0123456789ABCDEF01234567
 mirrored() {   # NETWORK MIRROR KEY_FP
     ( log() { :; }; err() { echo "ERR $*"; exit 1; }; usage() { :; }; np_preflight() { :; }
       NETWORK="$1" PEER_NODES="" SUBMIT_FLAGS="" BITCOIN_PEERS="" RPC_ALLOW="" SUBMIT_AUTH=""
-      SIGNET_CHALLENGE="" PREFLIGHT_ONLY=false SYNC_MODE=ibd ARCHIVE=false
+      SIGNET_CHALLENGE="" ALERT_WEBHOOK="${ALERT_WEBHOOK:-}" ALERT_TOPIC="${ALERT_TOPIC:-}" PREFLIGHT_ONLY=false SYNC_MODE=ibd ARCHIVE=false
       GHOST_VERSION=np-v9.9.9 AUTO_UPDATE=false TEST_RELEASE_MIRROR="$2" TEST_RELEASE_KEY_FP="$3"
       eval "$(localize "$validate")"
       echo "$NP_RELEASES_API_URL|$RELEASE_BASE|$RELEASE_KEY_URL|$GPG_KEY_FP" ) 2>/dev/null | tail -1
