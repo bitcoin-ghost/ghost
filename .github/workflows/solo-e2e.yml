@@ -6,8 +6,9 @@ name: Solo e2e
 # killed, ghost-audit against an honest and a hostile (treasury-skimming) build.
 
 on:
+  # ghost-solo was merged into main (11-08); the trigger stayed on the old branch and went quiet.
   push:
-    branches: [ghost-solo]
+    branches: [main]
   workflow_dispatch:
 
 env:
