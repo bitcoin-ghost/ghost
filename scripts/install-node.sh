@@ -36,11 +36,12 @@ set -euo pipefail
 # ⛔ GHOST_VERSION names a release of this channel: `np-latest` (the newest published np-vX.Y.Z)
 # or an exact `np-v…` tag. These releases have their own channel in the same GitHub repository:
 # tags `np-v*`, published as pre-releases, so they are never the repository's `latest`. `latest`
-# is the old network's (`main`), and its tags (v1.11.x) are refused here. There is no default; the
-# installer refuses without one (checked after the preflight, so --help and --preflight-only
-# work). The tarball is GPG-verified below regardless. RELEASE_BASE and POOL_TARBALL are set once
-# the tag is resolved.
-GHOST_VERSION="${GHOST_VERSION:-}"
+# is the old network's, and its tags (v1.11.x) are refused here. Unset means `np-latest`, so
+# `curl -sSL https://get.bitcoinghost.org | sudo bash` installs the newest Ghost Pool release: this
+# installer can only ever resolve np- tags, never `releases/latest`. It used to refuse without one,
+# which made the published one-liner fail at its first step (2026-11-08). The tarball is
+# GPG-verified below regardless. RELEASE_BASE and POOL_TARBALL are set once the tag is resolved.
+GHOST_VERSION="${GHOST_VERSION:-np-latest}"
 # Signed release artefacts (GPG: defenwycke release key).
 GPG_KEY_FP="777FE81F8CC077FD3D08055E852C2B3190F5B928"
 # ghostd now ships INSIDE the signed release tarball (same SHA256SUMS + GPG chain
@@ -81,7 +82,9 @@ RPC_ALLOW=""
 SUBMIT_AUTH="${GHOST_SUBMIT_AUTH:-}"
 PREFLIGHT_ONLY="false"
 ALERT_WEBHOOK=""
-ALERT_TOPIC="ghost-node"
+# Empty = keep the topic a previous install wrote, else a random one (see the re-run block). Never a
+# fixed default: ntfy topics are public by name, so every node sharing one told strangers about it.
+ALERT_TOPIC=""
 NICKNAME="ghost-node"
 SYNC_MODE="ibd"            # ibd (trustless, default) | haze (IRREVERSIBLE)
 # Optional custom pool name. Empty = fall back to the default coinbase tag
@@ -193,7 +196,7 @@ Removing the node:
   --yes                       With --uninstall: do not ask (for scripts).
 
 Environment:
-  GHOST_VERSION=<release>     Required. np-latest (the newest release of this channel) or an
+  GHOST_VERSION=<release>     np-latest (the default: the newest Ghost Pool release) or an
                                 exact np-v<x.y.z> tag. Old-network tags (v1.11.x) are refused.
 
 Miners connect to:
@@ -868,7 +871,7 @@ run_wizard() {
     if [[ "$wh" =~ ^https?://[^[:space:]\"]+$ ]]; then
       ALERT_WEBHOOK="$wh"
       local tp
-      read -rp "Alert topic [${ALERT_TOPIC}]: " tp || true
+      read -rp "Alert topic [${ALERT_TOPIC:-a random, private one}]: " tp || true
       tp="$(_trim "$tp")"; [[ -n "$tp" ]] && ALERT_TOPIC="$tp"
       break
     fi
@@ -1130,6 +1133,21 @@ fi
 if [[ -z "$SUBMIT_FLAGS" && -z "$PEER_NODES" ]]; then
   SUBMIT_FLAGS="$(_trim "$(old_key submit_rpc | tr -d '[]",')")"
   [[ -n "$SUBMIT_FLAGS" ]] && log "Keeping the found-block targets from ${OLD_POOL_CONFIG}: ${SUBMIT_FLAGS}"
+fi
+# Alerts: pool.toml is rewritten on every run, so a re-run without --alert-webhook used to write
+# alerts DISABLED on a node that had them. Keep the channel the last install (or the dashboard)
+# configured. A topic is never shared: ntfy topics are public by name, and the old fixed default
+# `ghost-node` put every node's alerts on one topic anyone could read (2026-11-08).
+OLD_NODE_CONFIG=/etc/ghost/pool.toml
+old_push() { [[ -r "$OLD_NODE_CONFIG" ]] && sed -nE "/^\[alerts\.channels\.push\]/,/^\[/s/^${1}[[:space:]]*=[[:space:]]*\"([^\"]*)\".*$/\1/p" "$OLD_NODE_CONFIG" | head -1 || true; }
+if [[ -z "$ALERT_WEBHOOK" ]]; then
+  ALERT_WEBHOOK="$(old_push webhook_url)"
+  [[ -n "$ALERT_WEBHOOK" ]] && log "Keeping the alert webhook from ${OLD_NODE_CONFIG}"
+fi
+if [[ -n "$ALERT_WEBHOOK" && -z "$ALERT_TOPIC" ]]; then
+  ALERT_TOPIC="$(old_push topic)"
+  [[ "$ALERT_TOPIC" == ghost-node ]] && ALERT_TOPIC=""
+  [[ -n "$ALERT_TOPIC" ]] || ALERT_TOPIC="ghostpool-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
 fi
 if [[ -z "$PEER_NODES" && -r "$OLD_BITCOIN_CONF" ]]; then
   RPC_ALLOW="$(sed -nE 's/^rpcallowip=([^[:space:]]+)$/\1/p' "$OLD_BITCOIN_CONF" | { /usr/bin/grep -vxE '127\.0\.0\.1(/32)?|::1' || true; } | paste -sd' ' -)"
