@@ -650,6 +650,7 @@ impl Solo {
         if raw.len() == 32 {
             prev_hash.copy_from_slice(raw);
         }
+        self.stats.new_round(hex::encode(prev_hash));
         st.tip = Some(TipView {
             prev_hash,
             n_bits: msg.n_bits,

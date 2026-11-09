@@ -101,6 +101,27 @@ test('every node is merged: workers tagged with their node, offline duplicates d
   assert.deepStrictEqual(m.blocks.map((b) => b.height), [974500, 974000]);
 });
 
+test('the best share is given since this block, over 24 hours, 30 days and all time', () => {
+  const best = (block, d30) => ({ block, '24h': 2e8, '30d': d30, ever: 4.1e9 });
+  const m = MP.mergeMiners([
+    { node: 'a', ok: true, status: 200, body: minerBody([worker('rig1', 'online', { best_share: best(3e6, 9e8) })]) },
+    { node: 'b', ok: true, status: 200, body: minerBody([worker('rig2', 'online', { best_share: best(5e5, 2e9) })], {
+      summary: Object.assign(minerBody([]).summary, { best_share: best(5e5, 2e9) }) }) }
+  ]);
+  // The summary of node a here comes from minerBody's own max, which knows only ever/24h:
+  // the merge keeps what each node reports and takes the higher.
+  assert.strictEqual(m.summary.best_share['30d'], 2e9);
+  assert.strictEqual(m.summary.best_share.block, 5e5);
+  const out = MP.renderAll({ query: MP.parseQuery('?address=' + ADDR), miners: m, history: goodState().history, now: NOW, names: NAMES }, 640);
+  const rows = strip(out.workers);
+  for (const label of ['this block', '24 h', '30 days', 'all time']) assert(rows.includes(label), label + ' in ' + rows);
+  assert(strip(out.tiles).includes('Best share, all time'), strip(out.tiles));
+  assert(strip(out.tiles).includes('this block'), strip(out.tiles));
+  // A node too old to report a period shows it as unknown, not zero.
+  const old = MP.renderAll(goodState(), 640);
+  assert(strip(old.workers).includes('this block —'), strip(old.workers));
+});
+
 test('the expected time is worked out again from the hashrate on every node together', () => {
   const w = goodState().miners.wait;
   assert.strictEqual(w.known, true);
@@ -149,7 +170,7 @@ test('the page renders every section from sample answers', () => {
   assert(out.tiles.includes('1.40<span class="unit">PH/s'), 'hashrate tile: ' + out.tiles);
   assert(tiles.includes('Workers online 2 of 2'), tiles);
   assert(tiles.includes('Shares, 24 hours 1,200'), tiles);
-  assert(tiles.includes('Best share 9.00 G'), tiles);
+  assert(tiles.includes('Best share, all time 9.00 G'), tiles);
   assert(tiles.includes('Blocks found 2 latest at height 974,500'), tiles);
   assert(/Expected time to a block ~1[01]\.\d years an average, not a promise/.test(tiles), tiles);
   const odds = strip(out.odds);

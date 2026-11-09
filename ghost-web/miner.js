@@ -62,6 +62,20 @@
 
   // ---------------------------------------------------------------- merging nodes
 
+  // The periods a best share is given over, shortest first. 'block' is since the last block on the
+  // network; a node too old to report a period leaves it unknown.
+  var BEST_PERIODS = [
+    { key: 'block', label: 'this block' }, { key: '24h', label: '24 h' },
+    { key: '30d', label: '30 days' }, { key: 'ever', label: 'all time' }
+  ];
+  function bestText(v) { return isNum(v) && v > 0 ? fmtDifficulty(v) : '—'; }
+  function bestRows(b) {
+    b = b || {};
+    return '<div class="best-rows">' + BEST_PERIODS.map(function (p) {
+      return '<div class="best-row"><span>' + esc(p.label) + '</span>' + esc(bestText(b[p.key])) + '</div>';
+    }).join('') + '</div>';
+  }
+
   function addOrNull(a, b) { return isNum(a) ? (isNum(b) ? a + b : a) : (isNum(b) ? b : null); }
   function maxOrNull(a, b) { return isNum(a) ? (isNum(b) ? Math.max(a, b) : a) : (isNum(b) ? b : null); }
 
@@ -72,7 +86,7 @@
       difficulty: null, waitReason: null,
       summary: { workers: 0, online: 0, idle: 0, offline: 0, hashrate_hs: { '15m': null, '1h': null, '24h': null },
                  shares_24h: { accepted: 0, stale: 0, rejected: 0, reject_reasons: {} }, last_share_at: null,
-                 best_share: { ever: null, '24h': null } }
+                 best_share: { block: null, '24h': null, '30d': null, ever: null } }
     };
     var seen = {};
     (results || []).forEach(function (r) {
@@ -95,8 +109,9 @@
       });
       out.summary.last_share_at = maxOrNull(out.summary.last_share_at, s.last_share_at);
       if (s.best_share) {
-        out.summary.best_share.ever = maxOrNull(out.summary.best_share.ever, s.best_share.ever);
-        out.summary.best_share['24h'] = maxOrNull(out.summary.best_share['24h'], s.best_share['24h']);
+        BEST_PERIODS.forEach(function (p) {
+          out.summary.best_share[p.key] = maxOrNull(out.summary.best_share[p.key], s.best_share[p.key]);
+        });
       }
       var e = b.expected_time_to_block || {};
       out.difficulty = maxOrNull(out.difficulty, e.network_difficulty);
@@ -347,8 +362,9 @@
         s ? (s.idle ? esc(fmtInt(s.idle)) + ' connected but quiet' : 'last share ' + esc(ago(s.last_share_at, st.now))) : 'no node answered') +
       tile('Shares, 24 hours', s ? esc(fmtInt(acc)) : null,
         s ? (rate == null ? 'none submitted' : esc(rate.toFixed(rate < 1 ? 2 : 1)) + '% stale or rejected') : 'no node answered') +
-      tile('Best share', s ? (s.best_share.ever == null ? 'none yet' : esc(fmtDifficulty(s.best_share.ever))) : null,
-        s && s.best_share['24h'] != null ? esc(fmtDifficulty(s.best_share['24h'])) + ' in the last 24 hours' : '') +
+      tile('Best share, all time', s ? (s.best_share.ever == null ? 'none yet' : esc(fmtDifficulty(s.best_share.ever))) : null,
+        s ? 'this block ' + esc(bestText(s.best_share.block)) + ' · 24 h ' + esc(bestText(s.best_share['24h'])) +
+          ' · 30 days ' + esc(bestText(s.best_share['30d'])) : '') +
       tile('Blocks found', M && M.answered.length ? esc(fmtInt(M.blocks.length)) : null, M && M.blocks.length ? 'latest at height ' + esc(fmtInt(M.blocks[0].height)) : 'none yet') +
       tile('Expected time to a block', w && w.known ? '~' + esc(fmtDuration(w.seconds)) : w && M && M.answered.length ? 'unknown' : null,
         w && w.known ? 'an average, not a promise' : w ? esc(w.reason) : 'no node answered') +
@@ -391,11 +407,11 @@
         '<td><span class="status ' + esc(w.status) + '">' + esc(w.status) + '</span><div class="sub">last share ' + esc(ago(w.last_share_at, st.now)) + '</div></td>' +
         '<td class="num">' + (hashrateHtml(w.hashrate_hs ? w.hashrate_hs['1h'] : null) || '—') + '</td>' +
         '<td class="num">' + esc(fmtInt(c.accepted || 0)) + '<div class="sub"' + (reasons ? ' title="' + esc(reasons) + '"' : '') + '>' + esc(fmtInt(c.stale || 0)) + ' stale · ' + esc(fmtInt(c.rejected || 0)) + ' rejected</div></td>' +
-        '<td class="num">' + (isNum(best.ever) && best.ever > 0 ? esc(fmtDifficulty(best.ever)) : '—') + '</td>' +
+        '<td class="num">' + bestRows(best) + '</td>' +
         '</tr>';
     }).join('');
     return '<div class="table-wrap"><table class="table">' +
-      '<thead><tr><th>Worker</th><th>Status</th><th class="num">Hashrate, 1 h</th><th class="num">Shares, 24 h</th><th class="num">Best share</th></tr></thead>' +
+      '<thead><tr><th>Worker</th><th>Status</th><th class="num">Hashrate, 1 h</th><th class="num">Shares, 24 h</th><th class="num" title="This block: since the last block on the network">Best share</th></tr></thead>' +
       '<tbody>' + rows + '</tbody></table></div>' + missing;
   }
 
@@ -548,7 +564,7 @@
       ? plural(merged.miners.length, 'miner') + ', ' + (P.hashrateText(total) || '0 H/s') + ' in all.'
       : fmtInt(shown.length) + ' of ' + plural(merged.miners.length, 'miner') + ' match.';
     return '<div class="table-wrap"><table class="table miner-list">' +
-      '<thead><tr><th>Address</th><th class="num" title="Workers connected and sending shares now">Online</th><th class="num" title="Averaged over the last 15 minutes">Hashrate</th><th class="num opt">Best share</th><th class="num opt">Last share</th></tr></thead>' +
+      '<thead><tr><th>Address</th><th class="num" title="Workers connected and sending shares now">Online</th><th class="num" title="Averaged over the last 15 minutes">Hashrate</th><th class="num opt" title="The best share ever seen from this address">Best share</th><th class="num opt">Last share</th></tr></thead>' +
       '<tbody>' + rows + '</tbody></table></div><p class="note">' + esc(count) + '</p>' + missing;
   }
 

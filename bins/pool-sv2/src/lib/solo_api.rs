@@ -7,7 +7,9 @@
 //! `null` when the pool has observed less than a minute of the window. A worker is `online` when
 //! it is connected and sent a share in the last 10 minutes, `idle` when it is connected but has
 //! not, `offline` when it is not connected. Difficulties are in difficulty-1 units; a best share
-//! of `0` means none yet.
+//! of `0` means none yet. A best share is given over four periods: `block` since the last block
+//! on the network (the current tip), `24h`, `30d`, and `ever` (since this node began keeping the
+//! worker; a worker silent for 30 days is forgotten).
 //!
 //! ## `GET /api/v1/miner/{address}`
 //!
@@ -21,12 +23,12 @@
 //!     "shares_24h": { "accepted": 812, "stale": 3, "rejected": 1,
 //!                     "reject_reasons": { "duplicate-share": 1 } },
 //!     "last_share_at": 1799999990,
-//!     "best_share": { "ever": 4.1e9, "24h": 2.2e8 }
+//!     "best_share": { "ever": 4.1e9, "30d": 9.0e8, "24h": 2.2e8, "block": 3.1e6 }
 //!   },
 //!   "workers": [{
 //!     "name": "rig1", "status": "online", "last_share_at": 1799999990,
 //!     "last_submit_at": 1799999990, "hashrate_hs": { … }, "shares_24h": { … },
-//!     "best_share": { "ever": 4.1e9, "24h": 2.2e8 },
+//!     "best_share": { "ever": 4.1e9, "30d": 9.0e8, "24h": 2.2e8, "block": 3.1e6 },
 //!     "connections": [{ "downstream_id": 4, "channel_id": 1, "kind": "extended" }]
 //!   }],
 //!   "blocks_found": [{ "height": 974900, "hash": "0000…", "worker": "rig1",
@@ -72,7 +74,7 @@
 //!                "network_difficulty": 1.1e14 },
 //!   "miners": { "connected": 3, "workers": 5 },
 //!   "pool_hashrate_hs": { "15m": 3.0e14, "1h": 2.9e14, "24h": 2.5e14 },
-//!   "best_share": { "ever": 9.9e10, "24h": 1.2e9 },
+//!   "best_share": { "ever": 9.9e10, "30d": 5.0e9, "24h": 1.2e9, "block": 4.4e7 },
 //!   "blocks_found": [ … as above, plus "address" … ],
 //!   "fee_policy": { "treasury_address": "bc1qgxg5ywk835c9fp6arz6d6x50xpk6y0ualt900k",
 //!                   "treasury_share_of_subsidy": 0.005, "treasury_sats_next_block": 1562500,
@@ -109,7 +111,7 @@
 //!     "workers": 2, "online": 1, "idle": 1, "offline": 0,
 //!     "hashrate_hs": { "15m": 1.2e14, "1h": 1.1e14, "24h": 9.8e13 },
 //!     "shares_24h": { "accepted": 812, "stale": 3, "rejected": 1, "reject_reasons": { … } },
-//!     "last_share_at": 1799999990, "best_share": { "ever": 4.1e9, "24h": 2.2e8 },
+//!     "last_share_at": 1799999990, "best_share": { "ever": 4.1e9, "30d": 9.0e8, "24h": 2.2e8, "block": 3.1e6 },
 //!     "blocks_found": 1
 //!   }]
 //! }
@@ -177,23 +179,32 @@ pub struct Rates {
 pub struct BestShare {
     /// The best ever seen here.
     pub ever: f64,
+    /// The best in the last 30 days.
+    #[serde(rename = "30d")]
+    pub d30: f64,
     /// The best in the last 24 hours.
     #[serde(rename = "24h")]
     pub h24: f64,
+    /// The best since the last block on the network (on the current tip).
+    pub block: f64,
 }
 
 impl BestShare {
     fn max(self, o: BestShare) -> BestShare {
         BestShare {
             ever: self.ever.max(o.ever),
+            d30: self.d30.max(o.d30),
             h24: self.h24.max(o.h24),
+            block: self.block.max(o.block),
         }
     }
 
-    fn of(w: &WorkerStats, now: u64) -> BestShare {
+    fn of(w: &WorkerStats, now: u64, tip: &str) -> BestShare {
         BestShare {
             ever: w.best_ever,
+            d30: w.best_30d(now),
             h24: w.best_24h(now),
+            block: w.best_this_block(tip),
         }
     }
 }
@@ -583,7 +594,9 @@ pub fn worker_views(snap: &Snapshot, channels: &[ChannelStatus], now: u64) -> Ve
                 last_submit_at,
                 hashrate_hs: worker_rates(ring, snap.collecting_since, now).0,
                 shares_24h: stats.map(|s| counts_24h(s, now)).unwrap_or_default(),
-                best_share: stats.map(|s| BestShare::of(s, now)).unwrap_or_default(),
+                best_share: stats
+                    .map(|s| BestShare::of(s, now, &snap.round_tip))
+                    .unwrap_or_default(),
                 connections: conns,
             }
         })
@@ -862,10 +875,11 @@ impl SoloApi {
         let stats = self.solo.miner_stats();
         let all = stats.all(now);
         let since = stats.collecting_since();
+        let round_tip = stats.round_tip();
         let pool_hashrate_hs = sum_rates(all.iter().map(|(_, _, w)| w), since, now);
         let best_share = all
             .iter()
-            .map(|(_, _, w)| BestShare::of(w, now))
+            .map(|(_, _, w)| BestShare::of(w, now, &round_tip))
             .fold(BestShare::default(), BestShare::max);
         let channels = self.solo.channel_status();
         let connected: HashSet<&[u8]> =

@@ -309,6 +309,12 @@ pub struct WorkerStats {
     /// The best share's difficulty it has ever sent here.
     #[serde(default)]
     pub best_ever: f64,
+    /// The tip (previous block hash, hex) its [`WorkerStats::best_round`] was mined on.
+    #[serde(default)]
+    pub round_tip: String,
+    /// The best share's difficulty it sent on [`WorkerStats::round_tip`].
+    #[serde(default)]
+    pub best_round: f64,
 }
 
 impl WorkerStats {
@@ -319,6 +325,8 @@ impl WorkerStats {
             last_share_at: None,
             last_submit_at: now,
             best_ever: 0.0,
+            round_tip: String::new(),
+            best_round: 0.0,
         }
     }
 
@@ -337,6 +345,40 @@ impl WorkerStats {
                 self.best_ever = share_difficulty;
             }
         }
+    }
+
+    /// Fold an accepted share mined while `tip` was the chain tip into the round best: a new tip
+    /// starts the round over.
+    fn note_round(&mut self, tip: &str, share_difficulty: f64) {
+        if tip.is_empty() || !share_difficulty.is_finite() {
+            return;
+        }
+        if self.round_tip != tip {
+            self.round_tip = tip.to_string();
+            self.best_round = 0.0;
+        }
+        if share_difficulty > self.best_round {
+            self.best_round = share_difficulty;
+        }
+    }
+
+    /// The best share's difficulty since the block `tip` (0 when none, or when `tip` is unknown).
+    pub fn best_this_block(&self, tip: &str) -> f64 {
+        if !tip.is_empty() && self.round_tip == tip {
+            self.best_round
+        } else {
+            0.0
+        }
+    }
+
+    /// The best share's difficulty in the 30 days [`COARSE`] holds (0 when none).
+    pub fn best_30d(&self, now: u64) -> f64 {
+        let from = now.saturating_sub(COARSE.span());
+        self.coarse
+            .buckets()
+            .filter(|b| b.start + COARSE.width > from)
+            .map(|b| b.best)
+            .fold(0.0, f64::max)
     }
 
     /// The best share's difficulty in the 24 hours before `now` (0 when none).
@@ -394,6 +436,8 @@ pub fn now_secs() -> u64 {
 #[derive(Default)]
 struct Inner {
     collecting_since: u64,
+    /// The current tip (previous block hash, hex); empty until the first one arrives.
+    round_tip: String,
     workers: HashMap<Vec<u8>, BTreeMap<String, WorkerStats>>,
     count: usize,
 }
@@ -428,6 +472,8 @@ impl Inner {
 pub struct Snapshot {
     /// When this node's history begins: buckets before it are unknown, not zero.
     pub collecting_since: u64,
+    /// The current tip (previous block hash, hex); empty until the first one arrives.
+    pub round_tip: String,
     /// The address's workers by name.
     pub workers: BTreeMap<String, WorkerStats>,
 }
@@ -540,6 +586,7 @@ impl MinerStats {
             return;
         }
         let mut st = self.lock();
+        let tip = st.round_tip.clone();
         let known = st
             .workers
             .get(script)
@@ -550,12 +597,29 @@ impl MinerStats {
             }
             st.count += 1;
         }
-        st.workers
+        let w = st
+            .workers
             .entry(script.to_vec())
             .or_default()
             .entry(worker.to_string())
-            .or_insert_with(|| WorkerStats::new(now))
-            .add(outcome, now);
+            .or_insert_with(|| WorkerStats::new(now));
+        w.add(outcome, now);
+        if let Outcome::Accepted {
+            share_difficulty, ..
+        } = outcome
+        {
+            w.note_round(&tip, share_difficulty);
+        }
+    }
+
+    /// A new chain tip (its previous block hash, hex): every worker's round best starts over.
+    pub fn new_round(&self, tip: String) {
+        self.lock().round_tip = tip;
+    }
+
+    /// The current tip, hex; empty until the first one arrives.
+    pub fn round_tip(&self) -> String {
+        self.lock().round_tip.clone()
     }
 
     /// The statistics of every worker paying `script`, pruned to `now`.
@@ -568,6 +632,7 @@ impl MinerStats {
         }
         Snapshot {
             collecting_since: st.collecting_since,
+            round_tip: st.round_tip.clone(),
             workers,
         }
     }

@@ -326,6 +326,70 @@ fn the_best_share_is_kept_ever_and_per_day() {
 }
 
 #[test]
+fn the_best_share_is_kept_per_block_and_over_thirty_days() {
+    let m = MinerStats::in_memory(T0);
+    let best = |sd: f64| Outcome::Accepted {
+        difficulty: 1.0,
+        share_difficulty: sd,
+    };
+    // Before any tip is known there is no round to report.
+    m.record(S, "rig1", best(800.0), T0);
+    assert_eq!(m.snapshot(S, T0).workers["rig1"].best_this_block(""), 0.0);
+
+    m.new_round("aa".repeat(32));
+    m.record(S, "rig1", best(300.0), T0 + 10);
+    m.record(S, "rig1", best(40.0), T0 + 20);
+    let snap = m.snapshot(S, T0 + 30);
+    assert_eq!(snap.round_tip, "aa".repeat(32));
+    assert_eq!(snap.workers["rig1"].best_this_block(&snap.round_tip), 300.0);
+
+    // A new block: the round starts over, though no share has come in on it yet.
+    m.new_round("bb".repeat(32));
+    let snap = m.snapshot(S, T0 + 40);
+    assert_eq!(snap.workers["rig1"].best_this_block(&snap.round_tip), 0.0);
+    m.record(S, "rig1", best(55.0), T0 + 50);
+    let snap = m.snapshot(S, T0 + 60);
+    let w = &snap.workers["rig1"];
+    assert_eq!(w.best_this_block(&snap.round_tip), 55.0);
+    assert_eq!(w.best_ever, 800.0);
+
+    // Ten days on, the 30-day best still holds the 800; past 30 days it has aged out.
+    let later = T0 + 10 * 86_400;
+    m.record(S, "rig1", best(20.0), later);
+    let w = &m.snapshot(S, later).workers["rig1"];
+    assert_eq!(w.best_24h(later), 20.0);
+    assert_eq!(w.best_30d(later), 800.0);
+    let much_later = T0 + 31 * 86_400;
+    m.record(S, "rig1", best(10.0), much_later);
+    let w = &m.snapshot(S, much_later).workers["rig1"];
+    assert_eq!(w.best_30d(much_later), 20.0);
+    assert_eq!(w.best_ever, 800.0);
+}
+
+#[test]
+fn the_round_best_survives_a_restart_on_the_same_tip() {
+    let path = temp_path("round");
+    let m = MinerStats::open(path.clone(), T0);
+    m.new_round("cc".repeat(32));
+    m.record(
+        S,
+        "a",
+        Outcome::Accepted {
+            difficulty: 1.0,
+            share_difficulty: 77.0,
+        },
+        T0 + 5,
+    );
+    m.save(T0 + 10).unwrap();
+    let m2 = MinerStats::open(path.clone(), T0 + 60);
+    // The tip arrives again after the restart: the same block, so the best stands.
+    m2.new_round("cc".repeat(32));
+    let snap = m2.snapshot(S, T0 + 60);
+    assert_eq!(snap.workers["a"].best_this_block(&snap.round_tip), 77.0);
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[test]
 fn a_share_difficulty_is_read_from_its_header() {
     // The genesis block's header: its hash meets about difficulty 2,536.
     let genesis = hex::decode(concat!(
