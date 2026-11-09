@@ -933,12 +933,14 @@ impl SoloApi {
         let now = (self.clock)();
         let stats = self.solo.miner_stats();
         let since = stats.collecting_since();
+        let tip = stats.round_tip();
         let mut by_script: BTreeMap<Vec<u8>, Snapshot> = BTreeMap::new();
         for (script, name, w) in stats.all(now) {
             by_script
                 .entry(script)
                 .or_insert_with(|| Snapshot {
                     collecting_since: since,
+                    round_tip: tip.clone(),
                     workers: BTreeMap::new(),
                 })
                 .workers
@@ -951,6 +953,7 @@ impl SoloApi {
         for script in channels.keys() {
             by_script.entry(script.clone()).or_insert_with(|| Snapshot {
                 collecting_since: since,
+                round_tip: tip.clone(),
                 workers: BTreeMap::new(),
             });
         }
