@@ -3907,10 +3907,25 @@ mod tests {
     /// left the original name attached to `shares_archive` (SQLite cannot rename an index, and
     /// rebuilding this one over the archive at startup is what v56 exists to avoid). The unpaid
     /// scan reads the LIVE table, so the live index is the one that has to be chosen.
+    ///
+    /// The plan is asserted against an ANALYZEd ledger, as a live node's is (`PRAGMA optimize`
+    /// in maintenance). Without statistics the choice falls to SQLite's built-in guesses, and
+    /// those differ by version: 3.39 picked the covering index on an empty table, 3.53 picks the
+    /// narrower `idx_shares_live_unpaid` there and the covering index once `sqlite_stat1` exists.
     #[test]
     fn v48_covering_index_is_used_by_the_unpaid_ledger_scan() {
         let conn = Connection::open_in_memory().expect("conn");
         run_migrations(&conn).expect("migrate");
+        conn.execute_batch(
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 2000)
+             INSERT INTO shares (round_id, miner_id, difficulty, work, share_hash, timestamp,
+                                 received_by, valid, paid_in_proposal_hash)
+             SELECT x / 100, 'miner' || (x % 50), 1.0, 1.0, printf('%064x', x), x, 'node0000', 1,
+                    CASE WHEN x % 2 = 0 THEN NULL ELSE 'proposal' END
+               FROM c;
+             ANALYZE;",
+        )
+        .expect("seed + analyze");
 
         let plan: String = conn
             .prepare(
