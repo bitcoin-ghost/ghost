@@ -96,12 +96,11 @@
 //! timeout) found: `reachable` is `null` until the first check, `height` and `last_ok_at` are from
 //! the last answer, `error` is why the last check failed. Credentials never appear.
 //!
-//! ## `GET /api/v1/pool/miners` (operator only)
+//! ## `GET /api/v1/pool/miners`
 //!
 //! Every payout address with an open channel or a share in the last 24 hours, the most hashrate
-//! (last hour) first. It names miners' addresses, so it is served on the loopback monitoring
-//! listener only, and ghost-mining forwards it only to HMAC-signed requests (the dashboard); the
-//! website proxy never forwards it.
+//! (last hour) first. Public, as on other solo pools: ghost-mining forwards it, and the website
+//! lists the live miners from it.
 //!
 //! ```json
 //! {
@@ -114,6 +113,22 @@
 //!     "last_share_at": 1799999990, "best_share": { "ever": 4.1e9, "30d": 9.0e8, "24h": 2.2e8, "block": 3.1e6 },
 //!     "blocks_found": 1
 //!   }]
+//! }
+//! ```
+//!
+//! ## `GET /api/v1/pool/leaderboard`
+//!
+//! The best shares, per worker, over each period: since the last block on the network, the last
+//! 24 hours, the last 30 days and ever (since this node began keeping the worker; a worker silent
+//! for 30 days is forgotten). At most [`LEADERBOARD_SIZE`] per period, best first; a worker with
+//! no share in a period is not listed in it. `active` is a share in the last 10 minutes. Each node
+//! ranks its own workers; the website merges every node's lists.
+//!
+//! ```json
+//! {
+//!   "network": "mainnet", "generated_at": 1800000000, "collecting_since": 1799990000,
+//!   "block": [{ "address": "bc1q…", "worker": "rig1", "best": 3.1e6, "active": true }],
+//!   "24h": [ … ], "30d": [ … ], "ever": [ … ]
 //! }
 //! ```
 
@@ -491,6 +506,43 @@ pub struct MinersResponse {
     pub collecting_since: u64,
     /// The addresses, most hashrate first.
     pub miners: Vec<MinerListEntry>,
+}
+
+/// The most workers listed in each leaderboard period.
+pub const LEADERBOARD_SIZE: usize = 100;
+
+/// One worker on the leaderboard.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LeaderEntry {
+    /// Its payout address.
+    pub address: String,
+    /// Its worker name.
+    pub worker: String,
+    /// Its best share's difficulty in the period.
+    pub best: f64,
+    /// Whether it sent a share in the last 10 minutes.
+    pub active: bool,
+}
+
+/// `GET /api/v1/pool/leaderboard`.
+#[derive(Debug, Clone, Serialize)]
+pub struct LeaderboardResponse {
+    /// The pool's network.
+    pub network: &'static str,
+    /// When this answer was built.
+    pub generated_at: u64,
+    /// When the share statistics begin.
+    pub collecting_since: u64,
+    /// Since the last block on the network.
+    pub block: Vec<LeaderEntry>,
+    /// The last 24 hours.
+    #[serde(rename = "24h")]
+    pub h24: Vec<LeaderEntry>,
+    /// The last 30 days.
+    #[serde(rename = "30d")]
+    pub d30: Vec<LeaderEntry>,
+    /// Ever.
+    pub ever: Vec<LeaderEntry>,
 }
 
 fn worker_rates(ring: &Ring, since: u64, now: u64) -> (Rates, [Option<SpanTotals>; 3]) {
@@ -928,6 +980,58 @@ impl SoloApi {
         }
     }
 
+    /// The best shares per worker over each period.
+    pub fn leaderboard(&self) -> LeaderboardResponse {
+        let now = (self.clock)();
+        let stats = self.solo.miner_stats();
+        let tip = stats.round_tip();
+        let rows: Vec<(String, String, BestShare, bool)> = stats
+            .all(now)
+            .into_iter()
+            .map(|(script, worker, w)| {
+                let active = w
+                    .last_share_at
+                    .is_some_and(|t| now.saturating_sub(t) <= ONLINE_SECS);
+                (
+                    self.solo.address_of(&script),
+                    worker,
+                    BestShare::of(&w, now, &tip),
+                    active,
+                )
+            })
+            .collect();
+        let top = |pick: fn(&BestShare) -> f64| {
+            let mut v: Vec<LeaderEntry> = rows
+                .iter()
+                .filter(|r| pick(&r.2).is_finite() && pick(&r.2) > 0.0)
+                .map(|r| LeaderEntry {
+                    address: r.0.clone(),
+                    worker: r.1.clone(),
+                    best: pick(&r.2),
+                    active: r.3,
+                })
+                .collect();
+            v.sort_by(|a, b| {
+                b.best
+                    .partial_cmp(&a.best)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.address.cmp(&b.address))
+                    .then_with(|| a.worker.cmp(&b.worker))
+            });
+            v.truncate(LEADERBOARD_SIZE);
+            v
+        };
+        LeaderboardResponse {
+            network: self.solo.network().as_str(),
+            generated_at: now,
+            collecting_since: stats.collecting_since(),
+            block: top(|b| b.block),
+            h24: top(|b| b.h24),
+            d30: top(|b| b.d30),
+            ever: top(|b| b.ever),
+        }
+    }
+
     /// Every payout address with an open channel or a share in the last 24 hours.
     pub fn miners(&self) -> MinersResponse {
         let now = (self.clock)();
@@ -1040,11 +1144,16 @@ pub fn router(api: Arc<SoloApi>) -> stratum_apps::monitoring::axum::Router {
         Json(api.miners()).into_response()
     }
 
+    async fn leaderboard(State(api): State<Arc<SoloApi>>) -> Response {
+        Json(api.leaderboard()).into_response()
+    }
+
     Router::new()
         .route("/api/v1/miner/{address}", get(miner))
         .route("/api/v1/miner/{address}/history", get(history))
         .route("/api/v1/pool/status", get(status))
         .route("/api/v1/pool/miners", get(miners))
+        .route("/api/v1/pool/leaderboard", get(leaderboard))
         .with_state(api)
 }
 

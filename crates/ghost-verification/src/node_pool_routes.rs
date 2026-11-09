@@ -12,6 +12,8 @@
 //!   channel or a share in the last 24 hours, with its workers and hashrate. It is public, like
 //!   the per-address page: the website lists the pool's live miners from it, as public solo pools
 //!   do. A payout address is pseudonymous and is on chain the moment it finds a block.
+//! - `GET /api/v1/pool/leaderboard` is forwarded the same way: the best shares per worker since
+//!   the last block, over 24 hours, 30 days and ever, for the website's leaderboard.
 //! - `GET /api/v1/node-pool/node-list` (dormant: the open-listing lister is gone) serves this node's open-listing lister's `node-list.json`
 //!   (`ghost-audit list`, enabled with `install-node.sh --lister`) read-only, so `ghost-audit
 //!   merge` can collect each lister's list over the API port every node already exposes, with no
@@ -146,6 +148,11 @@ async fn miners_handler(State(state): State<Arc<VerificationState>>) -> Response
     forward(&state, "/api/v1/pool/miners").await
 }
 
+/// `GET /api/v1/pool/leaderboard`: the best shares per worker over each period.
+async fn leaderboard_handler(State(state): State<Arc<VerificationState>>) -> Response {
+    forward(&state, "/api/v1/pool/leaderboard").await
+}
+
 /// Schema of a lister's `node-list.json`.
 const NODE_LIST_SCHEMA: &str = "ghost-audit/node-list/v1";
 /// Largest node list served (the merge reads at most this much from one lister).
@@ -201,6 +208,7 @@ pub(crate) fn node_pool_router() -> Router<Arc<VerificationState>> {
         .route("/api/v1/pool/status", get(status_handler))
         .route("/api/v1/node-pool/status", get(status_handler))
         .route("/api/v1/pool/miners", get(miners_handler))
+        .route("/api/v1/pool/leaderboard", get(leaderboard_handler))
 }
 
 /// A removed feature: what it was, and where its replacement is.
@@ -543,6 +551,16 @@ mod tests {
         assert_eq!(code, StatusCode::OK);
         assert_eq!(v["miners"][0]["address"], "bcrt1qx");
         assert_eq!(*seen.lock(), vec!["/api/v1/pool/miners".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn the_leaderboard_is_public_and_forwarded_unchanged() {
+        let (base, seen) = upstream(200, r#"{"block":[{"worker":"rig1","best":3.0}]}"#).await;
+        let app = crate::routes::create_router(state(&base));
+        let (code, v) = call(app, "GET", "/api/v1/pool/leaderboard").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["block"][0]["worker"], "rig1");
+        assert_eq!(*seen.lock(), vec!["/api/v1/pool/leaderboard".to_string()]);
     }
 
     #[tokio::test]

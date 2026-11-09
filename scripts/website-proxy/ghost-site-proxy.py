@@ -55,12 +55,14 @@ import time
 ADDR = r"[A-Za-z0-9]{1,100}"
 STATUS_ROUTE = "/api/v1/pool/status"
 MINERS_ROUTE = "/api/v1/pool/miners"
+LEADERBOARD_ROUTE = "/api/v1/pool/leaderboard"
 # Answers that are the same for every viewer, cached for --status-cache seconds.
-CACHED_ROUTES = (STATUS_ROUTE, MINERS_ROUTE)
+CACHED_ROUTES = (STATUS_ROUTE, MINERS_ROUTE, LEADERBOARD_ROUTE)
 # The read routes a page may ask a node for: (path regex, allowed query keys and values).
 ROUTES = [
     (re.compile(r"^/api/v1/pool/status$"), {}),
     (re.compile(r"^/api/v1/pool/miners$"), {}),
+    (re.compile(r"^/api/v1/pool/leaderboard$"), {}),
     (re.compile(r"^/api/v1/miner/" + ADDR + r"$"), {}),
     (re.compile(r"^/api/v1/miner/" + ADDR + r"/history$"), {"window": {"24h", "7d", "30d"}}),
 ]

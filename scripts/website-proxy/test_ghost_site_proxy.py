@@ -158,14 +158,15 @@ class ProxyTest(unittest.TestCase):
     # ---- allowed
 
     def test_a_configured_node_and_read_route_is_forwarded(self):
-        for route in ["/api/v1/pool/status", "/api/v1/pool/miners", "/api/v1/miner/" + ADDR,
+        for route in ["/api/v1/pool/status", "/api/v1/pool/miners", "/api/v1/pool/leaderboard",
+                      "/api/v1/miner/" + ADDR,
                       "/api/v1/miner/" + ADDR + "/history", "/api/v1/miner/" + ADDR + "/history?window=7d"]:
             code, body, hdrs = self.req("GET", "/api/pool/b" + route)
             self.assertEqual(code, 200, route)
             self.assertEqual(json.loads(body), {"node": "b", "path": route})
             self.assertEqual(hdrs.get("X-Ghost-Node"), "b")
             self.assertEqual(hdrs.get("Content-Type"), "application/json")
-        self.assertEqual(len(self.b.requests), 5)
+        self.assertEqual(len(self.b.requests), 6)
         self.assertEqual(self.a.requests, [])
 
     def test_each_node_is_asked_at_its_own_configured_port(self):
@@ -206,6 +207,11 @@ class ProxyTest(unittest.TestCase):
             code, body, _ = proxy.handle("GET", "/api/pool/a/api/v1/pool/miners")
             self.assertEqual((code, json.loads(body)["path"]), (200, "/api/v1/pool/miners"))
         self.assertEqual(len(self.a.requests), 6)
+        # And the leaderboard.
+        for _ in range(4):
+            code, body, _ = proxy.handle("GET", "/api/pool/a/api/v1/pool/leaderboard")
+            self.assertEqual((code, json.loads(body)["path"]), (200, "/api/v1/pool/leaderboard"))
+        self.assertEqual(len(self.a.requests), 7)
 
     # ---- refused
 

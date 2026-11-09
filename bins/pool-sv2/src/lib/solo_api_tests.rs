@@ -218,3 +218,49 @@ fn the_operator_list_names_active_addresses_most_hashrate_first() {
         assert!(m.get(k).is_some(), "{k} missing: {m}");
     }
 }
+
+#[test]
+fn the_leaderboard_ranks_workers_by_their_best_share_in_each_period() {
+    let api = api();
+    let s1 = api.payee_script(ADDR).unwrap();
+    let s2 = api.payee_script(ADDR2).unwrap();
+    let share = |script: &[u8], worker: &str, sd: f64, at: u64| {
+        api.solo.miner_stats().record(
+            script,
+            worker,
+            Outcome::Accepted {
+                difficulty: 1.0,
+                share_difficulty: sd,
+            },
+            at,
+        );
+    };
+    // Two days ago: rig1 found a big one. Today, on the current block: smaller ones.
+    share(&s1, "rig1", 9.0e9, T0 - 2 * 86_400);
+    api.solo.miner_stats().new_round("ab".repeat(32));
+    share(&s1, "rig1", 2.0e6, T0 - 300);
+    share(&s1, "rig2", 5.0e6, T0 - 3_600);
+    share(&s2, "axe", 7.0e6, T0 - 60);
+
+    let l = api.leaderboard();
+    let names = |v: &[LeaderEntry]| v.iter().map(|e| e.worker.clone()).collect::<Vec<_>>();
+    assert_eq!(names(&l.block), ["axe", "rig2", "rig1"]);
+    assert_eq!(names(&l.h24), ["axe", "rig2", "rig1"]);
+    assert_eq!(names(&l.d30), ["rig1", "axe", "rig2"]);
+    assert_eq!(names(&l.ever), ["rig1", "axe", "rig2"]);
+    assert_eq!(l.ever[0].best, 9.0e9);
+    assert_eq!(l.ever[0].address, ADDR);
+    assert_eq!(l.block[0].address, ADDR2);
+    assert!(l.block[0].active, "a share a minute ago");
+    assert!(!l.block[1].active, "an hour ago");
+
+    // A new block: nobody has a share on it yet, so that list is empty.
+    api.solo.miner_stats().new_round("cd".repeat(32));
+    let l = api.leaderboard();
+    assert!(l.block.is_empty());
+    assert_eq!(l.h24.len(), 3);
+    let v = serde_json::to_value(&l).unwrap();
+    for k in ["block", "24h", "30d", "ever"] {
+        assert!(v[k].is_array(), "{k}");
+    }
+}
