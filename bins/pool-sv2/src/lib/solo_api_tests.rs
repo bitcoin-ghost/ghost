@@ -69,6 +69,13 @@ fn a_miners_shares_hashrate_and_best_share_are_reported() {
     assert_eq!(r.summary.shares_24h.accepted, 100);
     assert_eq!(r.summary.best_share.ever, 9.0e6);
     assert_eq!(r.summary.best_share.h24, 9.0e6);
+    assert_eq!(r.summary.best_share.d30, 9.0e6);
+    assert_eq!(r.summary.best_share.block, 0.0, "no tip yet, so no round");
+    let v = serde_json::to_value(&r).unwrap();
+    for k in ["ever", "30d", "24h", "block"] {
+        assert!(v["summary"]["best_share"][k].is_number(), "{k}");
+        assert!(v["workers"][0]["best_share"][k].is_number(), "{k}");
+    }
     let h1 = r.summary.hashrate_hs.h1.unwrap();
     let want = 100.0 * 1_000.0 * 4_294_967_296.0 / 3_600.0;
     assert!((h1 - want).abs() / want < 0.05, "{h1} vs {want}");

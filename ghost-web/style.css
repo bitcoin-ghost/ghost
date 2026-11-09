@@ -422,3 +422,7 @@ main ol:not([class]), main ul:not([class]) { padding-left: 22px; }
   .miner-list .opt { display: none; }
   .miner-list th, .miner-list td { padding-left: 10px; padding-right: 10px; }
 }
+
+.best-rows { display: inline-grid; gap: 1px; }
+.best-row { display: flex; justify-content: space-between; gap: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.best-row span { font-size: 12px; color: var(--fainter); }
