@@ -536,7 +536,9 @@
     var rows = shown.map(function (m) {
       return '<tr>' +
         '<td><a class="mono" href="' + esc(queryString({ address: m.address })) + '" title="' + esc(m.address) + '">' + esc(shortAddress(m.address)) + '</a></td>' +
-        '<td class="num">' + esc(fmtInt(m.online)) + ' / ' + esc(fmtInt(m.workers)) + '</td>' +
+        // Online only: a worker that moved node is still listed (offline) on the node it left for
+        // 24 h, so totals over nodes count it twice. A connection is on one node at a time.
+        '<td class="num">' + esc(fmtInt(m.online)) + '</td>' +
         '<td class="num">' + (hashrateHtml(m.hashrate) || '—') + '</td>' +
         '<td class="num opt">' + (isNum(m.best) && m.best > 0 ? esc(fmtDifficulty(m.best)) : '—') + '</td>' +
         '<td class="num opt">' + esc(ago(m.last_share_at, now)) + '</td>' +
@@ -546,7 +548,7 @@
       ? plural(merged.miners.length, 'miner') + ', ' + (P.hashrateText(total) || '0 H/s') + ' in all.'
       : fmtInt(shown.length) + ' of ' + plural(merged.miners.length, 'miner') + ' match.';
     return '<div class="table-wrap"><table class="table miner-list">' +
-      '<thead><tr><th>Address</th><th class="num">Workers</th><th class="num" title="Averaged over the last 15 minutes">Hashrate</th><th class="num opt">Best share</th><th class="num opt">Last share</th></tr></thead>' +
+      '<thead><tr><th>Address</th><th class="num" title="Workers connected and sending shares now">Online</th><th class="num" title="Averaged over the last 15 minutes">Hashrate</th><th class="num opt">Best share</th><th class="num opt">Last share</th></tr></thead>' +
       '<tbody>' + rows + '</tbody></table></div><p class="note">' + esc(count) + '</p>' + missing;
   }
 

@@ -266,6 +266,8 @@ test('live list: renders rows that link to each miner, with a count', () => {
   const m = MP.mergeMinerLists(lists());
   const all = MP.minerListHtml(m, '', NOW);
   noJunk(all, 'list');
+  assert(!strip(all).includes(' / '), 'online only: totals over nodes double-count a moved worker');
+  assert(strip(all).includes(ADDR2.slice(0, 10)) && /<td class="num">4<\/td>/.test(all));
   assert(all.includes('?address=' + ADDR2));
   assert(strip(all).includes('2 miners'));
   const one = MP.minerListHtml(m, '7zvdh', NOW);
