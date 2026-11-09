@@ -95,7 +95,9 @@ rand = "0.8"
 hex = "0.4"
 
 # Database
-rusqlite = { version = "0.31", features = ["bundled-sqlcipher"] }
+# fallible_uint keeps the u64/usize ToSql/FromSql impls (error if > i64::MAX) that
+# rusqlite 0.38 moved behind a feature; behaviour is unchanged from 0.31.
+rusqlite = { version = "0.41.1", features = ["bundled-sqlcipher", "fallible_uint"] }
 
 # Caching
 lru = "0.12"
