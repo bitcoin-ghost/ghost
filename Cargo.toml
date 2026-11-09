@@ -60,7 +60,7 @@ exclude = ["vendor/stratum"]
 [workspace.package]
 version = "2.1.1"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 authors = ["Bitcoin Ghost Team"]
 license = "MIT"
 repository = "https://github.com/bitcoin-ghost/ghost"
