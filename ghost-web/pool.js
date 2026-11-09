@@ -380,9 +380,29 @@
     });
   }
 
+  // On a phone the nav scrolls sideways: show the current page's link, and fade the edge that
+  // still has links beyond it.
+  function navScroll(doc, win) {
+    var nav = doc.querySelector('nav.primary');
+    if (!nav) return;
+    var cur = nav.querySelector('a.current');
+    if (cur && cur.offsetLeft + cur.offsetWidth > nav.clientWidth) {
+      nav.scrollLeft = cur.offsetLeft - (nav.clientWidth - cur.offsetWidth) / 2;
+    }
+    function edges() {
+      var more = nav.scrollWidth - nav.clientWidth;
+      nav.classList.toggle('more-right', more > 1 && nav.scrollLeft < more - 1);
+      nav.classList.toggle('more-left', more > 1 && nav.scrollLeft > 1);
+    }
+    nav.addEventListener('scroll', edges, { passive: true });
+    win.addEventListener('resize', edges);
+    edges();
+  }
+
   function startBrowser(doc, win) {
     themeToggle(doc, win);
     copyOnClick(doc, win);
+    navScroll(doc, win);
     var connect = doc.querySelectorAll('[data-connect]');
     var stats = doc.querySelector('[data-pool-stats]');
     var blocks = doc.querySelector('[data-pool-blocks]');

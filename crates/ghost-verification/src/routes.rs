@@ -201,13 +201,6 @@ pub fn create_router(state: Arc<VerificationState>) -> Router {
         // Returns this node's best share only; website aggregates across
         // nodes. No auth; enumeration not possible (one response).
         .route("/api/v1/pool/records", get(api_pool_records_handler))
-        // Public per-window leaderboard: top miners by best-hash and by
-        // total shares contributed in the requested window. Used by the
-        // pool page gamification; same redaction rules as /records.
-        .route(
-            "/api/v1/pool/leaderboard",
-            get(api_pool_leaderboard_handler),
-        )
         // Tail of recent shares for the live quasar visualisation. One
         // lightweight row per share — the caller polls with ?since=<ts>
         // and gets everything accepted since that watermark.
@@ -1434,15 +1427,6 @@ struct PoolRecordsQuery {
     window: Option<String>,
 }
 
-/// Query parameters for the public leaderboard endpoint.
-/// `window` is `day | week | month` (no `block` — 10 min is too short
-/// to rank). `limit` defaults to 10, capped at 50 to prevent enumeration.
-#[derive(Debug, Deserialize)]
-struct PoolLeaderboardQuery {
-    window: Option<String>,
-    limit: Option<u32>,
-}
-
 /// Query parameters for the pool time-series endpoint.
 /// `window` is `1h | 24h` (defaults to `1h`, anything else is treated as `1h`).
 #[derive(Debug, Deserialize)]
@@ -2353,170 +2337,6 @@ async fn api_pool_mesh_leaderboard_handler(
         "limit_note": "This node only: the old mesh that aggregated every node was \
             removed. A per-miner leaderboard across nodes requires client-side \
             fan-out to every node.",
-    }))
-}
-
-/// Public leaderboard for the pool page. Returns both the best-hash
-/// leaderboard and the shares-contributed leaderboard for the window.
-/// Website fans out to every node and merges per-miner across nodes.
-async fn api_pool_leaderboard_handler(
-    State(state): State<Arc<VerificationState>>,
-    Query(params): Query<PoolLeaderboardQuery>,
-) -> impl IntoResponse {
-    let window_name = params
-        .window
-        .as_deref()
-        .unwrap_or("day")
-        .to_ascii_lowercase();
-    let limit = params.limit.unwrap_or(10).clamp(1, 50);
-
-    // "lifetime" queries the `miners` table directly and ignores the
-    // pruned shares timeline. Only the shares-contributed tab is useful
-    // in this mode — best-hash needs an actual share hash which we only
-    // keep in `shares` for a bounded window.
-    if window_name == "lifetime" {
-        let Some(ref db) = state.database else {
-            return Json(serde_json::json!({
-                "window": "lifetime",
-                "error": "Database not available",
-            }));
-        };
-        // Fetch a larger slice and filter so we still return the caller's
-        // requested `limit` after removing system accounts.
-        let over_fetch = (limit as usize).saturating_mul(3).max(30) as u32;
-        // 7-day activity filter matches the unpaid-ledger prune rule:
-        // a miner must have submitted at least one share in the last
-        // week to appear on the public lifetime leaderboard. Hides
-        // legacy translator attributions and abandoned wallets.
-        const ACTIVE_SECS: i64 = 7 * 24 * 3600;
-        let shares = db
-            .get_leaderboard_lifetime(over_fetch, ACTIVE_SECS)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(miner_id, _, _)| !is_system_miner(miner_id))
-            .take(limit as usize)
-            .map(|(miner_id, share_count, total_work)| {
-                serde_json::json!({
-                    "miner_id_redacted": redact_miner_id(&miner_id),
-                    "share_count": share_count,
-                    "total_work": total_work,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        return Json(serde_json::json!({
-            "window": "lifetime",
-            "best_hash": serde_json::Value::Array(Vec::new()),
-            "shares": shares,
-            "limit": limit,
-        }));
-    }
-
-    let window_secs: i64 = match window_name.as_str() {
-        "day" => 86_400,
-        "week" => 604_800,
-        "month" => 2_592_000,
-        _ => {
-            return Json(serde_json::json!({
-                "error": "Invalid window — expected day | week | month | lifetime",
-                "window": window_name,
-            }));
-        }
-    };
-
-    let now_s = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let since_ts = now_s - window_secs;
-
-    let Some(ref db) = state.database else {
-        return Json(serde_json::json!({
-            "window": window_name,
-            "since_ts": since_ts,
-            "error": "Database not available",
-        }));
-    };
-
-    // Over-fetch so we can filter out system miners (translator proxies)
-    // and still return `limit` real rows.
-    let over_fetch = (limit as usize).saturating_mul(3).max(30) as u32;
-
-    // Both leaderboard reads are moved onto the blocking pool.
-    //
-    // They are synchronous SQLite calls that scan history, and on the 4 GB nodes the long
-    // windows take SECONDS even after the query rewrite. Run inline on an async worker, such a
-    // call pins that worker for its whole duration and every other request scheduled on it
-    // stalls behind it — which is why `/health` measured 12 s on ghost-vm6 while doing no
-    // database work of its own, and 0.004 s on ghost-vm8 where the same query was fast. That is
-    // the #554 shape: one worker in uninterruptible disk wait taking unrelated endpoints down
-    // with it.
-    //
-    // `spawn_blocking` is the fix for the collateral damage; the SQL rewrite in
-    // `get_leaderboard_*` is the fix for the cost. Both are needed — a fast query can still
-    // block, and an offloaded slow query is still slow.
-    let db_bh = db.clone();
-    let best_hash_rows =
-        tokio::task::spawn_blocking(move || db_bh.get_leaderboard_best_hash(since_ts, over_fetch))
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "leaderboard: best-hash task failed");
-                Ok(Vec::new())
-            })
-            .unwrap_or_default();
-
-    let best_hash = best_hash_rows
-        .into_iter()
-        .filter(|(miner_id, _, _, _)| !is_system_miner(miner_id))
-        .take(limit as usize)
-        .map(|(miner_id, hash, ts, difficulty)| {
-            // `hash` is INTERNAL order from the DB: feed it straight to
-            // `share_difficulty_from_hash_hex`, but present the DISPLAY form
-            // (zeros at the front) for the website and leading-zero count.
-            let display_hash = internal_hex_to_display_hex(&hash);
-            let leading_hex_zeros = display_hash.chars().take_while(|c| *c == '0').count();
-            serde_json::json!({
-                "miner_id_redacted": redact_miner_id(&miner_id),
-                "share_hash": display_hash,
-                "leading_zero_bits": leading_hex_zeros * 4,
-                "timestamp": ts,
-                // Achieved difficulty from the hash (the score). `claimed_difficulty`
-                // is the stored vardiff target, kept for back-compat.
-                "difficulty": share_difficulty_from_hash_hex(&hash),
-                "claimed_difficulty": difficulty,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let db_sh = db.clone();
-    let shares_rows =
-        tokio::task::spawn_blocking(move || db_sh.get_leaderboard_shares(since_ts, over_fetch))
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "leaderboard: shares task failed");
-                Ok(Vec::new())
-            })
-            .unwrap_or_default();
-
-    let shares = shares_rows
-        .into_iter()
-        .filter(|(miner_id, _, _)| !is_system_miner(miner_id))
-        .take(limit as usize)
-        .map(|(miner_id, share_count, total_work)| {
-            serde_json::json!({
-                "miner_id_redacted": redact_miner_id(&miner_id),
-                "share_count": share_count,
-                "total_work": total_work,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    Json(serde_json::json!({
-        "window": window_name,
-        "since_ts": since_ts,
-        "limit": limit,
-        "best_hash": best_hash,
-        "shares": shares,
     }))
 }
 

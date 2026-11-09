@@ -33,4 +33,5 @@ done < <(find ghost-web -name '*.js' -print0)
 
 node scripts/web-tests/miner-page.test.js || status=1
 node scripts/web-tests/pool-site.test.js || status=1
+node scripts/web-tests/leaderboard.test.js || status=1
 exit "$status"
