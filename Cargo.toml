@@ -58,7 +58,7 @@ exclude = ["vendor/stratum"]
 # Use scripts/build-all-wallets.sh to build all wallet types.
 
 [workspace.package]
-version = "2.1.1"
+version = "2.1.2"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Bitcoin Ghost Team"]

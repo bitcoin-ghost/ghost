@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-ghost-tests"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "bitcoin",
  "ghost-buds",
@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "bitcoin_core_sv2"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "async-channel 1.9.0",
  "bitcoin-capnp-types",
@@ -2077,7 +2077,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-accounting"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "bitcoin",
  "ed25519-dalek",
@@ -2086,7 +2086,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-audit"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "bitcoin",
  "clap",
@@ -2101,7 +2101,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-buds"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "bitcoin",
  "ghost-common",
@@ -2111,11 +2111,11 @@ dependencies = [
 
 [[package]]
 name = "ghost-build-info"
-version = "2.1.1"
+version = "2.1.2"
 
 [[package]]
 name = "ghost-cli"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -2129,7 +2129,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-common"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "base64 0.22.1",
  "bitcoin",
@@ -2160,7 +2160,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-mining"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -2203,7 +2203,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-policy"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "bitcoin",
  "ghost-buds",
@@ -2214,7 +2214,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-reaper"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "bitcoin",
  "hex",
@@ -2225,7 +2225,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-setup"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "clap",
  "dirs 5.0.1",
@@ -2234,7 +2234,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-stats"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -2251,7 +2251,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-storage"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -2270,7 +2270,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-verification"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "axum 0.7.9",
  "base64 0.22.1",
@@ -3637,7 +3637,7 @@ dependencies = [
 
 [[package]]
 name = "pool_sv2"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "async-channel 1.9.0",
  "bitcoin_core_sv2",
@@ -4601,7 +4601,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stratum-apps"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "async-channel 1.9.0",
  "axum 0.8.9",
@@ -5286,7 +5286,7 @@ dependencies = [
 
 [[package]]
 name = "translator_sv2"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "async-channel 1.9.0",
  "clap",
