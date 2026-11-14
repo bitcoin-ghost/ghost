@@ -60,7 +60,7 @@ exclude = ["vendor/stratum"]
 [workspace.package]
 version = "2.1.3"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 authors = ["Bitcoin Ghost Team"]
 license = "MIT"
 repository = "https://github.com/bitcoin-ghost/ghost"
@@ -95,7 +95,9 @@ rand = "0.8"
 hex = "0.4"
 
 # Database
-rusqlite = { version = "0.31", features = ["bundled-sqlcipher"] }
+# fallible_uint keeps the u64/usize ToSql/FromSql impls (error if > i64::MAX) that
+# rusqlite 0.38 moved behind a feature; behaviour is unchanged from 0.31.
+rusqlite = { version = "0.41.1", features = ["bundled-sqlcipher", "fallible_uint"] }
 
 # Caching
 lru = "0.12"
