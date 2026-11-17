@@ -1,0 +1,11 @@
+# Keeps the commit-pinned GitHub Actions current: a weekly PR bumps a pinned sha (and its "# vN" comment)
+# when the action releases. Pinning to a sha stops a moved or hijacked tag from running in our workflows.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
