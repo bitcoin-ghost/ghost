@@ -27,21 +27,10 @@ ignore = [
     "RUSTSEC-2024-0415",  # gtk
     "RUSTSEC-2024-0420",  # gtk-sys
     "RUSTSEC-2024-0419",  # gtk3-macros
-    "RUSTSEC-2024-0429",  # glib (unsound) — gtk3 stack, GUI-only, upstream-abandoned
-    # --- Unmaintained: pulled by GUI/web (urlpattern, selectors) — GUI-only. ---
-    "RUSTSEC-2025-0081",  # unic-char-property  (via urlpattern)
-    "RUSTSEC-2025-0075",  # unic-char-range
-    "RUSTSEC-2025-0080",  # unic-common
-    "RUSTSEC-2025-0100",  # unic-ucd-ident
-    "RUSTSEC-2025-0098",  # unic-ucd-version
-    "RUSTSEC-2025-0057",  # fxhash (via selectors)
     # --- Unmaintained: ubiquitous transitive utils / FFI / ZK / bench. ---
     # No maintained drop-in; pulled by uniffi (mobile FFI), bellperson (ZK),
     # criterion (benches), and widely across the ecosystem.
-    "RUSTSEC-2024-0436",  # paste            (uniffi)
-    "RUSTSEC-2025-0141",  # bincode          (bellperson/uniffi)
     "RUSTSEC-2024-0384",  # instant          (fastrand 1.9 transitive)
-    "RUSTSEC-2024-0370",  # proc-macro-error (gtk3/glib macros)
     "RUSTSEC-2025-0052",  # async-std        (criterion benches)
     # --- rand unsound (RUSTSEC-2026-0097): reviewed, not exposed. ---
     # The UB requires calling rand::rng()/thread_rng() from INSIDE a custom
@@ -66,16 +55,4 @@ ignore = [
     # TDP coinbase construction — i.e. it is gated on a deliberate Bitcoin Core
     # version migration. Re-evaluate when that migration happens.
     "RUSTSEC-2025-0143",  # capnp (unsound) — unreachable; fix gated on a Bitcoin Core IPC version migration
-    # --- quick-xml DoS (RUSTSEC-2026-0194 + -0195): reviewed, GUI/macOS-bundling only. ---
-    # Two DoS advisories (quadratic run time on duplicate start-tag attributes;
-    # unbounded namespace-declaration allocation in NsReader). quick-xml is pulled
-    # ONLY via `plist` (Apple .plist parsing) in the desktop / macOS app-bundling
-    # path — not in any shipped node binary (ghost-mining / translator_sv2 / pool_sv2
-    # / ghostd; confirmed via cargo tree — no host-target dependents).
-    # `plist` reads local, trusted property lists, never untrusted network input, so
-    # the DoS is unreachable in ghost's usage. The fix (quick-xml >= 0.41) is
-    # upstream-gated: the latest `plist` (1.9.0) still pins quick-xml 0.39, so there
-    # is no patched version to adopt. Re-evaluate when `plist` moves to quick-xml >= 0.41.
-    "RUSTSEC-2026-0194",  # quick-xml (DoS) — GUI/macOS-bundling only via plist, unreachable; fix upstream-gated
-    "RUSTSEC-2026-0195",  # quick-xml (DoS) — same: GUI/macOS-bundling only via plist, unreachable; fix upstream-gated
 ]
